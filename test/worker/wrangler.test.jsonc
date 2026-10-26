@@ -1,0 +1,32 @@
+// Workers-runtime test config (test/worker/vitest.config.ts). Mirrors ../../wrangler.jsonc minus the
+// Qwik bundle / static assets, with a test entry (./entry.ts) and low proof-of-work difficulty.
+{
+  "name": "segv-sh-test",
+  "main": "./entry.ts",
+  "compatibility_date": "2026-10-20",
+  "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "segv-test",
+      "database_id": "00000000-0000-0000-0000-000000000001",
+      "migrations_dir": "../../migrations",
+    },
+  ],
+  "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "segv-blobs-test" }],
+  "durable_objects": { "bindings": [{ "name": "LOG", "class_name": "LogDO" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["LogDO"] }],
+  "ratelimits": [
+    { "name": "RL_WRITE", "namespace_id": "1001", "simple": { "limit": 60, "period": 60 } },
+    { "name": "RL_BLOB", "namespace_id": "1002", "simple": { "limit": 20, "period": 60 } },
+    { "name": "RL_READ", "namespace_id": "1003", "simple": { "limit": 600, "period": 60 } },
+  ],
+  // APP_HOSTS: the tests talk to https://segv.test (helpers.ts ORIGIN).
+  "vars": {
+    "POW_REGISTER": "6",
+    "POW_WRAP": "5",
+    "POW_APPEND": "4",
+    "POW_BLOB": "5",
+    "APP_HOSTS": "segv.test,localhost",
+  },
+}

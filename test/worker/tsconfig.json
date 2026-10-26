@@ -1,0 +1,15 @@
+{
+  // Type-checks the Workers-runtime tests: npx tsc -p test/worker
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "types": ["@cloudflare/vitest-plugin/types", "node"],
+    "incremental": false,
+    "noEmit": true
+  },
+  "include": [
+    "./**/*.ts",
+    "../../worker-configuration.d.ts",
+    "../../src/server/**/*.ts",
+    "../../src/lib/**/*.ts"
+  ]
+}

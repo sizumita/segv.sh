@@ -1,0 +1,64 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "segv-sh",
+  // Built by `qwik build` (vite SSR build of src/entry.cloudflare-workers.ts). Wrangler re-bundles it.
+  "main": "./server/entry.cloudflare-workers.js",
+  // Must stay <= the bundled workerd release (2026-10-23).
+  "compatibility_date": "2026-10-20",
+  "compatibility_flags": ["nodejs_compat"],
+  // Serve ONLY on the canonical custom domain: the passkey RP ID is the page hostname, so a registration
+  // on <name>.<account>.workers.dev or on a version preview URL would mint passkeys bound to that host
+  // (useless once it goes away) while writing to the production log, and preview URLs would run
+  // undeployed code against production data. Attach segv.sh as a Custom Domain of this Worker.
+  "workers_dev": false,
+  "preview_urls": false,
+  "assets": {
+    // MUST be "ASSETS": Qwik's cloudflare-pages middleware calls env.ASSETS.fetch() for static paths.
+    "binding": "ASSETS",
+    "directory": "./dist",
+    // API + websocket paths always hit the Worker (never the asset server).
+    "run_worker_first": ["/api/*"],
+  },
+  // Derived index of the public log (users, wraps) + blob registry. See migrations/.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "segv",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations",
+    },
+  ],
+  // Client-side-encrypted, content-addressed blobs: key "b/<b64u(sha256(blob))>".
+  "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "segv-blobs" }],
+  // The single sequencer of the public hash-chained log: env.LOG.getByName("global").
+  "durable_objects": {
+    "bindings": [{ "name": "LOG", "class_name": "LogDO" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["LogDO"] }],
+  // Per-IP (IPv6 /64) abuse limits. Keys are never persisted. Period must be 10 or 60 seconds.
+  "ratelimits": [
+    { "name": "RL_WRITE", "namespace_id": "1001", "simple": { "limit": 60, "period": 60 } },
+    { "name": "RL_BLOB", "namespace_id": "1002", "simple": { "limit": 20, "period": 60 } },
+    { "name": "RL_READ", "namespace_id": "1003", "simple": { "limit": 600, "period": 60 } },
+  ],
+  "vars": {
+    // Proof-of-work base difficulty (leading zero bits) per scope, docs/PROTOCOL.md §4.3. Appends and
+    // blobs need more for larger bodies (proto.powDifficulty).
+    "POW_REGISTER": "20",
+    "POW_WRAP": "18",
+    "POW_APPEND": "16",
+    "POW_BLOB": "18",
+    // Hostnames this Worker answers on (comma-separated; the first is canonical). Any other host gets a
+    // 308 to https://<first><path> (pages) or 421 (/api/*). "" disables the check. localhost = local dev
+    // (vp dev, wrangler dev, test/e2e). src/server/hosts.ts.
+    "APP_HOSTS": "segv.sh,localhost",
+  },
+  // Workers Logs: keep only our own console.error lines (they never contain addresses, ids or bodies).
+  // Invocation logs would retain every request's URL (handles, credential / blob ids) and request
+  // metadata for days, which the design promises not to keep.
+  "observability": {
+    "enabled": true,
+    "logs": { "enabled": true, "invocation_logs": false },
+    "traces": { "enabled": false },
+  },
+}
