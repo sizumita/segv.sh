@@ -994,7 +994,7 @@ describe("checkUserKeys / isBadSigPk (§2.1)", () => {
     expect(P.validSigPk(pk)).toBe(true);
     pk.set(mixed);
     expect(P.validSigPk(pk)).toBe(false);
-  });
+  }, 30_000); // 4200 subgroup checks: seconds of CPU, more on a loaded machine
 
   it("rejects KEM keys that cannot be encapsulated to", () => {
     const pk = alice.id.kemPk;

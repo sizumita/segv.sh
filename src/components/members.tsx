@@ -14,6 +14,9 @@ export const Members = component$<{ conv: ConversationView }>((props) => {
 
   const conv = props.conv;
   const meUid = state.me?.uid ?? "";
+  /** add and remove need a sendable, unfrozen conversation; a frozen member can still leave (SPEC §6.6 step 6) */
+  const canChange = conv.canSend && !conv.frozen;
+  const canLeave = conv.blocked !== "removed" && conv.blocked !== "left";
 
   const addMembers = $(async () => {
     if (busy.value) return;
@@ -60,7 +63,7 @@ export const Members = component$<{ conv: ConversationView }>((props) => {
                   {self && <span class="dim"> (you)</span>}
                   {m.left && <span class="dim"> (left)</span>}
                 </b>
-                {!self && conv.canSend && confirmUid.value !== m.uid && (
+                {!self && canChange && confirmUid.value !== m.uid && (
                   <button
                     type="button"
                     class="link"
@@ -102,7 +105,7 @@ export const Members = component$<{ conv: ConversationView }>((props) => {
         })}
       </ul>
 
-      {conv.canSend && (
+      {canChange && (
         <>
           <form class="addm" preventdefault:submit onSubmit$={addMembers}>
             <input
@@ -125,6 +128,10 @@ export const Members = component$<{ conv: ConversationView }>((props) => {
               {addError.value}
             </p>
           )}
+        </>
+      )}
+      {canLeave && (
+        <>
           <div class="leave">
             {!confirmLeave.value ? (
               <button

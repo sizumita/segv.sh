@@ -16,10 +16,18 @@ import { afterEach, beforeEach } from "vite-plus/test";
 import * as P from "../../src/lib/proto";
 import * as W from "../../src/lib/wire";
 import type { ConversationView, Engine } from "../../src/client/types";
+import { SegvEngine, type EngineOptions } from "../../src/client/engine";
+import type {
+  EngineClock,
+  EngineDelays,
+  EngineTimer,
+  WebSocketCtor,
+} from "../../src/client/options";
+import type { SelfLane } from "../../src/client/selflane";
 import { FakeWebSocket } from "./fake/rt";
 import { FakeWorld, type FakeWorldOptions } from "./fake/world";
 
-export { P, W, FakeWorld, FakeWebSocket };
+export { P, W, FakeWorld, FakeWebSocket, SegvEngine };
 export * from "./fake/world";
 export type { FakeParams, PublishRow } from "./fake/common";
 export type { ShardRow, ShardBatch } from "./fake/shard";
@@ -247,55 +255,230 @@ export const chat = (e: Engine, convId: string): string[] =>
 export const systemLines = (e: Engine, convId: string): string[] =>
   (view(e, convId)?.messages ?? []).filter((m) => m.kind === "system").map((m) => m.text ?? "");
 
-// ═════════════════════════ M6: engine-dependent helpers (placeholders) ═════════════════════════
-// These need SegvEngine (src/client/engine.ts, milestone M6), which does not exist yet. Signatures follow
-// docs/STAGE1-PLAN.md §2.2–§2.3; M6 replaces the bodies (and fills in EngineI).
+// ═════════════════════════ engines (M6a; docs/STAGE1-PLAN.md §2.2) ═════════════════════════
 
-const needsM6 = (what: string): never => {
-  throw new Error(`${what}: needs the v2 engine (milestone M6)`);
+type Timer = { due: number; fn: () => void; real: ReturnType<typeof setTimeout> | null };
+
+/**
+ * An engine's clocks in tests: real time plus offsets (plan §2.2). `world.tick(ms)` moves every registered engine
+ * clock with the world; `advance(ms, {mono?, wall?})` moves one engine's clocks (both by default); `pauseMono()` holds
+ * the monotonic clock still while the wall clock and the world run on. Timers run on the monotonic clock: they fire
+ * when it reaches their due time, by real time or at once when an advance passes it.
+ */
+export class TestClock implements EngineClock {
+  private monoOff = 0;
+  private wallOff = 0;
+  private pausedAt: number | null = null;
+  private seq = 0;
+  private readonly timers = new Map<number, Timer>();
+
+  mono(): number {
+    return (this.pausedAt ?? performance.now()) + this.monoOff;
+  }
+
+  wall(): number {
+    return Date.now() + this.wallOff;
+  }
+
+  setTimer(fn: () => void, ms: number): EngineTimer {
+    const id = ++this.seq;
+    this.timers.set(id, { due: this.mono() + Math.max(0, ms), fn, real: null });
+    this.arm(id);
+    return {
+      cancel: () => {
+        const t = this.timers.get(id);
+        if (t?.real) clearTimeout(t.real);
+        this.timers.delete(id);
+      },
+    };
+  }
+
+  /** Moves the monotonic and/or the wall clock by `ms` (both by default) and fires the timers that fall due. */
+  advance(ms: number, opts: { mono?: boolean; wall?: boolean } = {}): void {
+    if (opts.mono ?? true) this.monoOff += ms;
+    if (opts.wall ?? true) this.wallOff += ms;
+    this.fireDue();
+  }
+
+  /** Holds the monotonic clock still (a frozen tab, or a system asleep); timers wait with it. */
+  pauseMono(): void {
+    if (this.pausedAt === null) this.pausedAt = performance.now();
+  }
+
+  resumeMono(): void {
+    if (this.pausedAt === null) return;
+    this.monoOff += this.pausedAt - performance.now();
+    this.pausedAt = null;
+    for (const id of this.timers.keys()) this.arm(id);
+  }
+
+  /** The due time (monotonic ms) of the earliest timer, or null. */
+  nextDue(): number | null {
+    let due: number | null = null;
+    for (const t of this.timers.values()) if (due === null || t.due < due) due = t.due;
+    return due;
+  }
+
+  /** Cancels every timer (end of the test). */
+  dispose(): void {
+    for (const t of this.timers.values()) if (t.real) clearTimeout(t.real);
+    this.timers.clear();
+  }
+
+  private arm(id: number): void {
+    const t = this.timers.get(id);
+    if (!t) return;
+    if (t.real) clearTimeout(t.real);
+    t.real =
+      this.pausedAt === null
+        ? setTimeout(() => this.fire(id), Math.max(0, t.due - this.mono()))
+        : null;
+  }
+
+  private fire(id: number): void {
+    const t = this.timers.get(id);
+    if (!t) return;
+    if (this.mono() < t.due) return this.arm(id);
+    this.timers.delete(id);
+    t.fn();
+  }
+
+  private fireDue(): void {
+    const due = [...this.timers.entries()]
+      .filter(([, t]) => t.due <= this.mono())
+      .sort((a, b) => a[1].due - b[1].due);
+    for (const [id] of due) this.fire(id);
+    for (const id of this.timers.keys()) this.arm(id);
+  }
+}
+
+/** Protocol delays for tests: retries in milliseconds; the processing wait keeps its 30 s (tests that measure it). */
+export const TEST_DELAYS: Partial<EngineDelays> = {
+  retryBase: 20,
+  retryMax: 500,
+  rotationRank: 0,
+  resumeAfter: 0,
+  headsInterval: 0,
+  headsJitter: 0,
+  catchUpInterval: 1000,
 };
 
-/** White-box view of an engine (plan §2.3). M6 types it against SegvEngine's internals. */
+/** White-box view of an engine (plan §2.3). */
 export interface EngineI {
-  account: { uid: Uint8Array; uidB: string; AK: Uint8Array; id: P.Identity; handle: string } | null;
+  account: {
+    uid: Uint8Array;
+    uidB: string;
+    AK: Uint8Array;
+    id: P.Identity;
+    handle: string;
+    regEra: number | null;
+  } | null;
+  /** the account's self lane: its head and fold (null while signed out) */
+  self: SelfLane | null;
   convs: Map<string, unknown>;
   queue: Promise<unknown>;
   sendChains: Map<string, Promise<unknown>>;
+  imageCache: Map<string, Promise<string>>;
+  pending: Map<string, string>;
   fatal: boolean;
   generation: number;
   /** bumped on every applied row or record (settle's stamp) */
   version: number;
   /** in-flight actions plus scheduled protocol timers (settle waits for 0) */
   busy: number;
+  busyActions: number;
+  /** the engine's clocks (a TestClock for engines made by newEngine) */
+  clock: TestClock;
+  /** the clock sample `{s, mid, rtt}` the server-time estimate uses */
+  timeSample: { s: number; mid: number; rtt: number } | null;
+  nextProtocolDue(): number | null;
   catchUp(): Promise<void>;
-  unlock(AK: Uint8Array, uid: Uint8Array, handle: string): Promise<void>;
+  unlock(AK: Uint8Array, uid: Uint8Array, handle: string, registered?: boolean): Promise<void>;
   views(): ConversationView[];
 }
 
-/** M6: `new SegvEngine({...server().transport(who), ...opts})`, signed out by onCleanup after the test. */
-export function newEngine(_who?: string, _opts?: Record<string, unknown>): Engine {
-  return needsM6("newEngine");
+/** White-box access to an engine's private state. */
+export const I = (e: Engine): EngineI => e as unknown as EngineI;
+
+/**
+ * A new signed-out engine attributed to `who` (its requests carry it, plan §2.1), on its own TestClock registered
+ * with the world, with TEST_DELAYS and no inbox Web Worker. It is signed out after the test.
+ */
+export function newEngine(who: string | null = null, opts: EngineOptions = {}): SegvEngine {
+  const w = current;
+  const clock = new TestClock();
+  w.clocks.add(clock);
+  const t = w.transport(who);
+  const e = new SegvEngine({
+    fetch: t.fetch,
+    WebSocket: t.WebSocket as unknown as WebSocketCtor,
+    clock,
+    inboxWorker: null,
+    ...opts,
+    delays: { ...TEST_DELAYS, ...opts.delays },
+  });
+  onCleanup(async () => {
+    await e.logout();
+    clock.dispose();
+    w.clocks.delete(clock);
+  });
+  return e;
 }
 
-/** M6: unlock `u` on a new engine, wait for `!syncing`, then settle. */
-export async function engineFor(_u: TestUser, _opts?: Record<string, unknown>): Promise<Engine> {
-  return needsM6("engineFor");
+/** Unlocks `u` on a new engine, waits for the restore (`!syncing`), then settles (plan §2.2). */
+export async function engineFor(u: TestUser, opts: EngineOptions = {}): Promise<SegvEngine> {
+  const e = newEngine(u.handle, opts);
+  await I(e).unlock(u.AK, u.uid, u.handle);
+  await waitFor(
+    () => !e.getState().syncing || e.getState().phase === "fatal",
+    `${u.handle} restore`,
+  );
+  await settle(e);
+  return e;
 }
 
 /**
- * M6 (plan §2.2): rounds of {await queue + sendChains; server().ckpt.tick(); await I(e).catchUp()} until
- * `server().writeCount + Σ I(e).version` is unchanged for 2 rounds, every `I(e).busy === 0`, and
- * `server().inbox.pending(E) === 0`; advances the fake clock to a pending protocol timer instead of sleeping.
+ * Runs rounds of {await every engine's queue and sendChains; world.ckpt.tick(); await I(e).catchUp()} until
+ * `world.writeCount + Σ I(e).version` is unchanged for 2 rounds, every `I(e).busy` is 0 and the fake inbox holds no
+ * row with rel > closed (plan §2.2). When the engines are busy only with protocol timers, it moves the world and the
+ * engines' clocks to the earliest one with `world.tick` instead of sleeping.
  *
  * Checkpoints: `ckpt.tick()` mints a new q only once CKPT_PERIOD_MS (60 s) of world clock have passed since the last
- * checkpoint, as the CheckpointDO's alarm does (q grows at most once per 60 s; the client's §12.3 step 4 check
- * relies on it). When a round needs a fresh checkpoint, settle must first advance the world clock by at least 60 s
- * with `server().advance(CKPT_PERIOD_MS, { keepSockets: true })` (keepSockets, so the engines' sockets stay open),
- * then tick. Never use `tick({ force: true })` here: it models a server minting faster than the spec allows.
+ * checkpoint, as the CheckpointDO's alarm does (q grows at most once per 60 s; the client's §12.3 step 4 check relies
+ * on it). A test that needs a fresh checkpoint first calls `server().tick(CKPT_PERIOD_MS)`, which moves the world and
+ * every engine's clocks together; the server-only `advance` would leave the engines' clocks behind. Never use
+ * `tick({ force: true })` here: it models a server minting faster than the spec allows.
  */
-export async function settle(..._es: Engine[]): Promise<void> {
-  return needsM6("settle");
+export async function settle(...es: Engine[]): Promise<void> {
+  const w = current;
+  const end = Date.now() + 60_000;
+  let last = -1;
+  let same = 0;
+  for (let round = 0; ; round++) {
+    if (Date.now() > end) throw new Error("settle: timed out");
+    for (const e of es) {
+      const x = I(e);
+      await x.queue.catch(() => {});
+      for (const p of x.sendChains.values()) await p.catch(() => {});
+    }
+    w.ckpt.tick();
+    for (const e of es) {
+      const x = I(e);
+      if (x.account && !x.fatal) await x.catchUp().catch(() => {});
+    }
+    const stamp = w.writeCount + es.reduce((n, e) => n + I(e).version, 0);
+    same = stamp === last ? same + 1 : 0;
+    last = stamp;
+    const busy = es.filter((e) => I(e).busy > 0);
+    if (same >= 2 && busy.length === 0 && w.inbox.pendingTotal() === 0) return;
+    if (busy.length > 0 && busy.every((e) => I(e).busyActions === 0)) {
+      const wait = Math.min(
+        ...busy.map((e) => (I(e).nextProtocolDue() ?? Infinity) - I(e).clock.mono()),
+      );
+      if (Number.isFinite(wait)) w.tick(Math.max(0, Math.ceil(wait)));
+    } else if (busy.length === 0 && w.inbox.pendingTotal() > 0) {
+      w.tick(w.params.inboxSlot * 1000);
+    }
+    await sleep(round < 2 ? 2 : 10);
+  }
 }
-
-/** M6: white-box access to an engine's private state. */
-export const I = (_e: Engine): EngineI => needsM6("I");

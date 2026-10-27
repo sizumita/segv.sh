@@ -369,6 +369,22 @@ export class FakeWorld implements WorldCtx, RtHost {
     if (!opts.keepSockets) this.rt.closeAll(1001, "clock moved");
   }
 
+  /**
+   * Clocks that `tick` moves with the world: the engines' clocks (test/engine/harness.ts registers each engine's
+   * TestClock here). `advance` and `advanceEra` leave them alone.
+   */
+  readonly clocks = new Set<{ advance(ms: number): void }>();
+
+  /**
+   * Moves the world **and** every registered engine clock (monotonic and wall) by `ms`, firing the engine timers
+   * that fall due; sockets stay open (docs/STAGE1-PLAN.md §2.1). This is what settle uses.
+   */
+  tick(ms: number): void {
+    if (!Number.isFinite(ms) || ms < 0) throw new RangeError("tick: ms must be ≥ 0");
+    this.offsetMs += ms;
+    for (const c of this.clocks) c.advance(ms);
+  }
+
   /** Moves server time to the start of era `E_now + n`, plus 1 s; closes every FakeWebSocket. Returns the new era. */
   advanceEra(n = 1, opts: { keepSockets?: boolean } = {}): number {
     const now = this.now();

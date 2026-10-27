@@ -9,6 +9,7 @@ import {
   useVisibleTask$,
   type NoSerialize,
 } from "@qwik.dev/core";
+import type { Blocked } from "~/client/types";
 import { loadEngine } from "./engine-loader";
 import { UiCtx } from "./state";
 import { enqueue, errMsg, fmtBytes, MAX_IMAGE_INPUT_BYTES, textTooLong } from "./util";
@@ -35,7 +36,16 @@ const STASH_FILES = sync$((e: ClipboardEvent | DragEvent, el: HTMLElement): void
   }
 });
 
-export const Composer = component$<{ convId: string; canSend: boolean }>((props) => {
+/** Why the composer is replaced by a notice (docs/STAGE1-PLAN.md §0.4); "" never reaches it. */
+const BLOCKED_TEXT: Record<Exclude<Blocked, "">, string> = {
+  removed:
+    "you are no longer a member of this conversation. you can read its history but cannot send.",
+  left: "you are no longer a member of this conversation. you can read its history but cannot send.",
+  pending: "the conversation is changing membership; you can send again in a moment.",
+  frozen: "a removed member could still read this conversation; start a new conversation.",
+};
+
+export const Composer = component$<{ convId: string; blocked: Blocked }>((props) => {
   const ui = useContext(UiCtx);
   const draft = useSignal("");
   const hint = useSignal("");
@@ -90,12 +100,10 @@ export const Composer = component$<{ convId: string; canSend: boolean }>((props)
     }
   });
 
-  if (!props.canSend) {
+  if (props.blocked !== "") {
     return (
       <div class="composer">
-        <p class="dim">
-          you are no longer a member of this conversation. you can read its history but cannot send.
-        </p>
+        <p class="dim">{BLOCKED_TEXT[props.blocked]}</p>
       </div>
     );
   }

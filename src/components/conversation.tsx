@@ -57,7 +57,7 @@ export const ConversationPane = component$<{ conv: ConversationView }>((props) =
       <div class={["convbody", ui.members && "with-members"]}>
         <div class="thread">
           <Messages conv={conv} />
-          <Composer convId={conv.id} canSend={conv.canSend} />
+          <Composer convId={conv.id} blocked={conv.blocked} />
         </div>
         {ui.members && <Members conv={conv} />}
       </div>

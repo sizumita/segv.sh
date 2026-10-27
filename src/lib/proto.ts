@@ -1031,6 +1031,12 @@ export const serverP = (users: number): number => Math.max(0, floorLog2Div(users
 /** Client: p = max(0, min(P − 1, ⌊log2(dirSeq / 64)⌋, 16)). */
 export const clientP = (P: number, dirSeq: number): number => Math.max(0, Math.min(P - 1, floorLog2Div(dirSeq, 64), 16));
 
+/**
+ * Client: P* = max(P, ⌊log2(dirSeq / 2080)⌋), the params P bounded from below by the dirlog size (§10.6); a lookup
+ * uses p = clientP(P*, dirSeq).
+ */
+export const clientPStar = (P: number, dirSeq: number): number => Math.max(P, floorLog2Div(dirSeq, 2080));
+
 // ───────────────────────── blobs (§8.1) ─────────────────────────
 
 export const BLOB_AAD = "segv.sh/v2/blob";

@@ -28,6 +28,13 @@ const DAY = 24 * HOUR;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+const blockedMessage = (c: ConversationView): string =>
+  c.blocked === "pending"
+    ? "the conversation is changing membership; try again in a moment"
+    : c.blocked === "frozen"
+      ? "a removed member could still read this conversation; start a new conversation"
+      : "you are no longer a member of this conversation";
+
 function fakeFingerprint(seed: string): string {
   let h = 2166136261;
   const out: string[] = [];
@@ -114,8 +121,7 @@ class MockEngine implements Engine {
     if (this.opts.fatal) {
       this.set({
         phase: "fatal",
-        error:
-          "log integrity failure: row 4812 does not chain to row 4811 (expected h=3f9a…, got h=77c0…). refusing to continue.",
+        error: "your account was not found in the directory of this server",
       });
       return;
     }
@@ -124,14 +130,14 @@ class MockEngine implements Engine {
       if (this.opts.warn) {
         this.set({
           warnings: [
-            "split view: bob saw a different log head at seq 1093 than this device. the server may be showing different histories to different people.",
-            'signature check failed for 1 message in "project 夜明け" — it was dropped.',
+            "the server is showing different messages from @bob to different members",
+            "the public keys of @carol changed",
+            "ignored an invalid membership change (×2)",
           ],
           error: "upload failed: 413 payload too large",
         });
       }
-      if (this.opts.offline)
-        this.set({ connected: false, syncing: true, progress: "downloading log… 1840/5210" });
+      if (this.opts.offline) this.set({ connected: false, syncing: true, progress: "restoring…" });
       return;
     }
     this.set({ phase: "signed-out" });
@@ -201,6 +207,9 @@ class MockEngine implements Engine {
       members: [member(handle), member("bob")],
       epoch: 0,
       canSend: true,
+      blocked: "",
+      frozen: false,
+      request: false,
       lastTs: now - 2 * MIN,
       unread: 0,
       messages: [
@@ -249,6 +258,9 @@ class MockEngine implements Engine {
       members: [member(handle), member("bob"), member("carol"), member("dave", true)],
       epoch: 3,
       canSend: true,
+      blocked: "",
+      frozen: false,
+      request: false,
       lastTs: now - 9 * MIN,
       unread: 3,
       messages: [
@@ -287,6 +299,9 @@ class MockEngine implements Engine {
       members: [member("erin"), member("frank")],
       epoch: 5,
       canSend: false,
+      blocked: "removed",
+      frozen: false,
+      request: false,
       lastTs: now - 6 * DAY,
       unread: 0,
       messages: [
@@ -300,11 +315,64 @@ class MockEngine implements Engine {
       members: [member(handle), member("carol")],
       epoch: 0,
       canSend: true,
+      blocked: "",
+      frozen: false,
+      request: false,
       lastTs: now - 40 * DAY,
       unread: 0,
       messages: [m({ kind: "text", fromHandle: "carol", text: "ping", ts: now - 40 * DAY })],
     };
-    const list = [dm, group, removed, old].sort((a, b) => b.lastTs - a.lastTs);
+    const pending: ConversationView = {
+      id: randomId(),
+      name: "# release",
+      members: [member(handle), member("bob"), member("erin")],
+      epoch: 2,
+      canSend: false,
+      blocked: "pending",
+      frozen: false,
+      request: false,
+      lastTs: now - 30 * MIN,
+      unread: 0,
+      messages: [
+        m({ kind: "text", fromHandle: "erin", text: "adding frank in a sec", ts: now - 30 * MIN }),
+      ],
+    };
+    const frozen: ConversationView = {
+      id: randomId(),
+      name: "# infra",
+      members: [member(handle), member("dave"), member("mallory")],
+      epoch: 4,
+      canSend: false,
+      blocked: "frozen",
+      frozen: true,
+      request: false,
+      lastTs: now - 3 * HOUR,
+      unread: 0,
+      messages: [m({ kind: "system", text: "@mallory removed @dave", ts: now - 3 * HOUR })],
+    };
+    const request: ConversationView = {
+      id: randomId(),
+      name: "zed",
+      members: [member(handle), member("zed")],
+      epoch: 0,
+      canSend: true,
+      blocked: "",
+      frozen: false,
+      request: true,
+      lastTs: now - 50 * MIN,
+      unread: 1,
+      messages: [
+        m({
+          kind: "text",
+          fromHandle: "zed",
+          text: "hi! got your handle from erin",
+          ts: now - 50 * MIN,
+        }),
+      ],
+    };
+    const list = [dm, group, removed, old, pending, frozen, request].sort(
+      (a, b) => b.lastTs - a.lastTs,
+    );
     this.set({ conversations: list });
   }
 
@@ -375,6 +443,9 @@ class MockEngine implements Engine {
       members: [member(me.handle), ...handles.map((h) => member(h))],
       epoch: 0,
       canSend: true,
+      blocked: "",
+      frozen: false,
+      request: false,
       lastTs: now,
       unread: 0,
       messages: [],
@@ -406,7 +477,7 @@ class MockEngine implements Engine {
 
   async sendText(convId: string, text: string): Promise<void> {
     const c = this.conv(convId);
-    if (!c.canSend) this.fail("you are no longer a member of this conversation");
+    if (!c.canSend) this.fail(blockedMessage(c));
     const key = `local:${++this.local}`;
     this.pushMessage(
       convId,
@@ -424,7 +495,7 @@ class MockEngine implements Engine {
 
   async sendImage(convId: string, file: File): Promise<void> {
     const c = this.conv(convId);
-    if (!c.canSend) this.fail("you are no longer a member of this conversation");
+    if (!c.canSend) this.fail(blockedMessage(c));
     if (!file.type.startsWith("image/")) this.fail("not an image");
     let w = 0;
     let h = 0;
@@ -487,7 +558,7 @@ class MockEngine implements Engine {
       convId,
       this.msg({ kind: "leave", fromHandle: this.state.me!.handle, mine: true }),
     );
-    this.updateConv(convId, (c) => ({ ...c, canSend: false }));
+    this.updateConv(convId, (c) => ({ ...c, canSend: false, blocked: "left" }));
   }
 
   // ---- images ----
@@ -523,8 +594,10 @@ class MockEngine implements Engine {
   }
 
   markRead(convId: string): void {
+    // Also the "opened" hint: it accepts a request copy (SPEC §11.11).
     const c = this.state.conversations.find((x) => x.id === convId);
-    if (c && c.unread) this.updateConv(convId, (x) => ({ ...x, unread: 0 }));
+    if (c && (c.unread || c.request))
+      this.updateConv(convId, (x) => ({ ...x, unread: 0, request: false }));
   }
   clearError(): void {
     if (this.state.error) this.set({ error: "" });

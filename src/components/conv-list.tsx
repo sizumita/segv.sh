@@ -126,7 +126,7 @@ export const ConvList = component$(() => {
               "conv",
               c.id === ui.active && "on",
               c.unread > 0 && "unread",
-              !c.canSend && "gone",
+              (c.blocked === "removed" || c.blocked === "left") && "gone",
             ]}
             aria-current={c.id === ui.active ? "true" : undefined}
             onClick$={() => {
@@ -135,6 +135,7 @@ export const ConvList = component$(() => {
             }}
           >
             <span class="name">{c.name || "(no name)"}</span>
+            {c.request && <span class="dim small">request</span>}
             {c.unread > 0 && (
               <span class="badge" aria-label={`${c.unread} unread`}>
                 {c.unread > 99 ? "99+" : c.unread}
