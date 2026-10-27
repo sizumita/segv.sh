@@ -266,6 +266,17 @@ textarea:focus {
   word-spacing: 0.2em;
   overflow-wrap: break-word;
 }
+.lists {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--fg);
+}
+.lists [aria-pressed="true"] {
+  font-weight: 700;
+  text-decoration: none;
+}
 .list {
   flex: 1;
   overflow-y: auto;
@@ -303,15 +314,12 @@ textarea:focus {
 .conv .badge {
   font-weight: 700;
 }
-.conv.gone .name {
-  text-decoration: line-through;
-  text-decoration-thickness: 1px;
-}
 .conv .when {
   font-size: 12px;
   color: var(--dim);
 }
-.conv.on .when {
+.conv.on .when,
+.conv.on .dim {
   color: inherit;
 }
 .foot {

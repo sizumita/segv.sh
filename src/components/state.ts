@@ -1,10 +1,18 @@
 import { createContextId, type NoSerialize } from "@qwik.dev/core";
 import type { EngineState } from "~/client/types";
 
+/**
+ * The lists on the left: `chats`, `requests` (request copies, §11.5, shown as a preview until accepted) and
+ * `archives` (conversations this user left or was removed from).
+ */
+export type ListView = "chats" | "requests" | "archives";
+
 /** UI-only state. Secrets (the recovery code) and live objects are wrapped in noSerialize(). */
 export interface UiState {
   /** id of the conversation shown on the right ('' = none). Never put it in the URL. */
   active: string;
+  /** which list the left pane shows */
+  list: ListView;
   /** members panel open */
   members: boolean;
   /** recovery code to show once after register(); cleared when the user confirms */
@@ -36,6 +44,7 @@ export const initialEngineState = (): EngineState => ({
 
 export const initialUiState = (): UiState => ({
   active: "",
+  list: "chats",
   members: false,
   recovery: undefined,
   localError: "",
