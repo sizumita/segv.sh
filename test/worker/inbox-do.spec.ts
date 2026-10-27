@@ -279,7 +279,7 @@ describe("InboxDO posts", () => {
         },
         0,
       );
-    // IMP-9: start(E) − SKEW·1000 − 1 is refused; start(E) − SKEW·1000 and + 1 are accepted.
+    // start(E) − SKEW·1000 − 1 is refused; start(E) − SKEW·1000 and + 1 are accepted.
     expect(await early(P.eraStart(E) - 2_001)).toEqual({ s: "wrong_era", era: E - 1 });
     expect(rels(await early(P.eraStart(E) - 2_000))).toEqual([slotOf(P.eraStart(E) - 2_000) + 1]);
     expect(rels(await early(P.eraStart(E) - 1_999))).toEqual([slotOf(P.eraStart(E) - 1_999) + 1]);

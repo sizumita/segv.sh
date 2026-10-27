@@ -1,5 +1,5 @@
 /**
- * Engine-v2 test harness (docs/STAGE1-PLAN.md §2): runs the client engine (src/client/engine.ts, milestone M6) in
+ * Engine-v2 test harness: runs the client engine (src/client/engine.ts) in
  * Node against `FakeWorld`, an in-memory fake of the v2 Worker and its Durable Objects (test/engine/fake/).
  *
  * - `server()` is the current FakeWorld; `freshWorldPerTest()` gives every test its own world and an empty
@@ -256,12 +256,12 @@ export const chat = (e: Engine, convId: string): string[] =>
 export const systemLines = (e: Engine, convId: string): string[] =>
   (view(e, convId)?.messages ?? []).filter((m) => m.kind === "system").map((m) => m.text ?? "");
 
-// ═════════════════════════ engines (M6a; docs/STAGE1-PLAN.md §2.2) ═════════════════════════
+// ═════════════════════════ engines ═════════════════════════
 
 type Timer = { due: number; fn: () => void; real: ReturnType<typeof setTimeout> | null };
 
 /**
- * An engine's clocks in tests: real time plus offsets (plan §2.2). `world.tick(ms)` moves every registered engine
+ * An engine's clocks in tests: real time plus offsets. `world.tick(ms)` moves every registered engine
  * clock with the world; `advance(ms, {mono?, wall?})` moves one engine's clocks (both by default); `pauseMono()` holds
  * the monotonic clock still while the wall clock and the world run on. Timers run on the monotonic clock: they fire
  * when it reaches their due time, by real time or at once when an advance passes it.
@@ -369,7 +369,7 @@ export const TEST_DELAYS: Partial<EngineDelays> = {
   catchUpInterval: 1000,
 };
 
-/** White-box view of an engine (plan §2.3). */
+/** White-box view of an engine. */
 export interface EngineI {
   account: {
     uid: Uint8Array;
@@ -418,21 +418,21 @@ export interface EngineI {
 /** White-box access to an engine's private state. */
 export const I = (e: Engine): EngineI => e as unknown as EngineI;
 
-/** A copy of the engine by its view key (white-box; plan §2.2). */
+/** A copy of the engine by its view key (white-box). */
 export function conv(e: Engine, convId: string): Copy {
   const c = I(e).convs.get(convId) as Copy | undefined;
   if (!c) throw new Error(`no copy ${convId}`);
   return c;
 }
 
-/** The current epoch of a copy (white-box; plan §2.2). */
+/** The current epoch of a copy (white-box). */
 export function epoch(e: Engine, convId: string): Epoch {
   const c = conv(e, convId);
   return c.epochs.get(c.current)!;
 }
 
 /**
- * A new signed-out engine attributed to `who` (its requests carry it, plan §2.1), on its own TestClock registered
+ * A new signed-out engine attributed to `who` (its requests carry it), on its own TestClock registered
  * with the world, with TEST_DELAYS and no inbox Web Worker. It is signed out after the test.
  */
 export function newEngine(who: string | null = null, opts: EngineOptions = {}): SegvEngine {
@@ -456,7 +456,7 @@ export function newEngine(who: string | null = null, opts: EngineOptions = {}): 
   return e;
 }
 
-/** Unlocks `u` on a new engine, waits for the restore (`!syncing`), then settles (plan §2.2). */
+/** Unlocks `u` on a new engine, waits for the restore (`!syncing`), then settles. */
 export async function engineFor(u: TestUser, opts: EngineOptions = {}): Promise<SegvEngine> {
   const e = newEngine(u.handle, opts);
   await I(e).unlock(u.AK, u.uid, u.handle);
@@ -471,7 +471,7 @@ export async function engineFor(u: TestUser, opts: EngineOptions = {}): Promise<
 /**
  * Runs rounds of {await every engine's queue and sendChains; world.ckpt.tick(); await I(e).catchUp()} until
  * `world.writeCount + Σ I(e).version` is unchanged for 2 rounds, every `I(e).busy` is 0 and the fake inbox holds no
- * row with rel > closed (plan §2.2). When the engines are busy only with protocol timers, it moves the world and the
+ * row with rel > closed. When the engines are busy only with protocol timers, it moves the world and the
  * engines' clocks to the earliest one with `world.tick` instead of sleeping.
  *
  * Checkpoints: `ckpt.tick()` mints a new q only once CKPT_PERIOD_MS (60 s) of world clock have passed since the last
@@ -514,7 +514,7 @@ export async function settle(...es: Engine[]): Promise<void> {
   }
 }
 
-// ═════════════════════════ builders (plan §2.3; M6c) ═════════════════════════
+// ═════════════════════════ builders: rows ═════════════════════════
 
 /** A row as stored: era, label, class and body. */
 export interface BuiltRow {
@@ -525,7 +525,7 @@ export interface BuiltRow {
 }
 
 /**
- * A signed lane row of `from` in epoch `ep` at `(E, n)` (plan §2.3 `buildMessage`): TEXT, IMAGE, WELCOME or LEAVE,
+ * A signed lane row of `from` in epoch `ep` at `(E, n)` (`buildMessage`): TEXT, IMAGE, WELCOME or LEAVE,
  * with optional header overrides (a forged `ck`, another `ts`). `prev` is the sender's previous row on the lane, if
  * any (its stored label and body, for prevh).
  */
@@ -563,9 +563,9 @@ export function postRow(ep: Epoch, row: BuiltRow): void {
   if (!r) throw new Error("slot taken");
 }
 
-// ═════════════════════════ builders (plan §2.3; M7) ═════════════════════════
+// ═════════════════════════ builders: joins and claims ═════════════════════════
 
-/** An inbox invite of J to `to`, stored in era `era` (default: now) without proof of work (plan §2.3 `forgeJoin`). */
+/** An inbox invite of J to `to`, stored in era `era` (default: now) without proof of work. */
 export function forgeJoin(to: TestUser, J: P.Join, opts: { era?: number } = {}): void {
   const E = opts.era ?? current.era;
   const r = P.makeInvite(to.id.kemPk, E, 0, J);
@@ -597,7 +597,7 @@ export const firstCtlSlot = (ep: Epoch, E = current.era): number =>
   prefixLen(E, (x, n) => P.Lctl(ep.keys.rk, x, n));
 
 /**
- * A raw claim row of `by` in epoch `ep` at `Lctl(E, k)` (plan §2.3 `buildClaim`), with every claim field given or
+ * A raw claim row of `by` in epoch `ep` at `Lctl(E, k)`, with every claim field given or
  * defaulted from `ep` (cuts default to the real ones).
  */
 export function buildClaim(
@@ -671,7 +671,7 @@ export interface Committed {
 }
 
 /**
- * Exactly what an engine's commit does (plan §2.3 `commitChange`): D′ (continuing members keep their keys), the
+ * Exactly what an engine's commit does: D′ (continuing members keep their keys), the
  * bundle registered, a wait of Δ + SKEW (`world.tick`), the claim at the first empty control slot of the era with real
  * cuts, published on T_e, and J by inbox to the members it adds. `opts` forge it: another descriptor, a patched blob,
  * no J, a claim slot.
@@ -780,7 +780,7 @@ export async function commitChange(
   };
 }
 
-/** Every fake shard row that opens under `mk`, parsed (plan §2.3 `readableWith`). */
+/** Every fake shard row that opens under `mk`, parsed. */
 export function readableWith(mk: Uint8Array): P.Msg[] {
   const out: P.Msg[] = [];
   for (const r of current.shard.rows()) {
@@ -793,7 +793,7 @@ export function readableWith(mk: Uint8Array): P.Msg[] {
   return out;
 }
 
-/** Whether entry i of `blob` (epoch e of `conv`) opens for `user` (plan §2.3 `entryOutcome`). */
+/** Whether entry i of `blob` (epoch e of `conv`) opens for `user`. */
 export function entryOutcome(
   blob: Uint8Array,
   conv: Uint8Array,

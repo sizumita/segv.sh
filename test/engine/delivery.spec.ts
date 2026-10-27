@@ -1,5 +1,4 @@
-// Delivering J by inbox invites (docs/PROTOCOL.md §6.12 steps 2–4; docs/STAGE1-PLAN.md M6 test 7's 409 variant,
-// rewritten in round 10): a 409 `wrong era` naming an era the Worker accepts rebuilds the invites for it and posts
+// Delivering J by inbox invites (docs/PROTOCOL.md §6.12 steps 2–4): a 409 `wrong era` naming an era the Worker accepts rebuilds the invites for it and posts
 // again at once; the refused post leaves no trace, and every invitee joins.
 import { describe, expect, it } from "vite-plus/test";
 import { I, P, engineFor, freshWorldPerTest, makeUser, mustView, server, settle } from "./harness";

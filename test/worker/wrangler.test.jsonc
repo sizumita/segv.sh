@@ -42,7 +42,7 @@
     "POW_BLOB": "5",
     "POW_PUT": "4",
     "POW_INBOX": "4",
-    // v2: Δ = 1 s, SKEW = 0, Δin = 1 s (docs/STAGE1-PLAN.md §0.5). E_FIRST = 1 (era 0 is "before the
+    // v2: Δ = 1 s, SKEW = 0, Δin = 1 s. E_FIRST = 1 (era 0 is "before the
     // first deploy" for the era-bound tests).
     "DELTA_S": "1",
     "SKEW_S": "0",

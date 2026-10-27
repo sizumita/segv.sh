@@ -14,7 +14,7 @@ export const Members = component$<{ conv: ConversationView }>((props) => {
 
   const conv = props.conv;
   const meUid = state.me?.uid ?? "";
-  /** add and remove need a sendable, unfrozen conversation; a frozen member can still leave (SPEC §6.6 step 6) */
+  /** add and remove need a sendable, unfrozen conversation; a frozen member can still leave (§6.6 step 6) */
   const canChange = conv.canSend && !conv.frozen;
   const canLeave = conv.blocked !== "removed" && conv.blocked !== "left";
 

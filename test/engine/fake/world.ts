@@ -1,6 +1,6 @@
 /**
- * FakeWorld: an in-memory stand-in for the segv.sh v2 Worker and its components (docs/PROTOCOL.md §9–§10,
- * docs/STAGE1-PLAN.md §2.1), served through `fetch` and `FakeWebSocket`. Binary bodies are decoded and encoded
+ * FakeWorld: an in-memory stand-in for the segv.sh v2 Worker and its components (docs/PROTOCOL.md §9–§10),
+ * served through `fetch` and `FakeWebSocket`. Binary bodies are decoded and encoded
  * with the same `src/lib/wire.ts` codecs as the Worker, and commitments come from `src/lib/proto.ts`, so the fake
  * cannot drift from the wire format.
  *
@@ -15,7 +15,7 @@
  *
  * Request attribution. Every request and socket may carry a client name `who` (by convention the user's handle):
  *  - `world.fetchAs(who)` / `world.WebSocketAs(who)` / `world.transport(who)` give one client its own fetch and
- *    WebSocket (the M6 engine takes them through its options, so each engine is a separate client), or
+ *    WebSocket (the engine takes them through its options, so each engine is a separate client), or
  *  - a request carries the header `x-fake-who: <who>` (useful with the global fetch).
  * Unattributed traffic has `who = null`. `who` keys `shard.hide()`, the rate limiter (it stands for the client IP),
  * the per-client socket cap, and `requests[].who` (per-user counters).
@@ -381,7 +381,7 @@ export class FakeWorld implements WorldCtx, RtHost {
 
   /**
    * Moves the world **and** every registered engine clock (monotonic and wall) by `ms`, firing the engine timers
-   * that fall due; sockets stay open (docs/STAGE1-PLAN.md §2.1). This is what settle uses.
+   * that fall due; sockets stay open. This is what settle uses.
    */
   tick(ms: number): void {
     if (!Number.isFinite(ms) || ms < 0) throw new RangeError("tick: ms must be ≥ 0");

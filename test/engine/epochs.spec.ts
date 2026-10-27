@@ -1,6 +1,5 @@
-// Epochs at restore, forged member slots, WELCOME channels and races with logout (docs/STAGE1-PLAN.md M7
-// claims.spec.ts tests 24, 28, 29; ported from 3de5f5e:test/engine/sending.spec.ts engine-9 and engine-11; SPEC §6.6,
-// §6.12 step 1, §11.2, §11.3, §11.4 step 5).
+// Epochs at restore, forged member slots, WELCOME channels, and races with a removal and a logout (docs/PROTOCOL.md
+// §6.6, §6.12 step 1, §11.2, §11.3, §11.4 step 5; the races are ported from the v1 engine tests).
 import { describe, expect, it } from "vite-plus/test";
 import type { Engine } from "../../src/client/types";
 import {
@@ -36,7 +35,7 @@ async function group(names: string[], name = "g") {
   return { users, engines, id };
 }
 
-describe("followed lanes at restore (test 29)", () => {
+describe("followed lanes at restore", () => {
   it("a member who posted in c is not followed after a reload, and its rows of c−1 are not fetched", async () => {
     const {
       users: [alice, bob],
@@ -94,7 +93,7 @@ describe("followed lanes at restore (test 29)", () => {
   });
 });
 
-describe("WELCOME channels (test 24)", () => {
+describe("WELCOME channels", () => {
   it("an expired request is not a WELCOME channel: the J goes by inbox", async () => {
     const [alice, bob, carol] = ["alice", "bob", "carol"].map((h) => makeUser(h));
     const A = await engineFor(alice);
@@ -111,7 +110,7 @@ describe("WELCOME channels (test 24)", () => {
   });
 });
 
-describe("forged member slots (test 28)", () => {
+describe("forged member slots", () => {
   it("a slot with bob's sigPk but another kemPk is shown as unknown, and removing it leaves its key no entry", async () => {
     const [alice, bob, mallory] = ["alice", "bob", "mallory"].map((h) => makeUser(h));
     const X = newTestUser("xkey"); // a key mallory holds
@@ -171,7 +170,7 @@ describe("forged member slots (test 28)", () => {
   });
 });
 
-describe("races (ported from 3de5f5e sending.spec engine-9, engine-11)", () => {
+describe("races with a removal and a logout", () => {
   it("a send racing a removal ends failed with an error, not stuck sending", async () => {
     const {
       users: [, bob],

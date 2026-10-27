@@ -594,7 +594,7 @@ class MockEngine implements Engine {
   }
 
   markRead(convId: string): void {
-    // Also the "opened" hint: it accepts a request copy (SPEC §11.11).
+    // Also the "opened" hint: it accepts a request copy (§11.11).
     const c = this.state.conversations.find((x) => x.id === convId);
     if (c && (c.unread || c.request))
       this.updateConv(convId, (x) => ({ ...x, unread: 0, request: false }));

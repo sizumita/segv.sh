@@ -1,5 +1,5 @@
 /**
- * CheckpointDO (docs/PROTOCOL.md §9.5, §10.9, plan M2): the C_q chain and its signatures, no new q for
+ * CheckpointDO (docs/PROTOCOL.md §9.5, §10.9): the C_q chain and its signatures, no new q for
  * unchanged heads, the previous era's sealed shard (once more, then dropped), failing components (and ones that
  * never answered, which are left out), the sec clamp, the hourly blob registry head, alarm arming and ensure().
  *

@@ -1,6 +1,5 @@
-// Honest end-to-end flows of the engine against the FakeWorld (docs/STAGE1-PLAN.md M6b; ported from
-// 3de5f5e:test/engine/flows.spec.ts): 1:1 both ways (the recipient's copy is a request until it posts or opens it),
-// a later device, unknown handles, group "# " names and name sanitisation. Add, remove, rename and leave land with M7.
+// Honest end-to-end flows of the engine against the FakeWorld (ported from the v1 engine tests): 1:1 both ways (the recipient's copy is a request until it posts or opens it),
+// a later device, unknown handles, group "# " names and name sanitisation (membership changes: membership.spec.ts).
 import { describe, expect, it } from "vite-plus/test";
 import {
   I,
@@ -84,7 +83,7 @@ describe("1:1 conversations", () => {
     expect(mustView(B, id).name).toBe("@alice");
   });
 
-  it("a join's line takes D.ts clamped to the bundle's t_reg ± 5 min, live and after a reload (R10-2)", async () => {
+  it("a join's line takes D.ts clamped to the bundle's t_reg ± 5 min, live and after a reload", async () => {
     const alice = makeUser("alice");
     const bob = makeUser("bob");
     const A = await engineFor(alice);

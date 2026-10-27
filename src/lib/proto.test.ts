@@ -701,7 +701,7 @@ describe("sealing (KEM-DEM, §1.4)", () => {
   });
 });
 
-describe("throwing decapsulation (§1.1; plan M1 test 9)", () => {
+describe("throwing decapsulation (§1.1)", () => {
   const prf = fill(32, 0x11);
   const credId = seqBytes(20, 0x80);
   const cred = P.credKem(prf, credId);
@@ -1028,7 +1028,7 @@ describe("checkUserKeys / isBadSigPk (§2.1)", () => {
   });
 });
 
-describe("signature strictness (§1.1: validSigPk plus noble strict, cofactored; plan M1 test 13)", () => {
+describe("signature strictness (§1.1: validSigPk plus noble strict, cofactored)", () => {
   const L = Lq;
   const fromLe = leToBig;
   const a = edScalar(alice.id.sigSk);
@@ -1962,7 +1962,7 @@ describe("proof of work (§10.2)", () => {
     expect(P.leadingZeroBits(sha(cat(pre, be64(nonce))))).toBeGreaterThanOrEqual(8);
   });
 
-  it("powSolve searches from a start nonce past 2^32 up to 2^53 − 1, and a stopped search ends without a nonce (test 15)", async () => {
+  it("powSolve searches from a start nonce past 2^32 up to 2^53 − 1, and a stopped search ends without a nonce", async () => {
     // a challenge whose nonce 2^32 − 1 fails at difficulty 8, so a search started there must cross 2^32
     let pre = P.powPre("put", 1, sha(s2b("x")));
     for (let k = 0; P.powCheck(pre, 2 ** 32 - 1, 8); k++) pre = P.powPre("put", 1, sha(s2b(`x${k}`)));

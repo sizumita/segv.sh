@@ -1,6 +1,6 @@
 // The realtime socket (docs/PROTOCOL.md §10.8, §11.6): SUB / UNSUB / RESUME by seq, HELLO (a clock sample),
 // ROWS, GAP and RESUMED; ping every 30 s; reconnect with back-off and jitter, at least 60 s after a 1008 or 1013.
-// One socket of up to 256 topics (the second socket of §10.8 is for more than 256 topics, M6c).
+// One socket of up to 256 topics (the session opens a second one for more than 256 topics, §10.8).
 import * as P from "~/lib/proto";
 import * as W from "~/lib/wire";
 import type { EngineClock, EngineTimer, WebSocketCtor } from "./options";

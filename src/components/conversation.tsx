@@ -11,7 +11,7 @@ export const ConversationPane = component$<{ conv: ConversationView }>((props) =
   const conv = props.conv;
   const active = conv.members.filter((m) => !m.left).length;
 
-  // Opening the pane is the engine's "conversation opened" hint (SPEC §11.10–§11.11): it accepts a request copy and
+  // Opening the pane is the engine's "conversation opened" hint (§11.10–§11.11): it accepts a request copy and
   // starts scrollback once, even when nothing is unread (after a reload every conversation has unread = 0).
   useVisibleTask$(async ({ track }) => {
     const id = track(() => props.conv.id);

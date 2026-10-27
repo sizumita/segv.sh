@@ -1055,7 +1055,6 @@ export function decryptBlob(blob: Bytes, id: string, key: Bytes, aad = BLOB_AAD)
 }
 
 // ═════════════════════════ conversation codecs (§3.3, §5, §6.2, §7) ═════════════════════════
-// (added by the conversation-codec milestone; §5–§7 may still change)
 
 // Every codec below is self-contained (encoder, strict parser, exported types), so a later change to one layout
 // of §5–§7 touches one block. Encoders re-parse their output: nothing is emitted that a receiver would reject.
@@ -1842,7 +1841,7 @@ export class MissingClaimError extends Error {
 
 /**
  * §6.8 old-epoch acceptance. `selfRemoved`: the claim that ended the last listed epoch removed or dropped the receiver
- * itself (its own rm bit is 1), so the receiver holds no later epoch through it (answer R11-6).
+ * itself (its own rm bit is 1), so the receiver holds no later epoch through it.
  * `epochs` are consecutive held epochs: `epochs[0]` is D_e (the row's epoch) and
  * `epochs[k]` is D_{e+k}, so the list stops before an epoch reached by a skip re-add, and a frozen receiver's at its
  * frozen epoch. The caller passes the claim that ended each listed epoch whenever one exists, read at the position
@@ -1861,7 +1860,7 @@ export function acceptOldRow(row: WalkRow, epochs: readonly WalkEpoch[], selfRem
       const next = epochs[j + 1];
       if (!next) {
         // A receiver that this claim removed or dropped holds no later epoch: its epoch ends at the claim, as a removed
-        // sender's rows end there (answer R11-6). A frozen receiver stops and accepts.
+        // sender's rows end there. A frozen receiver stops and accepts.
         if (!claim || !selfRemoved) return true;
         if (row.t < claim.t) return true;
         if (j > 0 || row.t !== claim.t) return false;

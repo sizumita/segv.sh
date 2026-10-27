@@ -1,5 +1,5 @@
-// The registration's inbox cursor and the self lane's era floor (docs/PROTOCOL.md §7.3, §11.1, §11.5 step 1; the
-// spec session's answer R9-1): the cursor comes from the register response's server time, minus SKEW, once; and no
+// The registration's inbox cursor and the self lane's era floor (docs/PROTOCOL.md §7.3, §11.1, §11.5 step 1): the
+// cursor comes from the register response's server time, minus SKEW, once; and no
 // self row is written below the registration era.
 import { describe, expect, it, vi } from "vite-plus/test";
 import type { Api } from "../../src/client/api";
@@ -40,7 +40,7 @@ function toNextEraPlus(ms: number): number {
   return E;
 }
 
-describe("the registration's inbox cursor (R9-1)", () => {
+describe("the registration's inbox cursor", () => {
   it("lies below an invite posted right after a registration at start(E) + 500 ms into E − 1 by a lagging InboxDO", async () => {
     const E = toNextEraPlus(500);
     server().inboxLagMs = 2000; // the InboxDO's clock is SKEW behind: still in E − 1
@@ -86,7 +86,7 @@ describe("the registration's inbox cursor (R9-1)", () => {
   });
 });
 
-describe("the self lane's era floor (R9-1)", () => {
+describe("the self lane's era floor", () => {
   it("a device whose estimate lags into regEra − 1 writes its first self row in regEra", async () => {
     const id = P.deriveIdentity(P.random(32));
     const puts: W.PutRow[][] = [];

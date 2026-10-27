@@ -1,5 +1,5 @@
-// Leaves, re-adds and rows that land late in an older epoch (docs/STAGE1-PLAN.md M7 claims.spec.ts tests 16, 17,
-// 22 (a)–(c), 25, 26, 30 (a), 31, 32; SPEC §6.7 step 5, §6.8, §6.9, §11.2, §11.3 steps 1–3 and 8).
+// Leaves, re-adds and rows that land late in an older epoch (docs/PROTOCOL.md §6.7 step 5, §6.8, §6.9, §11.2,
+// §11.3 steps 1–3 and 8).
 import { describe, expect, it } from "vite-plus/test";
 import type { Engine } from "../../src/client/types";
 import type { EngineOptions } from "../../src/client/options";
@@ -39,7 +39,7 @@ async function group(names: string[], name = "g", opts: Record<string, EngineOpt
 const LEAVE = P.MT.LEAVE as number;
 const TEXT = P.MT.TEXT as number;
 
-describe("re-adds (tests 16, 32)", () => {
+describe("re-adds", () => {
   it("a removed leaver re-added by a later epoch accepts the skip, live and after a reload", async () => {
     const {
       users: [alice, bob],
@@ -97,7 +97,7 @@ describe("re-adds (tests 16, 32)", () => {
   });
 });
 
-describe("frozen and leaving (test 17)", () => {
+describe("frozen and leaving", () => {
   it("a frozen member can still send a text after another member left (no rotation)", async () => {
     const {
       users: [alice, bob, carol, mallory],
@@ -125,7 +125,7 @@ describe("frozen and leaving (test 17)", () => {
   });
 });
 
-describe("late rows in an older epoch (test 22)", () => {
+describe("late rows in an older epoch", () => {
   it("(a) a LEAVE sent right after a claim whose frame was lost lands in the new epoch", async () => {
     const {
       users: [alice, bob, zed],
@@ -196,7 +196,7 @@ describe("late rows in an older epoch (test 22)", () => {
   });
 });
 
-describe("leave order and WELCOMEs (tests 25, 26, 30)", () => {
+describe("leave order and WELCOMEs", () => {
   it("a lost LEAVE answer is recovered from the slot before the LEAVE record is written", async () => {
     const {
       engines: [A, B],
@@ -269,7 +269,7 @@ describe("leave order and WELCOMEs (tests 25, 26, 30)", () => {
   });
 });
 
-describe("others' leaves at a reload (test 31)", () => {
+describe("others' leaves at a reload", () => {
   it("a leave applied live is kept by a LEFT record: after a reload the next text still rotates first", async () => {
     const {
       users: [alice],

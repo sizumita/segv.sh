@@ -1,6 +1,6 @@
 /**
- * ShardDO (docs/PROTOCOL.md §9.1, plan M2): CAS, BAD, WRONG_ERA, sealing, batches and the head chain, feed
- * paging (feedBatches / feedRows, which never close a due batch), monotonic t (IMP-7), early acceptance at the SKEW
+ * ShardDO (docs/PROTOCOL.md §9.1): CAS, BAD, WRONG_ERA, sealing, batches and the head chain, feed
+ * paging (feedBatches / feedRows, which never close a due batch), monotonic t, early acceptance at the SKEW
  * boundary, identity and alarm discipline (an ended era arms nothing), the pinned Δ, and batches of thousands of
  * rows (closeBatch never reads a body; feed results stay within budget).
  *
@@ -418,7 +418,7 @@ describe("ShardDO batches", () => {
     expect(verifyChain(E, batches)).toEqual(h.head);
   });
 
-  it("IMP-7: after the alarm closed a batch, a put with the clock stepped back by SKEW gets t = closed_t + Δ", async () => {
+  it("after the alarm closed a batch, a put with the clock stepped back by SKEW gets t = closed_t + Δ", async () => {
     const E = freshEra();
     const c = at(E, 1000);
     await setClock(E, c, 2);
@@ -571,7 +571,7 @@ describe("ShardDO identity and alarms", () => {
     expect(await alarmOf(E_NOW - 3)).toBeNull();
   });
 
-  it("a DO of an era that has already ended arms no alarm in its constructor and seals in prepare() (CMP-18)", async () => {
+  it("a DO of an era that has already ended arms no alarm in its constructor and seals in prepare()", async () => {
     // The constructor runs before a test can reach the object: spy on setAlarm of every storage in the isolate.
     const proto = await runInDurableObject(stub(freshEra()), (_inst: ShardDO, state) => Object.getPrototypeOf(state.storage));
     const setAlarm = vi.spyOn(proto as DurableObjectStorage, "setAlarm");

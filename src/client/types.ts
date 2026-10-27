@@ -17,7 +17,7 @@ export interface Me {
 
 export interface MemberView {
   uid: string;
-  /** handle, or `?` + 8 uid characters for a member not (or not validly, or not yet) resolved in the directory (SPEC §11.2) */
+  /** handle, or `?` + 8 uid characters for a member not (or not validly, or not yet) resolved in the directory (§11.2) */
   handle: string;
   fingerprint: string;
   /** recorded as left in the current epoch (its LEAVE row, or a LEFT record at restore) and not yet rotated out */
@@ -40,7 +40,7 @@ export interface MessageView {
   from: string; // uid ('' for system lines)
   fromHandle: string;
   mine: boolean;
-  /** ms; sender time clamped to the row's public time ± 5 min (SPEC §11.8) */
+  /** ms; sender time clamped to the row's public time ± 5 min (§11.8) */
   ts: number;
   kind: "text" | "image" | "leave" | "system";
   text?: string; // text body, or the system line ("alice added bob")
@@ -52,14 +52,14 @@ export interface MessageView {
  * Why a conversation cannot be sent to (`""` when it can, so `canSend === (blocked === "")`):
  * - `removed` / `left`: this user is no longer a member (both: `removed`);
  * - `pending`: an undecided control slot, or a winning claim not yet final or processed, has stayed so for the 30 s
- *   processing wait, so a text would fail (SPEC §11.3 step 2); a shorter wait shows nothing, and a send made
+ *   processing wait, so a text would fail (§11.3 step 2); a shorter wait shows nothing, and a send made
  *   meanwhile waits;
- * - `frozen`: frozen by a change whose `rm` removed a member who had not left (SPEC §6.6 step 6).
+ * - `frozen`: frozen by a change whose `rm` removed a member who had not left (§6.6 step 6).
  */
 export type Blocked = "" | "removed" | "left" | "pending" | "frozen";
 
 export interface ConversationView {
-  /** opaque copy key (`b64u(conv)`, or `b64u(conv)~i` for a later copy, SPEC §7.3); secret, only ever used locally */
+  /** opaque copy key (`b64u(conv)`, or `b64u(conv)~i` for a later copy, §7.3); secret, only ever used locally */
   id: string;
   name: string; // explicit group name ("# name"), or the other members' handles joined by ", "
   members: MemberView[]; // current epoch, in descriptor order
@@ -67,18 +67,18 @@ export interface ConversationView {
   /**
    * true iff `blocked` is `""`: false once this user was removed or left, while an undecided control slot, or a
    * winning claim not yet final or processed, has stayed so for 30 s, and in a frozen conversation whose freezing
-   * change removed a member who had not left, by the current leave state (SPEC §11.3 step 2); otherwise a frozen
+   * change removed a member who had not left, by the current leave state (§11.3 step 2); otherwise a frozen
    * member can still send
    */
   canSend: boolean;
   blocked: Blocked;
-  /** the members can no longer change (SPEC §6.6 steps 4 and 6): adding and removing fail; sending and leaving work */
+  /** the members can no longer change (§6.6 steps 4 and 6): adding and removing fail; sending and leaving work */
   frozen: boolean;
-  /** a request copy (SPEC §11.5): opening it (`markRead`) accepts it and makes its inviter a contact */
+  /** a request copy (§11.5): opening it (`markRead`) accepts it and makes its inviter a contact */
   request: boolean;
   lastTs: number; // for sorting
   unread: number;
-  /** display order (SPEC §11.8); local echoes last */
+  /** display order (§11.8); local echoes last */
   messages: MessageView[];
 }
 
@@ -88,7 +88,7 @@ export interface EngineState {
   error: string; // last user-facing error, '' when none
   me: Me | null;
   conversations: ConversationView[]; // most recent activity first
-  /** latest verified checkpoint: {seq: q, h: b64u(C_q)}; `{seq: 0, h: ""}` until checkpoints are verified (M8) */
+  /** latest verified checkpoint: {seq: q, h: b64u(C_q)}; `{seq: 0, h: ""}` until a checkpoint is verified */
   head: { seq: number; h: string };
   connected: boolean; // realtime socket (/api/v2/rt) is open
   syncing: boolean; // restoring or catching up
@@ -115,15 +115,15 @@ export interface Engine {
 
   /**
    * Starts a conversation with the given handles (1 handle = 1:1). Resolves with the conversation id after the bundle
-   * upload and the first self row, with the conversation already in `conversations` (SPEC §6.1 step 5); the
+   * upload and the first self row, with the conversation already in `conversations` (§6.1 step 5); the
    * invitations finish in the background (at least Δ + SKEW later).
    */
   createConversation(handles: string[], name?: string): Promise<string>;
   sendText(convId: string, text: string): Promise<void>;
   sendImage(convId: string, file: File): Promise<void>;
-  /** Resolves after the switch to the new epoch and the first delivery attempt (SPEC §6.3). */
+  /** Resolves after the switch to the new epoch and the first delivery attempt (§6.3). */
   addMembers(convId: string, handles: string[]): Promise<void>;
-  /** Resolves after the switch to the new epoch and the first delivery attempt (SPEC §6.3). */
+  /** Resolves after the switch to the new epoch and the first delivery attempt (§6.3). */
   removeMember(convId: string, uid: string): Promise<void>;
   leave(convId: string): Promise<void>;
 
@@ -131,7 +131,7 @@ export interface Engine {
   loadImage(img: ImageRef): Promise<string>;
   /**
    * Resets `unread`. Also the "conversation opened" hint: it accepts a request copy and starts scrollback once
-   * (SPEC §11.10–§11.11), even when `unread` is 0.
+   * (§11.10–§11.11), even when `unread` is 0.
    */
   markRead(convId: string): void;
   clearError(): void;

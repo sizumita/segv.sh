@@ -1,7 +1,7 @@
-// The O(history) acceptance tests (docs/STAGE1-PLAN.md §4): every scenario runs in a clean world and in a noise
+// The O(history) acceptance tests: every scenario runs in a clean world and in a noise
 // world (50 000 random rows over the last four eras, 2 000 registered users, 5 000 inbox rows in older eras and 300
-// for others in the current era), and the client's cost must not depend on the noise. T4, T6 and T7 need snapshots
-// (M6c, after sent-2b) and are not here yet.
+// for others in the current era), and the client's cost must not depend on the noise. The restore-at-scale cases
+// (a long history, many groups, spam requests) need self-lane snapshots and are not here yet.
 import { describe, expect, it } from "vite-plus/test";
 import {
   FakeWorld,

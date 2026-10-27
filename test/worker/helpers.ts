@@ -451,7 +451,7 @@ type Signed = { record: string; sig: string };
 const ORDER8_POINT = "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05";
 
 /**
- * A mixed-order signing key (SPEC §2.1, Q16): `pk` = A + T, where A is the Ed25519 public key of `seed` and T has
+ * A mixed-order signing key (§2.1): `pk` = A + T, where A is the Ed25519 public key of `seed` and T has
  * order 8, so `pk` is a canonical point that is not of small order but lies outside the prime-order subgroup.
  * `sign` signs under `pk` with A's secret scalar a, drawing r until 8 divides k = H(R ‖ pk ‖ M) mod L: then
  * [k]T = O and [S]B = R + [k]pk, so the signature verifies under the cofactorless equation (WebCrypto) and the

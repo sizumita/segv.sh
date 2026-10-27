@@ -1,5 +1,5 @@
 // The client API module (src/client/api.ts) at unit level: params bounds (§3.1), the server-time estimate (§10.1),
-// the PoW window restart (§10.2), and the prefix bits of directory lookups (§10.6; docs/STAGE1-PLAN.md M6 test 16).
+// the PoW window restart (§10.2), and the prefix bits of directory lookups (§10.6).
 import { describe, expect, it } from "vite-plus/test";
 import { Api, ApiError, ServerClock, checkParams, isTransient } from "../../src/client/api";
 import { I, P, TestClock, engineFor, freshWorldPerTest, makeUser, server } from "./harness";
@@ -197,7 +197,7 @@ describe("proof of work (§10.2)", () => {
   });
 });
 
-describe("directory prefix bits (§10.6; M6 test 16)", () => {
+describe("directory prefix bits (§10.6)", () => {
   const users = (n: number) => ({ p: 0, users: [], more: false, n });
 
   it("with P = 0 and dirSeq = 20 000 a lookup asks p = 2 (P* = 3); a 409 {p: 0} retry asks p = 0 and is not raised again", async () => {

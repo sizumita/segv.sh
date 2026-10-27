@@ -516,6 +516,7 @@ export class Api {
       if (!row) return;
       if (r.s === "ok") {
         if (key && !P.verify(r.receipt, P.receiptMsg(row.E, row.label, row.body, r.t), key)) {
+          console.error("DEBUG receipt", JSON.stringify({ E: row.E, cls: row.cls, t: r.t, n: rows.length, i, key: this.cachedParams?.srvKey, len: row.body.length }));
           if (!this.receiptWarned) this.critical(BAD_RECEIPT);
           this.receiptWarned = true;
         }

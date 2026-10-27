@@ -1,5 +1,4 @@
-// Claims: e-validity, winner and finality, processing, commits (docs/STAGE1-PLAN.md M7 claims.spec.ts tests 1–3,
-// 5, 7–9, 11–15, 19, 27; SPEC §6.3–§6.6, §6.10, §11.3 step 2).
+// Claims: e-validity, winner and finality, processing, commits (docs/PROTOCOL.md §6.3–§6.6, §6.10, §11.3 step 2).
 import { describe, expect, it } from "vite-plus/test";
 import { CHANGING } from "../../src/client/conv";
 import { INVALID_CHANGE, frozenInvalid, frozenNoKey } from "../../src/client/claims";
@@ -51,7 +50,7 @@ async function group(names: string[], name = "g") {
 
 const crit = (E: Engine) => E.getState().warnings;
 
-describe("winner (tests 1–3)", () => {
+describe("winner", () => {
   it("the first e-valid claim wins over a later one; junk before it is skipped with a noise warning", async () => {
     const {
       users: [alice, bob, carol],
@@ -124,7 +123,7 @@ describe("winner (tests 1–3)", () => {
   });
 });
 
-describe("freezes (tests 5, 7–9)", () => {
+describe("freezes", () => {
   it("an e-valid claim with an invalid D′ freezes everyone; a later honest claim is not used; messaging goes on", async () => {
     const {
       users: [alice, bob, carol, mallory],
@@ -280,7 +279,7 @@ describe("freezes (tests 5, 7–9)", () => {
   });
 });
 
-describe("cuts (test 11)", () => {
+describe("cuts", () => {
   it("a cut beyond the claim's era is e-invalid", async () => {
     const {
       users: [alice, bob],
@@ -333,7 +332,7 @@ describe("cuts (test 11)", () => {
   });
 });
 
-describe("a removed receiver's epoch ends at the claim (answer R11-6)", () => {
+describe("a removed receiver's epoch ends at the claim", () => {
   it("drops a kept member's row stored after the claim, live and after a reload; keeps earlier rows", async () => {
     const {
       users: [alice, bob, rita],
@@ -389,7 +388,7 @@ describe("a removed receiver's epoch ends at the claim (answer R11-6)", () => {
   });
 });
 
-describe("bundle shape and undecided claims (test 12)", () => {
+describe("bundle shape and undecided claims", () => {
   it("a claim naming a large blob, a bad header or too small a B is e-invalid without fetching it", async () => {
     const {
       users: [alice, bob],
@@ -487,7 +486,7 @@ describe("bundle shape and undecided claims (test 12)", () => {
   });
 });
 
-describe("commits (tests 13–15, 19, 27)", () => {
+describe("commits", () => {
   it("an early CAS (shard clock behind BlobReg) is an ignored slot; the next claim wins", async () => {
     const {
       engines: [A, B],

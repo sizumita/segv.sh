@@ -1,4 +1,4 @@
-// Restore and creation (docs/STAGE1-PLAN.md M6 tests 1 and 5; SPEC §6.1, §11.4): a reload rebuilds conversations
+// Restore and creation (docs/PROTOCOL.md §6.1, §11.4): a reload rebuilds conversations
 // from the self lane, and a creation resolves before its commit wait, holds own sends until the decoy is stored, and
 // never turns a transient lookup failure into "unknown".
 import { describe, expect, it } from "vite-plus/test";
@@ -6,7 +6,7 @@ import { I, P, chat, engineFor, freshWorldPerTest, makeUser, mustView, server, s
 
 freshWorldPerTest();
 
-describe("restore from the self lane (test 1, without the snapshot part)", () => {
+describe("restore from the self lane", () => {
   it("a reload holds every conversation with its history, names and request state, and nothing unread", async () => {
     const [alice, bob, carol] = ["alice", "bob", "carol"].map((h) => makeUser(h));
     const A = await engineFor(alice);
@@ -43,7 +43,7 @@ describe("restore from the self lane (test 1, without the snapshot part)", () =>
   });
 });
 
-describe("creation (test 5)", () => {
+describe("creation", () => {
   it("resolves with the copy in conversations before the commit wait ends; own sends wait for the decoy", async () => {
     makeUser("bob");
     const A = await engineFor(makeUser("alice"));
@@ -95,7 +95,7 @@ describe("creation (test 5)", () => {
   });
 });
 
-describe("scrollback after a reload (test 12)", () => {
+describe("scrollback after a reload", () => {
   it("opening a 1:1 with 100 messages after a reload shows more than 60 of them", async () => {
     const [alice, bob] = ["alice", "bob"].map((h) => makeUser(h));
     const A = await engineFor(alice);

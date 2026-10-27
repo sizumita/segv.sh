@@ -1,6 +1,6 @@
 /**
  * HTTP + WebSocket API v2 tests (docs/PROTOCOL.md §9.7, §10, §12.5) against ../entry.ts inside workerd
- * (docs/STAGE1-PLAN.md M4). Tests that need to observe or replace a binding call handleApi directly
+ * Tests that need to observe or replace a binding call handleApi directly
  * (helpers.direct) with a spied or fake namespace.
  */
 import { runInDurableObject } from "cloudflare:test";
@@ -256,7 +256,7 @@ describe("GET /api/v2/era/{E}", () => {
     expectApiHeaders(res);
     expect(res.headers.get("cache-control")).toBe("no-store");
     const body = (await res.json()) as Record<string, unknown>;
-    // Exactly the §10.9 keys, in order (CMP-23: no kroute).
+    // Exactly the §10.9 keys, in order (no kroute).
     expect(Object.keys(body)).toEqual(["era", "start", "end", "delta", "shards", "kcommit", "sealed"]);
     expect(body).toEqual({
       era: E,
@@ -1013,7 +1013,7 @@ describe("directory: POST /api/v2/register and /api/v2/wraps", () => {
     expect((await api(`/api/v2/dir/uid/${a.uidB64}`)).status).toBe(404);
   });
 
-  it("400 on a mixed-order signing key whose signatures all verify (Q16); nothing is registered", async () => {
+  it("400 on a mixed-order signing key whose signatures all verify; nothing is registered", async () => {
     const a = makeAccount();
     const h0 = await dirlogHead();
     const res = await postJsonPow("/api/v2/register", "register", mixedOrderRegistration(a).body);

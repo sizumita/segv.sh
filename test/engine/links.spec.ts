@@ -1,4 +1,4 @@
-// Links (docs/STAGE1-PLAN.md M10 links.spec.ts; SPEC §4.3, §5.5, §7.2): hellos at the first empty slot, the owner's
+// Links (docs/PROTOCOL.md §4.3, §5.5, §7.2): hellos at the first empty slot, the owner's
 // probing, one-shot and expired links, junk hellos, and the conversation a link starts.
 import { describe, expect, it } from "vite-plus/test";
 import { UNDECRYPTABLE } from "../../src/client/sync";

@@ -7,7 +7,7 @@
 //   1. reference helpers — an independent re-implementation of the layouts on top of node:crypto (noble only for
 //                          XChaCha20 and X-Wing, which node:crypto lacks), used to cross-check byte for byte.
 //                          (noble's ed25519 Point is used only to build a mixed-order test key.)
-//   2. per-codec round trips, strictness, tamper tests and the plan's M1 test items.
+//   2. per-codec round trips, strictness, tamper tests and fuzzing.
 //   3. fuzz — truncations, extensions and random bytes are rejected, and parsers only ever throw Error.
 //   4. known answers — pinned outputs, with deterministic randomness through _setRandomForTests.
 import { afterEach, describe, expect, it } from "vite-plus/test";
@@ -611,7 +611,7 @@ describe("conversation rows: seal, sign, open (§3.3)", () => {
     }
   });
 
-  it("selects classes by size (plan M1 test 6)", () => {
+  it("selects classes by size", () => {
     const table: [number, number][] = [
       [1, 0],
       [129, 0],
@@ -644,7 +644,7 @@ describe("conversation rows: seal, sign, open (§3.3)", () => {
       expect(P.buildRow(ctx0(), E, m).cls).toBe(0);
   });
 
-  it("types 18 and 19 make a row malformed, even sealed and signed by a member (test 6)", () => {
+  it("types 18 and 19 make a row malformed, even sealed and signed by a member", () => {
     for (const [type, content] of [
       [18, be32(0)],
       [19, new Uint8Array(0)],
@@ -658,7 +658,7 @@ describe("conversation rows: seal, sign, open (§3.3)", () => {
     expect(Object.values(P.MT)).toEqual([1, 2, 8, 16, 17]);
   });
 
-  it("flipping any byte of a body, or changing the label or E, makes the row fail to open (test 3)", () => {
+  it("flipping any byte of a body, or changing the label or E, makes the row fail to open", () => {
     const r = P.buildRow(ctx0(), E, msg);
     expect(r.body.length).toBe(296);
     for (let i = 0; i < r.body.length; i++) {
@@ -671,7 +671,7 @@ describe("conversation rows: seal, sign, open (§3.3)", () => {
     expect(() => P.openRow(keys0.mk, E, r.label, r.body.slice(0, 295))).toThrow();
   });
 
-  it("changing conv or e makes the signature fail (test 3)", () => {
+  it("changing conv or e makes the signature fail", () => {
     const r = P.buildRow(ctx0(), E, msg);
     expect(P.verifyRow(bob.id.sigPk, r.sig, conv, 0, E, r.label, r.M)).toBe(true);
     expect(P.verifyRow(bob.id.sigPk, r.sig, flip(conv, 0), 0, E, r.label, r.M)).toBe(false);
@@ -747,7 +747,7 @@ describe("descriptor D: layout and rules", () => {
     expect(lens).toEqual([80, 160, 2896, 224, 2960]);
   });
 
-  it("a maximal D (32 members, 64 four-byte code points) is 2896 B and D ‖ dsig fits [4096] (test 1)", () => {
+  it("a maximal D (32 members, 64 four-byte code points) is 2896 B and D ‖ dsig fits [4096]", () => {
     const name = "😀".repeat(64);
     expect([...name].length).toBe(64);
     expect(s2b(name).length).toBe(256);
@@ -763,7 +763,7 @@ describe("descriptor D: layout and rules", () => {
     expect(() => P.parseD(cat(D, be8(0)))).toThrow(P.CodecError);
   });
 
-  it("parseD enforces every rule and nothing else (test 10)", () => {
+  it("parseD enforces every rule and nothing else", () => {
     const ms = [alice, bob].map(mem);
     const base: RefD = { conv, e: 1, prev: fill(32, 9), by: alice.uid, ts: TS, members: ms, name: s2b("n") };
     expect(P.parseD(refD(base)).name).toBe("n");
@@ -802,7 +802,7 @@ describe("descriptor D: layout and rules", () => {
       ["a missing byte", refD(base).slice(0, -1)],
     ];
     for (const [what, b] of bads) expect([what, throwsError(() => P.parseD(b))]).toEqual([what, true]);
-    // names: only valid UTF-8 of 1–64 code points, whatever validName says (round 5; no Unicode tables involved)
+    // names: only valid UTF-8 of 1–64 code points, whatever validName says (no Unicode tables involved)
     const names: [string, string, boolean][] = [
       ["a control character", "a\u0007", false],
       ["U+202E inside", "ok‮evil", false],
@@ -844,7 +844,7 @@ describe("descriptor D: layout and rules", () => {
     expect(P.verifyD(fill(10, 0), keys0.kc, dsig0)).toBe(false);
   });
 
-  it("descriptor keys: rows, dsig and bundles use keys from D or passed in, never a directory (test 12)", () => {
+  it("descriptor keys: rows, dsig and bundles use keys from D or passed in, never a directory", () => {
     // verifyRow(sigPk, sig, conv, e, E, label, M), verifyD(D, kc, dsig), buildBundle(spec): no directory argument
     expect(P.verifyRow.length).toBe(7);
     expect(P.verifyD.length).toBe(3);
@@ -880,7 +880,7 @@ describe("descriptor D: layout and rules", () => {
   });
 });
 
-describe("rm bits and the D′ checks (§6.2, §6.6 step 4, tests 7 and 10)", () => {
+describe("rm bits and the D′ checks (§6.2, §6.6 step 4)", () => {
   const claim = { from: 0, hD: D1.hash, rm: 2 };
   const next = { D: D1.bytes, dsig: dsig1, kc: keys1.kc, pks: pks1, EK: EK1 };
   const bundle = P.parseBundleBlob(built1.blob);
@@ -913,7 +913,7 @@ describe("rm bits and the D′ checks (§6.2, §6.6 step 4, tests 7 and 10)", ()
 
   it("accepts the honest D′", () => {
     expect(P.dPrimeChecks(next, D0, claim, bundle)).toEqual({ ok: true, D: D1 });
-    // the D′ checks never consult validName: a D′ named with characters it rejects is accepted (round 5)
+    // the D′ checks never consult validName: a D′ named with characters it rejects is accepted
     const [n, c] = variant({ name: "\u202eevil" });
     expect(P.validName("\u202eevil")).toBe(false);
     expect(P.dPrimeChecks(n, D0, c, bundle)).toMatchObject({ ok: true, D: { name: "\u202eevil" } });
@@ -1013,7 +1013,7 @@ describe("join payload J (§5.2)", () => {
   });
 });
 
-describe("inbox invites (§5.3, test 8)", () => {
+describe("inbox invites (§5.3)", () => {
   const J = P.encodeJ(join1);
 
   it("matches the reference construction and is 1416 B", () => {
@@ -1105,9 +1105,9 @@ describe("link hellos (§5.5)", () => {
   });
 });
 
-// ───────────────────────── SGB2 bundles (§5.4, test 7) ─────────────────────────
+// ───────────────────────── SGB2 bundles (§5.4) ─────────────────────────
 
-describe("SGB2 key bundles (§5.4, tests 1, 7, 10 and 12)", () => {
+describe("SGB2 key bundles (§5.4)", () => {
   const everyone = [alice, bob, carol, dave, erin].map((p) => p.id.kemSk);
   const stranger = P.kemKeygen(fill(32, 0xee)).sk;
   /** an X-Wing key with an ML-KEM coefficient ≥ q: no encapsulation succeeds */
@@ -1117,7 +1117,7 @@ describe("SGB2 key bundles (§5.4, tests 1, 7, 10 and 12)", () => {
   const kem9 = Array.from({ length: 9 }, (_, k) => fill(1216, k + 1)); // e = 0: no sealDet, so any 1216 bytes
   const spec9: P.BundleSpec = { conv, e: 0, D: D9, dsig: fill(64, 0), EK: EK0, pks: kem9, prevMembers: [], rm: 0 };
 
-  it("has the §3.2 sizes and offsets: descCt 4136 B at 16, pkCt B·1216 + 40 B at 4152, entries after (test 1)", () => {
+  it("has the §3.2 sizes and offsets: descCt 4136 B at 16, pkCt B·1216 + 40 B at 4152, entries after", () => {
     expect(built1.B).toBe(8);
     expect(built1.size).toBe(23456);
     expect(built1.blob.length).toBe(23456);
@@ -1159,7 +1159,7 @@ describe("SGB2 key bundles (§5.4, tests 1, 7, 10 and 12)", () => {
     for (const [what, f] of bads) expect([what, throwsError(f)]).toEqual([what, true]);
   });
 
-  it("matches the reference construction byte for byte: descCt, pkCt, sealDet entries and dummies (test 1)", () => {
+  it("matches the reference construction byte for byte: descCt, pkCt, sealDet entries and dummies", () => {
     for (const B of [8, 32] as const) {
       const calls: B[] = [];
       const b = withRng(recording(detRng(`segv.sh/v2/test/sgb2/${B}`), calls), () => P.buildBundle({ ...spec1, B }));
@@ -1184,7 +1184,7 @@ describe("SGB2 key bundles (§5.4, tests 1, 7, 10 and 12)", () => {
     }
   });
 
-  it("sealDet: a node:crypto + noble re-implementation gives the same 1192 bytes, and open() opens it (test 1)", () => {
+  it("sealDet: a node:crypto + noble re-implementation gives the same 1192 bytes, and open() opens it", () => {
     const cases: [Person, number][] = [
       [alice, 0],
       [carol, 2],
@@ -1227,7 +1227,7 @@ describe("SGB2 key bundles (§5.4, tests 1, 7, 10 and 12)", () => {
       expect(throwsError(f)).toBe(true);
   });
 
-  it("kept entries open EK′ for their owner and equal others' recomputation; the rest open for nobody (test 7)", () => {
+  it("kept entries open EK′ for their owner and equal others' recomputation; the rest open for nobody", () => {
     expect(toHex(P.openEntry(alice.id.kemSk, conv, 1, 0, built1.blob)!)).toBe(toHex(EK1));
     expect(toHex(P.openEntry(carol.id.kemSk, conv, 1, 2, built1.blob)!)).toBe(toHex(EK1));
     const b = P.parseBundleBlob(built1.blob);
@@ -1262,7 +1262,7 @@ describe("SGB2 key bundles (§5.4, tests 1, 7, 10 and 12)", () => {
     expect(toHex(P.openPks(keys0.dk, conv, 0, b.blob))).toBe(toHex(refPks(kem0, 8)));
   });
 
-  it("openDesc / openPks return D ‖ dsig and pks, and throw when corrupted or under a wrong EK′ (test 10)", () => {
+  it("openDesc / openPks return D ‖ dsig and pks, and throw when corrupted or under a wrong EK′", () => {
     expect(P.openDesc(keys1.dk, conv, 1, built1.blob)).toEqual({ D: D1.bytes, dsig: dsig1 });
     expect(toHex(P.openPks(keys1.dk, conv, 1, built1.blob))).toBe(toHex(pks1));
     const rk = refEpochKeys(EK1, conv, 1);
@@ -1340,7 +1340,7 @@ describe("SGB2 key bundles (§5.4, tests 1, 7, 10 and 12)", () => {
   });
 });
 
-describe("processing a winning claim and accepting a join (§6.6 steps 2–4, §6.7 steps 1–2, test 14)", () => {
+describe("processing a winning claim and accepting a join (§6.6 steps 2–4, §6.7 steps 1–2)", () => {
   const claim: P.Claim = { ...claim3, bundleId: built1.id, bundleSize: built1.size };
   const run = (i: number, sk: B, c = claim, blob: B = built1.blob) =>
     P.processClaim({ kemSk: sk, De: D0, i, from: 0, claim: c, blob });
@@ -1468,7 +1468,7 @@ describe("processing a winning claim and accepting a join (§6.6 steps 2–4, §
   });
 });
 
-// ───────────────────────── claims (§6.2, §6.4, §6.8, test 10) ─────────────────────────
+// ───────────────────────── claims (§6.2, §6.4, §6.8) ─────────────────────────
 
 describe("claims: content layout and shape rules", () => {
   it("matches the reference (137 + 6m) and round-trips", () => {
@@ -1533,7 +1533,7 @@ describe("claims: content layout and shape rules", () => {
   });
 });
 
-describe("acceptOldRow: the §6.8 walk (test 10)", () => {
+describe("acceptOldRow: the §6.8 walk", () => {
   const [A, Bu, C, Du] = [alice, bob, carol, dave].map((p) => p.uid);
   // epoch e: [A, B, C]; C_e at t = 100 removes B; cuts B: (5, 3)
   const Ce = {
@@ -1585,10 +1585,10 @@ describe("acceptOldRow: the §6.8 walk (test 10)", () => {
     ["frozen reader: removed member after the claim", row(1, 5000), [e0], false],
     ["frozen reader: removed member before the claim", row(1, 50), [e0], true],
     ["a member listed until the end", row(0, 9999), [e0, e1, e2], true],
-    // a carried LEFT record (round 9): NONE is never before a cut, so t_R = t(C) drops it
+    // a carried LEFT record: NONE is never before a cut, so t_R = t(C) drops it
     ["carried LEFT record: NONE with t_R = t(C)", row(1, 100, 0xffff, 0xffffffff), [e0, e1], false],
     ["carried LEFT record: NONE with t_R < t(C)", row(1, 99, 0xffff, 0xffffffff), [e0, e1], true],
-    // the bit without C_e (round 10): D_{e+1} lists C, so C's bit is 0 and the walk goes on to C_{e+1}
+    // the bit without C_e: D_{e+1} lists C, so C's bit is 0 and the walk goes on to C_{e+1}
     ["no C_e, D_{e+1} held: C removed by C_{e+1}, after", row(2, 250), [{ ...e0, claim: null }, e1], false],
     ["no C_e, D_{e+1} held: C removed by C_{e+1}, equal t", row(2, 200), [{ ...e0, claim: null }, e1], false],
     ["no C_e, D_{e+1} held: C removed by C_{e+1}, before", row(2, 199), [{ ...e0, claim: null }, e1], true],
@@ -1599,7 +1599,7 @@ describe("acceptOldRow: the §6.8 walk (test 10)", () => {
     expect(P.acceptOldRow(r, epochs)).toBe(want);
   });
 
-  // answer R11-6: a receiver removed by the last listed claim ends that epoch at the claim for every sender
+  // a receiver removed by the last listed claim ends that epoch at the claim for every sender
   const removedTable: [string, P.WalkRow, P.WalkEpoch[], boolean][] = [
     ["removed receiver: a kept member's row before the claim", row(2, 99), [e0], true],
     ["removed receiver: a kept member's row after the claim", row(2, 101), [e0], false],
@@ -1984,7 +1984,7 @@ describe("self rows S (§7.1)", () => {
     expect(() => P.encodeS({ ...row, records: [snap[1], contact[1]] })).toThrow(P.CodecError);
   });
 
-  it("a LEFT of 77 or 79 B, or with (E, n) = (0xFFFF, n ≠ 0xFFFFFFFF), makes its row or S2 malformed (test 4)", () => {
+  it("a LEFT of 77 or 79 B, or with (E, n) = (0xFFFF, n ≠ 0xFFFFFFFF), makes its row or S2 malformed", () => {
     const left = records.find(([n]) => n === "LEFT")!;
     const ok = refRecord(0x0e, left[2]);
     expect(P.parseS(refS(6, 4, fill(16, 1), TS, [ok])).records).toEqual([left[1]]);
@@ -2002,7 +2002,7 @@ describe("self rows S (§7.1)", () => {
     expect(toHex(S)).toBe(toHex(refS(0xffff, 0xffffffff, fill(16, 0), TS, [refRecord(0x20, snap[2])])));
     expect(P.parseS(S, "snap")).toEqual({ ...ptr, skipped: 0 });
     expect(() => P.parseS(S)).toThrow(P.CodecError);
-    // encodeS refuses a pointer row in the Lself prev chain (§7.1, Q27); readers ignore a pointer row's prev fields
+    // encodeS refuses a pointer row in the Lself prev chain (§7.1); readers ignore a pointer row's prev fields
     expect(() => P.encodeS({ ...row, records: [snap[1]] })).toThrow(P.CodecError);
     const chained = refS(6, 4, fill(16, 0x75), TS, [refRecord(0x20, snap[2])]);
     expect(P.parseS(chained, "snap").records).toEqual([snap[1]]);
@@ -2013,7 +2013,7 @@ describe("self rows S (§7.1)", () => {
     expect(P.parseS(withUnknown, "snap").skipped).toBe(1);
   });
 
-  it("sealSelf / openSelf: AAD, reference construction, and the EPOCH_PENDING / DELIVERED class rule (test 6)", () => {
+  it("sealSelf / openSelf: AAD, reference construction, and the EPOCH_PENDING / DELIVERED class rule", () => {
     const id = alice.id;
     const label = P.Lself(id.rS, E, 0);
     const nonce = seqBytes(24, 0x30);
@@ -2109,9 +2109,9 @@ describe("snapshots S2 (§7.4)", () => {
   });
 });
 
-// ───────────────────────── throwing decapsulation (§1.1, test 9) ─────────────────────────
+// ───────────────────────── throwing decapsulation (§1.1) ─────────────────────────
 
-describe("a low-order X25519 component makes every trial-open return 'does not open' (test 9)", () => {
+describe("a low-order X25519 component makes every trial-open return 'does not open'", () => {
   // X-Wing ct = ML-KEM ct (1088 B) ‖ X25519 ephemeral (32 B); u = 0 and u = 1 are low-order points
   const lowOrder = [fill(32, 0), cat(be8(1), fill(31, 0))].map((u) => cat(fill(1088, 5), u));
   const keys = [alice, bob, carol, dave].map((p) => p.id.kemSk);
@@ -2161,7 +2161,7 @@ describe("a low-order X25519 component makes every trial-open return 'does not o
 
 // ───────────────────────── 3. fuzz ─────────────────────────
 
-describe("fuzz: truncations, extensions and random bytes are rejected (test 4)", () => {
+describe("fuzz: truncations, extensions and random bytes are rejected", () => {
   const r = prng(0x5e9f);
   const samples: [string, (b: B) => unknown, B[]][] = [
     [
@@ -2347,7 +2347,7 @@ const KAT = {
   member:
     "0d0076a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a108d49f307d2069ae7103b5b61f6a8b2bb256dd9445960bab6413c565c0cb0e095350b0d409bc0335181d38f4f2" +
     "5ae3c82486104f11f0d04833bcfb216e55c768727272727272727272727272727272727272727272727272727272727272727205626f625f31",
-  // a LEFT record (78 bytes; round 9): conv | root | e = 4 | bob | t | (E, n) = (7, 12)
+  // a LEFT record (78 bytes): conv | root | e = 4 | bob | t | (E, n) = (7, 12)
   left: "0e004e606162636465666768696a6b6c6d6e6f525252525252525252525252525252525252525252525252525252525252525200000004a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a16a18a57b00070000000c",
 };
 

@@ -1,5 +1,5 @@
 /**
- * The v2 D1 directory (docs/PROTOCOL.md §2.4–§2.5, §9.6, §10.6; docs/STAGE1-PLAN.md M3), calling
+ * The v2 D1 directory (docs/PROTOCOL.md §2.4–§2.5, §9.6, §10.6), calling
  * src/server/directory.ts directly inside workerd (the HTTP layer is tested separately).
  */
 import { env } from "cloudflare:workers";
@@ -513,7 +513,7 @@ describe("dirRegister", () => {
     expect(await dirState()).toEqual(s0);
   });
 
-  it("400 on a mixed-order signing key (outside the prime-order subgroup) even when every signature verifies (Q16)", async () => {
+  it("400 on a mixed-order signing key (outside the prime-order subgroup) even when every signature verifies", async () => {
     const a = makeAccount();
     const { pk, body } = mixedOrderRegistration(a);
     const A = ed25519.Point.fromBytes(pk);

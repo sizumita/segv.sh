@@ -1,4 +1,4 @@
-// The inbox (docs/PROTOCOL.md §10.5, §11.5): the cursor rules. The poll and trial decryption land with M6b.
+// The inbox (docs/PROTOCOL.md §10.5, §11.5): the cursor rules, the poll and the trial decryption.
 import * as P from "~/lib/proto";
 
 /** An inbox cursor (Ein, relIn): every row of era E with rel ≤ relIn has been processed (§7.2 HEADS, §11.5). */
@@ -97,7 +97,7 @@ export function workerDecrypt(worker: Worker): Decrypt {
 }
 
 /**
- * Reads the inbox from `cursor` (or, without one, from the registration rule with `t_r = start(regEra)`, R9-1) up
+ * Reads the inbox from `cursor` (or, without one, from the registration rule with `t_r = start(regEra)`) up
  * to the current era and trial-decrypts every row (§11.5 steps 1–2, §5.3). Rows with `rel ≤ after` or above the
  * reported `closed` are ignored (§10.5). Errors are thrown (the caller retries later); a 410 skips that era.
  */

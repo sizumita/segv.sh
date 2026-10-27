@@ -1,5 +1,4 @@
-// Deliveries, WELCOMEs, parked joins and stale times (docs/STAGE1-PLAN.md M6 tests 6, 7, 8, 9 (c) and 15; SPEC §6.1,
-// §6.7, §6.11, §6.12, §10.1).
+// Deliveries, WELCOMEs, parked joins and stale times (docs/PROTOCOL.md §6.1, §6.7, §6.11, §6.12, §10.1).
 import { describe, expect, it } from "vite-plus/test";
 import { notNotified } from "../../src/client/deliver";
 import {
@@ -27,7 +26,7 @@ const postSizes = () =>
     .requests.filter((r) => r.method === "POST" && r.path === "/api/v2/inbox" && r.status === 200)
     .map((r) => (r.reqBytes - 7) / 1432);
 
-describe("creation crash and resume (test 6)", () => {
+describe("creation crash and resume", () => {
   it("a second device of the creator delivers J after RESUME_AFTER; the invitee holds the conversation", async () => {
     const [alice, bob] = ["alice", "bob"].map((h) => makeUser(h));
     const A = await engineFor(alice);
@@ -64,7 +63,7 @@ describe("creation crash and resume (test 6)", () => {
   });
 });
 
-describe("delivery under limits (test 7)", () => {
+describe("delivery under limits", () => {
   it("rows past the day cap stay pending with one warning each, and are delivered after the day rolls over", async () => {
     const names = ["bob", "carol", "dave", "erin"];
     const users = names.map((h) => makeUser(h));
@@ -86,7 +85,7 @@ describe("delivery under limits (test 7)", () => {
   });
 });
 
-describe("WELCOME through a qualifying 1:1 (test 8)", () => {
+describe("WELCOME through a qualifying 1:1", () => {
   it("dave, offline, finds the J that came as a WELCOME in his 1:1 with alice, behind 40 texts", async () => {
     const [alice, carol, dave] = ["alice", "carol", "dave"].map((h) => makeUser(h));
     const A = await engineFor(alice);
@@ -123,7 +122,7 @@ describe("WELCOME through a qualifying 1:1 (test 8)", () => {
   });
 });
 
-describe("parked joins (test 9 (c))", () => {
+describe("parked joins", () => {
   it("a join whose blob GET answers 503 twice is parked, holds the cursor, and is accepted once the fake recovers", async () => {
     const [alice, bob] = ["alice", "bob"].map((h) => makeUser(h));
     const A = await engineFor(alice);
@@ -148,7 +147,7 @@ describe("parked joins (test 9 (c))", () => {
   });
 });
 
-describe("stale server time (test 15)", () => {
+describe("stale server time", () => {
   it("cacheable responses with a weeks-old x-segv-now never move the estimate", async () => {
     const [alice, bob] = ["alice", "bob"].map((h) => makeUser(h));
     const A = await engineFor(alice);

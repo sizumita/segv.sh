@@ -1,5 +1,5 @@
-// Membership changes end to end (docs/STAGE1-PLAN.md M7; ported from 3de5f5e:test/engine/flows.spec.ts "add, remove
-// and rename" and "leave"; SPEC §6.3, §6.6, §6.9, §11.9).
+// Membership changes end to end (docs/PROTOCOL.md §6.3, §6.6, §6.9, §11.9): add, remove, rename and leave, as the
+// v1 engine tests had them, and history across epochs.
 import { describe, expect, it } from "vite-plus/test";
 import {
   chat,

@@ -1,5 +1,5 @@
 // Engine options (docs/PROTOCOL.md §11): the transport, the clocks, and every protocol delay, so tests can inject
-// them (docs/STAGE1-PLAN.md §2.2). The app constructs the engine without options.
+// them. The app constructs the engine without options.
 
 /** A scheduled callback; `cancel()` is idempotent. */
 export interface EngineTimer {

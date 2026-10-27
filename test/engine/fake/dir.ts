@@ -4,7 +4,7 @@
  * 64 wraps per uid) and the prefix lookups (`p ≤ min(32, P + 1)`, ordered by uid, 256 per page).
  *
  * `register(body)` and `postWrap(body)` are the HTTP handlers and are also called directly by tests (e.g. to register
- * a user between two engines' evaluations, SEC-3). They return the HTTP status and JSON body.
+ * a user between two engines' evaluations). They return the HTTP status and JSON body.
  *
  * Failure knob: `failDir(pred, n)` (prefix lookups for which `pred` holds answer 503 n times).
  */

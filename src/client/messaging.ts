@@ -479,7 +479,7 @@ export class Messaging {
     const by = this.whoOf(c, ep, ep.D.by);
     const text = ep.e === 0 ? `${by} started the conversation` : `${by} added you`;
     // A join without a stored row of its own takes D.ts clamped to the §11.8 window around the bundle's t_reg, so a
-    // far-future D.ts cannot pin the copy to the top of the list (answer R10-2). It sorts before the epoch's rows.
+    // far-future D.ts cannot pin the copy to the top of the list. It sorts before the epoch's rows.
     const ts = ep.tReg !== null ? clampTs(ep.D.ts, ep.tReg, this.params().delta) : ep.D.ts;
     const key = `sys:${ep.e}:join`;
     if (c.order.has(key)) return;
@@ -546,7 +546,7 @@ export class Messaging {
     if (!D || !dsig) return;
     const Dv: P.Descriptor = D;
     let tReg: number | null = request ? (rec as P.RequestRec).tReg : null;
-    // E_start from an EPOCH_PENDING only when it names this epoch's own bundle (sent-2b, round 14)
+    // E_start from an EPOCH_PENDING only when it names this epoch's own bundle
     if (tReg === null)
       tReg =
         f.pending.find(
@@ -827,7 +827,7 @@ export class Messaging {
       }
       this.h.check();
       if (u) this.learnUser(u, false);
-      else this.unregistered.add(uidB); // a complete answer without it (re-asked fresh once, R10-1)
+      else this.unregistered.add(uidB); // a complete answer without it (re-asked fresh once)
     }
     let changed = false;
     for (const c of copies) {
@@ -1104,7 +1104,7 @@ export class Messaging {
       .catch((e) => this.h.warn(`could not record a conversation: ${message(e)}`));
   }
 
-  /** A WELCOME's J (M6c sends them; receivers accept them whenever the row is processed, §5.2). */
+  /** A WELCOME's J: accepted whenever its row is processed (§5.2). */
   private async welcome(_c: Copy, _ep: Epoch, J: P.Join): Promise<void> {
     await this.h.track(this.h.enqueue(() => this.processJoins([{ J, at: null }])));
   }

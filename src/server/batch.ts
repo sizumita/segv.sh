@@ -9,7 +9,7 @@
  *     t = max(floor, last_t, closed_t + Δ if closed_t exists)
  *
  * where `floor` is the object's own lower bound (tpub(now), sec(start(E)), tpub(hw), …), so t never decreases and
- * never falls into a closed batch even when the clock steps back (IMP-7). Nothing here caches meta in memory: every
+ * never falls into a closed batch even when the clock steps back. Nothing here caches meta in memory: every
  * value is read from SQLite, so a rolled-back transactionSync never leaves stale state behind.
  */
 import { T0_MS, ZERO32, enc, leaf, mth, nextHead, u16, u32, u8, type Bytes } from "../lib/proto";

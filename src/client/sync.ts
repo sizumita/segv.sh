@@ -283,7 +283,7 @@ export const rowOrder = (ts: number, e: number, E: number, lane: number, n: numb
 
 /**
  * Processes one stored row of lane j at (E, n) (§3.3, §11.6): junk occupies its slot (an undecryptable row gives the
- * noise warning); a valid row updates the lane and is shown (TEXT, IMAGE), joined (WELCOME), or kept for M7 (LEAVE).
+ * noise warning); a valid row updates the lane and is shown (TEXT, IMAGE), joined (WELCOME), or recorded as a leave (LEAVE).
  */
 export function applyLaneRow(
   ctx: SyncCtx,

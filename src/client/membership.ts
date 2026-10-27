@@ -207,7 +207,7 @@ export function onLeave(
     const skipAbove = [...c.epochs.values()].some((x) => x.viaSkip && x.e > ep.e);
     if (!skipAbove) {
       c.left = true;
-      // One line per leave, at the earliest own LEAVE row held (repeats add none; answer R11-5).
+      // One line per leave, at the earliest own LEAVE row held (a repeated LEAVE adds none).
       const since = Math.max(0, ...[...c.epochs.values()].filter((x) => x.viaSkip).map((x) => x.e));
       putLineEarliest(c, `sys:you-left:${since}`, src.order, () => YOU_LEFT);
     }
@@ -274,7 +274,7 @@ export async function processWinner(
       await h.sweep([...ep.lanes.map((_, j) => ({ c, ep, lane: j })), ...unsweptBelow(c, ep)]);
     for (const l of ep.lanes) l.swept = true;
     for (const t of unsweptBelow(c, ep)) t.ep.lanes[t.lane as number].swept = true;
-    // "@by removed you" is decided at k (a self-leaver gets none) and stays when a skip re-add follows (R11-2).
+    // "@by removed you" is decided at k (a self-leaver gets none) and stays when a skip re-add follows.
     if (!h.leftAt(c, ep.e))
       putLine(
         c,

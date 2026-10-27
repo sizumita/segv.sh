@@ -1,6 +1,6 @@
 /**
- * BlobRegDO (docs/PROTOCOL.md §8.2, §9.2, plan M2): create-only registrations, the MISS high-water mark that
- * makes §6.4(g) final, closed_t (IMP-7), the head chain over H(id)-ordered leaves, and Δ pinned by the first write.
+ * BlobRegDO (docs/PROTOCOL.md §8.2, §9.2): create-only registrations, the MISS high-water mark that
+ * makes §6.4(g) final, closed_t, the head chain over H(id)-ordered leaves, and Δ pinned by the first write.
  *
  * The registry is one object, so every test moves its clock forward to a fresh hour far in the future (its
  * batch alarms then never fire on their own; tests run them by hand).

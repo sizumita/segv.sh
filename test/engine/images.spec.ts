@@ -1,4 +1,4 @@
-// Images (docs/PROTOCOL.md §8.1; ported from 3de5f5e:test/engine/images.spec.ts): an encrypted image that the
+// Images (docs/PROTOCOL.md §8.1): an encrypted image that the
 // other member loads, the cache keyed by id AND key (web-4), and uploads in flight across a logout (engine-11). The
 // canvas re-encoder (src/client/image.ts) needs a DOM, so it is replaced by a pass-through.
 import { resolveObjectURL } from "node:buffer";

@@ -36,7 +36,7 @@ const STASH_FILES = sync$((e: ClipboardEvent | DragEvent, el: HTMLElement): void
   }
 });
 
-/** Why the composer is replaced by a notice (docs/STAGE1-PLAN.md §0.4); "" never reaches it. */
+/** Why the composer is replaced by a notice (`ConversationView.blocked`); "" never reaches it. */
 const BLOCKED_TEXT: Record<Exclude<Blocked, "">, string> = {
   removed:
     "you are no longer a member of this conversation. you can read its history but cannot send.",

@@ -1,6 +1,6 @@
-// Accounts (docs/PROTOCOL.md §2.4–§2.5, §11.1; docs/STAGE1-PLAN.md §3 rows 1–10): wraps filed under someone
-// else's public id, the registration's lost response, passkeys without PRF, a second passkey, and "remember this
-// device" without IndexedDB, ported from v1 (3de5f5e:test/engine/accounts.spec.ts); plus the v2 account check and
+// Accounts (docs/PROTOCOL.md §2.4–§2.5, §11.1): wraps filed under someone else's public id, the registration's
+// lost response, passkeys without PRF, a second passkey, and "remember this device" without IndexedDB (ported from
+// the v1 engine tests); plus the v2 account check and
 // the registration's first self row. WebAuthn is replaced by an in-memory authenticator (credential id → uid + PRF).
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { ACCOUNT_KEYS_MISMATCH, ACCOUNT_MISSING } from "../../src/client/engine";
@@ -256,7 +256,7 @@ describe("v2: the registration's self row and the account check (§7.3, §11.1)"
     expect(row.records).toHaveLength(1);
     const first = row.records[0] as P.HeadsRec;
     expect(first).toMatchObject({ rtype: P.RT.HEADS, entries: [] });
-    // at the registration's slot (minus SKEW and a margin, R9-1), however long the test then takes
+    // at the registration's slot (minus SKEW and a margin), however long the test then takes
     const slot = Math.floor((regAt - P.T0_MS) / (server().params.inboxSlot * 1000));
     expect(first.Ein).toBe(server().era);
     expect(first.relIn).toBeLessThanOrEqual(slot);

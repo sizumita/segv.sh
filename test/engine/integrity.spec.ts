@@ -1,4 +1,4 @@
-// Integrity (docs/STAGE1-PLAN.md M8 integrity.spec.ts; ports of 3de5f5e:test/engine/sync.spec.ts #40–#45; SPEC §12):
+// Integrity (docs/PROTOCOL.md §12):
 // row immutability, lane omission through prev / prevh, receipts, checkpoints (key, rollback, rewrite, the range and
 // its skip), and the split-view check.
 import { describe, expect, it } from "vite-plus/test";
@@ -56,7 +56,7 @@ function mint(n: number): void {
   }
 }
 
-describe("row immutability (§12.1, SEC-14)", () => {
+describe("row immutability (§12.1)", () => {
   it("a changed body, t or class of a row this session saw is a critical warning", async () => {
     const { A, B, id } = await pair();
     await A.sendText(id, "original");
@@ -83,7 +83,7 @@ describe("row immutability (§12.1, SEC-14)", () => {
   });
 });
 
-describe("lane omission (§12.2, COR-10)", () => {
+describe("lane omission (§12.2)", () => {
   it("an omitted middle row: later rows are still shown, with one 'hiding messages' warning", async () => {
     const { alice, A, B, id } = await pair();
     const ep = epoch(A, id);
@@ -178,7 +178,7 @@ describe("checkpoints (§12.3)", () => {
     expect(crit(A2)).toContain(rolledBack(latest.q + 10, latest.q));
   });
 
-  it("equal q with a different C is 'history was rewritten', in every later session (CMP-16)", async () => {
+  it("equal q with a different C is 'history was rewritten', in every later session", async () => {
     mint(2);
     const latest = server().ckpt.latest()!;
     const k = (await (await fetch("/api/v2/params")).json()) as { srvKey: string };
@@ -207,7 +207,7 @@ describe("checkpoints (§12.3)", () => {
     expect(crit(A2)).toContain(rewritten(stored));
   });
 
-  it("q jumping far ahead of the time since the stored checkpoint is 'rewritten'; after 30 days the range is skipped (SEC-8)", async () => {
+  it("q jumping far ahead of the time since the stored checkpoint is 'rewritten'; after 30 days the range is skipped", async () => {
     mint(1);
     const c1 = server().ckpt.latest()!;
     mint(62);
@@ -233,7 +233,7 @@ describe("checkpoints (§12.3)", () => {
 });
 
 describe("split view (§12.4)", () => {
-  it("a reference that matches the first 8 bytes only is still detected (SEC-7); one line per sender", async () => {
+  it("a reference that matches the first 8 bytes only is still detected; one line per sender", async () => {
     mint(1);
     const { bob, A, B, id } = await pair();
     const ck = I(A).ckpt!.latest!;
