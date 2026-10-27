@@ -109,8 +109,17 @@ export const MAX_REGISTER_BODY = 64 * 1024;
 export const MAX_WRAP_BODY = 16 * 1024;
 /** Page budget of the public feed (§10.9), and the page size that one RL_READ token pays for. */
 const FEED_BUDGET = 4 * 1024 * 1024;
-/** Wire bytes of a feed page header (u8 more | u32 nb, §10.9). */
-const FEED_PAGE_HDR = 1 + 4;
+/** The most RL_READ tokens one feed page takes (§10.9). */
+const FEED_MAX_TOKENS = 64;
+
+/**
+ * RL_READ tokens of a feed page: one per started FEED_BUDGET of the page's batch encodings (`bytes`, without the page
+ * header), at least 1 and at most 64 (§9.1, §10.2, §10.9). The cap keeps every page readable by an address that has
+ * not spent its window.
+ */
+export function feedTokens(bytes: number): number {
+  return Math.min(Math.max(1, Math.ceil(bytes / FEED_BUDGET)), FEED_MAX_TOKENS);
+}
 const TEXT_MAX = 12_000;
 /** Stage 1 runs one shard per era (s_E = 0). */
 const SHARD_BITS = 0;
@@ -704,9 +713,9 @@ async function feed(c: Ctx, E: number, i: number): Promise<Response> {
   // from the shard ≤ FEED_BUDGET per RPC. The first pull happens before the 200 so that a shard failure is a 5xx.
   // Not stored in caches.default: a tee of the stream would buffer the whole batch for the slower reader.
   const big = page.batches.find((b) => !b.rows)!;
-  // One RL_READ token per started FEED_BUDGET of page (§10.2, §10.9): the first was taken above, the others are
-  // taken here, before any row is read, so a refused one is a 429 that cost the shard no feedRows call.
-  for (let k = Math.ceil((FEED_PAGE_HDR + big.bytes) / FEED_BUDGET) - 1; k > 0; k--) await readLimit(c);
+  // feedTokens(page) RL_READ tokens (§10.2, §10.9): the first was taken above, the others are taken here, before any
+  // row is read, so a refused one is a 429 that cost the shard no feedRows call. The page is this one batch.
+  for (let k = feedTokens(big.bytes) - 1; k > 0; k--) await readLimit(c);
   const first = await shard.feedRows(E, i, big.t, null, FEED_BUDGET);
   return new Response(feedStream(shard, E, i, page, first), {
     headers: { "content-type": OCTET, "cache-control": cacheControl, ...SECURITY_HEADERS },

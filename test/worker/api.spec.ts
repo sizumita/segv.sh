@@ -8,7 +8,7 @@ import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import * as P from "../../src/lib/proto";
 import * as W from "../../src/lib/wire";
-import { MAX_REGISTER_BODY, MAX_WRAP_BODY, _resetApiForTests, routeLabel } from "../../src/server/api";
+import { MAX_REGISTER_BODY, MAX_WRAP_BODY, _resetApiForTests, feedTokens, routeLabel } from "../../src/server/api";
 import type { CheckpointDO } from "../../src/server/ckpt-do";
 import type { RealtimeDO, RtLimits } from "../../src/server/realtime-do";
 import type { ShardDO } from "../../src/server/shard-do";
@@ -2326,7 +2326,24 @@ describe("Worker logic (fake Durable Objects)", () => {
     expect((await direct(path(), {}, { SHARD })).status).toBeGreaterThanOrEqual(500);
   });
 
-  it("feed tokens: one RL_READ token per started 4 MiB of page, all taken before feedRows; cached pages take none", async () => {
+  it("feedTokens: one per started 4 MiB of the page's batches, at least 1 and at most 64 (§10.9)", () => {
+    const MiB = 1 << 20;
+    for (const [bytes, tokens] of [
+      [0, 1],
+      [1, 1],
+      [4 * MiB, 1],
+      [4 * MiB + 1, 2],
+      [8 * MiB, 2],
+      [8 * MiB + 1, 3],
+      [63 * 4 * MiB + 1, 64],
+      [600 * 4 * MiB + 1, 64],
+      [300 * MiB, 64],
+      [2.6e9, 64],
+    ])
+      expect(feedTokens(bytes), `${bytes} B`).toBe(tokens);
+  });
+
+  it("feed tokens: one RL_READ token per started 4 MiB of the page's batches (at most 64), all taken before feedRows; cached pages take none", async () => {
     const E = eraNow();
     const rows = Array.from({ length: 3 }, () => ({ label: randomLabel(), cls: 0, body: randomBody(0) })).sort((a, b) => P.byteCmp(a.label, b.label));
     const batch = { t: 5, n: 3, root: P.random(32), head: P.random(32) };
@@ -2340,7 +2357,7 @@ describe("Worker logic (fake Durable Objects)", () => {
     });
     const path = () => `/api/v2/feed/${E}/0?after=${Math.floor(Math.random() * 1e9)}`;
 
-    // A page of one 9 MiB batch is 5 + 9 MiB on the wire: ⌈(5 + 9 MiB) / 4 MiB⌉ = 3 tokens.
+    // A page of one 9 MiB batch: ⌈9 MiB / 4 MiB⌉ = 3 tokens.
     let rl = countingLimiter(3);
     let res = await direct(path(), {}, { SHARD, RL_READ: rl });
     expect(res.status).toBe(200);
@@ -2359,12 +2376,13 @@ describe("Worker logic (fake Durable Objects)", () => {
       expect(rl.calls).toBe(left + 1);
       expect(feedRows).toBe(0);
     }
-    // The 5-byte page header counts: a batch of 8 MiB − 5 B is a page of exactly two tokens, one byte more needs three.
     for (const [size, tokens] of [
-      [(8 << 20) - 5, 2],
-      [(8 << 20) - 4, 3],
+      [8 << 20, 2],
+      [(8 << 20) + 1, 3],
       [(4 << 20) + 1, 2],
-      [64 << 20, 17],
+      [64 << 20, 16],
+      [600 * (4 << 20) + 1, 64],
+      [2.6e9, 64],
     ]) {
       bytes = size;
       rl = countingLimiter();
@@ -2373,6 +2391,15 @@ describe("Worker logic (fake Durable Objects)", () => {
       await res.arrayBuffer();
       expect(rl.calls, `${size} B`).toBe(tokens);
     }
+    // At most 64: a 2.6 GB batch with 63 tokens left is a 429 after 64 limiter calls, before any feedRows call.
+    bytes = 2.6e9;
+    rl = countingLimiter(63);
+    feedRows = 0;
+    res = await direct(path(), {}, { SHARD, RL_READ: rl });
+    expect(res.status).toBe(429);
+    expect(res.headers.get("retry-after")).toBe("60");
+    expect(rl.calls).toBe(64);
+    expect(feedRows).toBe(0);
 
     // An inline page (its rows came with feedBatches; it fits 4 MiB) takes one token and makes no feedRows call.
     inline = true;

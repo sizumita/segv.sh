@@ -1492,7 +1492,7 @@ describe("claims: content layout and shape rules", () => {
       expect(() => P.parseClaim(bad)).toThrow(P.CodecError);
   });
 
-  it("claimShapeValid rejects each failure of (a), (b), (e), (f) and the size set of (g)", () => {
+  it("claimShapeValid rejects each failure of (a), (b), (e), (f), the size set of (g) and B ≥ m of (h)", () => {
     const ok = { ...claim3, bundleSize: 23456 }; // m = 3, from 0, rm = bit 1, cuts in [2, 3]
     expect(P.claimShapeValid(ok, 3, 0, 2, 3)).toBeNull();
     expect(P.claimShapeValid(ok, 4, 0, 2, 3)).toBe("m");
@@ -1505,10 +1505,22 @@ describe("claims: content layout and shape rules", () => {
     expect(P.claimShapeValid({ ...ok, bundleSize: 23457 }, 3, 0, 2, 3)).toBe("bundleSize");
     expect(P.claimShapeValid({ ...ok, bundleSize: 11640 }, 3, 0, 2, 3)).toBe("bundleSize"); // the size before pkCt
     expect(P.claimShapeValid({ ...ok, bundleSize: 81248 }, 3, 0, 2, 3)).toBeNull();
-    // m = 32: bit 31 is a member's bit, not "at or above m"
-    const c32: P.Claim = { ...ok, rm: 2 ** 31, cuts: Array.from({ length: 32 }, () => ({ E: 2, cnt: 0 })) };
+    // m = 32 (with 81248: B = 32): bit 31 is a member's bit, not "at or above m"
+    const c32: P.Claim = {
+      ...ok,
+      bundleSize: 81248,
+      rm: 2 ** 31,
+      cuts: Array.from({ length: 32 }, () => ({ E: 2, cnt: 0 })),
+    };
     expect(P.claimShapeValid(c32, 32, 0, 2, 3)).toBeNull();
     expect(P.claimShapeValid(c32, 32, 31, 2, 3)).toBe("rm-self");
+    // (h)'s local half: B = (bundleSize − 4192) / 2408 must hold the m members (§6.4 "Order of requests")
+    const cuts = (m: number) => Array.from({ length: m }, () => ({ E: 2, cnt: 0 }));
+    const c9: P.Claim = { ...ok, cuts: cuts(9) };
+    expect(P.claimShapeValid(c9, 9, 0, 2, 3)).toBe("bundleSize"); // 23456: B = 8 < 9
+    expect(P.claimShapeValid({ ...c9, bundleSize: 81248 }, 9, 0, 2, 3)).toBeNull(); // B = 32
+    expect(P.claimShapeValid({ ...ok, cuts: cuts(8) }, 8, 0, 2, 3)).toBeNull(); // 23456: B = 8 = m
+    expect(P.claimShapeValid({ ...c32, bundleSize: 23456 }, 32, 0, 2, 3)).toBe("bundleSize");
   });
 
   it("cutBefore is exclusive in the cut's era", () => {
@@ -1573,10 +1585,38 @@ describe("acceptOldRow: the §6.8 walk (test 10)", () => {
     ["frozen reader: removed member after the claim", row(1, 5000), [e0], false],
     ["frozen reader: removed member before the claim", row(1, 50), [e0], true],
     ["a member listed until the end", row(0, 9999), [e0, e1, e2], true],
+    // a carried LEFT record (round 9): NONE is never before a cut, so t_R = t(C) drops it
+    ["carried LEFT record: NONE with t_R = t(C)", row(1, 100, 0xffff, 0xffffffff), [e0, e1], false],
+    ["carried LEFT record: NONE with t_R < t(C)", row(1, 99, 0xffff, 0xffffffff), [e0, e1], true],
+    // the bit without C_e (round 10): D_{e+1} lists C, so C's bit is 0 and the walk goes on to C_{e+1}
+    ["no C_e, D_{e+1} held: C removed by C_{e+1}, after", row(2, 250), [{ ...e0, claim: null }, e1], false],
+    ["no C_e, D_{e+1} held: C removed by C_{e+1}, equal t", row(2, 200), [{ ...e0, claim: null }, e1], false],
+    ["no C_e, D_{e+1} held: C removed by C_{e+1}, before", row(2, 199), [{ ...e0, claim: null }, e1], true],
+    ["no C_e, D_{e+1} held: A kept to the end", row(0, 9999), [{ ...e0, claim: null }, e1, e2], true],
   ];
 
   it.each(table)("%s", (_, r, epochs, want) => {
     expect(P.acceptOldRow(r, epochs)).toBe(want);
+  });
+
+  it("throws when the claim that ended an epoch is needed but not passed (§6.8 \"The bit without C_j\")", () => {
+    // B (index 1 of e) is not listed in D_{e+1}: its bit in C_e is 1, and C_e is needed for t(C_e) and the cut
+    for (const t of [50, 100, 5000]) {
+      const err = throwsError(() => P.acceptOldRow(row(1, t), [{ ...e0, claim: null }, e1]));
+      expect(err).toBe(true);
+    }
+    expect(() => P.acceptOldRow(row(1, 50), [{ ...e0, claim: null }, e1])).toThrow(P.MissingClaimError);
+    // also one epoch further: C (index 1 of e+1) is not listed in D_{e+2} = [A, D]
+    const e1open = { ...e1, claim: null };
+    expect(() => P.acceptOldRow(row(2, 250), [e0, e1open, e2])).toThrow(P.MissingClaimError);
+    try {
+      P.acceptOldRow(row(2, 250), [e0, e1open, e2]);
+    } catch (e) {
+      expect((e as P.MissingClaimError).j).toBe(1);
+    }
+    // the last listed epoch without a claim still accepts
+    expect(P.acceptOldRow(row(1, 5000), [{ ...e0, claim: null }])).toBe(true);
+    expect(P.acceptOldRow(row(2, 5000), [e0, e1open])).toBe(true);
   });
 });
 
@@ -1702,6 +1742,18 @@ const records: [string, P.SelfRecord, B, number][] = [
     { rtype: 13, uid: bob.uid, sigPk: bob.id.sigPk, kh: refKh(bob.id.kemPk), pin: fill(32, 0x72), handle: "bob_1" },
     cat(bob.uid, bob.id.sigPk, refKh(bob.id.kemPk), fill(32, 0x72), be8(5), s2b("bob_1")),
     113 + 5,
+  ],
+  [
+    "LEFT",
+    { rtype: 0x0e, ...copy, e: 4, uid: bob.uid, t: 1_780_000_123, row: { E: 7, n: 12 } },
+    cat(refCopy, be32(4), bob.uid, be32(1_780_000_123), be16(7), be32(12)),
+    78,
+  ],
+  [
+    "LEFT (carried, NONE)",
+    { rtype: 0x0e, ...copy, e: 5, uid: bob.uid, t: 1_780_000_123, row: P.NONE },
+    cat(refCopy, be32(5), bob.uid, be32(1_780_000_123), be16(0xffff), be32(0xffffffff)),
+    78,
   ],
   [
     "SNAP",
@@ -1830,6 +1882,8 @@ describe("self records (§7.2)", () => {
       ["MEMBER non-ASCII", 13, cat(bob.uid, bob.id.sigPk, fill(32, 0x71), fill(32, 0x72), be8(4), s2b("bö"))],
       ["MEMBER without kh (81 + hlen)", 13, cat(bob.uid, bob.id.sigPk, fill(32, 0x72), be8(5), s2b("bob_1"))],
       ["SNAP era 0xFFFF outside NONE", 0x20, cat(fill(32, 0x73), fill(32, 0x74), be32(4096), be16(0xffff), be32(1))],
+      ["LEFT (E, n) = (0xFFFF, 0)", 0x0e, cat(refCopy, be32(4), bob.uid, be32(1), be16(0xffff), be32(0))],
+      ["LEFT (E, n) = (0xFFFF, 0xFFFFFFFE)", 0x0e, cat(refCopy, be32(4), bob.uid, be32(1), be16(0xffff), be32(0xfffffffe))],
     ];
     for (const [what, rtype, c] of bads)
       expect([what, throwsError(() => P.parseRecord(rtype, c))]).toEqual([what, true]);
@@ -1841,6 +1895,9 @@ describe("self records (§7.2)", () => {
     expect(() =>
       P.encodeRecord({ rtype: 2, ...copy, ...mat, claim: { E: 7, n: 3 }, flags: 1 }),
     ).toThrow(P.CodecError);
+    expect(() =>
+      P.encodeRecord({ rtype: 0x0e, ...copy, e: 4, uid: bob.uid, t: 1, row: { E: 0xffff, n: 0 } }),
+    ).toThrow(P.CodecError);
     // DESC / REQUEST desc: only 224 ≤ dlen ≤ 2960 at parse time (the consumer parses D, §7.2)
     for (const n of [224, 2960]) {
       const desc = cat(refCopy, be32(0), be16(n), fill(n, 0));
@@ -1851,8 +1908,7 @@ describe("self records (§7.2)", () => {
   });
 
   it("returns null (skip) for unknown rtypes", () => {
-    // 0x0E (LEFT, round 7) stays unknown to this codec for now: rows that carry it keep parsing
-    for (const rtype of [0x00, 0x0e, 0x0f, 0x1f, 0x21, 0x80, 0xff])
+    for (const rtype of [0x00, 0x0f, 0x10, 0x1f, 0x21, 0x30, 0x80, 0xff])
       expect(P.parseRecord(rtype, fill(5, 0xff))).toBeNull();
   });
 });
@@ -1876,7 +1932,7 @@ describe("self rows S (§7.1)", () => {
 
   it("skips unknown rtypes but keeps parsing", () => {
     const S = refS(6, 4, fill(16, 0x75), TS, [
-      refRecord(0x0e, fill(3, 1)),
+      refRecord(0x10, fill(3, 1)),
       refRecord(5, contact[2]),
       refRecord(0xff, new Uint8Array(0)),
     ]);
@@ -1909,6 +1965,18 @@ describe("self rows S (§7.1)", () => {
     expect(() => P.encodeS({ ...row, records: Array(256).fill(contact[1]) })).toThrow(P.CodecError);
     expect(P.parseS(P.encodeS({ ...row, records: Array(255).fill(contact[1]) })).records.length).toBe(255);
     expect(() => P.encodeS({ ...row, records: [snap[1], contact[1]] })).toThrow(P.CodecError);
+  });
+
+  it("a LEFT of 77 or 79 B, or with (E, n) = (0xFFFF, n ≠ 0xFFFFFFFF), makes its row or S2 malformed (test 4)", () => {
+    const left = records.find(([n]) => n === "LEFT")!;
+    const ok = refRecord(0x0e, left[2]);
+    expect(P.parseS(refS(6, 4, fill(16, 1), TS, [ok])).records).toEqual([left[1]]);
+    expect(P.parseSnapshot(refS2(7, 30, TS, [ok])).records).toEqual([left[1]]);
+    expect(() => P.parseS(refS(6, 4, fill(16, 1), TS, [ok]), "snap")).toThrow(P.CodecError); // never at Lsnap
+    for (const c of [left[2].slice(0, 77), cat(left[2], be8(0)), cat(left[2].slice(0, 72), be16(0xffff), be32(0))]) {
+      expect(() => P.parseS(refS(6, 4, fill(16, 1), TS, [ok, refRecord(0x0e, c)]))).toThrow(P.CodecError);
+      expect(() => P.parseSnapshot(refS2(7, 30, TS, [refRecord(0x0e, c), ok]))).toThrow(P.CodecError);
+    }
   });
 
   it("snapshot pointer rows (Lsnap) hold exactly one SNAP, with prev fields NONE / ZERO16", () => {
@@ -2182,10 +2250,11 @@ function computeKat() {
       ts: TS,
       records: [records[3][1], records[0][1]],
     });
+    // LEFT (0x0E) came after this vector was pinned: it has a vector of its own (left, below)
     const snap = P.encryptSnapshot({
       pos: { E: 7, n: 30 },
       ts: TS,
-      records: records.filter(([, r]) => r.rtype !== 0x20).map(([, r]) => r),
+      records: records.filter(([, r]) => r.rtype !== 0x20 && r.rtype !== 0x0e).map(([, r]) => r),
     });
     return {
       D0: toHex(D0.bytes),
@@ -2213,6 +2282,7 @@ function computeKat() {
     sealDetSha: toHex(sha(withRng(noRng, () => P.sealDet(carol.id.kemPk, conv, 1, 2, EK1)))),
     heads: toHex(P.encodeRecord(record("HEADS with an entry"))),
     member: toHex(P.encodeRecord(record("MEMBER"))),
+    left: toHex(P.encodeRecord(record("LEFT"))),
   };
 }
 
@@ -2260,6 +2330,8 @@ const KAT = {
   member:
     "0d0076a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a108d49f307d2069ae7103b5b61f6a8b2bb256dd9445960bab6413c565c0cb0e095350b0d409bc0335181d38f4f2" +
     "5ae3c82486104f11f0d04833bcfb216e55c768727272727272727272727272727272727272727272727272727272727272727205626f625f31",
+  // a LEFT record (78 bytes; round 9): conv | root | e = 4 | bob | t | (E, n) = (7, 12)
+  left: "0e004e606162636465666768696a6b6c6d6e6f525252525252525252525252525252525252525252525252525252525252525200000004a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a16a18a57b00070000000c",
 };
 
 describe("known-answer vectors", () => {

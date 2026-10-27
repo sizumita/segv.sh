@@ -315,17 +315,46 @@ export function powCheck(pre: Bytes, nonce: number, difficulty: number): boolean
   return leadingZeroBits(H(concat(pre, u64(nonce)))) >= difficulty;
 }
 
-/** Finds a nonce. Yields to the event loop every `chunk` hashes so the UI stays responsive. */
-export async function powSolve(pre: Bytes, difficulty: number, chunk = 4096): Promise<number> {
+export interface PowSolveOptions {
+  /** the first nonce tried (default 0) */
+  start?: number;
+  /** hashes between two yields to the event loop (default 4096) */
+  chunk?: number;
+  /** checked before the search and at every yield: once aborted, the search ends without a nonce */
+  signal?: AbortSignal;
+}
+
+/**
+ * Finds a nonce in [start, 2^53 − 1], writing both halves of the big-endian u64 (§10.2). It yields to the event loop
+ * every `chunk` hashes so the UI stays responsive. A search stopped through `signal` resolves to null, so the caller
+ * can restart it with the next window when the one it searches in stops being current (§10.2).
+ */
+export function powSolve(pre: Bytes, difficulty: number, opts?: Omit<PowSolveOptions, "signal">): Promise<number>;
+export function powSolve(pre: Bytes, difficulty: number, opts: PowSolveOptions): Promise<number | null>;
+export async function powSolve(pre: Bytes, difficulty: number, opts: PowSolveOptions = {}): Promise<number | null> {
+  const { start = 0, chunk = 4096, signal } = opts;
+  if (!Number.isSafeInteger(start) || start < 0) throw new RangeError("pow: bad start nonce");
+  if (!Number.isSafeInteger(chunk) || chunk < 1) throw new RangeError("pow: bad chunk");
+  if (signal?.aborted) return null;
   const buf = new Uint8Array(pre.length + 8);
   buf.set(pre);
   const dv = new DataView(buf.buffer);
-  for (let nonce = 0; nonce <= 0xffffffff; nonce++) {
-    dv.setUint32(pre.length + 4, nonce); // high 32 bits stay zero (u64 big-endian)
+  let hi = Math.floor(start / 2 ** 32);
+  let lo = start - hi * 2 ** 32;
+  dv.setUint32(pre.length, hi);
+  for (let nonce = start, k = 1; nonce <= Number.MAX_SAFE_INTEGER; nonce++, k++) {
+    dv.setUint32(pre.length + 4, lo);
     if (leadingZeroBits(sha256(buf)) >= difficulty) return nonce;
-    if (nonce % chunk === chunk - 1) await new Promise((r) => setTimeout(r, 0));
+    if (++lo === 2 ** 32) {
+      lo = 0;
+      dv.setUint32(pre.length, ++hi);
+    }
+    if (k % chunk === 0) {
+      await new Promise((r) => setTimeout(r, 0));
+      if (signal?.aborted) return null;
+    }
   }
-  throw new Error('pow: nonce space exhausted');
+  throw new Error("pow: nonce space exhausted");
 }
 
 
@@ -1746,7 +1775,10 @@ export function rmBits(
   return rm;
 }
 
-/** The local e-validity rules (a) m = |D_e|, (b) from, (e), (f), and the size half of (g) (§6.4). */
+/**
+ * The local e-validity rules (a) m = |D_e|, (b) from, (e), (f), and the local halves of (g) and (h): the size set and
+ * B ≥ m with B from `bundleSize` (§6.4 "Order of requests": all of them pass before any `blob/meta` request).
+ */
 export type ClaimShapeFailure = "m" | "from" | "rm-high" | "rm-self" | "cut" | "bundleSize";
 
 export function claimShapeValid(
@@ -1761,7 +1793,8 @@ export function claimShapeValid(
   if (m < 32 && c.rm >= 2 ** m) return "rm-high";
   if (rmHas(c.rm, from)) return "rm-self";
   if (c.cuts.some((x) => x.E < Estart || x.E > E)) return "cut";
-  if (sgb2BOfSize(c.bundleSize) === null) return "bundleSize";
+  const B = sgb2BOfSize(c.bundleSize);
+  if (B === null || B < m) return "bundleSize";
   return null;
 }
 
@@ -1772,7 +1805,10 @@ export const cutBefore = (cut: Cut, E: number, n: number): boolean => E < cut.E 
 export interface WalkEpoch {
   /** uids of D_j in index order (raw or b64u), to follow the sender across epochs. */
   members: readonly (Bytes | string)[];
-  /** The final winning claim C_j the receiver holds (its stored t, rm and cuts), or null. */
+  /**
+   * The claim that ended epoch j (its stored t, rm and cuts): the final winning claim C_j, or, for the last epoch
+   * before a skip re-add, the claim that removed self; null when the epoch has no final winning claim yet.
+   */
   claim: { t: number; rm: number; cuts: readonly Cut[] } | null;
 }
 
@@ -1786,20 +1822,37 @@ export interface WalkRow {
 
 const uidKey = (u: Bytes | string): string => (typeof u === "string" ? u : b64u(u));
 
+/** `acceptOldRow` needs the claim that ended `epochs[j]`, which the caller holds but did not pass (§6.8). */
+export class MissingClaimError extends Error {
+  readonly j: number;
+  constructor(j: number) {
+    super(`acceptOldRow: the claim that ended epoch +${j} is needed`);
+    this.name = "MissingClaimError";
+    this.j = j;
+  }
+}
+
 /**
- * §6.8 old-epoch acceptance. `epochs[0]` is D_e (the row's epoch), `epochs[k]` is D_{e+k}; the list stops at the
- * last epoch whose descriptor the receiver holds (a frozen receiver's list stops at its frozen epoch).
+ * §6.8 old-epoch acceptance. `epochs` are consecutive held epochs: `epochs[0]` is D_e (the row's epoch) and
+ * `epochs[k]` is D_{e+k}, so the list stops before an epoch reached by a skip re-add, and a frozen receiver's at its
+ * frozen epoch. The caller passes the claim that ended each listed epoch whenever one exists, read at the position
+ * of the next held epoch's EPOCH record when it did not process it (for the epoch before a skip: the claim that
+ * removed self). A null claim on the last listed epoch means it has no final winning claim yet: accept. A null claim
+ * with a next epoch continues by membership, since the sender's bit is 0 iff D_{j+1} lists it ("The bit without
+ * C_j"); when D_{j+1} does not list the sender, the bit is 1 and the claim is needed, so the call throws
+ * `MissingClaimError`. A row is never accepted for lack of a claim.
  */
 export function acceptOldRow(row: WalkRow, epochs: readonly WalkEpoch[]): boolean {
   let idx = row.i;
   for (let j = 0; j < epochs.length; j++) {
     const { members, claim } = epochs[j];
-    if (!claim || idx < 0 || idx >= members.length) return true;
-    if (!rmHas(claim.rm, idx)) {
+    if (idx < 0 || idx >= members.length) return true;
+    if (!claim || !rmHas(claim.rm, idx)) {
       const next = epochs[j + 1];
       if (!next) return true;
       const key = uidKey(members[idx]);
       idx = next.members.findIndex((u) => uidKey(u) === key);
+      if (!claim && idx < 0) throw new MissingClaimError(j);
       continue;
     }
     if (row.t < claim.t) return true;
@@ -2205,6 +2258,7 @@ export const RT = {
   REQUEST: 0x0b,
   DESC: 0x0c,
   MEMBER: 0x0d,
+  LEFT: 0x0e,
   SNAP: 0x20,
 } as const;
 export type RType = (typeof RT)[keyof typeof RT];
@@ -2240,7 +2294,10 @@ export interface ConvJoinRec extends CopyRef, EpochMaterial {
 }
 export interface EpochRec extends CopyRef, EpochMaterial {
   rtype: typeof RT.EPOCH;
-  /** the winning claim on Lctl_{e−1}, or NONE for a skip re-add */
+  /**
+   * the winning claim that ended the previous held epoch: on Lctl_{e−1}, or, for a skip re-add (flag bit1), the claim
+   * that removed self, on Lctl_k of the epoch k it removed self from (§7.2)
+   */
   claim: Pos;
   flags: number;
 }
@@ -2327,6 +2384,19 @@ export interface MemberRec {
   pin: Bytes;
   handle: string;
 }
+/**
+ * Another member's leave as self recorded it (§7.2): `uid` is recorded as left in epoch e of the copy. It stands for
+ * the LEAVE row R of the leave's kept source (§6.9), so a restore decides the leave as R would be decided (§6.8).
+ */
+export interface LeftRec extends CopyRef {
+  rtype: typeof RT.LEFT;
+  e: number;
+  uid: Bytes;
+  /** the stored time of R */
+  t: number;
+  /** R's position when e is R's own epoch, or NONE when the leave was carried into e from an earlier epoch */
+  row: Pos;
+}
 export interface SnapRec {
   rtype: typeof RT.SNAP;
   blobId: Bytes;
@@ -2350,6 +2420,7 @@ export type SelfRecord =
   | RequestRec
   | DescRec
   | MemberRec
+  | LeftRec
   | SnapRec;
 
 const wrCopy = (x: CopyRef): Bytes => concat(fixed(x.conv, 16, "record conv"), fixed(x.root, 32, "record root"));
@@ -2416,6 +2487,8 @@ function recordContent(x: SelfRecord): Bytes {
         h,
       );
     }
+    case RT.LEFT:
+      return concat(wrCopy(x), u32(x.e), fixed(x.uid, 16, "LEFT uid"), u32(x.t), wrPos(x.row, "LEFT"));
     case RT.SNAP:
       return concat(
         fixed(x.blobId, 32, "SNAP blobId"),
@@ -2544,6 +2617,9 @@ export function parseRecord(rtype: number, c: Bytes): SelfRecord | null {
       x = { rtype, uid, sigPk, kh, pin: pin_, handle };
       break;
     }
+    case RT.LEFT:
+      x = { rtype, ...rdCopy(r), e: r.u32(), uid: r.bytes(16), t: r.u32(), row: rdPos(r, what) };
+      break;
     case RT.SNAP:
       x = { rtype, blobId: r.bytes(32), key: r.bytes(32), size: r.u32(), pos: rdPos(r, what) };
       break;

@@ -1961,6 +1961,29 @@ describe("proof of work (§10.2)", () => {
     expect(P.powCheck(pre, nonce, 8)).toBe(true);
     expect(P.leadingZeroBits(sha(cat(pre, be64(nonce))))).toBeGreaterThanOrEqual(8);
   });
+
+  it("powSolve searches from a start nonce past 2^32 up to 2^53 − 1, and a stopped search ends without a nonce (test 15)", async () => {
+    // a challenge whose nonce 2^32 − 1 fails at difficulty 8, so a search started there must cross 2^32
+    let pre = P.powPre("put", 1, sha(s2b("x")));
+    for (let k = 0; P.powCheck(pre, 2 ** 32 - 1, 8); k++) pre = P.powPre("put", 1, sha(s2b(`x${k}`)));
+    const nonce = await P.powSolve(pre, 8, { start: 2 ** 32 - 1 });
+    expect(nonce).toBeGreaterThan(2 ** 32 - 1);
+    expect(P.powCheck(pre, nonce, 8)).toBe(true);
+    expect(P.leadingZeroBits(sha(cat(pre, be64(nonce))))).toBeGreaterThanOrEqual(8); // both halves of the u64
+    for (let x = 2 ** 32 - 1; x < nonce; x++) expect(P.powCheck(pre, x, 8)).toBe(false); // the first from the start
+    // the search runs up to 2^53 − 1 and no further
+    expect(await P.powSolve(pre, 0, { start: Number.MAX_SAFE_INTEGER })).toBe(Number.MAX_SAFE_INTEGER);
+    await expect(P.powSolve(pre, 257, { start: Number.MAX_SAFE_INTEGER - 3 })).rejects.toThrow(/exhausted/);
+    for (const bad of [-1, 1.5, 2 ** 53]) await expect(P.powSolve(pre, 8, { start: bad })).rejects.toThrow(RangeError);
+    // stopped before the search, and while it runs (difficulty 257 never succeeds): null, no nonce
+    const stopped = new AbortController();
+    stopped.abort();
+    expect(await P.powSolve(pre, 0, { signal: stopped.signal })).toBeNull();
+    const ac = new AbortController();
+    const running = P.powSolve(pre, 257, { signal: ac.signal, chunk: 64 });
+    setTimeout(() => ac.abort(), 5);
+    expect(await running).toBeNull();
+  });
 });
 
 // ───────────────────────── directory prefixes (§9.6, §10.6) ─────────────────────────
