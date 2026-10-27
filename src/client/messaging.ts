@@ -44,6 +44,7 @@ import type {
 } from "./options";
 import { Realtime } from "./realtime";
 import { keysChangedWarning, type SelfLane } from "./selflane";
+import { scrollback } from "./history";
 import { prepareImage } from "./image";
 import { WelcomeRefused, sendRow, type SendCtx } from "./send";
 import {
@@ -326,6 +327,7 @@ export class Messaging {
       ready: Promise.resolve(),
       history: false,
       leaves: new Set(),
+      scrolled: false,
     };
   }
 
@@ -916,6 +918,11 @@ export class Messaging {
       this.h.changed();
     }
     if (c.request) void this.h.track(this.accept(c)).catch((e) => this.h.error(message(e)));
+    // The "conversation opened" hint: scrollback once per copy and session (§11.10).
+    if (!c.scrolled)
+      void this.h.track(this.h.enqueue(() => scrollback(this.syncCtx(), c))).catch(() => {
+        c.scrolled = false; // try again the next time it is opened
+      });
   }
 
   // ───────────────────────── creation (§6.1) ─────────────────────────

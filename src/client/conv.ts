@@ -50,6 +50,8 @@ export interface Lane {
   last: RowRef | null;
   /** a valid row of this member has been seen in this epoch */
   seen: boolean;
+  /** the oldest valid row loaded, with its prev pointer (scrollback continues below it, §11.10) */
+  oldest: { E: number; n: number; prev: Slot } | null;
 }
 
 /** The control lane of an epoch, before claims are processed (claims land with M7). */
@@ -109,6 +111,8 @@ export interface Copy {
   history: boolean;
   /** members (b64u uid) whose LEAVE row was seen in this copy (a WELCOME never goes to them, §6.12 step 1) */
   leaves: Set<string>;
+  /** scrollback ran in this session (once per copy, §11.10) */
+  scrolled: boolean;
 }
 
 /** The fold key of a copy: (conv, root). */
@@ -119,7 +123,7 @@ export const copyKeyOf = (c: { conv: Bytes; root: Bytes }): string =>
 export const rowKey = (E: number, label: Bytes): string => `${E}:${P.hex(label)}`;
 
 export function newLane(start: Slot): Lane {
-  return { next: { ...start }, tail: null, last: null, seen: false };
+  return { next: { ...start }, tail: null, last: null, seen: false, oldest: null };
 }
 
 /** An epoch's state from its key material and its verified descriptor. */

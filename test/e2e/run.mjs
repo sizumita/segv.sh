@@ -363,7 +363,8 @@ const t2 = `返信です secret-2 ${sfx}`;
 const t3 = `group hello secret-3 ${sfx}`;
 const t4 = `carol here secret-4 ${sfx}`;
 const t7 = `from alice's second device secret-7 ${sfx}`;
-const secrets = [t1, t2, t3, t4, t7];
+const bulk = (i) => `bulk ${i} secret-8 ${sfx}`;
+const secrets = [t1, t2, t3, t4, t7, bulk(0), bulk(99)];
 let codeAlice = "";
 
 try {
@@ -496,6 +497,31 @@ try {
     await D.ctx.close();
   });
 
+  await step(
+    "scrollback: after a reload, opening a 1:1 with 100 messages shows the oldest",
+    async () => {
+      await newConversation(C, H.alice);
+      for (let i = 0; i < 100; i++) await send(C, bulk(i));
+      const count = (d) =>
+        d.page.evaluate(
+          (needle) => document.querySelector(".thread").innerText.split(needle).length - 1,
+          `secret-8 ${sfx}`,
+        );
+      check((await count(C)) === 100, `carol shows ${await count(C)} of 100 messages`);
+      await A.page.reload({ waitUntil: "load" });
+      await signedOut(A);
+      await A.page.getByRole("button", { name: "sign in with passkey" }).click();
+      await ready(A);
+      await open(A, `@${H.carol}`);
+      await seen(A, bulk(99));
+      await seen(A, bulk(0)); // older than the last 30 of carol's lane: loaded by scrollback when the pane opened
+      check(
+        (await count(A)) > 60,
+        `alice shows ${await count(A)} of 100 messages after scrollback`,
+      );
+    },
+  );
+
   await step("the public data verifies and leaks no plaintext", async () => {
     const Enow = P.era(Date.now());
     const needles = [...secrets, team, ...Object.values(H)].map((s) => Buffer.from(s, "utf8"));
@@ -543,8 +569,9 @@ try {
         check(r.body.length === P.INBOX_BODY_LEN, `invite size ${r.body.length}`);
         clean(`an invite of era ${E}`, r.body);
       }
-    // bob's 1:1 invite and carol's group invite; bob's group J is a WELCOME in his 1:1 with alice (§6.12 step 1)
-    check(invites === 2, `expected 2 invites, got ${invites}`);
+    // bob's 1:1 invite, carol's group invite and alice's invite to carol's 1:1; bob's group J is a WELCOME in his
+    // 1:1 with alice (§6.12 step 1)
+    check(invites === 3, `expected 3 invites, got ${invites}`);
     // The directory's public log: four registrations.
     const log = await getJson(`/api/v2/dirlog?after=0&limit=1000`);
     const users = log.entries.filter((x) => x.kind === 1).length;

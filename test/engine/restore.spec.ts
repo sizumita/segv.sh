@@ -94,3 +94,26 @@ describe("creation (test 5)", () => {
     expect(I(A).views().map((v) => v.id)).toContain(id);
   });
 });
+
+describe("scrollback after a reload (test 12)", () => {
+  it("opening a 1:1 with 100 messages after a reload shows more than 60 of them", async () => {
+    const [alice, bob] = ["alice", "bob"].map((h) => makeUser(h));
+    const A = await engineFor(alice);
+    const B = await engineFor(bob);
+    const id = await A.createConversation(["bob"]);
+    await settle(A, B);
+    for (let i = 0; i < 100; i++) await A.sendText(id, `m ${i}`);
+    await settle(A, B);
+    expect(chat(B, id)).toHaveLength(100);
+    const B2 = await engineFor(bob);
+    const before = chat(B2, id).length;
+    expect(before).toBeLessThanOrEqual(30); // the initial history: the last 30 slots of alice's lane
+    B2.markRead(id);
+    await settle(B2);
+    const after = chat(B2, id);
+    expect(after.length).toBeGreaterThan(60);
+    expect(after.at(-1)).toBe("alice: m 99");
+    expect(after[0]).toBe("alice: m 0"); // the whole history fits VIEW_MESSAGES
+    expect(I(B2).views().find((v) => v.id === id)!.unread).toBe(0); // scrollback never counts as unread
+  });
+});

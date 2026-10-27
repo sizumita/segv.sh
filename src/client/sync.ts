@@ -276,6 +276,8 @@ export function applyLaneRow(
   if (m.from !== j || m.lane !== j) return; // the label pins the lane; a row of another lane is junk here
   if (!lane.last || P.posCmp({ E: r.E, n: r.n }, lane.last) > 0)
     lane.last = { E: r.E, n: r.n, label: r.label, body: r.body };
+  if (!lane.oldest || P.posCmp({ E: r.E, n: r.n }, lane.oldest) < 0)
+    lane.oldest = { E: r.E, n: r.n, prev: { ...m.prev } };
   lane.seen = true;
   ctx.onValidRow(c, ep, j);
   const mine = P.equalBytes(ep.D.members[j].uid, ctx.selfUid);
