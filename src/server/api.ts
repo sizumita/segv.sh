@@ -174,10 +174,24 @@ function edgeCache(): Cache | null {
   return c?.default ?? null;
 }
 
+/** The cache-control a cached response was stored with (§9.7). */
+const STORED_CC = "x-segv-cache-control";
+
+/**
+ * A caches.default entry, with the cache-control it was stored with. On a custom domain the zone's "Browser Cache
+ * TTL" rewrites the stored entry's cache-control (to 4 hours by default), which would let browsers keep the
+ * short-lived inbox tail for hours and miss new invites.
+ */
 async function cacheGet(key: string): Promise<Response | null> {
   const cache = edgeCache();
   if (!cache) return null;
-  return (await cache.match(key).catch(() => undefined)) ?? null;
+  const hit = (await cache.match(key).catch(() => undefined)) ?? null;
+  if (!hit) return null;
+  const cc = hit.headers.get(STORED_CC);
+  const res = new Response(hit.body, hit);
+  res.headers.delete(STORED_CC);
+  if (cc) res.headers.set("cache-control", cc);
+  return res;
 }
 
 /** Stores a copy (without x-segv-now: it is stamped later, on the returned object only). */
@@ -186,6 +200,8 @@ function cachePut(c: Ctx, key: string, res: Response): void {
   if (!cache || res.status !== 200) return;
   const copy = res.clone();
   copy.headers.delete("x-segv-now");
+  const cc = res.headers.get("cache-control");
+  if (cc) copy.headers.set(STORED_CC, cc);
   c.ctx.waitUntil(
     cache.put(key, copy).catch((e: unknown) => {
       console.error(JSON.stringify({ msg: "cache put failed", error: logErr(e) }));
