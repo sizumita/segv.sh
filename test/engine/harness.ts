@@ -24,6 +24,7 @@ import type {
   WebSocketCtor,
 } from "../../src/client/options";
 import type { SelfLane } from "../../src/client/selflane";
+import type { Copy, Epoch } from "../../src/client/conv";
 import { FakeWebSocket } from "./fake/rt";
 import { FakeWorld, type FakeWorldOptions } from "./fake/world";
 
@@ -229,10 +230,10 @@ export const junkRow = (E: number, label: Uint8Array = P.random(16), cls = 0) =>
 // ───────────────────────── views (through the Engine interface) ─────────────────────────
 
 /**
- * The engine's conversation views. Uses the public `getState()`; M6 should switch this to the synchronous
- * `I(e).views()` if state emission is throttled.
+ * The engine's conversation views, computed now (`I(e).views()`): the emitted `getState().conversations` is
+ * throttled, so a test reading it right after `settle` could see an older state.
  */
-export const viewsOf = (e: Engine): ConversationView[] => e.getState().conversations;
+export const viewsOf = (e: Engine): ConversationView[] => I(e).views();
 
 export const view = (e: Engine, convId: string): ConversationView | undefined =>
   viewsOf(e).find((c) => c.id === convId);
@@ -267,10 +268,15 @@ type Timer = { due: number; fn: () => void; real: ReturnType<typeof setTimeout> 
  */
 export class TestClock implements EngineClock {
   private monoOff = 0;
-  private wallOff = 0;
+  private wallOff: number;
   private pausedAt: number | null = null;
   private seq = 0;
   private readonly timers = new Map<number, Timer>();
+
+  /** `wallOffset`: the world's offset, so a new engine's wall clock agrees with the server's time. */
+  constructor(wallOffset = 0) {
+    this.wallOff = wallOffset;
+  }
 
   mono(): number {
     return (this.pausedAt ?? performance.now()) + this.monoOff;
@@ -393,12 +399,30 @@ export interface EngineI {
   timeSample: { s: number; mid: number; rtt: number } | null;
   nextProtocolDue(): number | null;
   catchUp(): Promise<void>;
-  unlock(AK: Uint8Array, uid: Uint8Array, handle: string, registered?: boolean): Promise<void>;
+  unlock(
+    AK: Uint8Array,
+    uid: Uint8Array,
+    handle: string,
+    registered?: { now: number | null } | null,
+  ): Promise<void>;
   views(): ConversationView[];
 }
 
 /** White-box access to an engine's private state. */
 export const I = (e: Engine): EngineI => e as unknown as EngineI;
+
+/** A copy of the engine by its view key (white-box; plan §2.2). */
+export function conv(e: Engine, convId: string): Copy {
+  const c = I(e).convs.get(convId) as Copy | undefined;
+  if (!c) throw new Error(`no copy ${convId}`);
+  return c;
+}
+
+/** The current epoch of a copy (white-box; plan §2.2). */
+export function epoch(e: Engine, convId: string): Epoch {
+  const c = conv(e, convId);
+  return c.epochs.get(c.current)!;
+}
 
 /**
  * A new signed-out engine attributed to `who` (its requests carry it, plan §2.1), on its own TestClock registered
@@ -406,7 +430,7 @@ export const I = (e: Engine): EngineI => e as unknown as EngineI;
  */
 export function newEngine(who: string | null = null, opts: EngineOptions = {}): SegvEngine {
   const w = current;
-  const clock = new TestClock();
+  const clock = new TestClock(w.offsetMs);
   w.clocks.add(clock);
   const t = w.transport(who);
   const e = new SegvEngine({

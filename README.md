@@ -3,8 +3,8 @@
 パスキー（WebAuthn PRF）で鍵を解錠し、1:1 / グループでテキストと画像をエンドツーエンド暗号化して送るミニマルなメッセンジャー。
 **サーバーの中身はすべて公開**：保存されるのは公開データだけで、誰でも読める。クライアントは自分宛ての行のラベルを計算し、その行だけを取得して復号する。
 
-> **現在の状態:** プロトコル v2（stage 1）を v1 の置き換えとして実装中。サーバー側（M0〜M5）は完成し、テスト済み。
-> クライアントエンジン（M6〜）はまだないため、アプリを開くと「プロトコル移行中」の画面になる（`?mock` 付きの開発用モックは使える）。
+> **現在の状態:** プロトコル v2（stage 1）を v1 の置き換えとして実装中。登録・サインイン、1:1 とグループの作成、
+> テキストの送受信、リロードや別端末での復元が動く（M6b）。画像、メンバーの追加・削除、退出はまだ（M6c・M7）。
 
 - バイト単位のプロトコル仕様（v2）: [docs/PROTOCOL-v2.md](docs/PROTOCOL-v2.md)、実装計画: [docs/STAGE1-PLAN.md](docs/STAGE1-PLAN.md)
 - 設計の理由・保証すること/しないこと: [docs/DESIGN.md](docs/DESIGN.md)（v1 時点の内容。v2 向けの書き直しは M9）
@@ -15,15 +15,15 @@
 | --------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | `src/lib/proto.ts`                | プロトコルの暗号コアと符号化（クライアント・Worker・Durable Object で共有）。`@noble/*` のみ使用                  |
 | `src/lib/wire.ts`                 | API のバイナリ形式（put / get / inbox / feed / realtime フレーム）の厳格なエンコーダ・デコーダ                    |
-| `src/client/`                     | ブラウザ専用のエンジン（M6 で実装。今は `engine.ts` が仮の実装）、パスキー/PRF、セッション、画像                  |
+| `src/client/`                     | ブラウザ専用のエンジン（`engine.ts`、会話の `messaging.ts` ほか）、パスキー/PRF、セッション、画像                 |
 | `src/routes/`, `src/components/`  | Qwik v2 の UI                                                                                                     |
 | `src/server/`                     | Worker の API（`/api/v2/*`）、Durable Objects（Shard / BlobReg / Inbox / Realtime / Checkpoint）、D1 ディレクトリ |
 | `src/entry.cloudflare-workers.ts` | Worker エントリ（`/api/*` → API、それ以外 → Qwik SSR）                                                            |
 | `migrations/`                     | D1 スキーマ（ディレクトリ: user / wrap / dirlog）                                                                 |
 | `src/lib/*.test.ts`               | 暗号コアとバイナリ形式の単体テスト（独立実装との突き合わせ・改ざん・既知解ベクトル・ファジング）                  |
 | `test/worker/`                    | Workers ランタイム上の API / Durable Object / ディレクトリのテスト                                                |
-| `test/engine/`                    | クライアントエンジンを動かすインメモリの偽サーバー `FakeWorld` とその自己テスト（エンジンのテストは M6 以降）     |
-| `test/e2e/`                       | Playwright + 仮想認証器（PRF 対応）による E2E テスト（v1 用。v2 向けの書き直しは M8）                             |
+| `test/engine/`                    | インメモリの偽サーバー `FakeWorld` と、その上でエンジンを動かすテスト（アカウント、1:1・グループ、復元）          |
+| `test/e2e/`                       | Playwright + 仮想認証器（PRF 対応）による v2 の E2E テスト（登録、会話、復元、別端末、公開データの監査）          |
 
 技術スタック: Vite+ (`vite-plus`) / Qwik v2 RC / Cloudflare Workers + D1 + Durable Objects + R2 / `@noble/curves`, `@noble/post-quantum` (X-Wing), `@noble/ciphers`, `@noble/hashes`。
 
@@ -44,7 +44,8 @@ npx vp test run            # 単体（暗号コア・バイナリ形式）+ Work
 npm run build              # 型チェック・lint 込みの本番ビルド
 ```
 
-`npm run test:e2e` は v1 のフローのままなので、M8 で v2 向けに書き直すまでは通らない。
+`npm run test:e2e` は本番ビルドと `wrangler dev` を立ち上げ、ヘッドレス Chromium で主要なフローと公開データの監査を流す
+（画像とメンバー操作の手順は M6c・M7 で加わる）。
 
 ## デプロイ（Cloudflare）
 

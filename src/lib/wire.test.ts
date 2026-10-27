@@ -6,6 +6,8 @@
 //   4. strictness — every truncation and every one-byte extension of every valid encoding is rejected with WireError;
 //      bad enums, classes, counts, flags; encoders refuse what decoders would refuse.
 //   5. fuzz — a seeded loop: decoders either return a value that re-encodes to the same bytes, or throw WireError.
+import { readFileSync } from "node:fs";
+import { stripTypeScriptTypes } from "node:module";
 import { describe, expect, it } from "vite-plus/test";
 import * as W from "./wire";
 import { BODY_LENS, INBOX_BODY_LEN } from "./proto";
@@ -722,4 +724,19 @@ describe("fuzz", () => {
     expect(accepted).toBeGreaterThan(100);
     expect(rejected).toBeGreaterThan(1000);
   }, 60_000);
+});
+
+// ───────────────────────── 6. Node type stripping ─────────────────────────
+
+describe("type stripping (test/e2e/run.mjs imports proto.ts and wire.ts with Node)", () => {
+  it.each(["proto.ts", "wire.ts"])("%s strips without a transform (no parameter properties, enums or namespaces)", (f) => {
+    const src = readFileSync(new URL(`./${f}`, import.meta.url), "utf8");
+    expect(() => stripTypeScriptTypes(src)).not.toThrow();
+  });
+
+  it("wire.ts imports proto.ts by its file name, as Node resolves it", () => {
+    const src = readFileSync(new URL("./wire.ts", import.meta.url), "utf8");
+    expect(src).toMatch(/from "\.\/proto\.ts";/);
+    expect(src).not.toMatch(/from "\.\/proto";/);
+  });
 });

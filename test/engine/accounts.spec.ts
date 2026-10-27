@@ -242,20 +242,24 @@ describe("v2: the registration's self row and the account check (§7.3, §11.1)"
     const R = newEngine("first");
     const { recoveryCode } = await R.register("first");
     await settle(R);
-    const self = I(R).self!;
-    expect(self.head).toMatchObject({ E: server().era, n: 0 });
-    const cursor = self.fold.cursor!;
-    const slot = Math.floor((server().now() - P.T0_MS) / (server().params.inboxSlot * 1000));
-    expect(cursor.E).toBe(server().era);
-    expect(cursor.rel).toBeLessThanOrEqual(slot);
-    expect(cursor.rel).toBeGreaterThanOrEqual(slot - 5);
-    // exactly one row, at Lself(E, 0) with prev NONE, published on Tself
+    // the first row, at Lself(E, 0) with prev NONE, holds only the HEADS record with the registration's cursor
     const id = P.deriveIdentity(I(R).account!.AK);
     const rows = server().shard.rows().filter((r) => P.equalBytes(r.label, P.Lself(id.rS, server().era, 0)));
     expect(rows).toHaveLength(1);
     const row = P.openSelf(id.kS, server().era, rows[0].label, rows[0].body);
     expect(row.prev).toEqual(P.NONE);
-    expect(row.records).toEqual([{ rtype: P.RT.HEADS, Ein: cursor.E, relIn: cursor.rel, entries: [] }]);
+    expect(row.records).toHaveLength(1);
+    const first = row.records[0] as P.HeadsRec;
+    expect(first).toMatchObject({ rtype: P.RT.HEADS, entries: [] });
+    const slot = Math.floor((server().now() - P.T0_MS) / (server().params.inboxSlot * 1000));
+    expect(first.Ein).toBe(server().era);
+    expect(first.relIn).toBeLessThanOrEqual(slot);
+    expect(first.relIn).toBeGreaterThanOrEqual(slot - 5);
+    // later HEADS rows only move the cursor forward (the inbox poll read past it)
+    const self = I(R).self!;
+    const cursor = self.fold.cursor!;
+    expect(cursor.E > first.Ein || (cursor.E === first.Ein && cursor.rel >= first.relIn)).toBe(true);
+    const head = { E: self.head!.E, n: self.head!.n };
     await R.logout();
 
     // A restore on another device probes the lane from (regEra, 0), applies the row and writes nothing.
@@ -265,7 +269,7 @@ describe("v2: the registration's self row and the account check (§7.3, §11.1)"
     await waitFor(() => !L.getState().syncing, "restore");
     await settle(L);
     expect(I(L).self!.fold.cursor).toEqual(cursor);
-    expect(I(L).self!.head).toMatchObject({ E: server().era, n: 0 });
+    expect(I(L).self!.head).toMatchObject(head);
     expect(writes()).toBe(before);
   });
 

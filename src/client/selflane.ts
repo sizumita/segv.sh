@@ -234,6 +234,8 @@ export interface SelfLaneHooks extends FoldHooks {
 export class SelfLane {
   /** the last row of the lane this device knows of, or null for an empty lane */
   head: SelfHead | null = null;
+  /** writes never go below this era: the account's registration era (§7.3), set after the account check */
+  floorEra = 0;
   readonly fold: SelfFold;
 
   constructor(
@@ -303,11 +305,12 @@ export class SelfLane {
   }
 
   /**
-   * Writes one row (§7.3): CAS at the first empty slot of era `max(E_now, head era)`. On CONFLICT the occupant is
+   * Writes one row (§7.3): CAS at the first empty slot of era `max(E_now, head era, regEra)` (a device whose estimate
+   * lags must not write below the registration era, where a restore never looks). On CONFLICT the occupant is
    * applied (if it opens) and the write moves to the next slot; on WRONG_ERA it moves to the era the server names.
    */
   async write(records: P.SelfRecord[]): Promise<SelfHead> {
-    let E = Math.max(P.era(this.api.serverNow()), this.head?.E ?? 0);
+    let E = Math.max(P.era(this.api.serverNow()), this.head?.E ?? 0, this.floorEra);
     let n = this.head && this.head.E === E ? this.head.n + 1 : 0;
     for (let attempt = 0; attempt < 256; attempt++) {
       const head = this.head;
@@ -330,7 +333,7 @@ export class SelfLane {
         continue;
       }
       if (r.s === "wrong_era") {
-        if (r.era < (this.head?.E ?? 0))
+        if (r.era < Math.max(this.head?.E ?? 0, this.floorEra))
           throw new ApiError(0, "self-lane write: the server's era is behind the lane");
         E = r.era;
         n = this.head && this.head.E === E ? this.head.n + 1 : 0;

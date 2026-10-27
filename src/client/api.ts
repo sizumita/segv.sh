@@ -450,20 +450,45 @@ export class Api {
 
   /** One put request (1..16 rows); per-row results in request order. */
   async put(rows: readonly W.PutRow[], onProgress?: Progress): Promise<W.PutResult[]> {
-    const res = await this.postPow(
-      "/api/v2/put",
-      "put",
-      W.encodePutRequest(rows),
-      "application/octet-stream",
-      onProgress,
-    );
+    const body = W.encodePutRequest(rows);
+    return this.sendPut(body, await this.putPow(body, onProgress), rows.length, onProgress);
+  }
+
+  /** The proof of work of a put request body (§10.2), computed before the request is sent (§11.3 step 6). */
+  putPow(body: Bytes, onProgress?: Progress): Promise<string> {
+    return this.powHeader("put", P.H(body), body.length, onProgress);
+  }
+
+  /**
+   * Sends a put request with its proof of work. On 403 (a window that ended meanwhile) it refreshes params and
+   * sends once more with a new proof.
+   */
+  async sendPut(
+    body: Bytes,
+    pow: string,
+    count: number,
+    onProgress?: Progress,
+  ): Promise<W.PutResult[]> {
+    let res: Response;
+    for (let attempt = 0; ; attempt++) {
+      res = await this.request("/api/v2/put", {
+        method: "POST",
+        headers: { "content-type": "application/octet-stream", "x-segv-pow": pow },
+        body: body as BodyInit,
+      });
+      if (res.ok) break;
+      const err = await readError(res);
+      if (res.status !== 403 || attempt > 0) throw err;
+      await this.params(true);
+      pow = await this.putPow(body, onProgress);
+    }
     let out: W.PutResult[];
     try {
       out = W.decodePutResponse(new Uint8Array(await res.arrayBuffer()));
     } catch {
       throw new ApiError(0, "malformed put response");
     }
-    if (out.length !== rows.length) throw new ApiError(0, "malformed put response");
+    if (out.length !== count) throw new ApiError(0, "malformed put response");
     return out;
   }
 
@@ -500,13 +525,136 @@ export class Api {
     return out as W.GetStatus[];
   }
 
+  // ── blobs (§10.7) ──
+
+  /** `PUT /api/v2/blob/{id}` with its proof of work; resolves with the registration time `t` (seconds since T0). */
+  async putBlob(
+    id: Bytes,
+    blob: Bytes,
+    onProgress?: Progress,
+  ): Promise<{ t: number; size: number }> {
+    const pow = await this.powHeader("blob", id, blob.length, onProgress);
+    const res = await this.request(`/api/v2/blob/${P.b64u(id)}`, {
+      method: "PUT",
+      headers: { "content-type": "application/octet-stream", "x-segv-pow": pow },
+      body: blob as BodyInit,
+    });
+    if (!res.ok) throw await readError(res);
+    const j = await this.json<{ t?: unknown; size?: unknown }>(res);
+    if (!isInt(j.t, 0, 0xffffffff) || j.size !== blob.length)
+      throw new ApiError(0, "malformed blob response");
+    return { t: j.t, size: j.size };
+  }
+
+  /** `GET /api/v2/blob/{id}/meta`: the registration `{t, size}`, or null when unregistered (§6.4(g)). */
+  async blobMeta(id: Bytes): Promise<{ t: number; size: number } | null> {
+    const res = await this.request(`/api/v2/blob/${P.b64u(id)}/meta`, { cache: "no-store" });
+    if (res.status === 404) return null;
+    if (!res.ok) throw await readError(res);
+    const j = await this.json<{ t?: unknown; size?: unknown }>(res);
+    if (!isInt(j.t, 0, 0xffffffff) || !isInt(j.size, 0, P.BLOB_MAX))
+      throw new ApiError(0, "malformed blob meta");
+    return { t: j.t, size: j.size };
+  }
+
+  /**
+   * `GET /api/v2/blob/{id}`, reading at most `max + 1` bytes: null for 404. A `content-length` other than `max`, or a
+   * body longer than `max`, is a size mismatch (the caller decides; §6.7 step 1).
+   */
+  async getBlob(id: Bytes, max: number): Promise<{ bytes: Bytes; sizeOk: boolean } | null> {
+    const res = await this.request(`/api/v2/blob/${P.b64u(id)}`);
+    if (res.status === 404) return null;
+    if (!res.ok) throw await readError(res);
+    const cl = res.headers.get("content-length");
+    if (cl !== null && Number(cl) !== max) {
+      await res.body?.cancel().catch(() => {});
+      return { bytes: new Uint8Array(0), sizeOk: false };
+    }
+    const chunks: Bytes[] = [];
+    let n = 0;
+    const reader = res.body?.getReader();
+    if (!reader) return { bytes: new Uint8Array(0), sizeOk: max === 0 };
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        n += value.length;
+        if (n > max) {
+          await reader.cancel().catch(() => {});
+          return { bytes: new Uint8Array(0), sizeOk: false };
+        }
+      }
+    } catch (e) {
+      throw new ApiError(0, `blob read failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    return { bytes: P.concat(...chunks), sizeOk: n === max };
+  }
+
+  // ── inbox (§10.5) ──
+
+  /**
+   * Posts 1..32 invites of era E (one burst, §6.12). A 409 `wrong era` throws an ApiError whose body names `era`.
+   */
+  async postInbox(
+    E: number,
+    rows: readonly W.InboxPostRow[],
+    onProgress?: Progress,
+  ): Promise<W.InboxPostResult[]> {
+    const body = W.encodeInboxPost({ E, bucket: 0, rows: [...rows] });
+    const res = await this.postPow(
+      "/api/v2/inbox",
+      "inbox",
+      body,
+      "application/octet-stream",
+      onProgress,
+    );
+    try {
+      return W.parseInboxPostResults(await res.json(), rows.length);
+    } catch {
+      throw new ApiError(0, "malformed inbox response");
+    }
+  }
+
+  /**
+   * One page of `GET /api/v2/inbox/{E}/0?after=` (§10.5). A malformed page (decreasing rel, or `more = 1` without a
+   * row above `after`) is a failed read.
+   */
+  async readInbox(E: number, after: number): Promise<W.InboxRead> {
+    const res = await this.request(`/api/v2/inbox/${E}/0?after=${after}`);
+    if (!res.ok) throw await readError(res);
+    let page: W.InboxRead;
+    try {
+      page = W.decodeInboxRead(new Uint8Array(await res.arrayBuffer()));
+    } catch {
+      throw new ApiError(0, "malformed inbox page");
+    }
+    if (page.more && !page.rows.some((r) => r.rel > after))
+      throw new ApiError(0, "inbox page without progress");
+    return page;
+  }
+
   // ── directory (§10.6) ──
 
-  register(
+  /**
+   * `POST /api/v2/register`. `now` is the response's `x-segv-now`: the server time of the registration, from which
+   * the first inbox cursor is computed (§11.1), or null when absent.
+   */
+  async register(
     body: { bundle: string; sig: string; wraps: WrapJson[] },
     onProgress?: Progress,
-  ): Promise<{ dirseq: number }> {
-    return this.postPowJson("/api/v2/register", "register", body, onProgress);
+  ): Promise<{ dirseq: number; now: number | null }> {
+    const res = await this.postPow(
+      "/api/v2/register",
+      "register",
+      P.utf8(JSON.stringify(body)),
+      "application/json",
+      onProgress,
+    );
+    const h = res.headers.get("x-segv-now");
+    const j = await this.json<{ dirseq: number }>(res);
+    const now = h !== null && /^\d{1,16}$/.test(h) ? Number(h) : null;
+    return { dirseq: j.dirseq, now: now !== null && Number.isSafeInteger(now) ? now : null };
   }
 
   postWrap(body: WrapJson, onProgress?: Progress): Promise<{ dirseq: number }> {
@@ -621,13 +769,36 @@ export class Api {
   }
 
   /** The verified user registered under `handle`, or null on a complete answer without it (§10.6). */
-  async userByHandle(handle: string, fresh = false): Promise<DirUser | null> {
-    const rows = await this.prefixUsers("h", P.hpre(handle), fresh);
-    for (const r of rows) {
-      if (r.handle !== handle) continue;
-      const u = verifyUser(r);
-      if (u) return u;
-    }
-    return null;
+  /**
+   * The verified user registered under `uid`, by uid prefix; null on a complete answer without it (§10.6). An answer
+   * from the session cache that lacks it is asked for again once (the user may have registered since).
+   */
+  userByUidPrefix(uid: Bytes, fresh = false): Promise<DirUser | null> {
+    const uidB = P.b64u(uid);
+    return this.findUser("u", P.upre(uid), (r) => r.uid === uidB, fresh);
+  }
+
+  /** The verified user registered under `handle`, or null on a complete answer without it (§10.6). */
+  userByHandle(handle: string, fresh = false): Promise<DirUser | null> {
+    return this.findUser("h", P.hpre(handle), (r) => r.handle === handle, fresh);
+  }
+
+  private async findUser(
+    kind: "h" | "u",
+    pre: number,
+    match: (r: UserJson) => boolean,
+    fresh: boolean,
+  ): Promise<DirUser | null> {
+    const pick = (rows: UserJson[]): DirUser | null => {
+      for (const r of rows) {
+        if (!match(r)) continue;
+        const u = verifyUser(r);
+        if (u) return u;
+      }
+      return null;
+    };
+    const found = pick(await this.prefixUsers(kind, pre, fresh));
+    if (found || fresh) return found;
+    return pick(await this.prefixUsers(kind, pre, true));
   }
 }

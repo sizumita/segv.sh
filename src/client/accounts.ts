@@ -48,7 +48,7 @@ export async function registerAccount(
   api: Api,
   handleIn: string,
   progress: Progress,
-): Promise<Unlocked & { handle: string; recoveryCode: string }> {
+): Promise<Unlocked & { handle: string; recoveryCode: string; regNow: number | null }> {
   const handle = normaliseHandle(handleIn);
   if (!P.HANDLE_RE.test(handle)) throw new UserError("handle must be 3–20 characters: a–z, 0–9, _");
   progress("checking handle…");
@@ -65,8 +65,10 @@ export async function registerAccount(
     P.makeWrap(uid, "passkey", credId, P.credKem(prf, credId), AK, id, now),
     P.makeWrap(uid, "recovery", rk.id, rk, AK, id, now),
   ];
+  // The registration's server time, when its response arrived: the first inbox cursor starts there (§11.1).
+  let regNow: number | null = null;
   try {
-    await api.register({ bundle, sig, wraps }, progress);
+    regNow = (await api.register({ bundle, sig, wraps }, progress)).now;
   } catch (e) {
     // A definitive rejection (4xx): the account does not exist, so the new passkey is useless (§2.5 step 7).
     if (e instanceof ApiError && !e.transient) {
@@ -88,7 +90,7 @@ export async function registerAccount(
       throw e;
     }
   }
-  return { AK, uid, handle, recoveryCode: P.formatRecoveryCode(code) };
+  return { AK, uid, handle, recoveryCode: P.formatRecoveryCode(code), regNow };
 }
 
 /** Discoverable passkey login (§2.5): the wraps filed under the credential id (and the user handle, if any). */

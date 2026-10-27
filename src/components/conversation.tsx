@@ -11,8 +11,22 @@ export const ConversationPane = component$<{ conv: ConversationView }>((props) =
   const conv = props.conv;
   const active = conv.members.filter((m) => !m.left).length;
 
-  // Mark read while the conversation is on screen and the tab is visible: when it is opened,
-  // when new messages arrive, and when the tab becomes visible again.
+  // Opening the pane is the engine's "conversation opened" hint (SPEC §11.10–§11.11): it accepts a request copy and
+  // starts scrollback once, even when nothing is unread (after a reload every conversation has unread = 0).
+  useVisibleTask$(async ({ track }) => {
+    const id = track(() => props.conv.id);
+    const visible = track(() => ui.visible);
+    if (visible && document.visibilityState === "visible") {
+      try {
+        (await loadEngine()).markRead(id);
+      } catch {
+        // ignore: it is sent again the next time the pane opens
+      }
+    }
+  });
+
+  // Mark read while the conversation is on screen and the tab is visible: when new messages arrive, and when the
+  // tab becomes visible again.
   useVisibleTask$(async ({ track }) => {
     const unread = track(() => props.conv.unread);
     const visible = track(() => ui.visible);

@@ -2,7 +2,7 @@
 // Shared by the Worker, the client and the engine test fake, so none of them can drift from the spec.
 // Every decoder is strict: exact lengths, known enums, counts within limits, no trailing bytes.
 // Keep this file free of DOM / Workers APIs.
-import { BODY_LENS, INBOX_BODY_LEN, MAX_CLS } from "./proto";
+import { BODY_LENS, INBOX_BODY_LEN, MAX_CLS } from "./proto.ts";
 
 export type Bytes = Uint8Array;
 
@@ -17,7 +17,10 @@ const fail = (what: string): never => {
 class Reader {
   private o = 0;
   private readonly dv: DataView;
-  constructor(private readonly b: Bytes) {
+  // an explicit field, not a parameter property: Node's type stripping (test/e2e/run.mjs) cannot transform those
+  private readonly b: Bytes;
+  constructor(b: Bytes) {
+    this.b = b;
     this.dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
   }
   private need(n: number): void {

@@ -1093,10 +1093,12 @@ const fixed = (b: Bytes, n: number, what: string): Bytes =>
 class Rd {
   private o = 0;
   private readonly dv: DataView;
-  constructor(
-    private readonly b: Bytes,
-    private readonly what: string,
-  ) {
+  // explicit fields, not parameter properties: Node's type stripping (test/e2e/run.mjs) cannot transform those
+  private readonly b: Bytes;
+  private readonly what: string;
+  constructor(b: Bytes, what: string) {
+    this.b = b;
+    this.what = what;
     this.dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
   }
   private take(n: number): number {

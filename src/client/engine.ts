@@ -2,8 +2,8 @@
 // code, checks the account against the directory, restores the account's state from its self lane, and turns it into
 // the view the UI renders. Browser only: the UI imports it dynamically (src/components/engine-loader.ts).
 //
-// Milestone M6a (docs/STAGE1-PLAN.md): sign-in, the registration's self-lane write, and the restore of an account
-// without conversations. Conversations, the inbox and realtime land with M6b.
+// The session's conversations live in Messaging (messaging.ts); this class owns accounts, the session lifecycle,
+// the generation guards, state emission and warnings.
 import * as P from "~/lib/proto";
 import {
   addPasskeyTo,
@@ -22,6 +22,8 @@ import {
   type EngineOptions,
   type EngineTimer,
 } from "./options";
+import { cursorAt, type InboxCursor } from "./inbox";
+import { Messaging, type MessagingHost } from "./messaging";
 import { SelfLane } from "./selflane";
 import { clearSession, loadSession, saveSession } from "./session";
 import type { ConversationView, Engine, EngineState, ImageRef } from "./types";
@@ -37,7 +39,7 @@ const MAX_NOISE = 5;
 export const ACCOUNT_MISSING = "your account was not found in the directory of this server";
 export const ACCOUNT_KEYS_MISMATCH =
   "the public keys registered for your account do not match your passkey's keys";
-const NOT_YET = "conversations are not available in this build yet";
+const NOT_YET = "this is not available in this build yet";
 
 interface Account {
   uid: Uint8Array;
@@ -47,6 +49,11 @@ interface Account {
   handle: string;
   /** era of registration, from the directory (§11.1); null until the account check */
   regEra: number | null;
+}
+
+/** What the registering device knows of its registration: its server time, when the response arrived (§11.1). */
+interface Registration {
+  now: number | null;
 }
 
 const emptyState = (): EngineState => ({
@@ -71,14 +78,14 @@ export class SegvEngine implements Engine {
   readonly clock: EngineClock;
   private readonly delays: EngineDelays;
   private readonly fetchFn: typeof fetch;
+  private readonly opts: EngineOptions;
   private api: Api;
 
   private account: Account | null = null;
   private self: SelfLane | null = null;
-  /** conversation copies by view key (M6b) */
-  readonly convs = new Map<string, unknown>();
+  /** the session's conversations, once restored */
+  private msg: Messaging | null = null;
   queue: Promise<unknown> = Promise.resolve();
-  readonly sendChains = new Map<string, Promise<unknown>>();
   readonly imageCache = new Map<string, Promise<string>>();
   readonly pending = new Map<string, string>();
   fatal = false;
@@ -86,8 +93,10 @@ export class SegvEngine implements Engine {
   generation = 0;
   /** bumped on every applied row or record (the test harness's settle stamp) */
   version = 0;
-  /** in-flight actions (sign-in flows, user actions) */
-  busyActions = 0;
+  /** in-flight actions and tracked background work (sign-in flows, user actions, deliveries) */
+  private inflight = 0;
+  /** of those, the ones now waiting on a protocol timer */
+  private waiting = 0;
   /** scheduled protocol timers (retries) with their monotonic due time; periodic timers are not here */
   private readonly protocolTimers = new Map<EngineTimer, { due: number; release: () => void }>();
   private live = false;
@@ -95,6 +104,7 @@ export class SegvEngine implements Engine {
   private readonly noise = new Map<string, number>();
 
   constructor(opts: EngineOptions = {}) {
+    this.opts = opts;
     this.clock = opts.clock ?? systemClock;
     this.delays = { ...DEFAULT_DELAYS, ...opts.delays };
     this.fetchFn = opts.fetch ?? ((input, init) => fetch(input, init));
@@ -133,7 +143,7 @@ export class SegvEngine implements Engine {
   register(handleIn: string, remember = false): Promise<{ recoveryCode: string }> {
     return this.authFlow(async () => {
       const r = await registerAccount(this.api, handleIn, (m) => this.progress(m));
-      await this.unlock(r.AK, r.uid, r.handle, true);
+      await this.unlock(r.AK, r.uid, r.handle, { now: r.regNow });
       if (remember) await this.remember(r);
       return { recoveryCode: r.recoveryCode };
     });
@@ -182,15 +192,18 @@ export class SegvEngine implements Engine {
     this.emitNow();
   }
 
-  async createConversation(_handles: string[], _name?: string): Promise<string> {
+  async createConversation(handles: string[], name?: string): Promise<string> {
     this.requireAccount();
-    return this.action(async () => {
-      throw new UserError(NOT_YET);
-    });
+    return this.action(() => this.messaging().create(handles, name));
   }
 
-  async sendText(_convId: string, _text: string): Promise<void> {
-    await this.notYet();
+  async sendText(convId: string, text: string): Promise<void> {
+    this.requireAccount();
+    try {
+      await this.messaging().sendText(convId, text);
+    } catch (e) {
+      this.patch({ error: message(e) });
+    }
   }
 
   async sendImage(_convId: string, _file: File): Promise<void> {
@@ -213,7 +226,9 @@ export class SegvEngine implements Engine {
     return Promise.reject(new UserError(NOT_YET));
   }
 
-  markRead(_convId: string): void {}
+  markRead(convId: string): void {
+    this.msg?.markRead(convId);
+  }
 
   clearError(): void {
     this.patch({ error: "" });
@@ -226,11 +241,31 @@ export class SegvEngine implements Engine {
     });
   }
 
+  private messaging(): Messaging {
+    if (!this.msg) throw new UserError("still restoring; try again in a moment");
+    return this.msg;
+  }
+
   // ───────────── white-box hooks (the test harness's I(e)) ─────────────
+
+  /** conversation copies by view key */
+  get convs(): Map<string, unknown> {
+    return this.msg?.copies ?? new Map();
+  }
+
+  /** the per-conversation send chains */
+  get sendChains(): Map<string, Promise<unknown>> {
+    return this.msg?.chains ?? new Map();
+  }
 
   /** Busy work: in-flight actions plus scheduled protocol timers (the harness's settle waits for 0). */
   get busy(): number {
-    return this.busyActions + this.protocolTimers.size;
+    return this.inflight + this.protocolTimers.size;
+  }
+
+  /** In-flight work that is not just waiting on a protocol timer (settle ticks the clocks when this is 0). */
+  get busyActions(): number {
+    return Math.max(0, this.inflight - this.waiting);
   }
 
   /** The monotonic due time of the earliest protocol timer, or null. */
@@ -245,30 +280,30 @@ export class SegvEngine implements Engine {
     return this.api.time.sample;
   }
 
-  /** One catch-up round: the self lane from its head (M6b adds the inbox poll and the lanes). */
+  /** One catch-up round (§11.6): the self lane, every copy's lanes, the inbox, HEADS. */
   async catchUp(): Promise<void> {
-    const acc = this.account;
-    const self = this.self;
-    if (!acc || !self || !this.live || this.fatal || acc.regEra === null) return;
-    const gen = this.generation;
-    await this.enqueue(async () => {
-      this.assertSession(acc, gen);
-      await self.catchUp({ E: acc.regEra!, n: 0 });
-    });
+    if (!this.msg || !this.live || this.fatal) return;
+    await this.msg.catchUp();
   }
 
   views(): ConversationView[] {
-    return [];
+    return this.msg?.views() ?? [];
   }
 
   // ───────────── unlock, account check and restore (§11.1, §11.4) ─────────────
 
   /**
    * Starts a session for an unlocked account: the UI is ready at once, and the account check (§11.1) and the restore
-   * (§11.4) run in the background (`syncing`). `registered`: the account was just created, so its first self row,
-   * a HEADS record with the inbox cursor at the current slot, is written right after the restore (§7.3, §11.1).
+   * (§11.4) run in the background (`syncing`). `registered`: the account was just created here, so its first self
+   * row, a HEADS record with the inbox cursor at the registration's slot, is written right after the restore (§7.3,
+   * §11.1).
    */
-  async unlock(AK: Uint8Array, uid: Uint8Array, handle: string, registered = false): Promise<void> {
+  async unlock(
+    AK: Uint8Array,
+    uid: Uint8Array,
+    handle: string,
+    registered: Registration | null = null,
+  ): Promise<void> {
     const id = P.deriveIdentity(AK);
     const uidB = P.b64u(uid);
     this.resetData();
@@ -289,22 +324,76 @@ export class SegvEngine implements Engine {
     void this.startSync(this.generation, registered);
   }
 
-  private async startSync(gen: number, registered: boolean): Promise<void> {
+  private async startSync(gen: number, registered: Registration | null): Promise<void> {
     const acc = this.account!;
     const self = this.self!;
+    // The registration's cursor is computed once, so a retried write keeps it (a later time could pass invites).
+    let cursor: InboxCursor | null = null;
     const ok = await this.retrying(gen, async () => {
-      await this.api.params();
+      const p = await this.api.params();
       if (acc.regEra === null) await this.checkAccount(acc, gen);
       if (this.fatal) return;
+      self.floorEra = acc.regEra!;
       await this.enqueue(() => self.catchUp({ E: acc.regEra!, n: 0 }));
       this.assertSession(acc, gen);
-      if (registered && !self.fold.cursor)
-        await this.enqueue(() => self.write([this.cursorHeads()]));
+      if (registered && !self.fold.cursor) {
+        cursor ??= cursorAt(
+          registered.now ?? P.eraStart(acc.regEra!),
+          p,
+          P.era(this.api.serverNow()),
+        );
+        const c = cursor;
+        await this.enqueue(() =>
+          self.write([{ rtype: P.RT.HEADS, Ein: c.E, relIn: c.rel, entries: [] }]),
+        );
+      }
+      const msg = (this.msg ??= new Messaging(this.host(acc, gen)));
+      await this.enqueue(() => msg.restore()); // serialised with the work it starts (new copies, member lookups)
     });
     if (!ok || gen !== this.generation || this.fatal) return;
     if (this.state.error.startsWith("sync failed:")) this.patch({ error: "" });
     this.live = true;
+    this.msg!.start();
     this.patch({ syncing: false });
+  }
+
+  /** What the session's Messaging calls back into. */
+  private host(acc: Account, gen: number): MessagingHost {
+    return {
+      api: this.api,
+      clock: this.clock,
+      delays: this.delays,
+      opts: this.opts,
+      acc: {
+        uid: acc.uid,
+        uidB: acc.uidB,
+        id: acc.id,
+        get handle() {
+          return acc.handle;
+        },
+        regEra: acc.regEra!,
+      },
+      self: this.self!,
+      check: () => this.assertSession(acc, gen),
+      warn: (t, c) => this.warn(t, c),
+      changed: () => {
+        this.version++;
+        this.scheduleEmit();
+      },
+      emitNow: () => this.emitNow(),
+      progress: (t) => this.progress(t),
+      error: (t) => this.patch({ error: t }),
+      wait: (ms) => this.wait(ms),
+      enqueue: (fn) => this.enqueue(fn),
+      track: (p) => this.track(p),
+      setConnected: (on) => this.patch({ connected: on }),
+    };
+  }
+
+  /** Counts background work as in flight until it settles (the harness's settle waits for it). */
+  private track<T>(p: Promise<T>): Promise<T> {
+    this.inflight++;
+    return p.finally(() => this.inflight--);
   }
 
   /** §11.1 step 2: the account must be registered with exactly the keys the unlocked AK derives. */
@@ -331,19 +420,6 @@ export class SegvEngine implements Engine {
   }
 
   /**
-   * The HEADS record (c = 0) written right after registration (§7.3, §11.1): the inbox cursor at the current slot,
-   * minus SKEW and one slot, so no invite posted after the registration can fall at or below it (§9.3).
-   */
-  private cursorHeads(): P.HeadsRec {
-    const p = this.api.cachedParams!;
-    const D = p.inboxSlot * 1000;
-    const at = this.api.serverNow() - p.skew * 1000 - D;
-    const E = Math.max(this.account!.regEra ?? 0, P.era(at));
-    const rel = Math.max(Math.floor((Math.max(at, P.eraStart(E)) - P.T0_MS) / D) - 1, 0);
-    return { rtype: P.RT.HEADS, Ein: E, relIn: rel, entries: [] };
-  }
-
-  /**
    * Runs `fn` until it succeeds, retrying failures with back-off on protocol timers (so the session's `busy` count
    * covers the wait). Resolves false when the session ended or went fatal.
    */
@@ -367,13 +443,14 @@ export class SegvEngine implements Engine {
    * (`stopTimers`); the caller then sees the new generation or `fatal` and stops.
    */
   private wait(ms: number): Promise<void> {
-    return new Promise((resolve) => {
+    this.waiting++;
+    return new Promise<void>((resolve) => {
       const t = this.clock.setTimer(() => {
         this.protocolTimers.delete(t);
         resolve();
       }, ms);
       this.protocolTimers.set(t, { due: this.clock.mono() + ms, release: resolve });
-    });
+    }).finally(() => this.waiting--);
   }
 
   private stopTimers(): void {
@@ -397,9 +474,9 @@ export class SegvEngine implements Engine {
   }
 
   private resetData(): void {
-    this.convs.clear();
+    this.msg?.stop();
+    this.msg = null;
     this.pending.clear();
-    this.sendChains.clear();
     this.imageCache.clear();
     this.critical = [];
     this.noise.clear();
@@ -429,7 +506,7 @@ export class SegvEngine implements Engine {
   private async authFlow<T>(fn: () => Promise<T>): Promise<T> {
     if (this.account) throw new UserError("already signed in");
     this.patch({ phase: "working", error: "", progress: "" });
-    this.busyActions++;
+    this.inflight++;
     try {
       return await fn();
     } catch (e) {
@@ -437,13 +514,13 @@ export class SegvEngine implements Engine {
       this.patch({ error: message(e) });
       throw e;
     } finally {
-      this.busyActions--;
+      this.inflight--;
       this.progress("");
     }
   }
 
   private async action<T>(fn: () => Promise<T>): Promise<T> {
-    this.busyActions++;
+    this.inflight++;
     try {
       return await fn();
     } catch (e) {
@@ -451,7 +528,7 @@ export class SegvEngine implements Engine {
       if (!(e instanceof SessionEnded)) this.patch({ error: message(e) });
       throw e;
     } finally {
-      this.busyActions--;
+      this.inflight--;
       this.progress("");
     }
   }
