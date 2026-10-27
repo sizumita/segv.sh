@@ -38,6 +38,7 @@ import {
   type InboxCursor,
 } from "./inbox";
 import { Checkpoints, different, hiding } from "./integrity";
+import { HelloProber, LINK_ERAS, liveLinks, putHello, type LiveLink } from "./links";
 import { acceptJoin, secondCopyWarning, type JoinCtx, type NewCopy, type SkipJoin } from "./join";
 import type {
   EngineClock,
@@ -147,6 +148,10 @@ export class Messaging {
   private readonly leaveWrites = new Map<string, Promise<void>>();
   /** the checkpoint chain this session verified (§12.3, §12.4) */
   readonly ckpt: Checkpoints;
+  /** the hello probing of the account's links (§5.5) */
+  private readonly hellos = new HelloProber();
+  /** Tlink of each live link, by b64u topic */
+  private readonly linkTopics = new Map<string, LiveLink>();
   /** rows whose `prev` this session does not hold yet: fetched and compared after the walk (§12.2) */
   private prevChecks: { c: Copy; ep: Epoch; j: number; prev: P.Pos; prevh: Bytes }[] = [];
   /** omission warnings already raised, per kind and sender (§12.2) */
@@ -216,6 +221,7 @@ export class Messaging {
     await this.initialHistory();
     await this.resolveMembers([...this.copies.values()].filter((c) => !c.request));
     await this.pollInbox();
+    await this.probeLinks();
     this.resumeDeliveries();
     this.repeatLeaves();
   }
@@ -291,6 +297,7 @@ export class Messaging {
       await this.absorbFold();
       await this.syncCopies([...this.copies.values()], false);
       await this.pollInbox();
+      await this.probeLinks();
       await this.resolveMembers([...this.copies.values()].filter((c) => !c.request));
     });
     this.resumeDeliveries();
@@ -1118,6 +1125,7 @@ export class Messaging {
     const tself = P.b64u(P.topicSelf(this.h.acc.id.nS));
     const stale = new Set<Copy>();
     const beyond: { c: Copy; ep: Epoch; j: number; row: FoundRow; msg: P.Msg }[] = [];
+    const links = new Set<LiveLink>();
     let self = false;
     for (const r of rows) {
       const cls = P.BODY_LENS.indexOf(r.body.length);
@@ -1125,6 +1133,11 @@ export class Messaging {
       const topic = P.b64u(r.topic);
       if (topic === tself) {
         self = true;
+        continue;
+      }
+      const link = this.linkTopics.get(topic);
+      if (link) {
+        links.add(link);
         continue;
       }
       const x = this.topics.get(topic);
@@ -1162,6 +1175,8 @@ export class Messaging {
           });
       }
     }
+    if (links.size)
+      void this.h.track(this.h.enqueue(() => this.probeLinks([...links]))).catch(() => {});
     if (self || stale.size)
       void this.h
         .track(
@@ -1192,18 +1207,29 @@ export class Messaging {
   }
 
   /**
-   * The topics, in priority order (§10.8): Tself, then the current epochs of accepted copies by recent activity.
-   * Requests are never subscribed. At most 256 per socket and 2 sockets; the rest are covered by catch-up.
+   * The topics, in priority order (§10.8): Tself, the current epochs of accepted copies by recent activity, the old
+   * epochs with followed lanes (§11.2), then the live links' Tlink. Requests are never subscribed. At most 256 per
+   * socket and 2 sockets; the rest are covered by catch-up.
    */
   private subscribe(): void {
     if (!this.live || !this.WS) return;
     const topics: Bytes[] = [P.topicSelf(this.h.acc.id.nS)];
     const accepted = [...this.copies.values()]
-      .filter((c) => !c.request)
+      .filter((c) => !c.request && !c.removed)
       .sort((a, b) => b.lastTs - a.lastTs);
     for (const c of accepted) {
       const ep = c.epochs.get(c.current);
       if (ep) topics.push(ep.topic);
+    }
+    for (const c of accepted) {
+      const ep = c.epochs.get(c.current);
+      const prev = ep && !ep.viaSkip ? c.epochs.get(ep.e - 1) : undefined;
+      if (prev?.lanes.some((l) => !l.swept)) topics.push(prev.topic);
+    }
+    this.linkTopics.clear();
+    for (const link of this.liveLinks()) {
+      this.linkTopics.set(P.b64u(link.topic), link);
+      topics.push(link.topic);
     }
     const parts = [topics.slice(0, RT_TOPICS), topics.slice(RT_TOPICS, 2 * RT_TOPICS)];
     parts.forEach((part, i) => {
@@ -1264,9 +1290,10 @@ export class Messaging {
    * last one (the durability order of §7.3), then holds the new copies. A parked join holds the cursor before it.
    */
   private async processJoins(
-    found: { J: P.Join; at: { E: number; rel: number } | null }[],
+    found: { J: P.Join; at: { E: number; rel: number } | null; hello?: boolean }[],
     next?: InboxCursor,
-  ): Promise<void> {
+  ): Promise<string[]> {
+    const kinds: string[] = [];
     const created: NewCopy[] = [];
     const skips: SkipJoin[] = [];
     let cursor = next ?? null;
@@ -1274,8 +1301,13 @@ export class Messaging {
       const out = await acceptJoin(
         this.joinCtx(created),
         x.J,
-        x.at ? { via: P.VIA.INBOX, ...x.at } : { via: P.VIA.WELCOME },
+        x.at
+          ? { via: P.VIA.INBOX, ...x.at }
+          : x.hello
+            ? { via: P.VIA.HELLO }
+            : { via: P.VIA.WELCOME },
       );
+      kinds.push(out.kind);
       this.h.check();
       if (out.kind === "parked" && x.at && cursor)
         cursor = minCursor(cursor, { E: x.at.E, rel: Math.max(0, x.at.rel - 1) });
@@ -1289,7 +1321,7 @@ export class Messaging {
         this.cursor = cursor;
         this.markHeads();
       }
-      return;
+      return kinds;
     }
     const records = [...created.flatMap((x) => x.records), ...skips.map((x) => x.record)];
     const heads: P.HeadsRec | null = cursor
@@ -1299,6 +1331,7 @@ export class Messaging {
     if (cursor) this.cursor = cursor;
     for (const x of created) this.adopt(x);
     for (const x of skips) this.adoptSkip(x);
+    return kinds;
   }
 
   /**
@@ -1442,6 +1475,16 @@ export class Messaging {
     this.h.progress("looking up handles…");
     const others = await resolveHandles(this.h.api, names);
     this.h.check();
+    return this.createWith(others, name, null);
+  }
+
+  /** §6.1 from step 1 for resolved users; `hello`: J goes to the single other member as a link hello (§5.5). */
+  private async createWith(
+    others: DirUser[],
+    name: string | undefined,
+    hello: { s: Bytes } | null,
+  ): Promise<string> {
+    const acc = this.h.acc;
     const now = Math.floor(this.h.clock.wall());
     const cr = buildCreation({ uid: acc.uid, id: acc.id }, others, name, now);
     this.h.progress("uploading conversation keys…");
@@ -1490,7 +1533,9 @@ export class Messaging {
       kemPk: u.kemPk,
       handle: u.handle,
     }));
-    void this.h.track(this.finishCreation(c, ep, putAt, tReg, recipients, release)).catch(() => {});
+    void this.h
+      .track(this.finishCreation(c, ep, putAt, tReg, recipients, release, hello))
+      .catch(() => {});
     return key;
   }
 
@@ -1502,6 +1547,7 @@ export class Messaging {
     tReg: number,
     recipients: Recipient[],
     release: () => void,
+    hello: { s: Bytes } | null = null,
   ): Promise<void> {
     try {
       await waitCommitTime(
@@ -1527,6 +1573,24 @@ export class Messaging {
       bundleId: ep.bundleId,
       bundleSize: ep.bundleSize,
     };
+    if (hello) {
+      // A link's owner gets J as a hello row (§5.5), then the DELIVERED row records it (§6.12 step 3).
+      const owner = recipients[0];
+      await this.retry(() => putHello(this.h.api, owner, hello.s, J, () => this.h.check()));
+      await this.h.enqueue(async () => {
+        await this.h.self.write([
+          {
+            rtype: P.RT.DELIVERED,
+            conv: c.conv,
+            root: c.root,
+            e: ep.e,
+            bundleId: ep.bundleId,
+            uids: [owner.uid],
+          },
+        ]);
+      });
+      return;
+    }
     const job = this.deliveries.enqueue({
       key: jobKey(copyKeyOf(c), ep.e, ep.bundleId),
       conv: c.conv,
@@ -1537,6 +1601,85 @@ export class Messaging {
       writeEmpty: true,
     });
     await this.deliveries.first(job);
+  }
+
+  // ───────────────────────── links (§4.3, §5.5) ─────────────────────────
+
+  /** The account's live links (not expired, not revoked). */
+  private liveLinks(): LiveLink[] {
+    return liveLinks(this.h.self.fold.links, P.era(this.h.api.serverNow()));
+  }
+
+  /**
+   * `createLink` (§5.5, §11.11; internal in stage 1): a new secret s, its LINK record (valid for 4 eras), the Tlink
+   * subscription. Resolves with the link to share.
+   */
+  async createLink(opts: { oneShot?: boolean } = {}): Promise<string> {
+    const s = P.random(16);
+    const E = P.era(this.h.api.serverNow());
+    await this.h.enqueue(async () => {
+      await this.h.self.write([
+        {
+          rtype: P.RT.LINK,
+          s,
+          Ecreated: E,
+          Eexpires: E + LINK_ERAS - 1,
+          flags: opts.oneShot ? P.LINK_ONE_SHOT : 0,
+        },
+      ]);
+    });
+    this.subscribe();
+    const host = typeof location === "undefined" ? "segv.sh" : location.host;
+    return P.encodeLink(host, s, this.h.acc.uid);
+  }
+
+  /**
+   * `openLink` (§5.5; internal in stage 1): the owner's bundle by uid prefix, then a 1:1 created as §6.1 whose J goes
+   * to the owner as a hello row. Resolves with the new conversation's id.
+   */
+  async openLink(url: string): Promise<string> {
+    let link: { host: string; s: Bytes; uid: Bytes };
+    try {
+      link = P.parseLink(url);
+    } catch {
+      throw new UserError("this is not a segv.sh link");
+    }
+    if (P.equalBytes(link.uid, this.h.acc.uid)) throw new UserError("this is your own link");
+    this.h.progress("looking up the link's owner…");
+    const owner = await this.h.api.userByUidPrefix(link.uid);
+    this.h.check();
+    if (!owner) throw new UserError("the link's owner was not found");
+    this.learnUser(owner, true);
+    return this.createWith([owner], undefined, { s: link.s });
+  }
+
+  /**
+   * The owner's side (§5.5): probe every live link's hellos, accept their J as first contacts (§6.7), and revoke a
+   * one-shot link after its first valid hello. In the queue.
+   */
+  private async probeLinks(links: LiveLink[] = this.liveLinks()): Promise<void> {
+    if (links.length === 0) return;
+    const found = await this.hellos.probe(
+      this.h.api,
+      this.h.acc.id.kemSk,
+      links,
+      P.era(this.h.api.serverNow()),
+      (t) => this.h.warn(t),
+    );
+    this.h.check();
+    if (found.length === 0) return;
+    const outcomes = await this.processJoins(found.map((f) => ({ J: f.J, at: null, hello: true })));
+    const used = new Set<string>();
+    found.forEach((f, i) => {
+      const k = outcomes[i];
+      if (f.link.oneShot && (k === "new" || k === "duplicate")) used.add(f.link.sB);
+    });
+    for (const sB of used) {
+      const r = this.h.self.fold.links.get(sB);
+      if (!r) continue;
+      await this.h.self.write([{ ...r, flags: r.flags | P.LINK_REVOKED }]);
+    }
+    if (used.size) this.subscribe();
   }
 
   /** §6.1 step 7: a class-1 row of random bytes at a random label of the current era, without a topic. */

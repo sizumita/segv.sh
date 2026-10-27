@@ -235,6 +235,20 @@ export class SegvEngine implements Engine {
     await this.action(() => this.messaging().leave(convId));
   }
 
+  /**
+   * Links (§4.3, §5.5, §11.11): internal in stage 1 (no link UI and no Engine method yet); the tests reach them
+   * through I(e). `createLink` resolves with the link to share, `openLink` with the new conversation's id.
+   */
+  async createLink(opts: { oneShot?: boolean } = {}): Promise<string> {
+    this.requireAccount();
+    return this.action(() => this.messaging().createLink(opts));
+  }
+
+  async openLink(url: string): Promise<string> {
+    this.requireAccount();
+    return this.action(() => this.messaging().openLink(url));
+  }
+
   loadImage(img: ImageRef): Promise<string> {
     if (!this.msg) return Promise.reject(new UserError("not signed in"));
     return this.msg.loadImage(img);

@@ -16,7 +16,8 @@ export const secondCopyWarning = (handle: string): string =>
 /** Where a join came from: its `via` (§7.2) and, for an inbox invite, its position. */
 export type JoinSource =
   | { via: typeof P.VIA.INBOX; E: number; rel: number }
-  | { via: typeof P.VIA.WELCOME };
+  | { via: typeof P.VIA.WELCOME }
+  | { via: typeof P.VIA.HELLO };
 
 /** A join that passed §6.7 and became a new copy, before it is written to the self lane. */
 export interface NewCopy {
