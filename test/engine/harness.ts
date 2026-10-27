@@ -692,6 +692,8 @@ export async function commitChange(
     hideFrom?: string[];
     /** build the claim row without storing it (post it with `postRow`) */
     noPost?: boolean;
+    /** wait Δ + SKEW on the server clock only (`world.advance`): the engines' clocks do not move */
+    serverOnly?: boolean;
   } = {},
 ): Promise<Committed> {
   const w = current;
@@ -736,7 +738,9 @@ export async function commitChange(
   if (!opts.noWait && !opts.noRegister) {
     // §6.3 step 5: server time ≥ t_reg + Δ + SKEW, so the claim lands in a later batch than the registration.
     const due = P.T0_MS + (reg.t + w.params.delta + w.params.skew) * 1000;
-    w.tick(Math.max(0, due - w.now()) + 1);
+    const ms = Math.max(0, due - w.now()) + 1;
+    if (opts.serverOnly) w.advance(ms, { keepSockets: true });
+    else w.tick(ms);
   }
   const claim = buildClaim(
     by,

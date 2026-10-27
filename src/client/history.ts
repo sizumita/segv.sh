@@ -1,10 +1,11 @@
 // Scrollback (docs/PROTOCOL-v2.md §11.10): when a conversation is opened, older rows of each lane are loaded until
-// the view holds VIEW_MESSAGES messages or the history is exhausted, once per copy and session. Rows found here are
-// processed like any other and never count as unread. This walks the current epoch; the epochs below a claim come
-// with M7 (their heads found from the sweep or from E_start, never from the claim's cuts).
+// the view holds VIEW_MESSAGES messages or the history is exhausted, once per copy and session; below the first row
+// of an epoch the walk continues in the copy's previous held epoch, whose lane heads are found first (never from the
+// cuts of the claim that ended it). The initial history of a restore (§11.4 step 6) takes its rows the same way.
+// Rows found here are processed like any other and never count as unread.
 import * as P from "~/lib/proto";
 import type * as W from "~/lib/wire";
-import { VIEW_MESSAGES, type Copy, type Epoch, type Slot } from "./conv";
+import { HISTORY_INITIAL, VIEW_MESSAGES, W_SLOTS, type Copy, type Epoch, type Slot } from "./conv";
 import { applyLaneRow, type SyncCtx } from "./sync";
 
 /** Slots probed below the oldest loaded row of a lane per round (§11.10: (E, n−32..n−1)). */
@@ -41,23 +42,79 @@ async function earlierEnd(
   }
 }
 
-/** Loads older rows of the copy's current epoch (§11.10); once per copy and session. */
-export async function scrollback(ctx: SyncCtx, c: Copy): Promise<void> {
-  if (c.scrolled) return;
-  c.scrolled = true;
-  const ep = c.epochs.get(c.current);
-  if (!ep || ep.Estart === null) return;
-  const Estart = ep.Estart;
-  // Per lane, the slot below which nothing is loaded yet, and whether the lane's history is exhausted.
-  const below: Slot[] = ep.lanes.map((l) =>
-    l.oldest ? { E: l.oldest.E, n: l.oldest.n } : { ...(l.tail ?? l.next) },
-  );
-  const done = ep.lanes.map(() => false);
-  for (
-    let round = 0;
-    round < 10_000 && c.messages.length < VIEW_MESSAGES && done.some((d) => !d);
-    round++
-  ) {
+/** The copy's previous held epoch below `ep` (§11.10): e−1, or below a skip re-add the highest held one below. */
+export function previousHeld(c: Copy, ep: Epoch): Epoch | undefined {
+  if (!ep.viaSkip) return c.epochs.get(ep.e - 1);
+  let best: Epoch | undefined;
+  for (const x of c.epochs.values()) if (x.e < ep.e && (!best || x.e > best.e)) best = x;
+  return best;
+}
+
+/**
+ * The lane heads of an older epoch (§11.10), as the slot after each lane's last row: from the processed position of
+ * an epoch this session swept, or from E_start for one it never processed, to the era after the era of the claim
+ * that ended it (at most E_now), one key per idle era and a gallop on hits.
+ */
+async function olderHeads(ctx: SyncCtx, ep: Epoch): Promise<(Slot | null)[]> {
+  const Es = ep.Estart!;
+  const Enow = P.era(ctx.api.serverNow());
+  const Emax = Math.min(Enow, (ep.ended?.at.E ?? Enow) + 1);
+  const starts = ep.lanes.map((l) => (ep.lanesOn ? { ...(l.tail ?? l.next) } : { E: Es, n: 0 }));
+  // The dense-prefix end of each (lane, era), found by probing forward from its first slot.
+  const ends = new Map<string, number>();
+  let probes = ep.lanes.flatMap((_, j) => {
+    const s = starts[j];
+    const out: { j: number; E: number; n: number; w: number }[] = [];
+    for (let E = Math.max(s.E, Es); E <= Emax; E++)
+      out.push({ j, E, n: E === s.E ? s.n : 0, w: 1 });
+    return out;
+  });
+  for (let round = 0; round < 256 && probes.length; round++) {
+    const keys = probes.flatMap((p) =>
+      Array.from({ length: p.w }, (_, i) => ({
+        E: p.E,
+        label: P.Lmsg(ep.keys.rk, p.j, p.E, p.n + i),
+        mode: 1 as const,
+      })),
+    );
+    const st = await ctx.api.get(keys);
+    let o = 0;
+    const next: typeof probes = [];
+    for (const p of probes) {
+      const part = st.slice(o, o + p.w);
+      o += p.w;
+      const miss = part.findIndex((s) => s.s !== "hit");
+      if (miss >= 0) ends.set(`${p.j}:${p.E}`, p.n + miss);
+      else next.push({ ...p, n: p.n + p.w, w: W_SLOTS });
+    }
+    probes = next;
+  }
+  return ep.lanes.map((_, j) => {
+    for (let E = Emax; E >= Es; E--) {
+      const end = ends.get(`${j}:${E}`) ?? (E === starts[j].E ? starts[j].n : 0);
+      if (end > 0) return { E, n: end };
+    }
+    return null;
+  });
+}
+
+/**
+ * The backward walk over one epoch's lanes from `start` (the slot after each lane's last row to consider): probes
+ * (E, n−32..n−1), and at n = 0 moves to the previous era with rows (the oldest loaded row's prev, or the dense-prefix
+ * end of an earlier era down to E_start). Stops when `enough()` holds or every lane is exhausted, or after `rounds`.
+ */
+async function walkBack(
+  ctx: SyncCtx,
+  c: Copy,
+  ep: Epoch,
+  start: (Slot | null)[],
+  enough: () => boolean,
+  rounds = 10_000,
+): Promise<void> {
+  const Estart = ep.Estart!;
+  const below: Slot[] = start.map((s) => s ?? { E: Estart, n: 0 });
+  const done = start.map((s) => s === null);
+  for (let round = 0; round < rounds && !enough() && done.some((d) => !d); round++) {
     const want: { j: number; E: number; n: number; label: Uint8Array }[] = [];
     for (let j = 0; j < ep.lanes.length; j++) {
       if (done[j]) continue;
@@ -68,7 +125,7 @@ export async function scrollback(ctx: SyncCtx, c: Copy): Promise<void> {
         const o = ep.lanes[j].oldest;
         if (o && o.E === b.E) {
           if (P.isNone(o.prev) || o.prev.E >= b.E) {
-            done[j] = true; // the lane's first row in this epoch (or a prev that points nowhere new)
+            done[j] = true;
             continue;
           }
           below[j] = { E: o.prev.E, n: o.prev.n + 1 };
@@ -102,4 +159,35 @@ export async function scrollback(ctx: SyncCtx, c: Copy): Promise<void> {
         );
     }
   }
+}
+
+/** Loads older rows of the copy, epoch by epoch down to its root (§11.10); once per copy and session. */
+export async function scrollback(ctx: SyncCtx, c: Copy): Promise<void> {
+  if (c.scrolled) return;
+  c.scrolled = true;
+  const enough = () => c.messages.length >= VIEW_MESSAGES;
+  for (let ep = c.epochs.get(c.current); ep && !enough(); ep = previousHeld(c, ep)) {
+    if (ep.Estart === null) break;
+    const start =
+      ep.e === c.current
+        ? ep.lanes.map((l) =>
+            l.oldest ? { E: l.oldest.E, n: l.oldest.n } : { ...(l.tail ?? l.next) },
+          )
+        : await olderHeads(ctx, ep);
+    await walkBack(ctx, c, ep, start, enough);
+  }
+}
+
+/**
+ * §11.4 step 6 for an epoch with fewer than HISTORY_INITIAL rows loaded: the last HISTORY_INITIAL slots of each lane
+ * of the copy's previous held epoch (its heads found as for an epoch never swept).
+ */
+export async function olderInitialHistory(ctx: SyncCtx, c: Copy): Promise<void> {
+  const cur = c.epochs.get(c.current);
+  if (!cur) return;
+  const loaded = [...cur.rows.values()].filter((r) => r.shown).length;
+  const prev = loaded < HISTORY_INITIAL ? previousHeld(c, cur) : undefined;
+  if (!prev || prev.Estart === null) return;
+  const heads = await olderHeads(ctx, prev);
+  await walkBack(ctx, c, prev, heads, () => false, 1);
 }

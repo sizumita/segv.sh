@@ -47,7 +47,7 @@ import type {
 } from "./options";
 import { Realtime } from "./realtime";
 import { keysChangedWarning, type SelfLane } from "./selflane";
-import { scrollback } from "./history";
+import { olderInitialHistory, scrollback } from "./history";
 import { prepareImage } from "./image";
 import { enterEpoch, onLeave, processWinner, relabel, type MembershipHost } from "./membership";
 import { WelcomeRefused, sendRow, type SendCtx } from "./send";
@@ -622,7 +622,9 @@ export class Messaging {
       )
         best = rec;
     if (!best) return null;
-    return this.epochOf(c, best);
+    const ep = await this.epochOf(c, best);
+    if (ep) this.joinLine(c, ep); // as the live skip join showed it (§11.4 step 5)
+    return ep;
   }
 
   /** An epoch from its key material (an EPOCH record): D from DESC or the bundle (checked), E_start from meta. */
@@ -691,11 +693,10 @@ export class Messaging {
           keys.push({ c, ep, j, E: lane.next.E, n, label: P.Lmsg(ep.keys.rk, j, lane.next.E, n) });
       });
     }
-    if (keys.length === 0) return;
-    const st = await this.h.api.get(
-      keys.map((x) => ({ E: x.E, label: x.label, mode: 0 as const })),
-    );
-    const ctx = this.syncCtx();
+    const ctx = this.syncCtx(true);
+    const st = keys.length
+      ? await this.h.api.get(keys.map((x) => ({ E: x.E, label: x.label, mode: 0 as const })))
+      : [];
     keys.forEach((x, i) => {
       const s = st[i];
       if (s.s === "hit" && s.body)
@@ -708,6 +709,8 @@ export class Messaging {
           true,
         );
     });
+    // An epoch with fewer than 30 rows also shows the end of the previous held epoch (§11.4 step 6).
+    for (const c of copies) if (!c.request) await olderInitialHistory(ctx, c);
   }
 
   // ───────────────────────── users (§7.3, §10.6, §11.2) ─────────────────────────

@@ -178,3 +178,58 @@ describe("leave", () => {
     expect(B2.getState().error).toBe("you left this conversation");
   });
 });
+
+describe("history across epochs (§11.4 step 6, §11.10)", () => {
+  it("a reload shows the end of the previous epoch, and scrollback walks down to the root epoch", async () => {
+    const [alice, bob, carol] = ["alice", "bob", "carol"].map((h) => makeUser(h));
+    const A = await engineFor(alice);
+    const B = await engineFor(bob);
+    const C = await engineFor(carol);
+    const id = await A.createConversation(["bob"], "hist");
+    await settle(A, B);
+    B.markRead(id);
+    await settle(A, B);
+    for (let i = 0; i < 40; i++) await A.sendText(id, `e0 #${i}`);
+    await A.addMembers(id, ["carol"]);
+    await settle(A, B, C);
+    await B.sendText(id, "e1 first");
+    await settle(A, B, C);
+    const B2 = await engineFor(bob);
+    const shown = chat(B2, id);
+    expect(shown).toContain("bob: e1 first");
+    expect(shown).toContain("alice: e0 #39"); // the previous epoch's end, without opening it
+    expect(shown).not.toContain("alice: e0 #0");
+    B2.markRead(id);
+    await settle(B2);
+    const all = chat(B2, id);
+    for (let i = 0; i < 40; i++) expect(all).toContain(`alice: e0 #${i}`);
+    expect(all.indexOf("alice: e0 #0")).toBeLessThan(all.indexOf("alice: e0 #39"));
+    expect(all.at(-1)).toBe("bob: e1 first");
+    // Carol, added at e1, has no history below her root epoch.
+    C.markRead(id);
+    await settle(C);
+    expect(chat(C, id)).toEqual(["bob: e1 first"]);
+  });
+
+  it("history below a removal shows the removed member's rows before the claim only", async () => {
+    const [alice, bob, rita] = ["alice", "bob", "rita"].map((h) => makeUser(h));
+    const A = await engineFor(alice);
+    const B = await engineFor(bob);
+    const R = await engineFor(rita);
+    const id = await A.createConversation(["bob", "rita"], "cut");
+    await settle(A, B, R);
+    for (const X of [B, R]) X.markRead(id);
+    await settle(A, B, R);
+    await R.sendText(id, "rita before");
+    await settle(A, B, R);
+    await A.removeMember(id, rita.uidB);
+    await settle(A, B, R);
+    await A.sendText(id, "after");
+    await settle(A, B);
+    const B2 = await engineFor(bob);
+    B2.markRead(id);
+    await settle(B2);
+    expect(chat(B2, id)).toEqual(["rita: rita before", "alice: after"]);
+    expect(systemLines(B2, id)).toContain("@alice removed @rita");
+  });
+});

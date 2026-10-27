@@ -456,6 +456,35 @@ try {
     await seen(B, t4);
   });
 
+  await step("removing a member cuts them off from new messages", async () => {
+    await open(A, team);
+    await open(B, team);
+    await open(C, team);
+    const panel = await openMembers(A);
+    const row = panel.locator("li", { hasText: H.carol });
+    await row.getByRole("button", { name: "remove" }).click();
+    await row.locator(".confirm").getByRole("button", { name: "remove" }).click();
+    await seen(A, `removed @${H.carol}`);
+    await seen(C, "removed you");
+    await C.page.getByText("you are no longer a member").waitFor({ timeout: T });
+    await send(A, t5);
+    await seen(B, t5);
+    await notSeen(C, t5);
+    await shot(C, "04-carol-removed");
+  });
+
+  await step("leaving rotates keys on the next send", async () => {
+    const panel = await openMembers(B);
+    await panel.getByRole("button", { name: "leave conversation" }).click();
+    await panel.locator(".confirm").getByRole("button", { name: "leave" }).click();
+    await B.page.getByText("you are no longer a member").waitFor({ timeout: T });
+    await seen(A, `@${H.bob} left`);
+    await send(A, t6);
+    await seen(A, `keys rotated after @${H.bob} left`);
+    await notSeen(B, t6);
+    await shot(A, "05-alice-after-leave");
+  });
+
   await step(
     'reload without "remember": signed out, passkey sign-in restores the texts',
     async () => {
@@ -499,35 +528,6 @@ try {
       await A2.ctx.close();
     },
   );
-
-  await step("removing a member cuts them off from new messages", async () => {
-    await open(A, team);
-    await open(B, team);
-    await open(C, team);
-    const panel = await openMembers(A);
-    const row = panel.locator("li", { hasText: H.carol });
-    await row.getByRole("button", { name: "remove" }).click();
-    await row.locator(".confirm").getByRole("button", { name: "remove" }).click();
-    await seen(A, `removed @${H.carol}`);
-    await seen(C, "removed you");
-    await C.page.getByText("you are no longer a member").waitFor({ timeout: T });
-    await send(A, t5);
-    await seen(B, t5);
-    await notSeen(C, t5);
-    await shot(C, "04-carol-removed");
-  });
-
-  await step("leaving rotates keys on the next send", async () => {
-    const panel = await openMembers(B);
-    await panel.getByRole("button", { name: "leave conversation" }).click();
-    await panel.locator(".confirm").getByRole("button", { name: "leave" }).click();
-    await B.page.getByText("you are no longer a member").waitFor({ timeout: T });
-    await seen(A, `@${H.bob} left`);
-    await send(A, t6);
-    await seen(A, `keys rotated after @${H.bob} left`);
-    await notSeen(B, t6);
-    await shot(A, "05-alice-after-leave");
-  });
 
   await step('"remember this device" survives a reload', async () => {
     const D = await device(browser, "dave");
