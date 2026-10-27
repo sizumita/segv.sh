@@ -4,9 +4,14 @@
  * with the same `src/lib/wire.ts` codecs as the Worker, and commitments come from `src/lib/proto.ts`, so the fake
  * cannot drift from the wire format.
  *
- * Clocks. Server time is `Date.now() + offsetMs` (the Worker, BlobReg, Inbox, Realtime and Checkpoint components);
- * the shard reads `now − shardLagMs`. Δ = 1, SKEW = 0, Δin = 1 by default; PoW is 0 for every scope and any (or no)
- * `x-segv-pow` header is accepted. `srvKey` / `SRV_SK` and `ROUTE_KEY` are fixed test keys.
+ * Clocks. Server time is `Date.now() + offsetMs` (the Worker, BlobReg, Realtime and Checkpoint components); the
+ * shard reads `now − shardLagMs` and the inbox `now − inboxLagMs`. Δ = 1, SKEW = 0, Δin = 1 by default; PoW is 0 for
+ * every scope and any (or no) `x-segv-pow` header is accepted. `srvKey` / `SRV_SK` and `ROUTE_KEY` are fixed test
+ * keys. `/era/{E}` answers from the world clock alone (`sealed = now ≥ end(E) + SKEW`), as the Worker does.
+ *
+ * Headers. Every response carries `x-segv-now` (the world clock), `nosniff`, `no-referrer`, and HSTS when the
+ * request URL is https, as the Worker stamps them (§9.7, §10.1); the one exception is the 101 of a WebSocket upgrade,
+ * which carries none of them (see `FakeWebSocket.upgradeHeaders`). Blob GETs carry `content-length`.
  *
  * Request attribution. Every request and socket may carry a client name `who` (by convention the user's handle):
  *  - `world.fetchAs(who)` / `world.WebSocketAs(who)` / `world.transport(who)` give one client its own fetch and
@@ -65,8 +70,10 @@ import {
 import { FakeBlobReg, FakeBlobs } from "./blobs";
 import { FakeCheckpoints, type CkptEntry } from "./ckpt";
 import {
+  HSTS,
   IMMUTABLE,
   NO_STORE,
+  SECURITY_HEADERS,
   bin,
   err,
   json,
@@ -235,6 +242,15 @@ function raceAbort<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
+/** A request URL the Worker would see as https (a `wss:` upgrade arrives as https). */
+const isHttps = (url: string): boolean => {
+  try {
+    return /^(https|wss):$/.test(new URL(url, "http://segv.test/").protocol);
+  } catch {
+    return false;
+  }
+};
+
 const blobHeaders = (etag: string): Record<string, string> => ({
   "content-type": "application/octet-stream",
   etag,
@@ -260,6 +276,11 @@ export class FakeWorld implements WorldCtx, RtHost {
   offsetMs = 0;
   /** The shard clock lags the rest of the server by this much. */
   shardLagMs = 0;
+  /**
+   * The inbox clock lags the rest of the server by this much: the InboxDO's era window, `ended`, `closed`, `rel` and
+   * day index read `now − inboxLagMs`, while the Worker's era bounds and 410 in front of it read the world clock.
+   */
+  inboxLagMs = 0;
   /** An ended era's shard seals at end(E) + SKEW + sealDelayMs (see also sealPrevious()). */
   sealDelayMs = 0;
   /** Cacheable (`public`) responses carry an `x-segv-now` `staleNowAgeMs` old, as a browser cache would replay it. */
@@ -328,6 +349,10 @@ export class FakeWorld implements WorldCtx, RtHost {
 
   shardNow(): number {
     return this.now() - this.shardLagMs;
+  }
+
+  inboxNow(): number {
+    return this.now() - this.inboxLagMs;
   }
 
   /** era(server now) */
@@ -441,8 +466,13 @@ export class FakeWorld implements WorldCtx, RtHost {
     this.rt.publish(rows);
   }
 
-  /** (internal) RtHost: the Worker's handling of `GET /api/v2/rt` with an upgrade. */
-  rtUpgrade(ws: FakeWebSocket): number {
+  /**
+   * (internal) RtHost: the Worker's handling of `GET /api/v2/rt` with an upgrade. A 101 is the RealtimeDO's response
+   * passed on unchanged, so it carries none of the per-response headers (§9.7, §10.1: HELLO carries the time); a
+   * refusal is an error response like any other: 404 for another path, 429 from RL_READ or the per-client cap, 503
+   * at the global cap or while `wsEnabled` is false.
+   */
+  rtUpgrade(ws: FakeWebSocket): { status: number; headers: Headers | null } {
     const entry: FakeRequest = {
       method: "GET",
       path: ws.path,
@@ -454,13 +484,32 @@ export class FakeWorld implements WorldCtx, RtHost {
     };
     this.requests.push(entry);
     const fail = this.hooks.fail?.("GET", ws.path, ws.who);
-    if (fail === "before") return 0;
-    let status: number;
-    if (ws.path !== "/api/v2/rt") status = 404;
-    else if (this.rateLimit("RL_READ", ws.who)) status = 429;
-    else status = this.rt.admit(ws);
-    entry.status = status;
-    return fail === "after" ? 0 : status;
+    if (fail === "before") return { status: 0, headers: null };
+    const refusal =
+      ws.path !== "/api/v2/rt"
+        ? err(404, `not found: GET ${ws.path}`)
+        : (this.rateLimit("RL_READ", ws.who) ?? this.admitRefusal(this.rt.admit(ws)));
+    let out: { status: number; headers: Headers };
+    if (refusal) {
+      out = {
+        status: refusal.status,
+        headers: this.respond(refusal, entry, isHttps(ws.url)).headers,
+      };
+    } else {
+      entry.status = 101;
+      out = { status: 101, headers: new Headers() };
+    }
+    return fail === "after" ? { status: 0, headers: null } : out;
+  }
+
+  /** The Worker's answer to a RealtimeDO refusal (the DO's status, error and `retry-after`); null for a 101. */
+  private admitRefusal(status: number): Res | null {
+    if (status === 101) return null;
+    const retry = { "retry-after": "60" };
+    if (status === 429) return err(429, "too many connections from this client", undefined, retry);
+    return this.rt.enabled
+      ? err(503, "too many connections", undefined, retry)
+      : err(503, "realtime unavailable");
   }
 
   /** (internal) RtHost */
@@ -509,13 +558,15 @@ export class FakeWorld implements WorldCtx, RtHost {
     const run = (async () => {
       await this.hooks.beforeRequest?.(method, req.path, req.who);
       await Promise.resolve();
+      // The Worker takes x-segv-now when it starts handling the request (§10.1), not when it answers.
+      const startNow = this.now();
       let res: Res;
       try {
         res = await this.handle(req, entry);
       } catch (e) {
         res = err(500, `fake server error: ${e instanceof Error ? e.message : String(e)}`);
       }
-      return this.respond(res, entry);
+      return this.respond(res, entry, url.protocol === "https:", startNow);
     })();
     const response = signal ? await raceAbort(run, signal) : await run;
     if (fail === "after")
@@ -538,13 +589,15 @@ export class FakeWorld implements WorldCtx, RtHost {
     return route.h(req, route.re.exec(req.path)!, entry);
   }
 
-  private respond(res: Res, entry: FakeRequest): Response {
+  /**
+   * The Response actually returned, with the headers the Worker puts on every response but the 101 upgrade:
+   * `cache-control`, `nosniff`, `no-referrer`, HSTS on https, and `x-segv-now` = `nowMs`, the world time when the
+   * request started being handled (§9.7, §10.1).
+   */
+  private respond(res: Res, entry: FakeRequest, https: boolean, nowMs = this.now()): Response {
     const cache = res.cache ?? NO_STORE;
-    const headers = new Headers({
-      "cache-control": cache,
-      "x-content-type-options": "nosniff",
-      "referrer-policy": "no-referrer",
-    });
+    const headers = new Headers({ "cache-control": cache, ...SECURITY_HEADERS });
+    if (https) headers.set("strict-transport-security", HSTS);
     let body: Bytes | null = null;
     if (res.bytes) {
       body = res.bytes;
@@ -556,7 +609,7 @@ export class FakeWorld implements WorldCtx, RtHost {
     for (const [k, v] of Object.entries(res.headers ?? {})) headers.set(k, v);
     // Stamped on the response actually returned; a cacheable response may be a stale replay (spec §10.1).
     const stale = this.staleNow && cache.startsWith("public");
-    headers.set("x-segv-now", String(this.now() - (stale ? this.staleNowAgeMs : 0)));
+    headers.set("x-segv-now", String(nowMs - (stale ? this.staleNowAgeMs : 0)));
     entry.status = res.status;
     entry.resBytes = body?.length ?? 0;
     const nullBody = res.status === 204 || res.status === 304;
@@ -575,7 +628,9 @@ export class FakeWorld implements WorldCtx, RtHost {
     const log = (this.rlLog.get(key) ?? []).filter((t) => now - t < periodMs);
     this.rlLog.set(key, log);
     if (log.length >= limit) {
-      const retry = Math.max(1, Math.ceil((log[0] + periodMs - now) / 1000));
+      // With limit 0 nothing was counted: a whole window.
+      const freeAt = (log.length > 0 ? log[0] : now) + periodMs;
+      const retry = Math.max(1, Math.ceil((freeAt - now) / 1000));
       return err(429, "rate limited", undefined, { "retry-after": String(retry) });
     }
     log.push(now);
@@ -705,14 +760,19 @@ export class FakeWorld implements WorldCtx, RtHost {
     });
   }
 
-  /** GET /api/v2/era/{E}: immutable once sealed. The era is parsed before RL_READ, as the Worker does. */
+  /**
+   * GET /api/v2/era/{E} (§10.9), answered from the world clock alone, as the Worker does (it addresses no Durable
+   * Object): `sealed = now ≥ end(E) + SKEW·1000`, immutable once sealed. It does not follow the shard fake
+   * (`sealDelayMs`, `sealPrevious()`, `shardLagMs`). The era is parsed before RL_READ, as the Worker does.
+   */
   private getEra(req: Req, s: string): Res {
     const E = eraParam(s);
     if (E === null) return err(400, "bad era");
     const limited = this.rateLimit("RL_READ", req.who);
     if (limited) return limited;
-    if (E > this.bounds().hi || E < this.params.efirst) return err(404, "unknown era");
-    const sealed = this.shard.sealed(E);
+    const now = this.now();
+    if (E > this.bounds(now).hi || E < this.params.efirst) return err(404, "unknown era");
+    const sealed = now >= eraEnd(E) + this.params.skew * 1000;
     return json(
       200,
       {
@@ -885,8 +945,9 @@ export class FakeWorld implements WorldCtx, RtHost {
   }
 
   /**
-   * GET /api/v2/blob/{id}: raw bytes, `public, immutable`. Id check, then the cache (If-None-Match answered from a
-   * hit with 304), RL_READ, the bucket.
+   * GET /api/v2/blob/{id}: raw bytes, `public, immutable`, with `content-length` = the byte length (the Worker sets
+   * it from the R2 object's size; `new Response(Uint8Array)` adds none). Id check, then the cache (If-None-Match
+   * answered from a hit with 304), RL_READ, the bucket.
    */
   private getBlob(req: Req, idS: string, log: FakeRequest): Res {
     if (!b64Param(idS, 32)) return err(400, "bad blob id");
@@ -906,16 +967,23 @@ export class FakeWorld implements WorldCtx, RtHost {
     if (!bytes) return err(404, "no such blob");
     const etag = `"${idS}"`;
     if (inm === etag) return { status: 304, cache: IMMUTABLE, headers: blobHeaders(etag) };
-    const res = bin(bytes, { cache: IMMUTABLE, headers: blobHeaders(etag) });
+    const res = bin(bytes, {
+      cache: IMMUTABLE,
+      headers: { ...blobHeaders(etag), "content-length": String(bytes.length) },
+    });
     this.cachePut(key, res);
     return res;
   }
 
-  /** GET /api/v2/blob/{id}/meta: `{t, size}` or 404 `{error: "unregistered", now}` (no-store); id check, then RL_READ. */
+  /**
+   * GET /api/v2/blob/{id}/meta: `{t, size}` or 404 `{error: "unregistered", now}` (no-store); id check, then RL_READ,
+   * then the BlobReg call (503 while `blobreg.failMeta` holds failures for the id).
+   */
   private getBlobMeta(req: Req, idS: string): Res {
     if (!b64Param(idS, 32)) return err(400, "bad blob id");
     const limited = this.rateLimit("RL_READ", req.who);
     if (limited) return limited;
+    if (this.blobreg.takeMetaFailure(idS)) return err(503, "storage unavailable");
     const m = this.blobreg.meta(idS);
     return m.hit ? json(200, { t: m.t, size: m.size }) : err(404, "unregistered", { now: m.now });
   }
@@ -998,13 +1066,18 @@ export class FakeWorld implements WorldCtx, RtHost {
     return h(body);
   }
 
-  /** GET /api/v2/dir/{h|u}/{p}/{x}[?after=uid] (§10.6). */
+  /**
+   * GET /api/v2/dir/{h|u}/{p}/{x}[?after=uid] (§10.6): RL_READ, the path and query checks, then D1 (503 while a
+   * `dir.failDir` rule matches), then the prefix-bits check (409) and the page.
+   */
   private getDirPrefix(req: Req, kind: "h" | "u", pS: string, xS: string): Res {
     const p = decimal(pS);
     const x = decimal(xS);
     if (p === null || p > 32 || x === null || x >= 2 ** p) return err(400, "bad prefix");
     const afterS = req.url.searchParams.get("after");
     if (afterS !== null && !b64Param(afterS, 16)) return err(400, "bad after");
+    if (this.dir.takeDirFailure({ kind, p, x, after: afterS, who: req.who }))
+      return err(503, "directory unavailable");
     return this.dir.byPrefix(kind, p, x, afterS);
   }
 

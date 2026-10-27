@@ -15,6 +15,11 @@
  *   socket accepted before the previous UTC hour is closed whenever sockets are counted (an upgrade) or sent to
  *   (a publish), as the DO's hour-tag sweep does.
  *
+ * - The handshake: `FakeWebSocket.upgradeStatus` and `upgradeHeaders` hold the Worker's answer to the upgrade. A 101
+ *   is passed on exactly as the RealtimeDO built it, with none of the per-response headers (`x-segv-now`, HSTS,
+ *   `nosniff`, `no-referrer`; §9.7, §10.1): HELLO carries the server time instead. A refusal (404, 429, 503) is an
+ *   ordinary error response with all of them.
+ *
  * Test controls: `restart()` (new boot and empty ring, so the next RESUME gets GAP), `enabled` (false: new sockets
  * fail to connect and publishes are lost), `dropPublish(pred)` (lose matching publishes), `closeAll()`.
  */
@@ -32,8 +37,12 @@ import type { PublishRow } from "./common";
 export interface RtHost {
   now(): number;
   readonly rt: FakeRealtime;
-  /** The Worker side of `GET /api/v2/rt` (logs the request, RL_READ, then `rt.admit`); returns the status, 101 = accept. */
-  rtUpgrade(ws: FakeWebSocket): number;
+  /**
+   * The Worker side of `GET /api/v2/rt` with an upgrade (logs the request, RL_READ, then `rt.admit`). Returns the
+   * status (101 = accept, 0 = no answer) and the response headers: empty on a 101, the Worker's error headers on a
+   * refusal, null when no answer arrived (`hooks.fail`).
+   */
+  rtUpgrade(ws: FakeWebSocket): { status: number; headers: Headers | null };
   /** shard.hide(): rows hidden from `who` are not delivered to its sockets. */
   isHidden(E: number, label: Bytes, who: string | null): boolean;
 }
@@ -207,8 +216,9 @@ export class FakeRealtime {
   _connect(ws: FakeWebSocket): void {
     setTimeout(() => {
       if (ws.readyState !== FakeWebSocket.CONNECTING) return;
-      const status = this.host.rtUpgrade(ws);
+      const { status, headers } = this.host.rtUpgrade(ws);
       ws.upgradeStatus = status;
+      ws.upgradeHeaders = headers;
       if (status !== 101) {
         ws._fail();
         return;
@@ -388,7 +398,14 @@ export class FakeWebSocket {
   win = -1;
   frames = 0;
   changes = 0;
+  /** Status of the upgrade response: 101 = accepted, 0 = not answered yet (or the answer was lost). */
   upgradeStatus = 0;
+  /**
+   * Headers of the upgrade response (null until answered, or when the answer was lost). Empty on a 101: the Worker
+   * passes the RealtimeDO's 101 on unchanged, without `x-segv-now`, HSTS, `nosniff` or `no-referrer` (§9.7, §10.1).
+   * A refusal carries them all, as every other response does. (A browser exposes neither; this is for tests.)
+   */
+  upgradeHeaders: Headers | null = null;
   /** close code and reason once closed */
   closeCode: number | null = null;
   closeReason = "";

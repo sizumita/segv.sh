@@ -22,6 +22,7 @@ import {
   sleep,
   uninstallBrowserGlobals,
   waitFor,
+  type DirPrefixQuery,
 } from "./harness";
 
 freshWorldPerTest();
@@ -68,6 +69,12 @@ const getJson = async (path: string) => {
   return { res, j: (await res.json()) as Record<string, any> };
 };
 
+const IMMUTABLE = "public, max-age=31536000, immutable";
+const HSTS = "max-age=63072000; includeSubDomains";
+
+/** Moves the world clock to `ms` (sockets stay open). */
+const setNow = (world: FakeWorld, ms: number) => world.advance(ms - world.now(), { keepSockets: true });
+
 const postJson = (path: string, body: unknown) =>
   fetch(path, { method: "POST", body: JSON.stringify(body), headers: { "content-type": "application/json" } });
 
@@ -102,7 +109,7 @@ async function hello(c: ReturnType<typeof openRt>) {
 // ───────────────────────── clock and headers ─────────────────────────
 
 describe("clock and response headers", () => {
-  it("stamps x-segv-now on every response, with the Worker's cache-control", async () => {
+  it("stamps x-segv-now and the security headers on every response, with the Worker's cache-control", async () => {
     const world = server();
     const E = world.era;
     const blob = P.random(200);
@@ -135,13 +142,86 @@ describe("clock and response headers", () => {
       const t = nowHeader(res);
       expect(t, what).toBeGreaterThanOrEqual(before);
       expect(t, what).toBeLessThanOrEqual(after);
+      expect(res.headers.get("x-content-type-options"), what).toBe("nosniff");
+      expect(res.headers.get("referrer-policy"), what).toBe("no-referrer");
+      expect(res.headers.get("strict-transport-security"), what).toBeNull(); // http
       if (status >= 400) expect(typeof ((await res.json()) as { error?: unknown }).error, what).toBe("string");
     }
     const res405 = await fetch("/api/v2/put");
     expect(res405.headers.get("allow")).toBe("POST");
     world.ckpt.tick();
     const c1 = await fetch("/api/v2/ckpt/1");
-    expect(c1.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+    expect(c1.headers.get("cache-control")).toBe(IMMUTABLE);
+
+    // Over https every response also carries HSTS: JSON, binary, errors, cacheable and 304 alike.
+    const cases2: [string, RequestInit | undefined, number][] = [
+      ["/api/v2/params", undefined, 200],
+      ["/api/v2/get", { method: "POST", body: W.encodeGetRequest([{ E, label: P.random(16), mode: 1 }]) as BodyInit }, 200],
+      [`/api/v2/blob/${id}`, undefined, 200],
+      [`/api/v2/blob/${id}`, { headers: { "if-none-match": `"${id}"` } }, 304],
+      ["/api/v2/rt", undefined, 426],
+      ["/api/v2/nope", undefined, 404],
+    ];
+    for (const [path, init, status] of cases2) {
+      const res = await fetch(`https://segv.test${path}`, init);
+      expect(res.status, path).toBe(status);
+      expect(res.headers.get("strict-transport-security"), path).toBe(HSTS);
+      expect(res.headers.get("x-content-type-options"), path).toBe("nosniff");
+      expect(res.headers.get("referrer-policy"), path).toBe("no-referrer");
+      expect(Math.abs(nowHeader(res) - world.now()), path).toBeLessThan(1000);
+    }
+  });
+
+  it("the 101 upgrade carries none of the per-response headers (HELLO has the time); refused upgrades carry them all", async () => {
+    const world = server();
+    const a = openRt("alice");
+    const h = await hello(a);
+    expect(a.ws.upgradeStatus).toBe(101);
+    expect([...a.ws.upgradeHeaders!.keys()]).toEqual([]); // no x-segv-now, HSTS, nosniff or no-referrer
+    expect(Math.abs(h.now - world.now())).toBeLessThan(1000);
+    expect(world.requests.filter((r) => r.path === "/api/v2/rt").map((r) => r.status)).toEqual([101]);
+    // Over wss (an https request to the Worker) the 101 has no HSTS either.
+    const S = world.WebSocketAs("alice");
+    const s = new S("wss://segv.test/api/v2/rt");
+    await waitFor(() => s.readyState === FakeWebSocket.OPEN, "wss socket");
+    expect([...s.upgradeHeaders!.keys()]).toEqual([]);
+
+    // Every refusal is an ordinary error response: x-segv-now, nosniff, no-referrer, no-store, and HSTS over wss.
+    const refused = async (who: string, url = "ws://segv.test/api/v2/rt") => {
+      const WS = world.WebSocketAs(who);
+      const ws = new WS(url);
+      await waitFor(() => ws.readyState === FakeWebSocket.CLOSED, "refused upgrade");
+      const hd = ws.upgradeHeaders!;
+      expect(Math.abs(Number(hd.get("x-segv-now")) - world.now()), url).toBeLessThan(1000);
+      expect(hd.get("x-content-type-options"), url).toBe("nosniff");
+      expect(hd.get("referrer-policy"), url).toBe("no-referrer");
+      expect(hd.get("cache-control"), url).toBe("no-store");
+      expect(hd.get("strict-transport-security"), url).toBe(url.startsWith("wss:") ? HSTS : null);
+      return ws;
+    };
+    world.rt.limits.perClient = 2;
+    const cap = await refused("alice");
+    expect([cap.upgradeStatus, cap.upgradeHeaders!.get("retry-after")]).toEqual([429, "60"]);
+    expect((await refused("alice", "wss://segv.test/api/v2/rt")).upgradeStatus).toBe(429);
+    world.rateLimits({ RL_READ: { limit: 0 } });
+    const limited = await refused("bob");
+    expect([limited.upgradeStatus, limited.upgradeHeaders!.get("retry-after")]).toEqual([429, "60"]);
+    world.rateLimits(false);
+    world.wsEnabled = false;
+    expect((await refused("carol")).upgradeStatus).toBe(503);
+    world.wsEnabled = true;
+    expect((await refused("dave", "ws://segv.test/api/v2/elsewhere")).upgradeStatus).toBe(404);
+
+    // No answer (hooks.fail): no status and no headers; 'after' still logs the 101 the server gave.
+    for (const mode of ["before", "after"] as const) {
+      world.hooks.fail = () => mode;
+      const WS = world.WebSocketAs("erin");
+      const ws = new WS("ws://segv.test/api/v2/rt");
+      await waitFor(() => ws.readyState === FakeWebSocket.CLOSED, "failed upgrade");
+      expect([ws.upgradeStatus, ws.upgradeHeaders], mode).toEqual([0, null]);
+      expect(world.requests[world.requests.length - 1].status, mode).toBe(mode === "before" ? 0 : 101);
+    }
+    world.hooks.fail = undefined;
   });
 
   it("staleNow: cacheable responses carry an x-segv-now weeks old, no-store responses the current time", async () => {
@@ -298,17 +378,46 @@ describe("shard", () => {
     expect(await get([{ E: E1, label: P.random(16), mode: 1 }])).toEqual([{ s: "miss", sealed: false }]);
     expect((await get([{ E: E1, label: L, mode: 1 }]))[0].s).toBe("hit");
     expect((await put([putRow(E1, P.random(16))]))[0]).toEqual({ s: "wrong_era", era: E1 + 1 });
-    const info0 = await getJson(`/api/v2/era/${E1}`);
-    expect(info0.j.sealed).toBe(false);
-    expect(info0.res.headers.get("cache-control")).toBe("no-store");
 
     world.sealPrevious();
     expect(await get([{ E: E1, label: P.random(16), mode: 1 }])).toEqual([{ s: "miss", sealed: true }]);
-    const info = await getJson(`/api/v2/era/${E1}`);
-    expect(info.j).toMatchObject({ era: E1, start: P.eraStart(E1), end: P.eraEnd(E1), delta: 1, shards: 1, sealed: true });
-    expect(info.j.kcommit).toBe(P.b64u(world.kcommitOf(E1)));
-    expect(info.res.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
-    expect((await fetch(`/api/v2/era/${world.era + 1}`)).status).toBe(404);
+  });
+
+  it("/era/{E} answers from the world clock: sealed = now ≥ end(E) + SKEW, whatever the shard says (sealDelayMs, sealPrevious, shardLagMs)", async () => {
+    const world = server();
+    world.params.skew = 2;
+    world.sealDelayMs = 3_600_000;
+    const E = world.era;
+    const era = (n: number) => getJson(`/api/v2/era/${n}`);
+    await put([putRow(E, P.random(16))]);
+
+    // E + 1 exists for the Worker from end(E) − SKEW on (its bounds), unsealed.
+    setNow(world, P.eraEnd(E) - 3000);
+    expect((await fetch(`/api/v2/era/${E + 1}`)).status).toBe(404);
+    setNow(world, P.eraEnd(E) - 1000);
+    expect((await era(E + 1)).j.sealed).toBe(false);
+
+    // Within SKEW after end(E): not sealed, even with the shard of E sealed early (sealPrevious).
+    setNow(world, P.eraEnd(E) + 1000);
+    world.sealPrevious();
+    expect(await get([{ E, label: P.random(16), mode: 1 }])).toEqual([{ s: "miss", sealed: true }]);
+    const open = await era(E);
+    expect(open.j).toEqual({ era: E, start: P.eraStart(E), end: P.eraEnd(E), delta: 1, shards: 1, kcommit: P.b64u(world.kcommitOf(E)), sealed: false });
+    expect(open.res.headers.get("cache-control")).toBe("no-store");
+
+    // From end(E) + SKEW: sealed and immutable, while the shard of E + 1 is still open (sealDelayMs) and lags.
+    setNow(world, P.eraEnd(E + 1) + 2000);
+    world.shardLagMs = 600_000;
+    expect(await get([{ E: E + 1, label: P.random(16), mode: 1 }])).toEqual([{ s: "miss", sealed: false }]);
+    const sealed = await era(E + 1);
+    expect(sealed.j).toEqual({ era: E + 1, start: P.eraStart(E + 1), end: P.eraEnd(E + 1), delta: 1, shards: 1, kcommit: P.b64u(world.kcommitOf(E + 1)), sealed: true });
+    expect(sealed.res.headers.get("cache-control")).toBe(IMMUTABLE);
+    expect((await era(E)).j.sealed).toBe(true);
+
+    // Above era(now + SKEW), or below E_FIRST: 404.
+    expect((await fetch(`/api/v2/era/${E + 3}`)).status).toBe(404);
+    world.params.efirst = E + 1;
+    expect((await fetch(`/api/v2/era/${E}`)).status).toBe(404);
   });
 
   it("batches close lazily; the feed's roots and head chain recompute; t never falls into a closed batch", async () => {
@@ -431,6 +540,20 @@ describe("shard", () => {
     release();
     world.hooks.beforeRequest = undefined;
   });
+
+  it("x-segv-now is the time the request started being handled, as the Worker takes it (§10.1)", async () => {
+    const world = server();
+    const E = world.era;
+    world.hooks.beforePut = () => {
+      world.advance(5_000, { keepSockets: true }); // the put is held while the world clock moves
+    };
+    const started = world.now();
+    const res = await fetch("/api/v2/put", { method: "POST", body: W.encodePutRequest([putRow(E, P.random(16))]) as BodyInit });
+    world.hooks.beforePut = undefined;
+    expect(res.status).toBe(200);
+    expect(world.now() - started).toBeGreaterThanOrEqual(5_000);
+    expect(nowHeader(res) - started).toBeLessThan(1_000);
+  });
 });
 
 // ───────────────────────── blobs ─────────────────────────
@@ -495,6 +618,62 @@ describe("blobs", () => {
 
     world.blobreg.forceT(id, put1.t + 100);
     expect(await (await fetch(`/api/v2/blob/${id}/meta`)).json()).toEqual({ t: put1.t + 100, size: 500 });
+  });
+
+  it("GET carries content-length = the byte length, fresh and from the cache; a 304 carries none", async () => {
+    const world = server();
+    const blob = P.random(1234);
+    const { id } = world.putBlob(blob);
+    const g = await fetch(`/api/v2/blob/${id}`);
+    expect(g.headers.get("content-length")).toBe("1234");
+    expect(await bytesOf(g)).toEqual(blob);
+
+    world.cache(true);
+    await fetch(`/api/v2/blob/${id}`);
+    const hit = await fetch(`/api/v2/blob/${id}`);
+    expect(world.requests[world.requests.length - 1].cached).toBe(true);
+    expect(hit.headers.get("content-length")).toBe("1234");
+    expect(await bytesOf(hit)).toEqual(blob);
+    const nm = await fetch(`/api/v2/blob/${id}`, { headers: { "if-none-match": `"${id}"` } });
+    expect(nm.status).toBe(304);
+    expect(nm.headers.get("content-length")).toBeNull();
+  });
+
+  it("failMeta(id, n): blob/meta answers 503 n times, then the BlobReg's answer; only that id and route; n = 0 clears", async () => {
+    const world = server();
+    const { id, t } = world.putBlob(P.random(300));
+    const unreg = P.b64u(P.random(32));
+    world.blobreg.failMeta(id, 2);
+    world.blobreg.failMeta(unreg);
+    for (let i = 0; i < 2; i++) {
+      const res = await fetch(`/api/v2/blob/${id}/meta`);
+      expect(res.status).toBe(503);
+      expect(res.headers.get("cache-control")).toBe("no-store");
+      expect(Math.abs(nowHeader(res) - world.now())).toBeLessThan(1000);
+      expect(await res.json()).toEqual({ error: "storage unavailable" });
+      expect((await fetch(`/api/v2/blob/${id}`)).status).toBe(200); // the blob GET is not affected
+    }
+    expect(await (await fetch(`/api/v2/blob/${id}/meta`)).json()).toEqual({ t, size: 300 });
+    expect((await fetch(`/api/v2/blob/${unreg}/meta`)).status).toBe(503); // registered or not
+    expect((await fetch(`/api/v2/blob/${unreg}/meta`)).status).toBe(404);
+
+    // RL_READ answers first and consumes nothing.
+    world.blobreg.failMeta(id);
+    world.rateLimits({ RL_READ: { limit: 0 } });
+    expect((await fetch(`/api/v2/blob/${id}/meta`)).status).toBe(429);
+    world.rateLimits(false);
+    expect((await fetch(`/api/v2/blob/${id}/meta`)).status).toBe(503);
+    expect((await fetch(`/api/v2/blob/${id}/meta`)).status).toBe(200);
+
+    // Infinity fails until n = 0 clears it; failGet works the same way.
+    world.blobreg.failMeta(id, Infinity);
+    for (let i = 0; i < 5; i++) expect((await fetch(`/api/v2/blob/${id}/meta`)).status).toBe(503);
+    world.blobreg.failMeta(id, 0);
+    expect((await fetch(`/api/v2/blob/${id}/meta`)).status).toBe(200);
+    world.blobs.failGet(id, Infinity);
+    for (let i = 0; i < 3; i++) expect((await fetch(`/api/v2/blob/${id}`)).status).toBe(503);
+    world.blobs.failGet(id, 0);
+    expect((await fetch(`/api/v2/blob/${id}`)).status).toBe(200);
   });
 });
 
@@ -664,6 +843,177 @@ describe("inbox", () => {
 
     // An attacker post ignores the era window.
     expect(world.inbox.post(E0, [invite()], { rel: 5 })).toEqual([{ rel: 5 }]);
+  });
+
+  it("inboxJitter: rel = max(⌊(ms + j)/D⌋ + 1, closed_hw + 1), j clamped into [0, D), drawn once per inserted row", async () => {
+    const world = server();
+    const E = world.era;
+    setNow(world, P.eraStart(E) + P.ERA_MS / 2 + 20); // mid-era, 20 ms into slot s
+    const s = Math.floor((world.now() - P.T0_MS) / 1000);
+    const calls: { D: number; E: number; eid: Uint8Array }[] = [];
+    let j = 0;
+    world.inbox.inboxJitter((D, row) => {
+      calls.push({ D, ...row });
+      return j;
+    });
+    const relOf = async (rows: W.InboxPostRow[]) =>
+      ((await (await inboxPost(E, rows)).json()) as { results: W.InboxPostResult[] }).results.map((x) => ("rel" in x ? x.rel : x.error));
+    const cases: [number, number][] = [
+      [0, s + 1],
+      [500, s + 1],
+      [990, s + 2], // ⌊(20 + 990)/1000⌋ = 1
+      [999, s + 2], // D − 1: the latest slot
+      [5000, s + 2], // clamped to D − 1
+      [-7000, s + 1], // clamped to 0
+      [123.9, s + 1], // floored
+    ];
+    const first = invite();
+    for (const [jit, rel] of cases) {
+      j = jit;
+      expect(await relOf([jit === 0 ? first : invite()]), String(jit)).toEqual([rel]);
+    }
+    expect(calls).toHaveLength(cases.length);
+    expect(calls[0]).toEqual({ D: 1000, E, eid: first.eid });
+
+    // No draw for an idempotent retry, a conflict or a full row.
+    world.inbox.dayCap = world.inbox.rowsOf(E).length;
+    expect(await relOf([first, { eid: first.eid, body: P.random(P.INBOX_BODY_LEN) }, invite()])).toEqual([s + 1, "conflict", "full"]);
+    expect(calls).toHaveLength(cases.length);
+    world.inbox.dayCap = 2000;
+
+    // closed_hw wins after a clock step back: max(⌊(ms − 5000 + 999)/1000⌋ + 1, s + 1) = s + 1.
+    expect((await inboxRead(E)).r!.closed).toBe(s);
+    world.advance(-5000, { keepSockets: true });
+    j = 999;
+    expect(await relOf([invite()])).toEqual([s + 1]);
+    // An attacker post draws j too, unless it forces rel; null restores j = 0.
+    expect(world.inbox.post(E, [invite()], { rel: 3 })).toEqual([{ rel: 3 }]);
+    expect(calls).toHaveLength(cases.length + 1);
+    expect(world.inbox.post(E, [invite()])).toEqual([{ rel: s + 1 }]);
+    expect(calls).toHaveLength(cases.length + 2);
+    world.inbox.inboxJitter(null);
+    world.advance(5000, { keepSockets: true });
+    expect(await relOf([invite()])).toEqual([s + 1]);
+
+    // D is the era's pinned Δin: still 1 s here after INBOX_SLOT changes, 3 s in a new era.
+    world.params.inboxSlot = 3;
+    world.inbox.inboxJitter((D) => {
+      calls.push({ D, E: -1, eid: new Uint8Array(0) });
+      return 0;
+    });
+    await relOf([invite()]);
+    world.advanceEra();
+    await inboxPost(world.era, [invite()]);
+    expect(calls.slice(-2).map((c) => c.D)).toEqual([1000, 3000]);
+  });
+
+  it("jitter D − 1: a post D/2 before end(E) lands after end(E), hidden from reads before end(E) + D; posts stop at end(E), ended at end(E) + SKEW", async () => {
+    const world = server();
+    world.params.skew = 2;
+    const E = world.era;
+    const D = 1000;
+    const K = (P.eraEnd(E) - P.T0_MS) / D; // the slot that closes at end(E)
+    const relOf = async (rows: W.InboxPostRow[]) => ((await (await inboxPost(E, rows)).json()) as { results: { rel: number }[] }).results.map((x) => x.rel);
+    setNow(world, P.eraEnd(E) - D / 2);
+    const plain = invite();
+    expect(await relOf([plain])).toEqual([K]); // j = 0
+    world.inbox.inboxJitter((d) => d - 1);
+    const late = invite();
+    expect(await relOf([late])).toEqual([K + 1]); // ⌊(end(E) − T0 − D/2 + D − 1)/D⌋ + 1
+
+    for (const at of [P.eraEnd(E) - 400, P.eraEnd(E) + 10, P.eraEnd(E) + 900]) {
+      setNow(world, at);
+      const r = (await inboxRead(E)).r!;
+      expect(r.closed, String(at - P.eraEnd(E))).toBe(at < P.eraEnd(E) ? K - 1 : K);
+      expect(r.rows.some((x) => P.equalBytes(x.eid, late.eid))).toBe(false);
+    }
+    // Posts stop at end(E) by the InboxDO's clock, although the Worker's bounds (SKEW) still let E through.
+    const refused = await inboxPost(E, [invite()]);
+    expect(refused.status).toBe(409);
+    expect(await refused.json()).toEqual({ error: "wrong era", era: E + 1 });
+
+    // At end(E) + D the era has not ended yet (SKEW = 2 s): closed = K + 1 shows the row, with a short max-age.
+    setNow(world, P.eraEnd(E) + D + 10);
+    const open = await inboxRead(E);
+    expect(open.r!.closed).toBe(K + 1);
+    expect(open.r!.rows.map((x) => x.rel)).toEqual([K, K + 1]);
+    expect(open.res.headers.get("cache-control")).toBe("public, max-age=1");
+    // From end(E) + SKEW the era has ended: closed = max(largest rel, closed_hw) = K + 1, final and immutable.
+    setNow(world, P.eraEnd(E) + 2000);
+    const ended = await inboxRead(E);
+    expect(ended.r).toEqual({
+      closed: K + 1,
+      more: false,
+      rows: [
+        { rel: K, eid: plain.eid, body: plain.body },
+        { rel: K + 1, eid: late.eid, body: late.body },
+      ],
+    });
+    expect(ended.res.headers.get("cache-control")).toBe(IMMUTABLE);
+  });
+
+  it("wrongEraOnce(): the next post past the Worker's checks gets 409 {error: 'wrong era', era} and stores nothing; calls queue up", async () => {
+    const world = server();
+    const E = world.era;
+    const writes = world.writeCount;
+    world.inbox.wrongEraOnce();
+    const inv = invite();
+    const r1 = await inboxPost(E, [inv]);
+    expect(r1.status).toBe(409);
+    expect(await r1.json()).toEqual({ error: "wrong era", era: E }); // by default the inbox clock's era
+    expect(r1.headers.get("cache-control")).toBe("no-store");
+    expect(world.inbox.rowsOf(E)).toEqual([]);
+    expect(world.writeCount).toBe(writes);
+    expect((await inboxPost(E, [inv])).status).toBe(200); // once
+
+    // An explicit era; two calls refuse the next two posts.
+    world.inbox.wrongEraOnce(E + 1);
+    world.inbox.wrongEraOnce();
+    expect(await (await inboxPost(E, [invite()])).json()).toEqual({ error: "wrong era", era: E + 1 });
+    expect(await (await inboxPost(E, [invite()])).json()).toEqual({ error: "wrong era", era: E });
+    expect((await inboxPost(E, [invite()])).status).toBe(200);
+
+    // Posts the Worker refuses itself (a bad bucket, an era outside its bounds) never reach it.
+    world.inbox.wrongEraOnce(E + 7);
+    const bad = W.encodeInboxPost({ E, bucket: 0, rows: [invite()] });
+    bad[5] = 1; // bucket 1
+    expect((await fetch("/api/v2/inbox", { method: "POST", body: bad as BodyInit })).status).toBe(400);
+    expect(await (await inboxPost(E + 1, [invite()])).json()).toEqual({ error: "wrong era", era: E });
+    expect(await (await inboxPost(E, [invite()])).json()).toEqual({ error: "wrong era", era: E + 7 });
+    expect(world.inbox.rowsOf(E)).toHaveLength(2);
+  });
+
+  it("inboxLagMs: the InboxDO's rel, closed, era window and ended follow its own clock; the Worker's bounds do not", async () => {
+    const world = server();
+    const E = world.era;
+    setNow(world, P.eraStart(E) + P.ERA_MS / 2 + 20); // mid-era, 20 ms into slot s
+    world.inboxLagMs = 5000;
+    const s = Math.floor((world.now() - P.T0_MS) / 1000);
+    const posted = (await (await inboxPost(E, [invite()])).json()) as { results: { rel: number }[] };
+    expect(posted.results[0].rel).toBe(s - 4); // ⌊(ms − 5000)/1000⌋ + 1
+    const r = await inboxRead(E);
+    expect(r.r).toEqual({ closed: s - 5, more: false, rows: [] });
+    expect(world.inbox.closedNow(E)).toBe(s - 5);
+
+    // Just after end(E) the Worker is in E + 1 and the inbox clock still in E.
+    setNow(world, P.eraEnd(E) + 1000);
+    const toE = await inboxPost(E, [invite()]); // the Worker's bounds (SKEW = 0): its own era
+    expect(toE.status).toBe(409);
+    expect(await toE.json()).toEqual({ error: "wrong era", era: E + 1 });
+    const toNext = await inboxPost(E + 1, [invite()]); // past the Worker, refused by the InboxDO: its clock's era
+    expect(toNext.status).toBe(409);
+    expect(await toNext.json()).toEqual({ error: "wrong era", era: E });
+    expect(world.inbox.rowsOf(E + 1)).toEqual([]);
+    // E has not ended by the inbox clock, so its reads are not final.
+    const notEnded = await inboxRead(E);
+    expect(notEnded.res.headers.get("cache-control")).toBe("public, max-age=1");
+    expect(notEnded.r!.closed).toBe((P.eraEnd(E) - P.T0_MS) / 1000 - 4);
+    // The inbox clock catches up: E has ended, closed = max(largest rel, closed_hw).
+    world.inboxLagMs = 0;
+    const ended = await inboxRead(E);
+    expect(ended.res.headers.get("cache-control")).toBe(IMMUTABLE);
+    expect(ended.r!.closed).toBe(notEnded.r!.closed);
+    expect(ended.r!.rows.map((x) => x.rel)).toEqual([s - 4]);
   });
 });
 
@@ -1135,6 +1485,44 @@ describe("directory", () => {
     const page = (await getJson("/api/v2/dirlog?after=120&limit=5")).j;
     expect(page.entries.map((e: { seq: number }) => e.seq)).toEqual([121, 122, 123, 124, 125]);
     expect((await fetch("/api/v2/dirlog?limit=0")).status).toBe(400);
+  });
+
+  it("failDir(pred, n): matching prefix lookups answer 503 n times; malformed lookups, other lookups and routes are unaffected", async () => {
+    const world = server();
+    const u = makeUser("alice");
+    const seen: DirPrefixQuery[] = [];
+    world.dir.failDir((q) => {
+      seen.push(q);
+      return q.kind === "h";
+    }, 2);
+    const first = await fetch("/api/v2/dir/h/0/0", { headers: whoHeader("bob") });
+    expect(first.status).toBe(503);
+    expect(await first.json()).toEqual({ error: "directory unavailable" });
+    expect(first.headers.get("cache-control")).toBe("no-store");
+    expect(Math.abs(nowHeader(first) - world.now())).toBeLessThan(1000);
+    expect(seen).toEqual([{ kind: "h", p: 0, x: 0, after: null, who: "bob" }]);
+    expect((await fetch("/api/v2/dir/u/0/0")).status).toBe(200); // pred false
+    expect((await fetch("/api/v2/dir/h/1/2")).status).toBe(400); // malformed: never reaches D1
+    expect((await fetch("/api/v2/dir/h/0/0?after=x")).status).toBe(400);
+    expect(seen).toHaveLength(2);
+    // D1 fails before the prefix-bits check (p = 2 > P + 1 would be 409).
+    expect((await fetch(`/api/v2/dir/h/2/0?after=${u.uidB}`)).status).toBe(503);
+    expect(seen[2]).toEqual({ kind: "h", p: 2, x: 0, after: u.uidB, who: null });
+    expect((await getJson("/api/v2/dir/h/0/0")).j.users).toHaveLength(1); // spent
+    expect((await fetch("/api/v2/dir/h/2/0")).status).toBe(409);
+
+    // Infinity until failDir(null); dir/uid, dir/wraps and dirlog are never affected.
+    world.dir.failDir(() => true, Infinity);
+    for (const path of ["/api/v2/dir/h/0/0", "/api/v2/dir/u/1/1", "/api/v2/dir/h/0/0"]) expect((await fetch(path)).status, path).toBe(503);
+    for (const path of [`/api/v2/dir/uid/${u.uidB}`, `/api/v2/dir/wraps/${P.b64u(u.rk.id)}`, "/api/v2/dirlog"]) expect((await fetch(path)).status, path).toBe(200);
+    world.dir.failDir(null);
+    expect((await fetch("/api/v2/dir/h/0/0")).status).toBe(200);
+
+    // Rules add up; a lookup consumes one failure of the first rule that matches.
+    world.dir.failDir((q) => q.who === "carol", 1);
+    world.dir.failDir(() => true, 1);
+    const asCarol = () => fetch("/api/v2/dir/h/0/0", { headers: whoHeader("carol") });
+    expect([(await asCarol()).status, (await asCarol()).status, (await asCarol()).status]).toEqual([503, 503, 200]);
   });
 });
 

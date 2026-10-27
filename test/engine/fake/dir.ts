@@ -5,6 +5,8 @@
  *
  * `register(body)` and `postWrap(body)` are the HTTP handlers and are also called directly by tests (e.g. to register
  * a user between two engines' evaluations, SEC-3). They return the HTTP status and JSON body.
+ *
+ * Failure knob: `failDir(pred, n)` (prefix lookups for which `pred` holds answer 503 n times).
  */
 import {
   MAX_ID_LEN,
@@ -59,6 +61,17 @@ export interface DirlogRow {
   h: string;
 }
 
+/** A prefix lookup (`GET /api/v2/dir/{kind}/{p}/{x}[?after=]`) as `failDir` predicates see it. */
+export interface DirPrefixQuery {
+  kind: "h" | "u";
+  p: number;
+  x: number;
+  /** the `after` uid (b64u), or null */
+  after: string | null;
+  /** the requesting client (FakeWorld request attribution), or null */
+  who: string | null;
+}
+
 /** The JSON shape of a user in lookups (§10.6). */
 export const userJson = (u: DirUserRow) => ({
   uid: u.uid,
@@ -99,6 +112,8 @@ export class FakeDirectory {
   private headH: Bytes = ZERO32;
   /** dirmeta.users */
   userCount = 0;
+  /** failDir rules, in the order they were added */
+  private readonly failRules: { pred: (q: DirPrefixQuery) => boolean; left: number }[] = [];
 
   constructor(private readonly w: WorldCtx) {}
 
@@ -213,6 +228,30 @@ export class FakeDirectory {
       entries: this.log.filter((e) => e.seq > after).slice(0, limit),
       head: { seq: this.log.length, h: b64u(this.headH) },
     };
+  }
+
+  // ───────────── failure knob ─────────────
+
+  /**
+   * The next `n` prefix lookups (`GET /api/v2/dir/{h|u}/{p}/{x}`) for which `pred` holds answer 503
+   * `{error: "directory unavailable"}`, as the Worker does when D1 fails (§9.6, §10.6). A lookup fails after its
+   * path and query checks (a malformed one still gets its 400 and consumes nothing) and RL_READ, before the
+   * prefix-bits check (409). Rules add up: a lookup consumes one failure of the first rule that matches. n = Infinity
+   * fails until `failDir(null)`, which removes every rule. Other directory routes (`dir/uid`, `dir/wraps`, `dirlog`,
+   * register, wraps) are not affected.
+   */
+  failDir(pred: ((q: DirPrefixQuery) => boolean) | null, n = 1): void {
+    if (pred === null) this.failRules.length = 0;
+    else if (n > 0) this.failRules.push({ pred, left: n });
+  }
+
+  /** (internal) Consumes one failure for this lookup; true when it must answer 503. */
+  takeDirFailure(q: DirPrefixQuery): boolean {
+    const i = this.failRules.findIndex((r) => r.pred({ ...q }));
+    if (i < 0) return false;
+    const r = this.failRules[i];
+    if (--r.left <= 0) this.failRules.splice(i, 1);
+    return true;
   }
 
   // ───────────── internals ─────────────

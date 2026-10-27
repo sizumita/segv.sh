@@ -6,7 +6,8 @@
  * (`now`), never the shard clock, so `world.shardLagMs` separates the two.
  *
  * Test controls: `forceT(id, t)` (forge a late registration), `missNow(fn)` (override the `now` a MISS reports),
- * and on the store `failGet(id, n)` (blob GET answers 503 n times).
+ * `failMeta(id, n)` (`GET /api/v2/blob/{id}/meta` answers 503 n times), and on the store `failGet(id, n)` (blob GET
+ * answers 503 n times). For both fail knobs, calls add up, n = Infinity fails until cleared, and n = 0 clears.
  */
 import {
   H,
@@ -23,7 +24,7 @@ import {
   BLOBREG_CID,
   type Bytes,
 } from "../../../src/lib/proto";
-import type { WorldCtx } from "./common";
+import { FailCounts, type WorldCtx } from "./common";
 
 export interface BlobRegEntry {
   readonly id: Bytes;
@@ -44,6 +45,7 @@ export class FakeBlobReg {
   readonly batches: { t: number; n: number; root: Bytes; head: Bytes }[] = [];
   private readonly open = new Map<number, BlobRegEntry[]>();
   private missHook: ((idB: string, now: number) => number | null | undefined) | null = null;
+  private readonly metaFailures = new FailCounts();
 
   constructor(private readonly w: WorldCtx) {}
 
@@ -115,6 +117,20 @@ export class FakeBlobReg {
     this.missHook = fn;
   }
 
+  /**
+   * The next `n` `GET /api/v2/blob/{idB}/meta` requests answer 503 `{error: "storage unavailable"}` (a failed
+   * BlobReg call), whether or not `idB` is registered. They fail after the id check and RL_READ, as a DO call would;
+   * other routes (blob GET and PUT) are not affected. Calls add up; Infinity fails until `failMeta(idB, 0)` clears.
+   */
+  failMeta(idB: string, n = 1): void {
+    this.metaFailures.add(idB, n);
+  }
+
+  /** (internal) Consumes one pending meta failure of `idB`; true when this request must fail. */
+  takeMetaFailure(idB: string): boolean {
+    return this.metaFailures.take(idB);
+  }
+
   private closeDue(): void {
     this.closeBefore(tpub(this.w.now(), this.w.params.delta));
   }
@@ -140,7 +156,7 @@ export class FakeBlobReg {
 /** The R2 bucket: content-addressed bytes, plus the failGet knob. */
 export class FakeBlobs {
   private readonly store = new Map<string, Bytes>();
-  private readonly failures = new Map<string, number>();
+  private readonly failures = new FailCounts();
 
   has(idB: string): boolean {
     return this.store.has(idB);
@@ -162,18 +178,14 @@ export class FakeBlobs {
     this.store.delete(idB);
   }
 
-  /** The next `n` GETs of `idB` answer 503. */
+  /** The next `n` GETs of `idB` answer 503. Calls add up; Infinity fails until `failGet(idB, 0)` clears. */
   failGet(idB: string, n = 1): void {
-    this.failures.set(idB, (this.failures.get(idB) ?? 0) + n);
+    this.failures.add(idB, n);
   }
 
   /** Consumes one pending failure of `idB`; true when this GET must fail. */
   takeFailure(idB: string): boolean {
-    const n = this.failures.get(idB) ?? 0;
-    if (n <= 0) return false;
-    if (n === 1) this.failures.delete(idB);
-    else this.failures.set(idB, n - 1);
-    return true;
+    return this.failures.take(idB);
   }
 
   get size(): number {

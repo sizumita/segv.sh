@@ -8,9 +8,9 @@
  *  - era bounds are checked with the Worker's clock before any per-era DO is addressed, so nobody can
  *    instantiate (and arm alarms in) arbitrary era objects;
  *  - immutable responses and the short-lived inbox tail are served from caches.default before the rate
- *    limiter;
- *  - every response carries a fresh `x-segv-now` stamped on the object actually returned (never stored in
- *    caches.default, §10.1).
+ *    limiter; a feed page takes one RL_READ token per started 4 MiB;
+ *  - every response except the 101 WebSocket upgrade carries a fresh `x-segv-now` (never stored in
+ *    caches.default, §10.1), nosniff, no-referrer and HSTS (https), stamped on the object actually returned.
  */
 import {
   BLOB_MAX,
@@ -107,8 +107,10 @@ import {
 /** Request body caps (bytes, §10.3–§10.6). */
 export const MAX_REGISTER_BODY = 64 * 1024;
 export const MAX_WRAP_BODY = 16 * 1024;
-/** Page budget of the public feed (§10.9). */
+/** Page budget of the public feed (§10.9), and the page size that one RL_READ token pays for. */
 const FEED_BUDGET = 4 * 1024 * 1024;
+/** Wire bytes of a feed page header (u8 more | u32 nb, §10.9). */
+const FEED_PAGE_HDR = 1 + 4;
 const TEXT_MAX = 12_000;
 /** Stage 1 runs one shard per era (s_E = 0). */
 const SHARD_BITS = 0;
@@ -702,6 +704,9 @@ async function feed(c: Ctx, E: number, i: number): Promise<Response> {
   // from the shard ≤ FEED_BUDGET per RPC. The first pull happens before the 200 so that a shard failure is a 5xx.
   // Not stored in caches.default: a tee of the stream would buffer the whole batch for the slower reader.
   const big = page.batches.find((b) => !b.rows)!;
+  // One RL_READ token per started FEED_BUDGET of page (§10.2, §10.9): the first was taken above, the others are
+  // taken here, before any row is read, so a refused one is a 429 that cost the shard no feedRows call.
+  for (let k = Math.ceil((FEED_PAGE_HDR + big.bytes) / FEED_BUDGET) - 1; k > 0; k--) await readLimit(c);
   const first = await shard.feedRows(E, i, big.t, null, FEED_BUDGET);
   return new Response(feedStream(shard, E, i, page, first), {
     headers: { "content-type": OCTET, "cache-control": cacheControl, ...SECURITY_HEADERS },
@@ -964,15 +969,19 @@ export function routeLabel(path: string): string {
 }
 
 /**
- * Stamps `x-segv-now` and HSTS (https only) on the response actually returned (after any cache lookup).
- * Responses from caches.default have immutable headers, so they are copied. 101 (WebSocket) responses are left
- * alone: their HELLO frame carries the server time. The Worker entries also apply it to the 421 of host pinning
- * on /api/v2/* paths, which never reaches handleApi (§10.1: every /api/v2/* response carries x-segv-now).
+ * Stamps `x-segv-now`, `nosniff`, `no-referrer` and HSTS (https only) on the response actually returned (after any
+ * cache lookup), whoever built it: JSON, binary, streamed, or a caches.default entry (whose stored headers are not
+ * trusted to carry them). Responses from caches.default have immutable headers, so they are copied. The 101
+ * WebSocket upgrade gets none of these headers: it is returned exactly as the RealtimeDO built it (its headers are
+ * immutable, and its HELLO frame carries the server time; §9.7, §10.1). The Worker entries also apply it to the 421
+ * of host pinning on /api/v2/* paths, which never reaches handleApi (§10.1: every /api/v2/* response carries
+ * x-segv-now).
  */
 export function stampResponse(res: Response, url: URL, now = Date.now()): Response {
   if (res.status === 101) return res;
   const stamp = (r: Response): Response => {
     r.headers.set("x-segv-now", String(now));
+    for (const [k, v] of Object.entries(SECURITY_HEADERS)) r.headers.set(k, v);
     if (url.protocol === "https:") r.headers.set("strict-transport-security", HSTS);
     return r;
   };

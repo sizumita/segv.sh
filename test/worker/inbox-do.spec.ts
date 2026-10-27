@@ -279,8 +279,10 @@ describe("InboxDO posts", () => {
         },
         0,
       );
+    // IMP-9: start(E) − SKEW·1000 − 1 is refused; start(E) − SKEW·1000 and + 1 are accepted.
     expect(await early(P.eraStart(E) - 2_001)).toEqual({ s: "wrong_era", era: E - 1 });
     expect(rels(await early(P.eraStart(E) - 2_000))).toEqual([slotOf(P.eraStart(E) - 2_000) + 1]);
+    expect(rels(await early(P.eraStart(E) - 1_999))).toEqual([slotOf(P.eraStart(E) - 1_999) + 1]);
     expect(await early(P.eraEnd(E) + 1_000)).toEqual({ s: "wrong_era", era: E + 1 });
   });
 
@@ -447,6 +449,80 @@ describe("InboxDO era end", () => {
     const c = box();
     expect((await c.read(end - 1)).closed).toBe(slotOf(end - 1));
     expect(await c.read(end + 1)).toMatchObject({ closed: slotOf(end - 1), ended: true, rows: [] });
+
+    // head() persists closed_hw as read does: an empty era whose only report came from head() ends there too.
+    const d = box();
+    expect(await d.head(end - 1)).toMatchObject({ tLast: 0, ended: false });
+    expect(await d.meta("closed_hw")).toBe(slotOf(end - 1));
+    expect(await d.read(end + DAY_MS)).toMatchObject({ closed: slotOf(end - 1), ended: true, more: false, rows: [] });
+    // With nothing ever reported, an empty era ends at closed = 0.
+    expect(await box().read(end)).toMatchObject({ closed: 0, ended: true, rows: [] });
+  });
+
+  it("a post at end(E) − D/2 with jitter D − 1 is above the closed of every read before end(E) + D; a read after ended returns it", async () => {
+    const b = box();
+    const end = P.eraEnd(b.E);
+    const SKEW_MS = 2_000; // ≥ D: reads up to end(E) + D still run before `ended`
+    const call = <R>(now: number, fn: (inst: Inner) => R) =>
+      b.at(
+        now,
+        (inst) => {
+          inst.skewMs = SKEW_MS;
+          return fn(inst);
+        },
+        D - 1,
+      );
+    const x = invite();
+    const [rel] = rels(await call(end - D / 2, (i) => i.post(b.E, b.g, 0, [x]))) as number[];
+    expect(rel).toBe((end - P.T0_MS) / D + 1);
+    for (const now of [end - D / 2, end - 1, end, end + D / 2, end + D - 1]) {
+      const r = await call(now, (i) => i.read(b.E, b.g, 0, 0, 1024));
+      expect(r.ended, String(now - end)).toBe(false);
+      expect(r.closed, String(now - end)).toBeLessThan(rel);
+      expect(r.rows).toEqual([]);
+    }
+    // Posts closed at end(E); once the era has ended, a read returns the row and closed covers it.
+    expect(await call(end, (i) => i.post(b.E, b.g, 0, [invite()]))).toEqual({ s: "wrong_era", era: b.E + 1 });
+    const r = await call(end + SKEW_MS, (i) => i.read(b.E, b.g, 0, 0, 1024));
+    expect(r).toMatchObject({ closed: rel, ended: true, more: false });
+    expect(r.rows.map((y) => [y.rel, P.b64u(y.eid)])).toEqual([[rel, P.b64u(x.eid)]]);
+
+    // The same with SKEW = 0: every read before end(E) misses it, and the first read at end(E) (ended) returns it.
+    const c = box();
+    const [rel0] = rels(await c.post(end - D / 2, [x], D - 1));
+    expect(rel0).toBe(rel);
+    expect((await c.read(end - 1)).rows).toEqual([]);
+    expect(await c.read(end)).toMatchObject({ closed: rel, ended: true, rows: [{ rel, eid: x.eid, body: x.body }] });
+  });
+
+  it("an alarm that fires before end(E) + SKEW sets no `ended` and re-arms at max(end(E) + SKEW, now + 1000)", async () => {
+    const b = box();
+    const end = P.eraEnd(b.E);
+    const alarm = () => runInDurableObject(b.stub, (_i: InboxDO, s) => s.storage.getAlarm());
+    const fire = async (now: number, skewMs = 0) => {
+      await b.at(now, (inst) => void (inst.skewMs = skewMs));
+      expect(await runDurableObjectAlarm(b.stub)).toBe(true);
+    };
+    expect(await alarm()).toBe(end); // armed by the constructor (SKEW = 0)
+
+    // A few ms early (the alarm ran ahead of this object's clock): 1 s from now, never at once.
+    await fire(end - 5);
+    expect(await b.meta("ended")).toBeUndefined();
+    expect(await alarm()).toBe(end - 5 + 1000);
+    // Well before the end: at end(E) + SKEW.
+    await fire(end - 60_000);
+    expect(await b.meta("ended")).toBeUndefined();
+    expect(await alarm()).toBe(end);
+    await fire(end - 60_000, 2_000);
+    expect(await alarm()).toBe(end + 2_000);
+    // Inside the SKEW window after end(E): not ended yet, and again never sooner than now + 1000.
+    await fire(end + 1_500, 2_000);
+    expect(await b.meta("ended")).toBeUndefined();
+    expect(await alarm()).toBe(end + 2_500);
+    // On time: `ended` is persisted and nothing is re-armed.
+    await fire(end + 2_000, 2_000);
+    expect(await b.meta("ended")).toBe(1);
+    expect(await alarm()).toBeNull();
   });
 
   it("prepare() seals without the alarm, and SKEW delays it", async () => {

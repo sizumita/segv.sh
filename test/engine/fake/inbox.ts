@@ -1,19 +1,22 @@
 /**
- * InboxDO fake (docs/PROTOCOL-v2.md §9.3), one per era, bucket 0 only (β = 0).
+ * InboxDO fake (docs/PROTOCOL-v2.md §9.3), one per era, bucket 0 only (β = 0). It reads the world's *inbox* clock
+ * (`now − inboxLagMs`); the Worker's checks in front of it (era bounds, 410) read the world clock.
  *
- * Jitter is 0, so with `D = Δin · 1000` and `ms = now − T0`:
- *   rel    = max(⌊ms / D⌋ + 1, closed_hw + 1)
+ * With `D = Δin · 1000`, `ms = now − T0` and a per-row jitter j ∈ [0, D) (0 unless `inboxJitter` sets it):
+ *   rel    = max(⌊(ms + j) / D⌋ + 1, closed_hw + 1)
  *   closed = max(⌊ms / D⌋, closed_hw)               (after `ended`: max(max rel, closed_hw), so it never falls)
  * Δin is pinned per era by the era's first write (a persisted closed_hw or an inserted row); before that it is
  * `params.inboxSlot`, so changing the parameter mid-era does not freeze `closed`.
  * Posts are accepted while `start(E) − SKEW ≤ now < end(E)` and the era has not ended (`ended` is set once
- * `now ≥ end(E) + SKEW`). Each post row gets `rel`, `conflict` (eid reused with another body) or `full` (the day
- * cap; posts in the SKEW window before start(E) count against the era's first day, so an era holds at most
+ * `now ≥ end(E) + SKEW`); otherwise the whole post is WRONG_ERA(era(now)), which the Worker answers with 409
+ * `{error: "wrong era", era}`. Each post row gets `rel`, `conflict` (eid reused with another body) or `full` (the
+ * day cap; posts in the SKEW window before start(E) count against the era's first day, so an era holds at most
  * 7 · dayCap rows). Reads return whole rel groups and persist `closed_hw`. Slots with rows are committed (head
  * chain, t = rel) once closed.
  *
- * Test controls: `dayCap` (default 2000), `rollDay()` (a new cap day), and `post()` (an attacker post that
- * bypasses the era window, rate limits and PoW).
+ * Test controls: `dayCap` (default 2000), `rollDay()` (a new cap day), `inboxJitter(fn)` (the per-row j),
+ * `wrongEraOnce(era?)` (refuse the next post with WRONG_ERA), and `post()` (an attacker post that bypasses the
+ * era window, rate limits and PoW).
  */
 import {
   T0_MS,
@@ -41,6 +44,13 @@ export interface InboxStoredRow {
 
 export type InboxRowResult = { rel: number } | { error: "conflict" } | { error: "full" };
 
+/**
+ * An `inboxJitter` callback: the jitter j (ms) of one row being inserted, given `D = Δin · 1000` of its era (the
+ * pinned value) and the row. Called once per inserted row (never for an idempotent retry, a conflict or a full
+ * row); the result is floored and clamped into [0, D), as the InboxDO clamps its own.
+ */
+export type InboxJitterFn = (D: number, row: { E: number; eid: Bytes }) => number;
+
 class InboxEra {
   /** every row, kept sorted by (rel, eid) */
   readonly rows: InboxStoredRow[] = [];
@@ -65,6 +75,9 @@ export class FakeInbox {
   dayCap = INBOX_DAY_CAP;
   private dayOffset = 0;
   private readonly eras = new Map<number, InboxEra>();
+  private jitterFn: InboxJitterFn | null = null;
+  /** wrongEraOnce(): the eras the next posts are refused with (undefined: the era of the inbox clock) */
+  private readonly forcedWrongEra: (number | undefined)[] = [];
 
   constructor(private readonly w: WorldCtx) {}
 
@@ -75,8 +88,10 @@ export class FakeInbox {
     E: number,
     rows: readonly { eid: Bytes; body: Bytes }[],
   ): { s: "wrong_era"; era: number } | { s: "ok"; results: InboxRowResult[] } {
-    const s = this.prepare(E);
-    const now = this.w.now();
+    const now = this.w.inboxNow();
+    const s = this.prepare(E, now);
+    if (this.forcedWrongEra.length > 0)
+      return { s: "wrong_era", era: this.forcedWrongEra.shift() ?? era(now) };
     if (s.ended || now < eraStart(E) - this.w.params.skew * 1000 || now >= eraEnd(E))
       return { s: "wrong_era", era: era(now) };
     return { s: "ok", results: rows.map((r) => this.insert(s, r, now, false)) };
@@ -88,8 +103,9 @@ export class FakeInbox {
     after: number,
     limit: number,
   ): { closed: number; more: boolean; rows: InboxStoredRow[]; ended: boolean } {
-    const s = this.prepare(E);
-    const closed = this.report(s);
+    const now = this.w.inboxNow();
+    const s = this.prepare(E, now);
+    const closed = this.report(s, now);
     const out: InboxStoredRow[] = [];
     let more = false;
     for (let i = firstAbove(s.rows, after); i < s.rows.length && s.rows[i].rel <= closed;) {
@@ -105,30 +121,50 @@ export class FakeInbox {
 
   /** InboxDO.head: commits every closed slot, then `{head, tLast, ended}`. */
   head(E: number): { head: Bytes; tLast: number; ended: boolean } {
-    const s = this.prepare(E);
-    this.report(s);
+    const now = this.w.inboxNow();
+    const s = this.prepare(E, now);
+    this.report(s, now);
     return { head: s.head, tLast: Math.max(0, s.lastSlot), ended: s.ended };
   }
 
   /** `closed` as a read would report it now (without persisting anything). */
   closedNow(E: number): number {
-    const s = this.prepare(E);
-    return this.closed(s);
+    const now = this.w.inboxNow();
+    return this.closed(this.prepare(E, now), now);
   }
 
   // ───────────── test / attacker controls ─────────────
 
   /**
+   * The per-row jitter j of the rel formula (default 0): `fn(D, row)` is called once per inserted row and its
+   * result is clamped into [0, D) (see InboxJitterFn). `(D) => D - 1` is the maximum, the latest slot a row can
+   * get. Applies to `post()` too, unless it forces `rel`. null restores j = 0.
+   */
+  inboxJitter(fn: InboxJitterFn | null): void {
+    this.jitterFn = fn;
+  }
+
+  /**
+   * The next post that reaches the InboxDO (one that passed the Worker's checks: rate limit, length, bucket, era
+   * bounds) is refused as a whole with WRONG_ERA, which the Worker answers with 409 `{error: "wrong era", era}`.
+   * Nothing is stored or counted against the day cap. `reported` is the era the refusal names; by default the era
+   * of the inbox clock, as InboxDO.post reports it. Calls queue up: n calls refuse the next n posts.
+   */
+  wrongEraOnce(reported?: number): void {
+    this.forcedWrongEra.push(reported);
+  }
+
+  /**
    * An attacker post straight into era E's inbox: no era window, rate limit or PoW. Conflicts still apply, and the
-   * day cap unless `ignoreCap`. `rel` forces the slot (default: the formula above).
+   * day cap unless `ignoreCap`. `rel` forces the slot (default: the formula above, with the `inboxJitter` j).
    */
   post(
     E: number,
     rows: readonly { eid: Bytes; body: Bytes }[],
     opts: { rel?: number; ignoreCap?: boolean } = {},
   ): InboxRowResult[] {
-    const s = this.prepare(E);
-    const now = this.w.now();
+    const now = this.w.inboxNow();
+    const s = this.prepare(E, now);
     return rows.map((r) => this.insert(s, r, now, opts.ignoreCap ?? false, opts.rel));
   }
 
@@ -139,8 +175,9 @@ export class FakeInbox {
 
   /** Rows of era E posted but not yet visible to readers (rel > closed). */
   pending(E: number): number {
-    const s = this.prepare(E);
-    return s.rows.length - firstAbove(s.rows, this.closed(s));
+    const now = this.w.inboxNow();
+    const s = this.prepare(E, now);
+    return s.rows.length - firstAbove(s.rows, this.closed(s, now));
   }
 
   /** Rows of every era posted but not yet visible to readers (settle waits for 0). */
@@ -168,9 +205,10 @@ export class FakeInbox {
     return s;
   }
 
-  private prepare(E: number): InboxEra {
+  /** The DO's prepare(): persists `ended` once `now ≥ end(E) + SKEW` by the inbox clock. */
+  private prepare(E: number, now: number): InboxEra {
     const s = this.eraState(E);
-    if (!s.ended && this.w.now() >= eraEnd(E) + this.w.params.skew * 1000) s.ended = true;
+    if (!s.ended && now >= eraEnd(E) + this.w.params.skew * 1000) s.ended = true;
     return s;
   }
 
@@ -184,14 +222,14 @@ export class FakeInbox {
     s.slotMs ??= this.slotMs(s);
   }
 
-  private closed(s: InboxEra): number {
+  private closed(s: InboxEra, now: number): number {
     if (s.ended) return Math.max(s.closedHw, s.rows.length ? s.rows[s.rows.length - 1].rel : 0);
-    return Math.max(Math.floor((this.w.now() - T0_MS) / this.slotMs(s)), s.closedHw);
+    return Math.max(Math.floor((now - T0_MS) / this.slotMs(s)), s.closedHw);
   }
 
   /** Reports `closed`: persists it as closed_hw and commits every closed slot first. */
-  private report(s: InboxEra): number {
-    const c = this.closed(s);
+  private report(s: InboxEra, now: number): number {
+    const c = this.closed(s, now);
     if (c > s.closedHw) {
       this.pin(s);
       s.closedHw = c;
@@ -232,7 +270,9 @@ export class FakeInbox {
     if (!ignoreCap && n >= this.dayCap) return { error: "full" };
     const D = this.slotMs(s);
     const row: InboxStoredRow = {
-      rel: rel ?? Math.max(Math.floor((now - T0_MS) / D) + 1, s.closedHw + 1),
+      rel:
+        rel ??
+        Math.max(Math.floor((now - T0_MS + this.jitter(D, s.E, r.eid)) / D) + 1, s.closedHw + 1),
       eid: r.eid.slice(),
       body: r.body.slice(),
     };
@@ -242,6 +282,14 @@ export class FakeInbox {
     s.cnt.set(day, n + 1);
     this.w.bumpWrites();
     return { rel: row.rel };
+  }
+
+  /** j for one inserted row: 0 without `inboxJitter`, else the callback's value floored and clamped into [0, D). */
+  private jitter(D: number, E: number, eid: Bytes): number {
+    if (!this.jitterFn) return 0;
+    const j = this.jitterFn(D, { E, eid: eid.slice() });
+    if (!Number.isFinite(j)) throw new RangeError(`inboxJitter returned ${j}`);
+    return Math.min(Math.max(Math.floor(j), 0), D - 1);
   }
 }
 

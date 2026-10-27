@@ -474,6 +474,7 @@ describe("RealtimeDO RESUME", () => {
   it("a replay over the replay budget gets GAP(since), and the topics are still installed", async () => {
     const stub = fresh();
     const size = 47 + P.BODY_LENS[0];
+    expect(await inside(stub, (i) => i.limits.replayBytes)).toBe(2 * 1024 * 1024); // §10.8: 2 MiB of 47 B + body
     await setLimits(stub, { replayBytes: 2 * size });
     const [T, U] = [topic(), topic()];
     const a = await connect(stub);

@@ -175,9 +175,11 @@ export class InboxDO extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
-    this.prepare(this.clock());
-    // Fired early (clock difference): try again at the seal time.
-    if (!this.ended) await this.ctx.storage.setAlarm(this.sealAt());
+    const now = this.clock();
+    this.prepare(now);
+    // Fired early (clock differences): try again at the seal time, but never sooner than 1 s from now (§9), so an
+    // alarm that fired a few ms early does not re-arm a time that has already passed and fire again at once.
+    if (!this.ended) await this.ctx.storage.setAlarm(Math.max(this.sealAt(), now + 1000));
   }
 
   /**

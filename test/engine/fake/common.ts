@@ -30,10 +30,12 @@ export interface PublishRow {
 
 /** What a component needs from the world: the clocks, the parameters and a few cross-component calls. */
 export interface WorldCtx {
-  /** Server time of the Worker, BlobReg, Inbox, Realtime and Checkpoint components: Date.now() + offsetMs. */
+  /** Server time of the Worker, BlobReg, Realtime and Checkpoint components: Date.now() + offsetMs. */
   now(): number;
   /** The ShardDO clock: now() − shardLagMs. */
   shardNow(): number;
+  /** The InboxDO clock: now() − inboxLagMs. */
+  inboxNow(): number;
   readonly params: FakeParams;
   /** Extra delay before an ended era's shard seals itself (0 = at end(E) + SKEW, as in production). */
   readonly sealDelayMs: number;
@@ -55,6 +57,35 @@ export interface Res {
 
 export const NO_STORE = "no-store";
 export const IMMUTABLE = "public, max-age=31536000, immutable";
+
+/** `nosniff` and `no-referrer`: on every response except the 101 upgrade (§9.7; src/server/http.ts). */
+export const SECURITY_HEADERS: Readonly<Record<string, string>> = {
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "no-referrer",
+};
+/** HSTS, added to every https response except the 101 upgrade (§9.7; src/server/http.ts). */
+export const HSTS = "max-age=63072000; includeSubDomains";
+
+/**
+ * Per-key countdowns of the `fail*` knobs. `add(key, n)` queues n more failures (n ≤ 0 clears the key; Infinity
+ * fails until cleared); `take(key)` consumes one and says whether this request fails.
+ */
+export class FailCounts {
+  private readonly left = new Map<string, number>();
+
+  add(key: string, n: number): void {
+    if (!(n > 0)) this.left.delete(key);
+    else this.left.set(key, (this.left.get(key) ?? 0) + n);
+  }
+
+  take(key: string): boolean {
+    const n = this.left.get(key) ?? 0;
+    if (n <= 0) return false;
+    if (n === 1) this.left.delete(key);
+    else this.left.set(key, n - 1);
+    return true;
+  }
+}
 
 export const json = (status: number, j: unknown, extra?: Partial<Res>): Res => ({
   status,

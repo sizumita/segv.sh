@@ -1,7 +1,7 @@
 /**
  * CheckpointDO (docs/PROTOCOL-v2.md §9.5, §10.9, plan M2): the C_q chain and its signatures, no new q for
- * unchanged heads, the previous era's sealed shard (once more, then dropped), failing components, the hourly blob
- * registry head, alarm arming and ensure().
+ * unchanged heads, the previous era's sealed shard (once more, then dropped), failing components (and ones that
+ * never answered, which are left out), the sec clamp, the hourly blob registry head, alarm arming and ensure().
  *
  * The checkpoint object is one instance: each test moves its clock to a fresh era further in the future and drives
  * tick() by hand (the alarm it re-arms then never fires on its own). Components are reached through the real DOs;
@@ -53,6 +53,25 @@ async function shardWrite(E: number, ms: number): Promise<void> {
   expect((await shardStub(env, E, 0).put(E, 0, [shardRow()]))[0].s).toBe("ok");
   await shardClock(E, ms + 3000);
 }
+
+/** Runs `fn` with some bindings of the checkpoint object replaced (the rest read through to the real env). */
+async function withEnv(patch: Record<string, unknown>, fn: () => Promise<void>): Promise<void> {
+  let real: Env | undefined;
+  await runInDurableObject(ck(), (inst: CheckpointDO) => {
+    const self = inst as unknown as CkInternals;
+    real = self.env;
+    self.env = new Proxy(real, { get: (t, k) => (typeof k === "string" && k in patch ? patch[k] : Reflect.get(t, k)) });
+  });
+  try {
+    await fn();
+  } finally {
+    await runInDurableObject(ck(), (inst: CheckpointDO) => {
+      (inst as unknown as CkInternals).env = real!;
+    });
+  }
+}
+/** A DO namespace whose every object fails head(). */
+const deadNs = { getByName: () => ({ head: () => Promise.reject(new Error("component unavailable")) }) };
 
 /** Checks one record: sorted cids, hd = H(heads), C chains from `prevC`, and the signature. */
 function checkRecord(r: CkptRecord, prevC: Uint8Array): void {
@@ -162,30 +181,14 @@ describe("CheckpointDO", () => {
     const X = P.random(32);
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      const withEnv = async (patch: Record<string, unknown>, fn: () => Promise<void>) => {
-        let real: Env | undefined;
-        await runInDurableObject(ck(), (inst: CheckpointDO) => {
-          const self = inst as unknown as CkInternals;
-          real = self.env;
-          self.env = new Proxy(real, { get: (t, k) => (typeof k === "string" && k in patch ? patch[k] : Reflect.get(t, k)) });
-        });
-        try {
-          await fn();
-        } finally {
-          await runInDurableObject(ck(), (inst: CheckpointDO) => {
-            (inst as unknown as CkInternals).env = real!;
-          });
-        }
-      };
-      const deadShards = { getByName: () => ({ head: () => Promise.reject(new Error("shard unavailable")) }) };
       const fakeDb = (first: () => Promise<unknown>) => ({ prepare: () => ({ first }) });
 
       // The shard fails: it keeps h1, so nothing changed and no new q is made.
-      await withEnv({ SHARD: deadShards }, async () => {
+      await withEnv({ SHARD: deadNs }, async () => {
         expect((await tick()).q).toBe(r1.q);
       });
       // The shard still fails while the dirlog moves: the new checkpoint carries the old shard head.
-      await withEnv({ SHARD: deadShards, DB: fakeDb(async () => ({ seq: 9, h: P.b64u(X) })) }, async () => {
+      await withEnv({ SHARD: deadNs, DB: fakeDb(async () => ({ seq: 9, h: P.b64u(X) })) }, async () => {
         const r = await tick();
         expect(r.q).toBe(r1.q + 1);
         expect(headOf(r, P.shardCid(F, 0))).toEqual(h1);
@@ -212,6 +215,46 @@ describe("CheckpointDO", () => {
     // Back to the real components.
     const r = await tick();
     expect(headOf(r, P.shardCid(F, 0))).toEqual(h2);
+  });
+
+  it("leaves out a component that has never answered (never ZERO32); sec never decreases", async () => {
+    const [Pe, F] = freshEras();
+    const base = P.eraStart(F) + 30 * 60_000;
+    await ckClock(base);
+    const prev = (await ck().latest()) ?? { q: 0, C: P.ZERO32 };
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    let r1: CkptRecord | undefined;
+    try {
+      // No shard or inbox of eras F and F − 1 has ever answered, and none answers now.
+      await withEnv({ SHARD: deadNs, INBOX: deadNs }, async () => {
+        r1 = await tick();
+      });
+      expect(errors.mock.calls.filter((c) => String(c[0]).includes("did not answer"))).toHaveLength(4);
+    } finally {
+      errors.mockRestore();
+    }
+    expect(r1!.q).toBe(prev.q + 1);
+    checkRecord(r1!, prev.C);
+    for (const cid of [P.shardCid(F, 0), P.shardCid(Pe, 0), P.inboxCid(F, 0), P.inboxCid(Pe, 0)]) {
+      expect(headOf(r1!, cid), cid).toBeUndefined();
+    }
+    expect(r1!.heads.map((h) => h.cid)).toEqual([P.BLOBREG_CID, P.DIRLOG_CID]);
+    expect(r1!.sec).toBe(P.secOf(base));
+
+    // They answer again while the clock has stepped back 2 minutes: a new q (they are listed now), sec clamped.
+    await ckClock(base - 120_000);
+    const r2 = await tick();
+    expect(r2.q).toBe(r1!.q + 1);
+    checkRecord(r2, r1!.C);
+    expect(headOf(r2, P.shardCid(F, 0))).toEqual(P.ZERO32); // the empty shard's real head
+    expect(headOf(r2, P.inboxCid(F, 0))).toEqual(P.ZERO32);
+    expect(r2.sec).toBe(r1!.sec); // sec(now) is 120 lower
+    // Forward again: sec follows the clock.
+    await ckClock(base + 60_000);
+    await shardWrite(F, base + 50_000);
+    const r3 = await tick();
+    expect(r3.q).toBe(r2.q + 1);
+    expect(r3.sec).toBe(P.secOf(base + 60_000));
   });
 
   it("takes the blob registry head at most once per UTC hour", async () => {

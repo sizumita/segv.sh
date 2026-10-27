@@ -23,9 +23,11 @@ export type Bytes = Uint8Array;
 // ───────────────────────── encoding ─────────────────────────
 
 const te = new TextEncoder();
-const td = new TextDecoder('utf-8', { fatal: true });
+// §1.2: invalid UTF-8 is rejected, and a leading U+FEFF is kept (the default decoder would strip it).
+const td = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 export const utf8 = (s: string): Bytes => te.encode(s);
+/** Strict UTF-8 decoding (§1.2): throws on invalid UTF-8 and keeps a leading U+FEFF. */
 export const fromUtf8 = (b: Bytes): string => td.decode(b);
 
 export function concat(...parts: Bytes[]): Bytes {
@@ -169,11 +171,15 @@ export function sigPub(sk: Bytes): Bytes {
 export function sign(msg: Bytes, sk: Bytes): Bytes {
   return ed25519.sign(msg, sk);
 }
+/**
+ * SIG.verify (§1.1), the one pinned rule for every v2 signature: validSigPk(pk), then noble's strict RFC 8032
+ * verification (canonical R, S < L, the cofactored equation [8]([S]B − R − [k]A) = O). noble's ed25519 defaults
+ * to ZIP-215, which accepts small-order public keys: with A = R = identity and S = 0 one "signature" verifies for
+ * EVERY message. A mixed-order key is refused by validSigPk: the cofactored equation ignores its torsion part.
+ */
 export function verify(sig: Bytes, msg: Bytes, pk: Bytes): boolean {
   try {
-    // Strict RFC 8032 verification. noble's ed25519 defaults to ZIP-215, which accepts small-order
-    // public keys: with A = R = identity and S = 0 one "signature" verifies for EVERY message.
-    return sig.length === 64 && pk.length === 32 && ed25519.verify(sig, msg, pk, { zip215: false });
+    return sig.length === 64 && pk.length === 32 && !isBadSigPk(pk) && ed25519.verify(sig, msg, pk, { zip215: false });
   } catch {
     return false;
   }
@@ -275,7 +281,10 @@ export const MAX_NAME = 64;
 const BAD_NAME_CHARS = /[\p{Cc}\p{Cf}\p{Cs}\u061c\u2028\u2029\u115f\u1160\u3164\uffa0\u2800]/u;
 const VISIBLE = /[\p{L}\p{N}\p{P}\p{S}]/u;
 
-/** Group names: 1..MAX_NAME code points, no control / bidi characters, not only whitespace. */
+/**
+ * Group names: 1..MAX_NAME code points, no control / bidi characters, not only whitespace. A rule for building a new
+ * name and for displaying one (§5.1), never for parsing: its character classes follow the engine's Unicode version.
+ */
 export function validName(name: unknown): name is string {
   return (
     typeof name === 'string' &&
@@ -446,12 +455,19 @@ export function clsFor(len: number, minCls = 0): number {
 export const SEAL_OVERHEAD = KEM_CT_LEN + NONCE_LEN + TAG_LEN; // 1160
 /** Inbox invite body (§5.3): 1120 + 24 + 256 + 16. */
 export const INBOX_BODY_LEN = KEM_CT_LEN + NONCE_LEN + 256 + TAG_LEN; // 1416
-/** SGB2 bundle sizes (§3.2): 16 + 2088 + B·1192 for B ∈ {8, 32}. */
+/** SGB2 bundle sizes (§3.2): 16 + 4136 + (B·1216 + 40) + B·1192 = 4192 + 2408·B for B ∈ {8, 32}. */
 export const SGB2_HEADER_LEN = 16;
-export const SGB2_DESC_LEN = NONCE_LEN + 2048 + TAG_LEN; // 2088
+/** descCt: D ‖ dsig padded to [4096] (§5.4). */
+export const SGB2_DESC_LEN = NONCE_LEN + 4096 + TAG_LEN; // 4136
+/** pkCt: the B·1216-byte pks (§5.4), sealed under dk_e. */
+export const sgb2PkCtLen = (B: number): number => B * KEM_PK_LEN + NONCE_LEN + TAG_LEN; // 9768, 38952
 export const SGB2_ENTRY_LEN = SEAL_OVERHEAD + 32; // 1192
-export const sgb2Size = (B: number): number => SGB2_HEADER_LEN + SGB2_DESC_LEN + B * SGB2_ENTRY_LEN;
-export const SGB2_SIZES = [sgb2Size(8), sgb2Size(32)] as const; // 11640, 40248
+/** Byte offset of pkCt (after the header and descCt). */
+export const SGB2_PKCT_AT = SGB2_HEADER_LEN + SGB2_DESC_LEN; // 4152
+/** Byte offset of entry_0: 4192 + 1216·B (13920 or 43104). */
+export const sgb2EntriesAt = (B: number): number => SGB2_PKCT_AT + sgb2PkCtLen(B);
+export const sgb2Size = (B: number): number => sgb2EntriesAt(B) + B * SGB2_ENTRY_LEN;
+export const SGB2_SIZES = [sgb2Size(8), sgb2Size(32)] as const; // 23456, 81248
 
 // ───────────────────────── sealing (KEM-DEM, §1.4) ─────────────────────────
 
@@ -589,25 +605,53 @@ export function verifyBundle(bundle: string, sigB64: string): User {
   return u;
 }
 
-/** True when `pk` is not a usable Ed25519 key: not a point, or a point of small order (§1.1, §5.1). */
-export function isBadSigPk(pk: Bytes): boolean {
-  if (pk.length !== 32) return true;
+/** validSigPk results by hex(pk); cleared when it reaches SIG_PK_CACHE_MAX entries (§1.1 allows a cache). */
+const sigPkCache = new Map<string, boolean>();
+const SIG_PK_CACHE_MAX = 4096;
+
+/**
+ * validSigPk (§1.1): `pk` is 32 bytes, decodes canonically (y < p; x = 0 only with sign bit 0), is not of small
+ * order ([8]A ≠ O), and lies in the prime-order subgroup ([L]A = O): a mixed-order key (a real key plus a torsion
+ * point) is refused. Memoised per key.
+ */
+export function validSigPk(pk: Bytes): boolean {
+  if (pk.length !== 32) return false;
+  const key = hex(pk);
+  const known = sigPkCache.get(key);
+  if (known !== undefined) return known;
+  let ok: boolean;
   try {
-    return ed25519.Point.fromBytes(pk).isSmallOrder();
+    const A = ed25519.Point.fromBytes(pk); // strict decoding (zip215 = false)
+    ok = !A.isSmallOrder() && A.isTorsionFree();
   } catch {
-    return true;
+    ok = false;
+  }
+  if (sigPkCache.size >= SIG_PK_CACHE_MAX) sigPkCache.clear();
+  sigPkCache.set(key, ok);
+  return ok;
+}
+
+/** True when `pk` is not a usable Ed25519 key (§1.1, §5.1): !validSigPk(pk). */
+export function isBadSigPk(pk: Bytes): boolean {
+  return !validSigPk(pk);
+}
+
+/**
+ * The kemPk half of checkUserKeys (§2.1): 1216 bytes and KEM.encap succeeds. Whether an X-Wing encapsulation
+ * succeeds depends only on the key, so the randomness (noble's own CSPRNG, never random()) does not matter.
+ */
+export function validKemPk(kemPk: Bytes): boolean {
+  try {
+    return kemPk.length === KEM_PK_LEN && xwing.encapsulate(kemPk).cipherText.length === KEM_CT_LEN;
+  } catch {
+    return false;
   }
 }
 
-/** §2.1: sigPk is a point not of small order, and KEM.encap(kemPk) succeeds. Throws otherwise. */
+/** §2.1: validSigPk(sigPk), and KEM.encap(kemPk) succeeds. Throws otherwise. */
 export function checkUserKeys(sigPk: Bytes, kemPk: Bytes): void {
-  if (isBadSigPk(sigPk)) throw new Error("bundle: unusable signing key");
-  try {
-    if (kemPk.length !== KEM_PK_LEN) throw new Error("length");
-    xwing.encapsulate(kemPk);
-  } catch {
-    throw new Error("bundle: unusable KEM key");
-  }
+  if (!validSigPk(sigPk)) throw new Error("bundle: unusable signing key");
+  if (!validKemPk(kemPk)) throw new Error("bundle: unusable KEM key");
 }
 
 /** fp = H(enc("segv.sh/v2/fp", uid, sigPk, kemPk)), shown as 6 groups of 5 digits (§2.2). */
@@ -1086,18 +1130,27 @@ export const memberIndex = (d: { members: readonly { uid: Bytes }[] }, uid: Byte
 export const D_VER = 2;
 /** ver | conv | e | prev | by | ts | m: the offset of the member list. */
 export const D_FIXED_LEN = 78;
+/** uid[16] | sigPk[32] | kh[32]. */
+export const D_MEMBER_LEN = 80;
+/** nlen ≤ 256 (§5.1). */
+export const MAX_NAME_BYTES = 256;
 /** m = 1, no name. */
-export const D_MIN_LEN = D_FIXED_LEN + 48 + 2; // 128
-/** 78 + 48·32 + 2 + 256. */
-export const D_MAX_LEN = D_FIXED_LEN + 48 * 32 + 2 + 256; // 1872
+export const D_MIN_LEN = D_FIXED_LEN + D_MEMBER_LEN + 2; // 160
+/** 78 + 80·32 + 2 + 256. */
+export const D_MAX_LEN = D_FIXED_LEN + D_MEMBER_LEN * MAX_MEMBERS + 2 + MAX_NAME_BYTES; // 2896
 /** D ‖ dsig, the plaintext of descCt and of DESC / REQUEST records. */
-export const DESC_MIN_LEN = D_MIN_LEN + SIG_LEN; // 192
-export const DESC_MAX_LEN = D_MAX_LEN + SIG_LEN; // 1936
+export const DESC_MIN_LEN = D_MIN_LEN + SIG_LEN; // 224
+export const DESC_MAX_LEN = D_MAX_LEN + SIG_LEN; // 2960
 
 export interface Member {
   uid: Bytes;
   sigPk: Bytes;
+  /** kh = kemHash(kemPk) of the member's X-Wing key (§5.1); parseD puts no rule on it. */
+  kh: Bytes;
 }
+
+/** kh = H(enc("segv.sh/v2/kh", kemPk)): a member's X-Wing key by hash (§5.1). */
+export const kemHash = (kemPk: Bytes): Bytes => H(enc("segv.sh/v2/kh", kemPk));
 
 export interface DescriptorFields {
   conv: Bytes;
@@ -1119,11 +1172,16 @@ export interface Descriptor extends DescriptorFields {
   hash: Bytes;
 }
 
+/**
+ * Encodes D (§5.1). The name is checked only by the parse rules (≤ 256 bytes, 1–64 code points of well-formed
+ * text), never by validName: the engine applies validName to a new name before building (§6.1, §6.3), and a name
+ * carried over is copied unchanged.
+ */
 export function encodeD(d: DescriptorFields): Bytes {
   const m = d.members.length;
   if (m < 1 || m > MAX_MEMBERS) bad("D: bad member count");
   // "" would encode as nlen = 0 and come back as null: no name is null
-  if (d.name !== null && !validName(d.name)) bad("D: bad name");
+  if (d.name === "") bad("D: an empty name is written as null");
   const name = d.name === null ? new Uint8Array(0) : encodeUtf8(d.name, "D name");
   const out = concat(
     u8(D_VER),
@@ -1133,7 +1191,7 @@ export function encodeD(d: DescriptorFields): Bytes {
     fixed(d.by, 16, "D by"),
     u64(d.ts),
     u8(m),
-    ...d.members.flatMap((x) => [fixed(x.uid, 16, "D uid"), fixed(x.sigPk, 32, "D sigPk")]),
+    ...d.members.flatMap((x) => [fixed(x.uid, 16, "D uid"), fixed(x.sigPk, 32, "D sigPk"), fixed(x.kh, 32, "D kh")]),
     u16(name.length),
     name,
   );
@@ -1141,7 +1199,11 @@ export function encodeD(d: DescriptorFields): Bytes {
   return out;
 }
 
-/** Parses D and enforces every §5.1 rule. */
+/**
+ * Parses D and enforces every §5.1 rule. The name rules are only `nlen ≤ 256` and, for nlen > 0, valid UTF-8
+ * (§1.2: a leading U+FEFF is kept and counts) of 1–64 code points: nothing here depends on the Unicode tables of
+ * the JavaScript engine (no \p{…}, trim or normalize), since a D′ that fails to parse freezes the conversation.
+ */
 export function parseD(b: Bytes): Descriptor {
   if (b.length > D_MAX_LEN) bad("D: too long");
   const r = new Rd(b, "D");
@@ -1154,8 +1216,9 @@ export function parseD(b: Bytes): Descriptor {
   const m = r.u8();
   if (m < 1 || m > MAX_MEMBERS) bad("D: bad member count");
   const members: Member[] = [];
-  for (let i = 0; i < m; i++) members.push({ uid: r.bytes(16), sigPk: r.bytes(32) });
+  for (let i = 0; i < m; i++) members.push({ uid: r.bytes(16), sigPk: r.bytes(32), kh: r.bytes(32) });
   const nlen = r.u16();
+  if (nlen > MAX_NAME_BYTES) bad("D: name over 256 bytes");
   const nameBytes = r.bytes(nlen);
   r.end();
   if (e >= E_MAX) bad("D: e must be below 2^32 − 1");
@@ -1165,9 +1228,10 @@ export function parseD(b: Bytes): Descriptor {
   let name: string | null = null;
   if (nlen > 0) {
     name = decodeUtf8(nameBytes, "D name");
-    if (!validName(name)) bad("D: bad name");
+    const cps = [...name].length;
+    if (cps < 1 || cps > MAX_NAME) bad("D: the name must be 1–64 code points");
   }
-  if (members.some((x) => isBadSigPk(x.sigPk))) bad("D: unusable sigPk");
+  if (members.some((x) => !validSigPk(x.sigPk))) bad("D: unusable sigPk");
   return { conv, e, prev, by, ts, members, name, bytes: b.slice(), hash: H(b) };
 }
 
@@ -1196,7 +1260,34 @@ export function splitDesc(desc: Bytes): { D: Bytes; dsig: Bytes } {
   return { D: desc.slice(0, desc.length - SIG_LEN), dsig: desc.slice(desc.length - SIG_LEN) };
 }
 
-/** The D′ checks of §6.6 step 4 (shared by claim processing and chained joins, §6.7 step 5), in spec order. */
+/** kemPk of D.members[j]: slot j of pks (§5.4). */
+export const pksAt = (pks: Bytes, j: number): Bytes => pks.subarray(j * KEM_PK_LEN, (j + 1) * KEM_PK_LEN);
+
+/** Why `pks` does not fit D (checkPks): `|D| > B`, or any other pks rule. */
+export type PksFailure = "size" | "pks";
+
+/**
+ * The pks rules of §6.6 step 4 and §6.7 step 2: `|D| ≤ B` ("size"); pks is B·1216 bytes and zero after slot
+ * |D| − 1, and every pks[j] hashes to D.members[j].kh and passes the kemPk half of checkUserKeys ("pks").
+ * `skipKem(j)` skips that encapsulation for a slot that another check encapsulates to anyway (a kept member's
+ * sealDet recomputation, §6.6 step 4); whether it succeeds does not depend on the randomness (§2.1).
+ */
+export function checkPks(
+  D: { members: readonly { kh: Bytes }[] },
+  pks: Bytes,
+  B: number,
+  skipKem: (j: number) => boolean = () => false,
+): PksFailure | null {
+  const m = D.members.length;
+  if (m > B) return "size";
+  if (pks.length !== B * KEM_PK_LEN) return "pks";
+  if (pks.subarray(m * KEM_PK_LEN).some((x) => x !== 0)) return "pks";
+  for (let j = 0; j < m; j++) if (!equalBytes(kemHash(pksAt(pks, j)), D.members[j].kh)) return "pks";
+  for (let j = 0; j < m; j++) if (!skipKem(j) && !validKemPk(pksAt(pks, j))) return "pks";
+  return null;
+}
+
+/** The D′ checks of §6.6 step 4, in spec order. */
 export type DPrimeCheck =
   /** D′ ‖ dsig′ is malformed (descCt does not open, or D′ does not parse) */
   | "desc"
@@ -1209,20 +1300,32 @@ export type DPrimeCheck =
   /** D′ ∩ D_e ≠ the members whose rm bit is 0 */
   | "members"
   /** a continuing member's sigPk changed */
-  | "sigPk";
+  | "sigPk"
+  /** a continuing member's kh changed */
+  | "kh"
+  /** |D′| > B */
+  | "size"
+  /** pkCt does not open, or pks′ breaks a checkPks rule (length, tail, a kh, a kemPk) */
+  | "pks"
+  /** a kept entry is not sealDet(pks′[j], …) under EK′ byte for byte */
+  | "entry";
 
 export type DPrimeResult = { ok: true; D: Descriptor } | { ok: false; failed: DPrimeCheck };
 
 /**
- * Checks D_{e+1} (bytes `next.D`, signature `next.dsig`, `next.kc` = kc_{e+1}) against D_e and the claim
- * (`from` = the committer's index in D_e, `hD`, `rm`). Returns the first failing check.
+ * The D′ checks of §6.6 step 4 after the decryption: D_{e+1} (bytes `next.D` and `next.dsig` from openDesc,
+ * `next.pks` = pks′ from openPks, `next.kc` = kc_{e+1}, `next.EK` = EK′) against D_e, the claim (`from` = the
+ * committer's index in D_e, `hD`, `rm`) and the bundle of e+1. Returns the first failing check. The caller maps a
+ * throw of openDesc / openPks to "desc" / "pks" (processClaim).
  */
 export function dPrimeChecks(
-  next: { D: Bytes; dsig: Bytes; kc: Bytes },
+  next: { D: Bytes; dsig: Bytes; kc: Bytes; pks: Bytes; EK: Bytes },
   De: Descriptor,
   claim: { from: number; hD: Bytes; rm: number },
+  bundle: BundleBlob,
 ): DPrimeResult {
   const no = (failed: DPrimeCheck): DPrimeResult => ({ ok: false, failed });
+  fixed(next.EK, 32, "D′ checks EK′");
   if (next.dsig.length !== SIG_LEN) return no("desc");
   if (!equalBytes(H(next.D), claim.hD)) return no("hD");
   let D: Descriptor;
@@ -1237,11 +1340,26 @@ export function dPrimeChecks(
   const committer = De.members[claim.from];
   if (!committer || !equalBytes(D.by, committer.uid)) return no("by");
   if (!verify(next.dsig, dSigMsg(next.D, next.kc), committer.sigPk)) return no("dsig");
-  const kept = De.members.map((_, j) => !rmHas(claim.rm, j));
+  const kept = De.members.map((_, i) => !rmHas(claim.rm, i));
   const at = De.members.map((x) => memberIndex(D, x.uid));
-  const present = at.map((i) => i >= 0);
-  if (kept.some((k, j) => k !== present[j])) return no("members");
-  if (kept.some((k, j) => k && !equalBytes(D.members[at[j]].sigPk, De.members[j].sigPk))) return no("sigPk");
+  if (kept.some((k, i) => k !== (at[i] >= 0))) return no("members");
+  if (kept.some((k, i) => k && !equalBytes(D.members[at[i]].sigPk, De.members[i].sigPk))) return no("sigPk");
+  if (kept.some((k, i) => k && !equalBytes(D.members[at[i]].kh, De.members[i].kh))) return no("kh");
+  // a kept member's encapsulation is performed by its sealDet recomputation below
+  const continuing = new Set(at.filter((_, i) => kept[i]));
+  const pf = checkPks(D, next.pks, bundle.B, (j) => continuing.has(j));
+  if (pf) return no(pf);
+  for (let i = 0; i < De.members.length; i++) {
+    if (!kept[i]) continue;
+    let want: Bytes;
+    try {
+      want = sealDet(pksAt(next.pks, at[i]), De.conv, D.e, i, next.EK);
+    } catch {
+      return no("pks"); // the kemPk half of checkUserKeys fails
+    }
+    const entry = bundle.entries[i];
+    if (!entry || !equalBytes(entry, want)) return no("entry");
+  }
   return { ok: true, D };
 }
 
@@ -1364,13 +1482,12 @@ export function openHello(kemSk: Bytes, s: Bytes, E: number, label: Bytes, body:
 
 export const SGB2_MAGIC = "SGB2";
 export const SGB2_VER = 1;
-export const DESC_CLASSES = [2048] as const;
+export const DESC_CLASSES = [4096] as const;
 export const REKEY_LABEL = "segv.sh/v2/rekey";
-/** The value sealed to a dropped member of the previous epoch. */
-export const REMOVED = ZERO32;
 
 export const rekeyCtx = (conv: Bytes, e: number, i: number): Bytes => enc(conv, u32(e), u16(i));
 export const descAad = (conv: Bytes, e: number): Bytes => enc("segv.sh/v2/desc", conv, u32(e));
+export const pksAad = (conv: Bytes, e: number): Bytes => enc("segv.sh/v2/pks", conv, u32(e));
 
 /** B = 8 if max(|D_prev|, |D_e|) ≤ 8, otherwise 32 (e = 0: prevM = 0). */
 export const sgb2B = (prevM: number, curM: number): 8 | 32 => (Math.max(prevM, curM) <= 8 ? 8 : 32);
@@ -1379,18 +1496,48 @@ export const sgb2B = (prevM: number, curM: number): 8 | 32 => (Math.max(prevM, c
 export const sgb2BOfSize = (size: number): 8 | 32 | null =>
   size === SGB2_SIZES[0] ? 8 : size === SGB2_SIZES[1] ? 32 : null;
 
+/** rr_e = HKDF(EK_e, conv, enc("segv.sh/v2/ep/rekey", u32 e), 32): the root of the derived entries (§5.4). */
+export function rekeyRoot(EK: Bytes, conv: Bytes, e: number): Bytes {
+  fixed(EK, 32, "rr EK");
+  fixed(conv, 16, "rr conv");
+  return HKDF(EK, conv, enc("segv.sh/v2/ep/rekey", u32(e)));
+}
+
+/**
+ * sealDet (§5.4): the entry of a member X_i kept by e (`pk` = its kemPk in pks_e), a seal of EK_e whose randomness
+ * is derived from EK_e, so every member of e recomputes it byte for byte:
+ *   ρ = HKDF(rr_e, "", enc("segv.sh/v2/rekey-rnd", u16 i), 88)
+ *   (kct, ss) = X-Wing EncapsulateDerand(pk, ρ[0..64])     ρ[0..32] ML-KEM coins, ρ[32..64] the X25519 ephemeral key
+ *   entry = kct ‖ ρ[64..88] ‖ XChaCha20-Poly1305(k, nonce ρ[64..88], EK_e, aad = enc("segv.sh/v2/rekey", ctx))
+ * with k and ctx = enc(conv, u32 e, u16 i) as in seal(pk, "segv.sh/v2/rekey", ctx, EK_e) (§1.4), whose layout it
+ * has, so open() opens it. 1192 B. Uses no RNG. Throws when `pk` cannot be encapsulated to.
+ */
+export function sealDet(pk: Bytes, conv: Bytes, e: number, i: number, EK: Bytes): Bytes {
+  const ctx = rekeyCtx(conv, e, i);
+  const rho = HKDF(rekeyRoot(EK, conv, e), "", enc("segv.sh/v2/rekey-rnd", u16(i)), 88);
+  const r = xwing.encapsulate(fixed(pk, KEM_PK_LEN, "sealDet pk"), rho.slice(0, 64));
+  const nonce = rho.slice(64, 88);
+  const k = sealKey(r.sharedSecret, r.cipherText, REKEY_LABEL, ctx);
+  return concat(r.cipherText, nonce, xchacha20poly1305(k, nonce, enc(REKEY_LABEL, ctx)).encrypt(EK));
+}
+
 export interface BundleSpec {
   conv: Bytes;
   /** The epoch the bundle defines. */
   e: number;
-  /** D_e bytes (not re-validated here, so tests can build bundles with bad descriptors). */
+  /** D_e bytes (not validated here, so tests can build bundles with bad descriptors; its uids are read by layout). */
   D: Bytes;
   dsig: Bytes;
   EK: Bytes;
-  /** kemPk of D_{e−1}.members[i] (verified per §5.4), or null for an unknown member (a dummy entry). Empty for e = 0. */
-  prevMembers: readonly (Bytes | null)[];
-  /** keep[i]: D_{e−1}.members[i] ∈ D_e (EK sealed), else REMOVED. */
-  keep: readonly boolean[];
+  /**
+   * pks_e: the kemPk of D_e.members[j], in D order (§5.4). A continuing member's comes from pks_{e−1} (the bundle of
+   * e−1), a new member's from its verified directory bundle, self's from its identity. Nothing is looked up here.
+   */
+  pks: readonly Bytes[];
+  /** The uids of D_{e−1}.members in index order; empty for e = 0. */
+  prevMembers: readonly Bytes[];
+  /** The claim's rm (§6.2): bit i set iff D_{e−1}.members[i] is not in D_e. 0 for e = 0. */
+  rm: number;
   /** Defaults to sgb2B(|D_{e−1}|, |D_e|). */
   B?: 8 | 32;
 }
@@ -1403,32 +1550,53 @@ export interface BuiltBundle {
   B: 8 | 32;
 }
 
+/** The member uids of D bytes, read by layout only (D is not validated). */
+function layoutUids(D: Bytes): Bytes[] {
+  const m = D.length < D_MIN_LEN ? 0 : D[D_FIXED_LEN - 1];
+  if (m < 1 || D.length < D_FIXED_LEN + D_MEMBER_LEN * m + 2) bad("SGB2: short descriptor");
+  const at = (j: number): number => D_FIXED_LEN + D_MEMBER_LEN * j;
+  return Array.from({ length: m }, (_, j) => D.subarray(at(j), at(j) + 16));
+}
+
+/**
+ * Builds the SGB2 blob of epoch e (§5.4): header, descCt (D ‖ dsig padded to [4096]), pkCt (pks zero-filled to
+ * B·1216 bytes), and per i < B: sealDet(pks[j], …) for a member X_i = D_{e−1}.members[i] whose rm bit is 0 (j = its
+ * index in D_e), a dummy seal otherwise (rm bit 1, i ≥ |D_{e−1}|, and every entry for e = 0). random() is drawn for
+ * the descCt nonce, the pkCt nonce, then each dummy entry in index order.
+ */
 export function buildBundle(x: BundleSpec): BuiltBundle {
-  const { conv, e, D, dsig, EK, prevMembers, keep } = x;
+  const { conv, e, D, dsig, EK, pks, prevMembers, rm } = x;
   fixed(conv, 16, "SGB2 conv");
   fixed(EK, 32, "SGB2 EK");
   fixed(dsig, SIG_LEN, "SGB2 dsig");
-  if (keep.length !== prevMembers.length) bad("SGB2: keep and prevMembers differ in length");
-  if (e === 0 && prevMembers.length > 0) bad("SGB2: epoch 0 has no previous members");
-  if (D.length < D_MIN_LEN) bad("SGB2: short descriptor");
-  const m = D[D_FIXED_LEN - 1];
-  const B = x.B ?? sgb2B(prevMembers.length, m);
+  if (e === 0 && (prevMembers.length > 0 || rm !== 0)) bad("SGB2: epoch 0 has no previous members");
+  const uids = layoutUids(D);
+  if (pks.length !== uids.length) bad("SGB2: one kemPk per member of D");
+  const B = x.B ?? sgb2B(prevMembers.length, uids.length);
   if (B !== 8 && B !== 32) bad("SGB2: B must be 8 or 32");
-  if (B < prevMembers.length || B < m) bad("SGB2: B too small");
-  const descCt = aeadSeal(epochKeys(EK, conv, e).dk, pad(concat(D, dsig), DESC_CLASSES), descAad(conv, e));
+  if (B < prevMembers.length || B < uids.length) bad("SGB2: B too small");
+  if (!Number.isInteger(rm) || rm < 0 || rm >= 2 ** prevMembers.length) bad("SGB2: rm must fit D_{e−1}");
+  const { dk } = epochKeys(EK, conv, e);
+  const descCt = aeadSeal(dk, pad(concat(D, dsig), DESC_CLASSES), descAad(conv, e));
+  const pksPt = new Uint8Array(B * KEM_PK_LEN);
+  pks.forEach((pk, j) => pksPt.set(fixed(pk, KEM_PK_LEN, "SGB2 kemPk"), j * KEM_PK_LEN));
+  const pkCt = aeadSeal(dk, pksPt, pksAad(conv, e));
   const entries: Bytes[] = [];
   for (let i = 0; i < B; i++) {
-    const ctx = rekeyCtx(conv, e, i);
-    const pk = i < prevMembers.length ? prevMembers[i] : null;
-    entries.push(pk ? seal(pk, REKEY_LABEL, ctx, keep[i] ? EK : REMOVED) : dummySeal(REKEY_LABEL, ctx, 32));
+    if (i < prevMembers.length && !rmHas(rm, i)) {
+      const j = uids.findIndex((u) => equalBytes(u, prevMembers[i]));
+      if (j < 0) bad("SGB2: a kept member is not in D_e");
+      entries.push(sealDet(pks[j], conv, e, i, EK));
+    } else entries.push(dummySeal(REKEY_LABEL, rekeyCtx(conv, e, i), 32));
   }
-  const blob = concat(utf8(SGB2_MAGIC), u8(SGB2_VER), u8(B), new Uint8Array(10), descCt, ...entries);
+  const blob = concat(utf8(SGB2_MAGIC), u8(SGB2_VER), u8(B), new Uint8Array(10), descCt, pkCt, ...entries);
   return { blob, id: H(blob), size: blob.length, B };
 }
 
 export interface BundleBlob {
   B: 8 | 32;
   descCt: Bytes;
+  pkCt: Bytes;
   entries: Bytes[];
 }
 
@@ -1442,30 +1610,27 @@ function sgb2Header(blob: Bytes, B: 8 | 32): Sgb2HeaderFailure | null {
   return null;
 }
 
-/** Strict: the size is 11640 or 40248, magic "SGB2", ver 1, B matching the size, 10 zero bytes. */
+/**
+ * Strict: the size is 23456 or 81248, magic "SGB2", ver 1, B matching the size, 10 zero bytes. Splits descCt
+ * (at 16), pkCt (at 4152) and the B entries (from 4192 + 1216·B).
+ */
 export function parseBundleBlob(blob: Bytes): BundleBlob {
   const B = sgb2BOfSize(blob.length) ?? bad("SGB2: bad size");
   const f = sgb2Header(blob, B);
   if (f) bad(`SGB2: bad ${f}`);
-  const at = SGB2_HEADER_LEN + SGB2_DESC_LEN;
+  const at = sgb2EntriesAt(B);
   const entries: Bytes[] = [];
   for (let i = 0; i < B; i++) entries.push(blob.slice(at + i * SGB2_ENTRY_LEN, at + (i + 1) * SGB2_ENTRY_LEN));
-  return { B, descCt: blob.slice(SGB2_HEADER_LEN, at), entries };
+  return { B, descCt: blob.slice(SGB2_HEADER_LEN, SGB2_PKCT_AT), pkCt: blob.slice(SGB2_PKCT_AT, at), entries };
 }
 
 const bundleOf = (blob: Bytes | BundleBlob): BundleBlob => (blob instanceof Uint8Array ? parseBundleBlob(blob) : blob);
 
 /**
- * Opens entry i for epoch e (§6.6 step 2): EK, "removed" (REMOVED was sealed), or null when it does not open
- * (a decapsulation throw, an AEAD failure, a length ≠ 32, a malformed blob or i ≥ B).
+ * Opens entry i for epoch e (§6.6 step 2): EK, or null when it does not open (a decapsulation throw, an AEAD
+ * failure, a length ≠ 32, a malformed blob or i ≥ B).
  */
-export function openEntry(
-  kemSk: Bytes,
-  conv: Bytes,
-  e: number,
-  i: number,
-  blob: Bytes | BundleBlob,
-): Bytes | "removed" | null {
+export function openEntry(kemSk: Bytes, conv: Bytes, e: number, i: number, blob: Bytes | BundleBlob): Bytes | null {
   let b: BundleBlob;
   try {
     b = bundleOf(blob);
@@ -1474,16 +1639,23 @@ export function openEntry(
   }
   if (!Number.isInteger(i) || i < 0 || i >= b.B) return null;
   const V = tryOpen(kemSk, REKEY_LABEL, rekeyCtx(conv, e, i), b.entries[i]);
-  if (!V || V.length !== 32) return null;
-  return equalBytes(V, REMOVED) ? "removed" : V;
+  return V && V.length === 32 ? V : null;
 }
 
-/** Decrypts descCt with dk_e and splits D ‖ dsig. Throws on any failure. Does not parse D. */
+/**
+ * Decrypts descCt with dk_e, unpads and splits D ‖ dsig. Throws on any failure (a wrong key, a corrupted descCt,
+ * a length outside [224, 2960]); never returns garbage. Does not parse D.
+ */
 export function openDesc(dk: Bytes, conv: Bytes, e: number, blob: Bytes | BundleBlob): { D: Bytes; dsig: Bytes } {
   return splitDesc(unpad(aeadOpen(dk, bundleOf(blob).descCt, descAad(conv, e))));
 }
 
-/** §6.4 (h), each failure separately: bundleSize ∉ {11640, 40248}, length, hash, magic, ver, B, the zero bytes, B < m. */
+/** Decrypts pkCt with dk_e: pks_e, B·1216 bytes (§5.4). Throws on any failure (a wrong key, a corrupted pkCt). */
+export function openPks(dk: Bytes, conv: Bytes, e: number, blob: Bytes | BundleBlob): Bytes {
+  return aeadOpen(dk, bundleOf(blob).pkCt, pksAad(conv, e));
+}
+
+/** §6.4 (h), each failure separately: bundleSize ∉ {23456, 81248}, length, hash, magic, ver, B, the zero bytes, B < m. */
 export type BundleShapeFailure = "size" | "length" | "hash" | Sgb2HeaderFailure | "m";
 
 export function bundleShapeValid(blob: Bytes, size: number, id: Bytes, m: number): BundleShapeFailure | null {
@@ -1642,7 +1814,8 @@ export function acceptOldRow(row: WalkRow, epochs: readonly WalkEpoch[]): boolea
 
 export const M_VER = 2;
 export const M_HEADER_LEN = 62;
-export const MT = { TEXT: 1, IMAGE: 2, WELCOME: 8, CLAIM: 16, LEAVE: 17, NEED_KEY: 18, KEY_OK: 19 } as const;
+/** The types of M (§3.3): every other value is invalid. */
+export const MT = { TEXT: 1, IMAGE: 2, WELCOME: 8, CLAIM: 16, LEAVE: 17 } as const;
 export type MsgType = (typeof MT)[keyof typeof MT];
 const MSG_TYPES: readonly number[] = Object.values(MT);
 /** lane of a CLAIM. */
@@ -1708,9 +1881,7 @@ export type MBody =
   | { type: typeof MT.IMAGE; image: ImageRef }
   | { type: typeof MT.WELCOME; join: Join }
   | { type: typeof MT.CLAIM; claim: Claim }
-  | { type: typeof MT.LEAVE }
-  | { type: typeof MT.NEED_KEY; ef: number }
-  | { type: typeof MT.KEY_OK };
+  | { type: typeof MT.LEAVE };
 
 export type Msg = MHeader & MBody;
 
@@ -1726,10 +1897,7 @@ function encodeContent(m: MBody): Bytes {
       return encodeJ(m.join);
     case MT.CLAIM:
       return encodeClaim(m.claim);
-    case MT.NEED_KEY:
-      return u32(m.ef);
     case MT.LEAVE:
-    case MT.KEY_OK:
       return new Uint8Array(0);
     default:
       return bad("M: bad type");
@@ -1747,11 +1915,7 @@ function parseContent(type: number, c: Bytes): MBody {
       return { type: MT.WELCOME, join: parseJ(c) };
     case MT.CLAIM:
       return { type: MT.CLAIM, claim: parseClaim(c) };
-    case MT.NEED_KEY:
-      if (c.length !== 4) bad("need-key: bad length");
-      return { type: MT.NEED_KEY, ef: new DataView(c.buffer, c.byteOffset, 4).getUint32(0) };
     case MT.LEAVE:
-    case MT.KEY_OK:
       if (c.length !== 0) bad("M: content must be empty");
       return { type };
     default:
@@ -1760,10 +1924,10 @@ function parseContent(type: number, c: Bytes): MBody {
 }
 
 /**
- * Parses M and checks every rule that needs no epoch context: ver, type, content, `lane = from` for lane rows and
- * `lane = 0xFFFF` with NONE / ZERO16 prev fields for a CLAIM, `from < 32`, prevh = ZERO16 with NONE, ck16 = ZERO16
- * with ckq = 0. `from < |D_e|`, the label, NEED_KEY's e_f ≥ e, a CLAIM's m = |D_e| and the signature are
- * contextual (acceptRow).
+ * Parses M and checks every parse rule of §3.3 (none needs epoch context): ver, type ∈ {1, 2, 8, 16, 17}, content,
+ * `lane = from` for lane rows and `lane = 0xFFFF` with NONE / ZERO16 prev fields for a CLAIM, `from < 32`, the
+ * position rule, prevh = ZERO16 with NONE, ts ≤ 2^53 − 1, ck16 = ZERO16 with ckq = 0, len. `from < |D_e|`, the
+ * label, a CLAIM's m = |D_e| and the signature are contextual (acceptRow).
  */
 export function parseM(M: Bytes): Msg {
   const r = new Rd(M, "M");
@@ -1902,7 +2066,6 @@ export function acceptRow(ctx: RowContext, E: number, label: Bytes, body: Bytes)
   const m = row.msg;
   if (m.from >= ctx.members.length) return no("from");
   if (!equalBytes(expectedLabel(ctx.keys, m, E), label)) return no("label");
-  if (m.type === MT.NEED_KEY && m.ef < ctx.e) return no("content");
   if (m.type === MT.CLAIM && m.claim.cuts.length !== ctx.members.length) return no("content");
   if (!verifyRow(ctx.members[m.from].sigPk, row.sig, ctx.conv, ctx.e, E, label, row.M)) return no("sig");
   return { ok: true, ...row };
@@ -1922,14 +2085,17 @@ export function buildRow(
 
 // ───────────────────────── processing a winning claim (§6.6 steps 2–4) ─────────────────────────
 
-/** What member i of D_e does with the final winning claim (§6.6 steps 3–4). */
+/**
+ * What member i of D_e does with the final winning claim (§6.6 steps 3–4): removed (rm bit 1); frozen "nokey" (its
+ * entry does not open, or its ekc mismatches); frozen "invalid" with the first failing D′ check; or accept.
+ */
 export type ClaimOutcome =
   | { kind: "removed" }
-  | { kind: "excluded" }
-  | { kind: "withheld" }
+  | { kind: "nokey" }
   | { kind: "invalid"; failed: DPrimeCheck }
-  | { kind: "accept"; EK: Bytes; keys: EpochKeys; D: Descriptor; dsig: Bytes };
+  | { kind: "accept"; EK: Bytes; keys: EpochKeys; D: Descriptor; dsig: Bytes; pks: Bytes };
 
+/** §6.6 steps 2–4 for one member. Whatever the bundle holds, every failure is an outcome, never a throw. */
 export function processClaim(p: {
   kemSk: Bytes;
   De: Descriptor;
@@ -1943,31 +2109,45 @@ export function processClaim(p: {
   const { De, claim } = p;
   const e1 = De.e + 1;
   if (rmHas(claim.rm, p.i)) return { kind: "removed" };
-  const V = openEntry(p.kemSk, De.conv, e1, p.i, p.blob);
-  if (V === "removed") return { kind: "excluded" };
-  if (!V || !equalBytes(ekc(De.conv, e1, V), claim.ekc)) return { kind: "withheld" };
-  const keys = epochKeys(V, De.conv, e1);
-  let pair: { D: Bytes; dsig: Bytes };
+  let b: BundleBlob;
   try {
-    pair = openDesc(keys.dk, De.conv, e1, p.blob);
+    b = bundleOf(p.blob);
   } catch {
-    return { kind: "invalid", failed: "desc" };
+    return { kind: "nokey" }; // no entry opens (rule (h) has already refused such a blob)
   }
-  const r = dPrimeChecks({ ...pair, kc: keys.kc }, De, { from: p.from, hD: claim.hD, rm: claim.rm });
-  return r.ok ? { kind: "accept", EK: V, keys, D: r.D, dsig: pair.dsig } : { kind: "invalid", failed: r.failed };
+  const V = openEntry(p.kemSk, De.conv, e1, p.i, b);
+  if (!V || !equalBytes(ekc(De.conv, e1, V), claim.ekc)) return { kind: "nokey" };
+  const keys = epochKeys(V, De.conv, e1);
+  // The first D′ check: descCt and pkCt open under dk_{e+1}(EK′); D′ ‖ dsig′ unpads (and parses, in dPrimeChecks).
+  let opened: "desc" | "pks" = "desc";
+  let pair: { D: Bytes; dsig: Bytes };
+  let pks: Bytes;
+  try {
+    pair = openDesc(keys.dk, De.conv, e1, b);
+    opened = "pks";
+    pks = openPks(keys.dk, De.conv, e1, b);
+  } catch {
+    return { kind: "invalid", failed: opened };
+  }
+  const r = dPrimeChecks({ ...pair, kc: keys.kc, pks, EK: V }, De, { from: p.from, hD: claim.hD, rm: claim.rm }, b);
+  if (!r.ok) return { kind: "invalid", failed: r.failed };
+  return { kind: "accept", EK: V, keys, D: r.D, dsig: pair.dsig, pks };
 }
 
 // ───────────────────────── accepting a join (§6.7 steps 1–2) ─────────────────────────
 
-export type JoinCheckFailure = "hash" | "size" | "header" | "desc" | "conv" | "e" | "dsig" | "self";
+/** "pks": pkCt does not open, or checkPks fails; "self": self is missing, or listed with a foreign sigPk or kh. */
+export type JoinCheckFailure = "hash" | "size" | "header" | "desc" | "pks" | "conv" | "e" | "dsig" | "self";
 export type JoinCheck =
-  | { ok: true; D: Descriptor; dsig: Bytes; keys: EpochKeys }
+  | { ok: true; D: Descriptor; dsig: Bytes; keys: EpochKeys; pks: Bytes }
   | { ok: false; failed: JoinCheckFailure };
 
 /**
- * §6.7 steps 1–2: the fetched blob matches J (hash, size = bundleSize ∈ {11640, 40248}, header), descCt opens
- * with dk_e(EK), D parses with D.conv = J.conv and D.e = J.e < 2^32 − 1, dsig verifies under D's own key for
- * D.by, and self is listed with its own sigPk. Steps 3–6 (duplicates, fit, D.by's directory key) are the engine's.
+ * §6.7 steps 1–2 on a fetched blob: it matches J (hash, size = bundleSize ∈ {23456, 81248}, header with 10 zero
+ * bytes), descCt and pkCt open with dk_e(EK), D parses with D.conv = J.conv and D.e = J.e < 2^32 − 1, dsig verifies
+ * under D's own key for D.by, pks fits D (checkPks), and self is listed with its own sigPk and kh. Returns pks too
+ * (later commits copy continuing members' kemPk from it). Steps 3–6 (duplicates, fit, D.by's directory key) are
+ * the engine's.
  */
 export function checkJoinBundle(J: Join, blob: Bytes, self: Member): JoinCheck {
   const no = (failed: JoinCheckFailure): JoinCheck => ({ ok: false, failed });
@@ -1981,20 +2161,26 @@ export function checkJoinBundle(J: Join, blob: Bytes, self: Member): JoinCheck {
   }
   if (J.e >= E_MAX) return no("e");
   const keys = epochKeys(J.EK, J.conv, J.e);
+  let opened: "desc" | "pks" = "desc";
   let pair: { D: Bytes; dsig: Bytes };
   let D: Descriptor;
+  let pks: Bytes;
   try {
     pair = openDesc(keys.dk, J.conv, J.e, b);
     D = parseD(pair.D);
+    opened = "pks";
+    pks = openPks(keys.dk, J.conv, J.e, b);
   } catch {
-    return no("desc");
+    return no(opened);
   }
   if (!equalBytes(D.conv, J.conv)) return no("conv");
   if (D.e !== J.e) return no("e");
   if (!verifyD(D, keys.kc, pair.dsig)) return no("dsig");
+  if (checkPks(D, pks, b.B)) return no("pks");
   const i = memberIndex(D, self.uid);
-  if (i < 0 || !equalBytes(D.members[i].sigPk, self.sigPk)) return no("self");
-  return { ok: true, D, dsig: pair.dsig, keys };
+  const listed = i >= 0 ? D.members[i] : null;
+  if (!listed || !equalBytes(listed.sigPk, self.sigPk) || !equalBytes(listed.kh, self.kh)) return no("self");
+  return { ok: true, D, dsig: pair.dsig, keys, pks };
 }
 
 // ───────────────────────── self lane (§7.1–§7.3) ─────────────────────────
@@ -2002,7 +2188,7 @@ export function checkJoinBundle(J: Join, blob: Bytes, self: Member): JoinCheck {
 export const S_VER = 2;
 export const S_HEADER_LEN = 32;
 export const MAX_SELF_RECORDS = 255;
-/** A self row carrying EPOCH_PENDING is padded with these classes, so it is class ≥ 1 (§7.1). */
+/** A self row carrying EPOCH_PENDING or DELIVERED is padded with these classes, so it is class ≥ 1 (§7.1). */
 export const SELF_PENDING_CLASSES = [1024, 4096, 16384] as const;
 
 export const RT = {
@@ -2028,8 +2214,7 @@ export const VIA = { CREATED: 1, INBOX: 2, WELCOME: 3, HELLO: 4, REQUEST_ACCEPTE
 export type Via = (typeof VIA)[keyof typeof VIA];
 const isVia = (v: number): v is Via => v >= 1 && v <= 5;
 
-/** EPOCH flags. */
-export const EPOCH_CHAINED = 1;
+/** EPOCH flags: bit1 = accepted by a skip join; every other bit, bit0 included, is 0 (§7.2). */
 export const EPOCH_SKIP = 2;
 /** LINK flags. */
 export const LINK_ONE_SHOT = 1;
@@ -2137,6 +2322,8 @@ export interface MemberRec {
   rtype: typeof RT.MEMBER;
   uid: Bytes;
   sigPk: Bytes;
+  /** kemHash of the member's directory kemPk (§5.1) */
+  kh: Bytes;
   pin: Bytes;
   handle: string;
 }
@@ -2223,6 +2410,7 @@ function recordContent(x: SelfRecord): Bytes {
       return concat(
         fixed(x.uid, 16, "MEMBER uid"),
         fixed(x.sigPk, 32, "MEMBER sigPk"),
+        fixed(x.kh, 32, "MEMBER kh"),
         fixed(x.pin, 32, "MEMBER pin"),
         u8(h.length),
         h,
@@ -2296,7 +2484,7 @@ export function parseRecord(rtype: number, c: Bytes): SelfRecord | null {
     case RT.EPOCH: {
       x = { rtype, ...rdCopy(r), ...rdMaterial(r), claim: rdPos(r, what), flags: r.u8() };
       if (x.e === 0) bad(`${what}: EPOCH is for e ≥ 1`);
-      if (x.flags & ~(EPOCH_CHAINED | EPOCH_SKIP)) bad(`${what}: bad flags`);
+      if (x.flags & ~EPOCH_SKIP) bad(`${what}: bad flags`);
       break;
     }
     case RT.EPOCH_PENDING:
@@ -2347,12 +2535,13 @@ export function parseRecord(rtype: number, c: Bytes): SelfRecord | null {
     case RT.MEMBER: {
       const uid = r.bytes(16);
       const sigPk = r.bytes(32);
+      const kh = r.bytes(32);
       const pin_ = r.bytes(32);
       const hlen = r.u8();
       if (hlen < 3 || hlen > 20) bad(`${what}: bad handle length`);
       const handle = decodeUtf8(r.bytes(hlen), what);
       if (!HANDLE_RE.test(handle)) bad(`${what}: bad handle`);
-      x = { rtype, uid, sigPk, pin: pin_, handle };
+      x = { rtype, uid, sigPk, kh, pin: pin_, handle };
       break;
     }
     case RT.SNAP:
@@ -2408,12 +2597,17 @@ export interface ParsedSelfRow extends SelfRow {
   skipped: number;
 }
 
-/** Encodes S; a row whose records are one SNAP is a snapshot pointer (Lsnap), any other may not hold SNAP. */
+/**
+ * Encodes S; a row whose records are one SNAP is a snapshot pointer (Lsnap) with prev fields NONE / ZERO16 (it is not
+ * part of the Lself prev chain, §7.1), any other may not hold SNAP.
+ */
 export function encodeS(row: SelfRow): Bytes {
   const count = row.records.length;
   if (count < 1 || count > MAX_SELF_RECORDS) bad("S: 1 ≤ count ≤ 255");
-  checkRecordsAt(row.records, row.records.some((x) => x.rtype === RT.SNAP) ? "snap" : "self");
+  const pointer = row.records.some((x) => x.rtype === RT.SNAP);
+  checkRecordsAt(row.records, pointer ? "snap" : "self");
   if (isNone(row.prev) && !equalBytes(row.prevh, ZERO16)) bad("S: prevh without prev");
+  if (pointer && !isNone(row.prev)) bad("S: a pointer row has prev fields NONE / ZERO16");
   return concat(
     u8(S_VER),
     wrPos(row.prev, "S prev"),
@@ -2441,10 +2635,13 @@ export function parseS(S: Bytes, at: "self" | "snap" = "self"): ParsedSelfRow {
 export const selfAad = (E: number, label: Bytes): Bytes =>
   enc("segv.sh/v2/self", u16(E), fixed(label, 16, "self label"));
 
-/** body = aeadSeal(kS, pad(S, CLASSES), aad); a row with EPOCH_PENDING uses pad(S, [1024, 4096, 16384]) (§7.1). */
+/**
+ * body = aeadSeal(kS, pad(S, CLASSES), aad); a row with EPOCH_PENDING or DELIVERED uses pad(S, [1024, 4096, 16384]),
+ * so it is class ≥ 1 (§7.1).
+ */
 export function sealSelf(kS: Bytes, E: number, label: Bytes, row: SelfRow): SealedRow {
   const S = encodeS(row);
-  const pending = row.records.some((x) => x.rtype === RT.EPOCH_PENDING);
+  const pending = row.records.some((x) => x.rtype === RT.EPOCH_PENDING || x.rtype === RT.DELIVERED);
   const { cls, pt } = padClass(S, pending ? SELF_PENDING_CLASSES : CLASSES);
   return { cls, body: aeadSeal(kS, pt, selfAad(E, label)) };
 }

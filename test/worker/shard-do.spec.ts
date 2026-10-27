@@ -1,14 +1,15 @@
 /**
  * ShardDO (docs/PROTOCOL-v2.md §9.1, plan M2): CAS, BAD, WRONG_ERA, sealing, batches and the head chain, feed
- * paging (feedBatches / feedRows), monotonic t (IMP-7), early acceptance at the SKEW boundary, identity and alarm
- * discipline, and batches of thousands of rows (closeBatch never reads a body; feed results stay within budget).
+ * paging (feedBatches / feedRows, which never close a due batch), monotonic t (IMP-7), early acceptance at the SKEW
+ * boundary, identity and alarm discipline (an ended era arms nothing), the pinned Δ, and batches of thousands of
+ * rows (closeBatch never reads a body; feed results stay within budget).
  *
  * Every test uses fresh eras far in the future, so every alarm a DO arms lies in the future and only fires when a
  * test runs it (runDurableObjectAlarm). Time inside a DO is set through its protected `clock` field.
  */
 import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import * as P from "../../src/lib/proto";
 import { leafShardFromHash } from "../../src/server/batch";
 import type { ShardDO } from "../../src/server/shard-do";
@@ -455,6 +456,31 @@ describe("ShardDO batches", () => {
     expect(await alarmOf(E)).toBe(batchDue(t));
     expect((await stub(E).head(E, 0)).tLast).toBe(0);
   });
+
+  it("the feed never closes a due batch: feedBatches and feedRows leave it open until head() closes it", async () => {
+    const E = freshEra();
+    const c = at(E, 200);
+    await setClock(E, c);
+    const t = await putOk(E, [row(0), row(3), row(1)]);
+    await setClock(E, c + 5000); // tpub(now) > open_t: the batch is due, and its alarm has not run
+    for (let k = 0; k < 2; k++) {
+      expect(await stub(E).feedBatches(E, 0, 0, 1 << 30)).toEqual({ batches: [], more: false, sealed: false });
+      expect(await stub(E).feedBatches(E, 0, 0, 1)).toEqual({ batches: [], more: false, sealed: false });
+      await runInDurableObject(stub(E), (inst: ShardDO, state) => {
+        expect(() => inst.feedRows(E, 0, t, null, 1 << 20)).toThrow(/no closed batch/);
+        expect(metaOf(state, "open_t")).toBe(t);
+        expect(metaOf(state, "closed_t")).toBeNull();
+        expect(state.storage.sql.exec("SELECT count(*) AS n FROM batch").one().n).toBe(0);
+      });
+    }
+    // head() closes the due batch first, so every head it reports is in the feed's chain.
+    const h = await stub(E).head(E, 0);
+    expect(h.tLast).toBe(t);
+    const batches = await feedAll(E);
+    expect(batches.map((b) => [b.t, b.n])).toEqual([[t, 3]]);
+    expect(verifyChain(E, batches)).toEqual(h.head);
+    expect(await feedAll(E, 1)).toEqual(batches); // the same rows through feedRows chunks
+  });
 });
 
 describe("ShardDO era window", () => {
@@ -543,6 +569,85 @@ describe("ShardDO identity and alarms", () => {
 
     // An object of an ended era arms nothing.
     expect(await alarmOf(E_NOW - 3)).toBeNull();
+  });
+
+  it("a DO of an era that has already ended arms no alarm in its constructor and seals in prepare() (CMP-18)", async () => {
+    // The constructor runs before a test can reach the object: spy on setAlarm of every storage in the isolate.
+    const proto = await runInDurableObject(stub(freshEra()), (_inst: ShardDO, state) => Object.getPrototypeOf(state.storage));
+    const setAlarm = vi.spyOn(proto as DurableObjectStorage, "setAlarm");
+    const stateOf = (E: number) => runInDurableObject(stub(E), (_inst: ShardDO, state) => metaOf(state, "state"));
+    try {
+      // The spy sees the constructor of a running era arm its seal alarm …
+      const live = freshEra();
+      expect(await alarmOf(live)).toBe(P.eraEnd(live));
+      expect(setAlarm.mock.calls.map((c) => c[0])).toEqual([P.eraEnd(live)]);
+      setAlarm.mockClear();
+
+      // … and nothing from an ended era: neither its constructor nor prepare(), which seals on the first RPC.
+      const E = E_NOW - 5;
+      expect(await alarmOf(E)).toBeNull();
+      expect(await stateOf(E)).toBeNull(); // the constructor persisted nothing either
+      expect(await stub(E).get(E, 0, [{ v: P.random(8), label: P.random(16), mode: 1 }])).toEqual([
+        { s: "miss", sealed: true },
+      ]);
+      expect(await stateOf(E)).toBe("sealed");
+      expect(await stub(E).head(E, 0)).toMatchObject({ head: P.ZERO32, tLast: 0, sealed: true });
+      await evictDurableObject(stub(E));
+      expect(await alarmOf(E)).toBeNull();
+      expect(setAlarm).not.toHaveBeenCalled();
+    } finally {
+      setAlarm.mockRestore();
+    }
+  });
+
+  it("keeps the pinned Δ when the deployment Δ changes, and logs the mismatch exactly once per instance", async () => {
+    const E = freshEra();
+    const c = at(E, 1000);
+    const s = P.secOf(c);
+    expect(s % 10).toBe(0); // sec(start(E)) is a multiple of every Δ that divides 604 800
+    /** Runs the object with its clock at `ms` under a deployment Δ of `delta`. */
+    const deploy = (ms: number, delta: number) =>
+      runInDurableObject(stub(E), (inst: ShardDO) => {
+        internals(inst).clock = () => ms;
+        internals(inst).params = { ...internals(inst).params, delta };
+      });
+    const pinned = () => runInDurableObject(stub(E), (_inst: ShardDO, state) => metaOf(state, "delta"));
+
+    // The first put pins the deployment Δ = 10.
+    await deploy(c, 10);
+    expect(await pinned()).toBeNull();
+    expect(await putOk(E, [row()])).toBe(s);
+    expect(await pinned()).toBe(10);
+
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const logged = () => errors.mock.calls.filter((x) => String(x[0]).includes("pinned delta"));
+    try {
+      // The deployment now says Δ = 1: t, closing a batch and the batch alarm keep the pinned Δ = 10.
+      await deploy(c + 13_500, DELTA);
+      const t1 = await putOk(E, [row()]);
+      expect(t1).toBe(s + 10); // tpub under Δ = 10 (Δ = 1 would give s + 13); it closed batch s
+      await deploy(c + 19_999, DELTA);
+      expect((await stub(E).head(E, 0)).tLast).toBe(s); // tpub(now) = s + 10 = open_t under Δ = 10: still open
+      await deploy(c + 20_000, DELTA);
+      expect((await stub(E).head(E, 0)).tLast).toBe(t1);
+      expect(await pinned()).toBe(10);
+      expect(logged()).toHaveLength(1); // once per instance, however many calls
+      expect(JSON.parse(String(logged()[0][0]))).toEqual({ msg: expect.any(String), E, pinned: 10, env: DELTA });
+
+      // A new instance (Δ = 1 from the env) keeps Δ = 10 for t and for the batch alarm it re-arms, and logs once.
+      await evictDurableObject(stub(E));
+      await setClock(E, c + 25_000);
+      const t2 = await putOk(E, [row()]);
+      expect(t2).toBe(s + 20); // closed_t + 10 (Δ = 1 would give s + 25)
+      expect(logged()).toHaveLength(2);
+      await runInDurableObject(stub(E), (_inst: ShardDO, state) => state.storage.deleteAlarm());
+      await evictDurableObject(stub(E));
+      expect(await alarmOf(E)).toBe(P.T0_MS + (t2 + 10) * 1000 + 1000);
+      expect(logged()).toHaveLength(3);
+      expect(await pinned()).toBe(10);
+    } finally {
+      errors.mockRestore();
+    }
   });
 });
 

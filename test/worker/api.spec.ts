@@ -36,6 +36,7 @@ import {
   jsonBytes,
   makeAccount,
   makeRow,
+  mixedOrderRegistration,
   needBits,
   nonceBetween,
   nowOf,
@@ -255,6 +256,8 @@ describe("GET /api/v2/era/{E}", () => {
     expectApiHeaders(res);
     expect(res.headers.get("cache-control")).toBe("no-store");
     const body = (await res.json()) as Record<string, unknown>;
+    // Exactly the §10.9 keys, in order (CMP-23: no kroute).
+    expect(Object.keys(body)).toEqual(["era", "start", "end", "delta", "shards", "kcommit", "sealed"]);
     expect(body).toEqual({
       era: E,
       start: P.eraStart(E),
@@ -273,7 +276,19 @@ describe("GET /api/v2/era/{E}", () => {
     const res = await api(`/api/v2/era/${E}`);
     expect(res.status).toBe(200);
     expect(res.headers.get("cache-control")).toBe(IMMUTABLE);
-    expect(await res.json()).toMatchObject({ era: E, sealed: true, kcommit: P.b64u(P.kcommit(testKroute(E))) });
+    expectApiHeaders(res);
+    // A sealed era has the same keys: kroute_E is not published in stage 1 (§10.9).
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(Object.keys(body)).toEqual(["era", "start", "end", "delta", "shards", "kcommit", "sealed"]);
+    expect(body).toEqual({
+      era: E,
+      start: P.eraStart(E),
+      end: P.eraEnd(E),
+      delta: 1,
+      shards: 1,
+      kcommit: P.b64u(P.kcommit(testKroute(E))),
+      sealed: true,
+    });
     for (const e of [eraNow() + 1, 65000, 0]) {
       const r = await api(`/api/v2/era/${e}`);
       expect(r.status, String(e)).toBe(404);
@@ -855,14 +870,20 @@ describe("inbox", () => {
     const cached = await waitCached(key);
     expect(cached.headers.get("x-segv-now")).toBeNull();
     await cached.arrayBuffer();
-    // Replace the entry with a marker: a request with reordered / junk parameters is served from it.
+    // Replace the entry with a marker: a request with reordered / junk parameters is served from it, without an
+    // RL_READ token or an InboxDO call, and with a fresh x-segv-now.
     const marker = W.encodeInboxRead({ closed: 4242, more: false, rows: [] });
     await edgeCache().put(key, new Response(marker as BodyInit, { headers: { "cache-control": "public, max-age=60", "content-type": "application/octet-stream" } }));
     const t0 = Date.now();
-    const hit = await inboxReadRaw(E, `?limit=9&junk=1&after=${after}`);
+    const rl = countingLimiter();
+    const names: string[] = [];
+    const hit = await direct(`/api/v2/inbox/${E}/0?limit=9&junk=1&after=${after}`, {}, { RL_READ: rl, INBOX: fakeNs({}, names) });
     expect(hit.status).toBe(200);
     expect(W.decodeInboxRead(await bytesOf(hit)).closed).toBe(4242);
     expect(nowOf(hit)).toBeGreaterThanOrEqual(t0);
+    expectApiHeaders(hit);
+    expect(rl.calls).toBe(0);
+    expect(names).toEqual([]);
     await edgeCache().delete(key);
   });
 });
@@ -989,6 +1010,17 @@ describe("directory: POST /api/v2/register and /api/v2/wraps", () => {
     const notJson = await postJsonPow("/api/v2/register", "register", P.utf8("{not json"));
     expect(notJson.status).toBe(400);
     expect(await errorOf(notJson)).toBe("invalid JSON");
+    expect((await api(`/api/v2/dir/uid/${a.uidB64}`)).status).toBe(404);
+  });
+
+  it("400 on a mixed-order signing key whose signatures all verify (Q16); nothing is registered", async () => {
+    const a = makeAccount();
+    const h0 = await dirlogHead();
+    const res = await postJsonPow("/api/v2/register", "register", mixedOrderRegistration(a).body);
+    expect(res.status).toBe(400);
+    expectApiHeaders(res);
+    expect(await errorOf(res)).toMatch(/signing key/);
+    expect(await dirlogHead()).toEqual(h0);
     expect((await api(`/api/v2/dir/uid/${a.uidB64}`)).status).toBe(404);
   });
 
@@ -1924,7 +1956,8 @@ describe("era bounds (§9.7): no Durable Object for out-of-range eras", () => {
       { s: "wrong_era", era: E },
       { s: "wrong_era", era: E },
     ]);
-    for (const e of [65000, 0]) {
+    // Inbox posts: 409 {error: "wrong era", era} outside [era(now − SKEW), era(now + SKEW)] (SKEW = 0 here).
+    for (const e of [65000, 0, E + 1, E - 1]) {
       const post = W.encodeInboxPost({ E: e, bucket: 0, rows: [randomInvite()] });
       const r = await direct("/api/v2/inbox", await powInit("inbox", post), spies);
       expect(r.status, String(e)).toBe(409);
@@ -1963,12 +1996,17 @@ describe("era bounds (§9.7): no Durable Object for out-of-range eras", () => {
 // ───────────────────────────── server time and caching ─────────────────────────────
 
 describe("server time (x-segv-now) and cache before limits", () => {
-  it("every v2 response carries x-segv-now (success and errors, every route family)", async () => {
+  it("every v2 response except the 101 upgrade carries x-segv-now, nosniff, no-referrer and HSTS (JSON and binary, every route family)", async () => {
     const E = eraNow();
     const before = Date.now();
     const responses: [string, Response][] = [
       ["params", await api("/api/v2/params")],
       ["era", await api(`/api/v2/era/${E}`)],
+      ["200 put (binary)", await putRaw([makeRow()])],
+      ["200 get (binary)", await getRaw([{ E, label: randomLabel(), mode: 1 }])],
+      ["200 inbox read (binary, public)", await inboxReadRaw(E, `?after=${Math.floor(Math.random() * 1e9)}`)],
+      ["200 feed (binary)", await api(`/api/v2/feed/${E}/0?after=4294967295`)],
+      ["421", await api("/api/v2/params", { origin: "https://elsewhere.example" })],
       ["404", await api("/api/v2/nope")],
       ["405", await api("/api/v2/params", { method: "POST", body: new Uint8Array(1) })],
       ["403 put", await api("/api/v2/put", { method: "POST", body: new Uint8Array(3) })],
@@ -1990,8 +2028,47 @@ describe("server time (x-segv-now) and cache before limits", () => {
       expect(now, name).toBeGreaterThanOrEqual(before);
       expect(now, name).toBeLessThanOrEqual(after);
       expect(res.headers.get("x-content-type-options"), name).toBe("nosniff");
+      expect(res.headers.get("referrer-policy"), name).toBe("no-referrer");
+      expect(res.headers.get("strict-transport-security"), name).toBe(HSTS);
       if (res.status >= 400) expect(res.headers.get("cache-control"), name).toBe("no-store");
       await res.body?.cancel();
+    }
+  });
+
+  it("the 101 upgrade is returned exactly as the RealtimeDO built it: no x-segv-now, HSTS, nosniff or no-referrer", async () => {
+    const PER_RESPONSE = ["x-segv-now", "strict-transport-security", "x-content-type-options", "referrer-policy"];
+    // Through the Worker entry and the real RealtimeDO: HELLO carries the server time instead.
+    const res = await rtUpgrade();
+    expect(res.status).toBe(101);
+    for (const h of PER_RESPONSE) expect(res.headers.get(h), h).toBeNull();
+    const c = rtClient(res.webSocket!);
+    try {
+      await c.until(() => c.hello !== null, "HELLO");
+      expect(c.hello!.now).toBeGreaterThan(0);
+    } finally {
+      c.close();
+    }
+    // handleApi hands back the very Response object the RealtimeDO returned, its headers untouched.
+    _resetApiForTests();
+    let built: Response | undefined;
+    const RT = fakeNs({
+      wsTagKey: async () => new Uint8Array(32).fill(9),
+      fetch: async () => {
+        const pair = new WebSocketPair();
+        pair[1].accept();
+        built = new Response(null, { status: 101, webSocket: pair[0], headers: { "x-from-the-do": "1" } });
+        return built;
+      },
+    });
+    try {
+      const r = await direct("/api/v2/rt", { headers: { upgrade: "websocket", origin: ORIGIN } }, { RT });
+      expect(r.status).toBe(101);
+      expect(r).toBe(built);
+      expect([...r.headers]).toEqual([["x-from-the-do", "1"]]);
+      r.webSocket!.accept();
+      r.webSocket!.close(1000);
+    } finally {
+      _resetApiForTests();
     }
   });
 
@@ -2047,7 +2124,8 @@ describe("server time (x-segv-now) and cache before limits", () => {
         await edgeCache().put(key, entry);
         const res = await direct(path, {}, { RL_READ: deny });
         expect(res.status, path).toBe(200);
-        nowOf(res);
+        // The stored entries carry none of the per-response headers: all of them are stamped on the way out.
+        expectApiHeaders(res);
         await res.arrayBuffer();
       }
       // Uncached reads are rate limited.
@@ -2064,6 +2142,12 @@ describe("server time (x-segv-now) and cache before limits", () => {
 /** A fake namespace whose every stub is `stub` (records the names asked for). */
 function fakeNs(stub: Record<string, unknown>, names: string[] = []) {
   return { getByName: (n: string) => (names.push(n), stub) };
+}
+
+/** A rate-limit binding that grants `left` tokens and refuses every later one; `calls` counts every limit() call. */
+function countingLimiter(left = Number.POSITIVE_INFINITY) {
+  const l = { calls: 0, limit: async (): Promise<{ success: boolean }> => ({ success: ++l.calls <= left }) };
+  return l;
 }
 
 describe("Worker logic (fake Durable Objects)", () => {
@@ -2215,6 +2299,7 @@ describe("Worker logic (fake Durable Objects)", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("application/octet-stream");
     expect(res.headers.get("cache-control")).toBe(IMMUTABLE);
+    expectApiHeaders(res);
     expect(W.decodeFeed(await bytesOf(res))).toEqual({ more: true, batches: [batch] });
     expect(calls).toEqual([
       [77, null, 4 << 20],
@@ -2239,6 +2324,82 @@ describe("Worker logic (fake Durable Objects)", () => {
     calls.length = 0;
     failAt = 1;
     expect((await direct(path(), {}, { SHARD })).status).toBeGreaterThanOrEqual(500);
+  });
+
+  it("feed tokens: one RL_READ token per started 4 MiB of page, all taken before feedRows; cached pages take none", async () => {
+    const E = eraNow();
+    const rows = Array.from({ length: 3 }, () => ({ label: randomLabel(), cls: 0, body: randomBody(0) })).sort((a, b) => P.byteCmp(a.label, b.label));
+    const batch = { t: 5, n: 3, root: P.random(32), head: P.random(32) };
+    const want = { more: false, batches: [{ ...batch, rows }] };
+    let bytes = 9 << 20; // the batch size feedBatches reports (the rows themselves stay small)
+    let inline = false;
+    let feedRows = 0;
+    const SHARD = fakeNs({
+      feedBatches: async () => ({ batches: [inline ? { ...batch, bytes, rows } : { ...batch, bytes }], more: false, sealed: true }),
+      feedRows: async () => (feedRows++, { rows, done: true }),
+    });
+    const path = () => `/api/v2/feed/${E}/0?after=${Math.floor(Math.random() * 1e9)}`;
+
+    // A page of one 9 MiB batch is 5 + 9 MiB on the wire: ⌈(5 + 9 MiB) / 4 MiB⌉ = 3 tokens.
+    let rl = countingLimiter(3);
+    let res = await direct(path(), {}, { SHARD, RL_READ: rl });
+    expect(res.status).toBe(200);
+    expect(W.decodeFeed(await bytesOf(res))).toEqual(want);
+    expect(rl.calls).toBe(3);
+    expect(feedRows).toBe(1);
+    // With fewer tokens left: 429 with retry-after, before the shard is asked for any row.
+    for (const left of [2, 1, 0]) {
+      rl = countingLimiter(left);
+      feedRows = 0;
+      res = await direct(path(), {}, { SHARD, RL_READ: rl });
+      expect(res.status, `${left} left`).toBe(429);
+      expect(res.headers.get("retry-after")).toBe("60");
+      expectApiHeaders(res);
+      expect(await errorOf(res)).toBe("rate limited");
+      expect(rl.calls).toBe(left + 1);
+      expect(feedRows).toBe(0);
+    }
+    // The 5-byte page header counts: a batch of 8 MiB − 5 B is a page of exactly two tokens, one byte more needs three.
+    for (const [size, tokens] of [
+      [(8 << 20) - 5, 2],
+      [(8 << 20) - 4, 3],
+      [(4 << 20) + 1, 2],
+      [64 << 20, 17],
+    ]) {
+      bytes = size;
+      rl = countingLimiter();
+      res = await direct(path(), {}, { SHARD, RL_READ: rl });
+      expect(res.status).toBe(200);
+      await res.arrayBuffer();
+      expect(rl.calls, `${size} B`).toBe(tokens);
+    }
+
+    // An inline page (its rows came with feedBatches; it fits 4 MiB) takes one token and makes no feedRows call.
+    inline = true;
+    bytes = 72 + rows.reduce((n, r) => n + 17 + r.body.length, 0);
+    rl = countingLimiter();
+    feedRows = 0;
+    res = await direct(path(), {}, { SHARD, RL_READ: rl });
+    expect(W.decodeFeed(await bytesOf(res))).toEqual(want);
+    expect(rl.calls).toBe(1);
+    expect(feedRows).toBe(0);
+
+    // A page served from caches.default takes none, and reaches no shard.
+    const p = path();
+    const key = `${ORIGIN}${p}`;
+    await edgeCache().put(key, new Response(W.encodeFeed(want) as BodyInit, { headers: { "cache-control": IMMUTABLE } }));
+    try {
+      rl = countingLimiter();
+      const names: string[] = [];
+      res = await direct(p, {}, { SHARD: fakeNs({}, names), RL_READ: rl });
+      expect(res.status).toBe(200);
+      expect(W.decodeFeed(await bytesOf(res))).toEqual(want);
+      expectApiHeaders(res);
+      expect(rl.calls).toBe(0);
+      expect(names).toEqual([]);
+    } finally {
+      await edgeCache().delete(key);
+    }
   });
 
   it("rt: forwards only the upgrade and an opaque client tag to the RealtimeDO, and relays its refusals", async () => {

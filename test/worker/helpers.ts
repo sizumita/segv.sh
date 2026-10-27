@@ -4,6 +4,10 @@
  */
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
+import { ed25519 } from "@noble/curves/ed25519.js";
+import { bytesToNumberLE, numberToBytesLE } from "@noble/curves/utils.js";
+import { sha512 } from "@noble/hashes/sha2.js";
+import { hexToBytes } from "@noble/hashes/utils.js";
 import { expect } from "vitest";
 import * as P from "../../src/lib/proto";
 import * as W from "../../src/lib/wire";
@@ -439,6 +443,68 @@ export async function registerOk(a: Account): Promise<number> {
   const { dirseq } = (await res.json()) as { dirseq: number };
   expect(Number.isSafeInteger(dirseq) && dirseq >= 1).toBe(true);
   return dirseq;
+}
+
+type Signed = { record: string; sig: string };
+
+/** A point of order 8 on edwards25519 (one of the eight torsion points; canonical encoding). */
+const ORDER8_POINT = "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05";
+
+/**
+ * A mixed-order signing key (SPEC §2.1, Q16): `pk` = A + T, where A is the Ed25519 public key of `seed` and T has
+ * order 8, so `pk` is a canonical point that is not of small order but lies outside the prime-order subgroup.
+ * `sign` signs under `pk` with A's secret scalar a, drawing r until 8 divides k = H(R ‖ pk ‖ M) mod L: then
+ * [k]T = O and [S]B = R + [k]pk, so the signature verifies under the cofactorless equation (WebCrypto) and the
+ * cofactored one (noble) alike, and only a subgroup check can refuse the key.
+ */
+export function mixedOrderKey(seed: Bytes): { pk: Bytes; sign: (msg: Bytes) => Bytes } {
+  const Pt = ed25519.Point;
+  const L = Pt.Fn.ORDER;
+  const { scalar: a, point: A } = ed25519.utils.getExtendedPublicKey(seed);
+  const pk = A.add(Pt.fromBytes(hexToBytes(ORDER8_POINT))).toBytes();
+  const sign = (msg: Bytes): Bytes => {
+    for (;;) {
+      const r = bytesToNumberLE(P.random(64)) % L;
+      if (r === 0n) continue;
+      const R = Pt.BASE.multiply(r).toBytes();
+      const k = bytesToNumberLE(sha512(P.concat(R, pk, msg))) % L;
+      if (k % 8n !== 0n) continue;
+      return P.concat(R, numberToBytesLE((r + k * a) % L, 32));
+    }
+  };
+  return { pk, sign };
+}
+
+/**
+ * The registration body of `a` with its signing key replaced by the mixed-order key of `a`'s seed: the bundle and
+ * every wrap are signed under it (valid for WebCrypto and noble), so only `checkUserKeys` can refuse it.
+ */
+export function mixedOrderRegistration(a: {
+  bundle: string;
+  ident: P.Identity;
+  passkey: Signed;
+  recovery: Signed;
+}): {
+  pk: Bytes;
+  body: { bundle: string; sig: string; wraps: Signed[] };
+} {
+  const key = mixedOrderKey(a.ident.sigSk);
+  const bundle = JSON.stringify({
+    ...(JSON.parse(a.bundle) as Record<string, unknown>),
+    sig: P.b64u(key.pk),
+  });
+  const resign = (w: Signed): Signed => ({
+    record: w.record,
+    sig: P.b64u(key.sign(P.wrapSigMsg(w.record))),
+  });
+  return {
+    pk: key.pk,
+    body: {
+      bundle,
+      sig: P.b64u(key.sign(P.bundleSigMsg(bundle))),
+      wraps: [resign(a.passkey), resign(a.recovery)],
+    },
+  };
 }
 
 export interface DirUserJson {

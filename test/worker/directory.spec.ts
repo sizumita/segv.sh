@@ -3,9 +3,10 @@
  * src/server/directory.ts directly inside workerd (the HTTP layer is tested separately).
  */
 import { env } from "cloudflare:workers";
+import { ed25519 } from "@noble/curves/ed25519.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as P from "../../src/lib/proto";
-import { HttpError } from "../../src/server/http";
+import { HttpError, ed25519Verify } from "../../src/server/http";
 import {
   MAX_WRAPS_PER_ID,
   MAX_WRAPS_PER_UID,
@@ -29,6 +30,7 @@ import {
   type DirUser,
   type DirlogEntry,
 } from "../../src/server/directory";
+import { mixedOrderRegistration } from "./helpers";
 
 // ───────────── accounts (proto) ─────────────
 
@@ -217,8 +219,31 @@ describe("schema", () => {
     }
     // v1's tables are gone (migrations/0001_init.sql holds only the directory).
     for (const n of ["users", "wraps", "blobs"]) expect(names).not.toContain(n);
-    const meta = await all<{ k: string }>("SELECT k FROM dirmeta");
-    expect(meta.map((m) => m.k)).toContain("users");
+    const meta = await all<{ k: string; v: number }>("SELECT k, v FROM dirmeta");
+    expect(meta).toEqual([{ k: "users", v: 0 }]); // inserted by the migration (§9.6)
+  });
+  it("on the freshly migrated database the first registration makes dirmeta.users = 1, and currentP() follows it", async () => {
+    // Storage is per test file, and this is the file's first registration (the directory is still empty).
+    expect(await dirState()).toEqual({ users: 0, wraps: 0, head: 0, meta: 0 });
+    await register(makeAccount());
+    expect(await dirState()).toEqual({ users: 1, wraps: 2, head: 3, meta: 1 });
+    _resetDirectoryCacheForTests();
+    expect(await currentP(env)).toBe(P.serverP(1));
+    // P follows the registrations' increments: at 63 users P = 0, and the 64th registration makes P = 1.
+    await env.DB.prepare("UPDATE dirmeta SET v = 63 WHERE k = 'users'").run();
+    try {
+      _resetDirectoryCacheForTests();
+      expect(await currentP(env)).toBe(0);
+      await register(makeAccount());
+      expect((await dirState()).meta).toBe(64);
+      _resetDirectoryCacheForTests();
+      expect(await currentP(env)).toBe(1);
+      expect(P.serverP(64)).toBe(1);
+    } finally {
+      await env.DB.prepare("UPDATE dirmeta SET v = (SELECT count(*) FROM user) WHERE k = 'users'").run();
+      _resetDirectoryCacheForTests();
+    }
+    expect(await dirState()).toMatchObject({ users: 2, meta: 2 });
   });
 });
 
@@ -486,6 +511,24 @@ describe("dirRegister", () => {
     const rec = { record: a.passkey.record, sig: forgedSig };
     await rejects(dirRegister(env, { bundle, sig: forgedSig, wraps: [rec] }, Date.now()), 400);
     expect(await dirState()).toEqual(s0);
+  });
+
+  it("400 on a mixed-order signing key (outside the prime-order subgroup) even when every signature verifies (Q16)", async () => {
+    const a = makeAccount();
+    const { pk, body } = mixedOrderRegistration(a);
+    const A = ed25519.Point.fromBytes(pk);
+    expect(A.isSmallOrder()).toBe(false);
+    expect(A.isTorsionFree()).toBe(false);
+    // The Worker's own (WebCrypto) checks accept every signature: only checkUserKeys can refuse the key.
+    expect(await ed25519Verify(pk, P.fromB64u(body.sig), P.bundleSigMsg(body.bundle))).toBe(true);
+    for (const w of body.wraps) expect(await ed25519Verify(pk, P.fromB64u(w.sig), P.wrapSigMsg(w.record))).toBe(true);
+    const s0 = await dirState();
+    await rejects(dirRegister(env, body, Date.now()), 400, /signing key/);
+    expect(await dirState()).toEqual(s0);
+    expect(await dirByUid(env, a.uidB64)).toBeNull();
+    // The same account with its real key registers (nothing of the refused attempt is left).
+    await register(a);
+    expect((await dirByUid(env, a.uidB64))?.bundle).toBe(a.bundle);
   });
 });
 

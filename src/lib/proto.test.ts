@@ -19,6 +19,7 @@ import {
   sign as nodeSign,
   verify as nodeVerify,
 } from "node:crypto";
+import { ed25519 } from "@noble/curves/ed25519.js";
 import { ml_kem768_x25519 as xwing } from "@noble/post-quantum/hybrid.js";
 import { xchacha20poly1305 } from "@noble/ciphers/chacha.js";
 import * as P from "./proto";
@@ -26,6 +27,7 @@ import * as P from "./proto";
 type B = Uint8Array;
 
 // ───────────────────────── 1. reference helpers (independent of proto.ts) ─────────────────────────
+// (noble's ed25519 is used only to show what the library alone accepts, next to the pinned rule of §1.1.)
 
 const te = new TextEncoder();
 const s2b = (x: B | string): B => (typeof x === "string" ? te.encode(x) : x);
@@ -133,6 +135,57 @@ const edSmallOrder = (p: Pt): boolean => {
   let q = p;
   for (let i = 0; i < 3; i++) q = edAdd(q, q);
   return q[0] === 0n && q[1] === 1n;
+};
+const Lq = 2n ** 252n + 27742317777372353535851937790883648493n;
+const isId = (p: Pt): boolean => p[0] === 0n && p[1] === 1n;
+const edNeg = ([x, y]: Pt): Pt => [md(-x), y];
+/** Extended coordinates (X : Y : Z : T), x = X/Z, y = Y/Z, xy = T/Z: the unified add-2008-hwcd-3 formula (a = −1). */
+type Ext = [bigint, bigint, bigint, bigint];
+const D2q = md(2n * Dq);
+const extAdd = ([X1, Y1, Z1, T1]: Ext, [X2, Y2, Z2, T2]: Ext): Ext => {
+  const a = md((Y1 - X1) * (Y2 - X2));
+  const b = md((Y1 + X1) * (Y2 + X2));
+  const c = md(T1 * D2q * T2);
+  const d = md(2n * Z1 * Z2);
+  const [e, f, g, h] = [md(b - a), md(d - c), md(d + c), md(b + a)];
+  return [md(e * f), md(g * h), md(f * g), md(e * h)];
+};
+/** [k]P by double-and-add (k ≥ 0). */
+const edMul = ([x, y]: Pt, k: bigint): Pt => {
+  let r: Ext = [0n, 1n, 1n, 0n];
+  let q: Ext = [x, y, 1n, md(x * y)];
+  for (let e = k; e > 0n; e >>= 1n) {
+    if (e & 1n) r = extAdd(r, q);
+    q = extAdd(q, q);
+  }
+  const iz = inv(r[2]);
+  return [md(r[0] * iz), md(r[1] * iz)];
+};
+/** [L]P = identity: P lies in the prime-order subgroup. */
+const edTorsionFree = (p: Pt): boolean => isId(edMul(p, Lq));
+const BASE = edDecode(fromHex("5866666666666666666666666666666666666666666666666666666666666666"))!;
+const leToBig = (b: B): bigint => b.reduceRight((acc, x) => (acc << 8n) | BigInt(x), 0n);
+const sha512 = (b: B): B => new Uint8Array(createHash("sha512").update(b).digest());
+/** RFC 8032 §5.1.5: the secret scalar of a 32-byte seed. */
+const edScalar = (seed: B): bigint => {
+  const h = sha512(seed).slice(0, 32);
+  h[0] &= 248;
+  h[31] &= 127;
+  h[31] |= 64;
+  return leToBig(h);
+};
+/** A signature with an explicit R (any point) whose discrete log r is known up to torsion: S = r + k·a mod L. */
+const edSignRaw = (Renc: B, r: bigint, a: bigint, Aenc: B, msg: B): B =>
+  cat(Renc, le32((r + (leToBig(sha512(cat(Renc, Aenc, msg))) % Lq) * a) % Lq));
+/** The cofactored equation [8]([S]B − R − [k]A) = O over the exact bytes (BigInt, independent of noble). */
+const edCofactoredOk = (sig: B, msg: B, Aenc: B): boolean => {
+  const R = edDecode(sig.subarray(0, 32));
+  const A = edDecode(Aenc);
+  const S = leToBig(sig.subarray(32));
+  if (!R || !A || S >= Lq) return false;
+  const k = leToBig(sha512(cat(sig.subarray(0, 32), Aenc, msg))) % Lq;
+  const d = edAdd(edMul(BASE, S), edNeg(edAdd(R, edMul(A, k))));
+  return isId(edMul(d, 8n));
 };
 
 /** Deterministic PRNG (mulberry32) so fuzz failures are reproducible. */
@@ -332,6 +385,14 @@ describe("encoding (§1.2) and the shared primitives", () => {
     expect(toHex(P.enc("é", ""))).toBe(toHex(refEnc("é", "")));
   });
 
+  it("fromUtf8 is strict and keeps a leading U+FEFF (§1.2: ignoreBOM)", () => {
+    expect(P.fromUtf8(fromHex("efbbbf61"))).toBe("﻿a");
+    expect(P.fromUtf8(fromHex("efbbbf"))).toBe("﻿");
+    expect(P.fromUtf8(P.utf8("﻿﻿x"))).toBe("﻿﻿x");
+    expect(P.fromUtf8(s2b("ckpt/heads"))).toBe("ckpt/heads");
+    for (const h of ["ff", "c080", "eda080", "f4908080", "e282", "80"]) expect(() => P.fromUtf8(fromHex(h)), h).toThrow();
+  });
+
   it("t16 / t8 copy the first 16 / 8 bytes; ZERO16 / ZERO32", () => {
     const x = seqBytes(32);
     expect(toHex(P.t16(x))).toBe(toHex(seqBytes(16)));
@@ -499,9 +560,17 @@ describe("size classes (§3.2)", () => {
     expect(P.SEAL_OVERHEAD).toBe(1120 + 24 + 16);
     expect(P.INBOX_BODY_LEN).toBe(1416);
     expect(P.INBOX_BODY_LEN).toBe(1120 + 24 + 256 + 16);
-    expect([P.SGB2_HEADER_LEN, P.SGB2_DESC_LEN, P.SGB2_ENTRY_LEN]).toEqual([16, 2088, 1192]);
-    expect([...P.SGB2_SIZES]).toEqual([11640, 40248]);
-    expect([P.sgb2Size(8), P.sgb2Size(32)]).toEqual([16 + 2088 + 8 * 1192, 16 + 2088 + 32 * 1192]);
+    // SGB2: header | descCt (pad [4096] + 40) | pkCt (B·1216 + 40) | B entries of 1192 B = 4192 + 2408·B
+    expect([P.SGB2_HEADER_LEN, P.SGB2_DESC_LEN, P.SGB2_ENTRY_LEN]).toEqual([16, 4136, 1192]);
+    expect([P.sgb2PkCtLen(8), P.sgb2PkCtLen(32)]).toEqual([9768, 38952]);
+    expect([...P.SGB2_SIZES]).toEqual([23456, 81248]);
+    for (const B of [8, 32]) {
+      expect(P.sgb2Size(B)).toBe(16 + 4136 + (B * 1216 + 40) + B * 1192);
+      expect(P.sgb2Size(B)).toBe(4192 + 2408 * B);
+    }
+    // offsets: descCt at 16, pkCt at 4152, entries at 4192 + 1216·B
+    expect(P.SGB2_PKCT_AT).toBe(4152);
+    expect([P.sgb2EntriesAt(8), P.sgb2EntriesAt(32)]).toEqual([13920, 43104]);
     // a key wrap and an SGB2 entry are a seal of 32 bytes
     expect(P.SGB2_ENTRY_LEN).toBe(P.WRAP_LEN);
     expect(P.SEAL_OVERHEAD + 32).toBe(1192);
@@ -865,22 +934,34 @@ describe("checkUserKeys / isBadSigPk (§2.1)", () => {
     ["all ones", "ff".repeat(32)],
   ];
 
+  // a mixed-order key: a real key plus a point of order 8 (not of small order, not in the prime-order subgroup)
+  const mixed = edEncode(edAdd(edDecode(alice.id.sigPk)!, edDecode(fromHex(smallOrder[4][1]))!));
+
   it("the reference agrees with the classification", () => {
+    expect(toHex(edEncode(BASE))).toBe("58" + "66".repeat(31));
+    for (const u of [alice, bob, carol]) expect(toHex(edEncode(edMul(BASE, edScalar(u.id.sigSk))))).toBe(toHex(u.id.sigPk));
     for (const [name, h] of smallOrder) {
       const p = edDecode(fromHex(h));
       expect(p, name).not.toBeNull();
       expect(edSmallOrder(p!), name).toBe(true);
     }
     for (const [name, h] of notPoints) expect(edDecode(fromHex(h)), name).toBeNull();
-    for (const u of [alice, bob, carol]) expect(edSmallOrder(edDecode(u.id.sigPk)!)).toBe(false);
+    for (const u of [alice, bob, carol]) {
+      expect(edSmallOrder(edDecode(u.id.sigPk)!)).toBe(false);
+      expect(edTorsionFree(edDecode(u.id.sigPk)!)).toBe(true);
+    }
+    expect(edSmallOrder(edDecode(mixed)!)).toBe(false);
+    expect(edTorsionFree(edDecode(mixed)!)).toBe(false);
   });
 
-  it("accepts real keys and rejects small-order, non-canonical and non-point signing keys", () => {
+  it("accepts real keys and rejects small-order, mixed-order, non-canonical and non-point signing keys", () => {
     for (const u of [alice, bob, carol]) {
+      expect(P.validSigPk(u.id.sigPk)).toBe(true);
       expect(P.isBadSigPk(u.id.sigPk)).toBe(false);
       expect(() => P.checkUserKeys(u.id.sigPk, u.id.kemPk)).not.toThrow();
     }
-    for (const [name, h] of [...smallOrder, ...notPoints]) {
+    for (const [name, h] of [...smallOrder, ...notPoints, ["mixed order (real key + order 8)", toHex(mixed)]]) {
+      expect(P.validSigPk(fromHex(h)), name).toBe(false);
       expect(P.isBadSigPk(fromHex(h)), name).toBe(true);
       expect(() => P.checkUserKeys(fromHex(h), alice.id.kemPk), name).toThrow(/signing key/);
     }
@@ -892,11 +973,27 @@ describe("checkUserKeys / isBadSigPk (§2.1)", () => {
       found++;
       expect(P.isBadSigPk(b), `y = ${y}`).toBe(true);
     }
-    for (const n of [0, 31, 33, 64]) expect(P.isBadSigPk(new Uint8Array(n)), `${n} bytes`).toBe(true);
-    // a mixed-order key (real key + an order-8 point) is not of small order: §2.1 accepts it
-    const mixed = edEncode(edAdd(edDecode(alice.id.sigPk)!, edDecode(fromHex(smallOrder[4][1]))!));
-    expect(edSmallOrder(edDecode(mixed)!)).toBe(false);
-    expect(P.isBadSigPk(mixed)).toBe(false);
+    for (const n of [0, 31, 33, 64]) expect(P.validSigPk(new Uint8Array(n)), `${n} bytes`).toBe(false);
+    // every torsion component makes a mixed-order key
+    for (const [name, h] of smallOrder.filter(([n]) => !n.startsWith("identity"))) {
+      const k = edEncode(edAdd(edDecode(bob.id.sigPk)!, edDecode(fromHex(h))!));
+      expect(P.validSigPk(k), name).toBe(false);
+    }
+  });
+
+  it("validSigPk is memoised per key and stays correct past the cache bound (4096 keys)", () => {
+    const r = prng(0x51c);
+    for (let k = 0; k < 4200; k++) P.validSigPk(r.bytes(32));
+    for (let k = 0; k < 2; k++) {
+      expect(P.validSigPk(alice.id.sigPk)).toBe(true);
+      expect(P.validSigPk(mixed)).toBe(false);
+      expect(P.validSigPk(fromHex(smallOrder[4][1]))).toBe(false);
+    }
+    // the cache is keyed by the bytes, not by the array
+    const pk = alice.id.sigPk.slice();
+    expect(P.validSigPk(pk)).toBe(true);
+    pk.set(mixed);
+    expect(P.validSigPk(pk)).toBe(false);
   });
 
   it("rejects KEM keys that cannot be encapsulated to", () => {
@@ -916,27 +1013,99 @@ describe("checkUserKeys / isBadSigPk (§2.1)", () => {
       ["low-order X25519 u = 1", lowX1],
       ["ML-KEM coefficient out of range", badMl],
     ];
-    for (const [name, k] of bad) expect(() => P.checkUserKeys(alice.id.sigPk, k), name).toThrow(/KEM key/);
+    for (const [name, k] of bad) {
+      expect(() => P.checkUserKeys(alice.id.sigPk, k), name).toThrow(/KEM key/);
+      expect(P.validKemPk(k), name).toBe(false);
+    }
+    for (const u of [alice, bob, carol]) expect(P.validKemPk(u.id.kemPk)).toBe(true);
+    // the KEM half draws noble's own randomness, never random(): a test RNG stream is not consumed
+    withRandom(
+      () => {
+        throw new Error("random() must not be called");
+      },
+      () => expect(P.validKemPk(alice.id.kemPk)).toBe(true),
+    );
   });
 });
 
-describe("signature strictness (§1.1: RFC 8032, zip215 false)", () => {
-  const L = 2n ** 252n + 27742317777372353535851937790883648493n;
-  const fromLe = (b: B): bigint => b.reduceRight((acc, x) => (acc << 8n) | BigInt(x), 0n);
+describe("signature strictness (§1.1: validSigPk plus noble strict, cofactored; plan M1 test 13)", () => {
+  const L = Lq;
+  const fromLe = leToBig;
+  const a = edScalar(alice.id.sigSk);
+  const A = edDecode(alice.id.sigPk)!;
+  const T8 = edDecode(fromHex("26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05"))!; // order 8
+  const msg = s2b("segv.sh/v2/test message");
 
   it("rejects the universal forgery under a small-order key and malleated signatures (S + L)", () => {
-    const A = fromHex("01" + "00".repeat(31)); // identity
-    const sig = cat(A, new Uint8Array(32)); // R = identity, S = 0
-    for (const m of ["bundle", "", "other"]) expect(P.verify(sig, s2b(m), A), m).toBe(false);
-    expect(() => P.verifyBundle(JSON.stringify({ ...(JSON.parse(alice.bundle) as object), sig: P.b64u(A) }), P.b64u(sig))).toThrow(
+    const Aid = fromHex("01" + "00".repeat(31)); // identity
+    const sig = cat(Aid, new Uint8Array(32)); // R = identity, S = 0
+    for (const m of ["bundle", "", "other"]) expect(P.verify(sig, s2b(m), Aid), m).toBe(false);
+    expect(() => P.verifyBundle(JSON.stringify({ ...(JSON.parse(alice.bundle) as object), sig: P.b64u(Aid) }), P.b64u(sig))).toThrow(
       /signature/,
     );
-    const msg = P.bundleSigMsg(alice.bundle);
+    const bmsg = P.bundleSigMsg(alice.bundle);
     const good = P.fromB64u(alice.sig);
-    expect(P.verify(good, msg, alice.id.sigPk)).toBe(true);
+    expect(P.verify(good, bmsg, alice.id.sigPk)).toBe(true);
     const mall = cat(good.subarray(0, 32), le32(fromLe(good.subarray(32)) + L));
-    expect(P.verify(mall, msg, alice.id.sigPk)).toBe(false);
-    expect(edVerify(good, msg, alice.id.sigPk)).toBe(true);
+    expect(P.verify(mall, bmsg, alice.id.sigPk)).toBe(false);
+    expect(edVerify(good, bmsg, alice.id.sigPk)).toBe(true);
+  });
+
+  it("the reference signer agrees with RFC 8032 (node:crypto)", () => {
+    const r = leToBig(sha512(cat(sha512(alice.id.sigSk).subarray(32), msg))) % L; // RFC 8032 nonce
+    const sig = edSignRaw(edEncode(edMul(BASE, r)), r, a, alice.id.sigPk, msg);
+    expect(toHex(sig)).toBe(toHex(edSign(msg, alice.id.sigSk)));
+    expect(edCofactoredOk(sig, msg, alice.id.sigPk)).toBe(true);
+  });
+
+  it("a mixed-order key is rejected even with a signature the cofactored equation accepts (R = rB, S = r + k·a)", () => {
+    const mixedPt = edAdd(A, T8);
+    const mixed = edEncode(mixedPt);
+    const r = 0x1234567890abcdefn;
+    const sig = edSignRaw(edEncode(edMul(BASE, r)), r, a, mixed, msg);
+    // [8]([S]B − R − [k](aB + T)) = [8](−[k]T) = O: the cofactored equation holds, and noble alone accepts it
+    expect(edCofactoredOk(sig, msg, mixed)).toBe(true);
+    expect(ed25519.verify(sig, msg, mixed, { zip215: false })).toBe(true);
+    // the pinned rule refuses the key itself
+    expect(P.validSigPk(mixed)).toBe(false);
+    expect(P.verify(sig, msg, mixed)).toBe(false);
+    expect(() => P.checkUserKeys(mixed, alice.id.kemPk)).toThrow(/signing key/);
+  });
+
+  it("non-canonical (y ≥ p), identity and order-8 keys are rejected", () => {
+    const keys: [string, B][] = [
+      ["y = p (non-canonical 0)", fromHex("ed" + "ff".repeat(30) + "7f")],
+      ["y = p + 1 (non-canonical identity)", fromHex("ee" + "ff".repeat(30) + "7f")],
+      ["identity", fromHex("01" + "00".repeat(31))],
+      ["order 8", edEncode(T8)],
+    ];
+    for (const [name, k] of keys) {
+      expect(P.validSigPk(k), name).toBe(false);
+      expect(P.verify(cat(k, new Uint8Array(32)), msg, k), name).toBe(false); // R = A, S = 0
+      expect(P.verify(edSign(msg, alice.id.sigSk), msg, k), name).toBe(false);
+    }
+  });
+
+  it("under a valid key a torsioned R = rB + T verifies (the cofactored equation), S ≥ L or a non-canonical R does not", () => {
+    const r = 0xfeedfacecafebeefn;
+    const Rt = edEncode(edAdd(edMul(BASE, r), T8));
+    const sig = edSignRaw(Rt, r, a, alice.id.sigPk, msg);
+    expect(edCofactoredOk(sig, msg, alice.id.sigPk)).toBe(true);
+    expect(P.verify(sig, msg, alice.id.sigPk)).toBe(true);
+    // a cofactorless verifier (OpenSSL through node:crypto, like WebCrypto) refuses it: the rule is pinned
+    expect(edVerify(sig, msg, alice.id.sigPk)).toBe(false);
+    // S ≥ L: the same equation modulo L, refused
+    const big = cat(sig.subarray(0, 32), le32(leToBig(sig.subarray(32)) + L));
+    expect(edCofactoredOk(big, msg, alice.id.sigPk)).toBe(false);
+    expect(P.verify(big, msg, alice.id.sigPk)).toBe(false);
+    // a non-canonical R: the identity as y = p + 1, with S = k·a over those exact bytes
+    const Rnc = fromHex("ee" + "ff".repeat(30) + "7f");
+    const nc = edSignRaw(Rnc, 0n, a, alice.id.sigPk, msg);
+    expect(ed25519.verify(nc, msg, alice.id.sigPk, { zip215: true })).toBe(true); // a lenient decoder accepts it
+    expect(P.verify(nc, msg, alice.id.sigPk)).toBe(false);
+    // the canonical identity R with S = k·a verifies
+    const Rid = fromHex("01" + "00".repeat(31));
+    expect(P.verify(edSignRaw(Rid, 0n, a, alice.id.sigPk, msg), msg, alice.id.sigPk)).toBe(true);
   });
 });
 

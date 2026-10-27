@@ -11,6 +11,8 @@
  *    share the one DO alarm; the earliest due is always armed, in the same synchronous block as the commit.
  *  - prepare() seals once now ≥ end(E) + SKEW: closes the open batch and persists state = sealed. MISS(sealed)
  *    is only answered once that is persisted.
+ *  - Δ is pinned in meta 'delta' by the first put that inserts a row (§3.1); a deployment Δ that differs later is
+ *    logged once per instance and ignored for this era.
  *  - get / head / feedBatches / feedRows are the reads. The feed (public enumeration, closed batches only) is two
  *    RPCs so that no RPC result carries more than the caller's budget of bodies, however large one batch is: the
  *    Worker gets a page's batch list (with the rows inline when the page fits) and pulls an oversized batch's rows
@@ -94,6 +96,8 @@ export class ShardDO extends DurableObject<Env> {
   private readonly meta: Meta;
   private readonly chain: BatchChain;
   private readonly alarmSlot: AlarmSlot;
+  /** The pinned-Δ mismatch has been logged by this instance. */
+  private deltaLogged = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -287,9 +291,19 @@ export class ShardDO extends DurableObject<Env> {
     return this.meta.str("state") === "sealed";
   }
 
-  /** Δ of this era: pinned by the first write, the deployment parameter before that. */
+  /**
+   * Δ of this era: pinned by the first write, the deployment parameter before that. A deployment Δ that differs
+   * from the pinned one is logged once per instance (§3.1); the pinned value always wins.
+   */
   private delta(): number {
-    return this.meta.num("delta") ?? this.params.delta;
+    const pinned = this.meta.num("delta");
+    if (pinned === null) return this.params.delta;
+    if (pinned !== this.params.delta && !this.deltaLogged) {
+      this.deltaLogged = true;
+      const msg = "shard: DELTA_S differs from the pinned delta; keeping the pinned value";
+      console.error(JSON.stringify({ msg, E: this.E, pinned, env: this.params.delta }));
+    }
+    return pinned;
   }
 
   private sealAt(): number {
