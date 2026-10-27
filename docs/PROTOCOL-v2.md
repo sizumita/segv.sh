@@ -8,6 +8,18 @@ write or serve them, and there is no migration (no v1 data exists).
 
 Key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 
+**Implementation vocabulary** (round 10). These are implementation-defined and not part of the protocol: the names of
+functions, constants and types that the plan, the delta, `answers.md`, the appendices and the tests use (for example
+`dPrimeChecks`, `checkPks`, `checkJoinBundle`, `processClaim`, `acceptOldRow`, `rekeyRoot`, `validKemPk`, `pksAt`,
+`SGB2_PKCT_AT`, `logErr`); the failure codes or reasons such helpers return; the order in which a client evaluates
+checks whose order this spec does not state (§6.6 step 4, "Check order"); and the text, keys and format of log lines
+(§9.7). What is normative is the bytes written, served and accepted; the labels; the verdicts (valid, e-valid,
+undecided, D′-invalid, frozen, removed, dropped, parked); the warning and system-line texts; the requests a client
+makes; and the server's status codes and headers, and its bodies as this spec defines them (binary layouts, JSON keys
+and the error strings it names; any other error text is diagnostic). No implementation-defined item may change any of
+these. Unit tests MAY assert failure codes as diagnostics of one implementation; engine tests assert verdicts and
+texts.
+
 ## 0. Model
 
 ### 0.1 What the server is
@@ -140,8 +152,8 @@ are ASCII strings starting with `segv.sh/v2/`.
 
 **Time and sequence fields.** These `u64` fields hold values ≤ 2^53 − 1, and encoders and parsers MUST reject larger
 values: `ts` of D (§5.1), M (§3.3), S (§7.1) and S2 (§7.4), `lastTs` of a HEADS entry (§7.2), and in realtime frames
-(§10.8) `now_ms` and `seq` of HELLO, `seq` of ROWS and `since_seq` of RESUME and GAP. Other `u64` values (the routing
-value of §4.4 and the PoW nonce of §10.2) are not affected.
+(§10.8) `now_ms` and `seq` of HELLO, `seq` of ROWS and `since_seq` of RESUME and GAP. The routing value of §4.4 is
+not affected; the PoW nonce has the same bound, set in §10.2 (round 8).
 
 **Signed JSON rule** (directory only). A signed JSON object is sent as the exact UTF-8 text its signer produced.
 Verifiers MUST verify the signature over exactly those bytes, and nobody re-serialises signed JSON. Before verifying,
@@ -347,8 +359,8 @@ tpub(ms)  = ⌊sec(ms) / Δ⌋ · Δ                                 the only ti
   the current Δin to past eras. Changing either needs a new deployment with empty v2 storage. `SKEW` MUST NOT change
   within an era. Durable Objects MAY pin Δ and Δin at their first write as a defence against operator error (ShardDO
   and BlobRegDO meta `'delta'`, InboxDO meta `'slot'`, §9.1–§9.3); an object whose pin differs from the deployment
-  value MUST keep using the pin and SHOULD log (`logErr`) the mismatch once per instance (every pinning object, the
-  ShardDO included). Pins do not make a change safe.
+  value MUST keep using the pin and SHOULD log the mismatch once per instance (one log line, §9.7; every pinning
+  object, the ShardDO included). Pins do not make a change safe.
   `/api/v2/params` and `/api/v2/era/{E}` report the deployment values.
 - A Worker whose configured Δ does not divide 604 800, or whose deployment parameters include one that is present but
   not a decimal in its range, MUST answer every `/api/v2/*` request with 503 `{error: "server misconfigured"}`, without
@@ -369,11 +381,11 @@ tpub(ms)  = ⌊sec(ms) / Δ⌋ · Δ                                 the only ti
   and 8) also read the local monotonic and wall clocks.
 - A position on a lane is a pair `(E, n)`, ordered lexicographically. **NONE** = `(0xFFFF, 0xFFFFFFFF)` sorts before
   every real position.
-- A **position field** is `(Eprev, nprev)` of M and S, `(claimE, claimK)` of EPOCH, or `(Eh, nh)` of SNAP and S2. If
-  its E is 0xFFFF it MUST be exactly NONE: parsers reject `(0xFFFF, n)` with `n ≠ 0xFFFFFFFF`, and encoders refuse it.
-  A position with `E ≠ 0xFFFF` may have any n. The `(E, cnt)` pairs are not position fields and have no parse-time
-  range rule: the claim cuts (§6.2) and, in HEADS, `(ctlE, ctlCnt)`, the lane and followed-lane positions, and the
-  inbox cursor `(Ein, relIn)`. §6.4(f) bounds the cuts.
+- A **position field** is `(Eprev, nprev)` of M and S, `(claimE, claimK)` of EPOCH, `(E, n)` of LEFT (round 9), or
+  `(Eh, nh)` of SNAP and S2. If its E is 0xFFFF it MUST be exactly NONE: parsers reject `(0xFFFF, n)` with
+  `n ≠ 0xFFFFFFFF`, and encoders refuse it. A position with `E ≠ 0xFFFF` may have any n. The `(E, cnt)` pairs are not
+  position fields and have no parse-time range rule: the claim cuts (§6.2) and, in HEADS, `(ctlE, ctlCnt)`, the lane
+  and followed-lane positions, and the inbox cursor `(Ein, relIn)`. §6.4(f) bounds the cuts.
 
 ### 3.2 Size classes
 
@@ -858,6 +870,15 @@ The row is e-valid iff all of these hold:
   header `"SGB2"`, ver 1, `B ∈ {8, 32}` with `bundleSize = 4192 + 2408·B`, and 10 zero bytes (§5.4), and
   `B ≥ |D_e|`.
 
+**Order of requests** (rounds 11–12). The **local rules** are (a)–(e), the `bundleSize` clause of (g), and
+`B ≥ |D_e|` of (h), where `B = (bundleSize − 4192) / 2408` follows from `bundleSize`; (f) is local too when the reader
+holds `t_reg` of e's own bundle. A reader makes no `blob/meta` request and no blob fetch for a row before its local
+rules have passed; then it makes (f)'s `meta` request if it needs one, (g)'s `meta` request only after (f) has passed,
+and (h)'s blob fetch only after (g) has passed. The `get` that supplies the row's body, or its `t_row` for (g) when the
+row arrived in a realtime frame (§6.4(g), §11.6), is not ordered by this paragraph (round 12). So a row that fails a
+local rule costs no `blob/meta` request and no blob fetch, and every reader that holds the same facts makes the same
+such requests for it. The order among the local rules is free (preamble).
+
 Outcomes:
 
 - If any of (a)–(f) fails, or (g) or (h) fails definitively, the row is **not e-valid**. It is ignored: it still
@@ -918,7 +939,8 @@ of e, made by `by = D_e.members[from]`:
      - `|D'| ≤ B`, `pks'` is `B·1216` bytes and zero after slot `|D'| − 1`, and for every `j < |D'|`,
        `H(enc("segv.sh/v2/kh", pks'[j])) = D'.members[j].kh` and `pks'[j]` passes the `kemPk` half of `checkUserKeys`
        (for a kept member, the `sealDet` recomputation below performs that encapsulation, and whether it succeeds does
-       not depend on its randomness, §2.1, so a checker MAY skip the separate one: at most 32 encapsulations in all);
+       not depend on its randomness, §2.1, so a checker MAY skip the separate one, and a throw of that recomputation
+       is then a failure of this check: at most 32 encapsulations in all; round 10);
      - **every kept entry recomputes**: for every `i < |D_e|` whose `rm` bit is 0, `entry_i` equals
        `sealDet(pks'[j], enc(conv, u32 e+1, u16 i), i)` under `EK'` byte for byte, where j is the index of
        `D_e.members[i]` in `D'` (§5.4). X's own entry is included.
@@ -931,6 +953,17 @@ of e, made by `by = D_e.members[from]`:
      key always opens. So either every member of `D_e ∩ D'` accepts e+1 or none does, and no join moves a member into
      e+1 later (§6.7 step 5): membership is frozen for the whole conversation, as v1's never-delivered state and
      burned slot were, but the signer is known.
+
+     **Check order** (round 10). The D′ checks are one conjunction over data the member already holds: the claim is
+     D′-invalid iff at least one of them fails, whichever it is. A checker MAY evaluate them in any order and MAY stop
+     at the first failure (for example, it may compare `H(D')` with `hD` before parsing D′). Every check MUST be
+     total: for any bytes a committer or the server can supply it passes or fails, and it never throws past the
+     checker, waits or makes a request. The same holds for the local checks of §6.7 steps 1–2 on a fetched blob. This
+     paragraph changes no order that this spec states explicitly, such as the `rm` bit before the entry (step 3: a
+     removed member is removed whatever its entry holds), the own entry before the D′ checks (this step: it selects
+     the warning), the order of e-validity's requests (§6.4: the local rules first, among them the `bundleSize`
+     clause of (g) and `B ≥ |D_e|` of (h), then (f), (g) and (h); rounds 11–12),
+     `bundleSize`, then `meta`, then the blob (§6.7 step 1), and the server's order of checks (§10.1).
    - Otherwise X **accepts e+1**:
      - members `D'`; leaves carry over (§6.9); system lines (§11.9);
      - X subscribes to `T_{e+1}`. It keeps following the lane of e of every continuing member who has not yet posted
@@ -942,11 +975,19 @@ of e, made by `by = D_e.members[from]`:
      (§7.3).
 5. **System lines from `rm`.** Every member of e that processes C, frozen or not, shows "`who(by)` removed `who(x)`,
    …" for the members whose `rm` bit is 1 and who had not left, and "keys rotated after `who(l)`, … left" for dropped
-   leavers (§11.9). A removed member shows only "@by removed you".
+   leavers (§11.9). A removed member shows only "@by removed you". Who had left is the member's current leave state
+   in e (§6.9), not the state when C was processed: when a source of a leave in e is added, replaced or dropped later
+   (a sweep, scrollback, a late frame, or §6.8 on a new final winner), the two lines are derived again, so the same rows
+   give the same lines in every order of arrival (round 11). A reload holds fewer rows: the leave state of its HEADS
+   epoch and of later epochs comes from the LEFT records and the lanes it processes (§11.4 step 5), as live, but that of
+   an older epoch only from the rows that the initial history and scrollback load (§11.4 step 6, §11.10). So until
+   they load a leave's source, a claim below the HEADS epoch can show a removal where the live view showed "keys
+   rotated" (round 12). The gate of step 6 depends only on the current epoch, so a reload keeps it.
 6. **Frozen.** There is one frozen state; the two warnings above differ only in what X could see. A frozen member:
    - stays in epoch e, keeps receiving there, and applies the cut rule through `rm` (§6.8);
-   - keeps sending there (`canSend = true`), unless `rm` of C has a bit for a member who had not left. That member was
-     told it was removed but still holds e's keys, so texts and images in e are refused (§11.3);
+   - keeps sending there (`canSend = true`), unless `rm` of C has a bit for a member who had not left (by the current
+     leave state, step 5; round 11). That member was told it was removed but still holds e's keys, so texts and images
+     in e are refused (§11.3);
    - refuses its own membership changes with "the members of this conversation can no longer change; start a new
      conversation" (its control lane of e has a winner it cannot follow).
 
@@ -1017,22 +1058,39 @@ processed, sends wait at most 30 s and then fail, as in v1 (§11.3). Commits wai
      check as a first contact) and raise the critical warning "@x sent you a second, different copy of a conversation
      you were added to; both are shown marked ⚠ — only one can be genuine". Copies that are not confirmed are shown
      with "⚠ " when more than one copy exists.
-7. On acceptance, write CONV_JOIN or REQUEST (a new copy) or EPOCH (a skip, flag bit1) to the self lane at once
-   (§7.3). For an accepted copy, subscribe to `T_e` and probe the control lane and the lanes from `E_start(e)`. A
-   request is probed as §11.5 says.
+7. On acceptance, write CONV_JOIN or REQUEST (a new copy) or EPOCH (a skip, flag bit1, naming the position of the
+   claim of k that removed self, §7.2; round 11) to the self lane at once (§7.3). For an accepted copy, subscribe to
+   `T_e` and probe the control lane and the lanes from `E_start(e)`. A request is probed as §11.5 says.
 
 ### 6.8 Old-epoch acceptance (cuts and claim times)
 
 A receiver accepts a valid lane row R of epoch e from `s = D_e.members[i]` at `(E', n')`, with stored time `t_R`,
-iff this walk accepts it. For `j = e, e+1, …`, while the receiver holds the final winning claim `C_j` of epoch j (with
-stored time `t_j`) and s is a member of `D_j` at index `i_j` (`i_e = i`):
+iff this walk accepts it. For `j = e, e+1, …`, while s is a member of `D_j` at index `i_j` (`i_e = i`) and the
+receiver holds `D_{j+1}` or the final winning claim `C_j` of epoch j (with stored time `t_j`; round 10). The epochs are
+consecutive: an epoch that the receiver reached by a skip (§6.7 step 5) is not `D_{j+1}` of the epoch it was removed
+from, and never continues the walk (round 11).
 
 - If bit `i_j` of `rm(C_j)` is 0, s continues into `D_{j+1}`. If the receiver holds `D_{j+1}`, continue with `j + 1`;
-  otherwise (a frozen receiver) stop and accept.
+  otherwise (a frozen receiver, or one removed or dropped at j+1) stop and accept.
 - If the bit is 1 (s was removed or dropped at j+1), accept iff `t_R < t_j`, or `j = e`, `t_R = t_j` and R is before the
   cut of lane i in `C_e`. Stop.
 
 If the walk ends without a removal, accept.
+
+**The bit without `C_j`** (rounds 10–12). A receiver that holds `D_{j+1}` accepted it through `C_j`, whose `rm` has
+bit 0 exactly for the members of `D_j` that `D_{j+1}` lists (§6.6 step 4). It therefore reads s's bit from `D_{j+1}`,
+and needs `C_j` itself only at a step whose bit is 1 (for `t_j`, and for the cut when `j = e`). A receiver that was
+removed or dropped at j+1 holds no `D_{j+1}` and needs `C_j` at step j (round 11). A receiver that needs `C_j` but did
+not process it (a restore that started at a later HEADS epoch with that epoch's key from a snapshot's EPOCH record,
+§11.4 step 5, or scrollback, §11.10) reads `C_j` from the position that the EPOCH record of the copy's next held epoch
+names: the record for j+1, or, when self was removed or dropped at j+1, the record of the skip re-add that followed
+(§7.2; round 11). A snapshot holds an EPOCH record for every held epoch above the root (§7.4), and a restore
+re-derives every held epoch that no record gives by processing the claim before it (§7.3, §11.4 step 5; round 12), so
+it holds every held epoch and those claims. The copy's previous held epoch below an epoch is the highest held epoch
+below it (e−1, or the epoch k self was removed from below a skip re-add). The read is a body `get`, opened with
+`mk_j`, whose stored `t`, `rm` and cuts the receiver uses without evaluating the claim again (the record is the
+account's own). It retries a transient failure, and the row is not shown before it is decided. A receiver never
+accepts a row because it lacks `C_j`.
 
 - A committer cannot erase a removed member's earlier rows with a low cut: rows with `t_R < t(C)` are always
   accepted. It cannot let a removed member keep posting with a high cut either: rows with `t_R > t(C)` are always
@@ -1040,10 +1098,21 @@ If the walk ends without a removal, accept.
 - A member removed at e+1 cannot post into e after the claim, nor into any earlier epoch after a later claim that
   removed it. Equal times count as "after" for later claims, which is the safe side.
 - Valid rows of members who are still listed are shown even if they land late.
-- Every device applies the rule to the same stored `t` and the same public `rm`, so live, restored and frozen views
-  agree: a freeze stops every continuing member of e at e (§6.6), so frozen members hold the same claims as the
-  others. Decisions are recomputed when the receiver learns a new final winner: a row that is now dropped is removed
-  from the view and from `unread`. Dropped rows give no warning, and §11.3 step 7 marks one's own echo `failed`.
+- Every device applies the rule to the same stored `t` and the same public `rm` (from `C_j`, or from `D_{j+1}` as
+  above), so live, restored and frozen views agree: a freeze stops every continuing member of e at e (§6.6), so frozen
+  members hold the same claims as the others. Decisions are recomputed when the receiver learns a new final winner: a
+  row that is now dropped is removed from the view and from `unread`. Dropped rows give no warning, and §11.3 step 7
+  marks one's own echo `failed`. A leave stands in an epoch only while this walk accepts the source the receiver keeps
+  for it there (§6.9: the least of the leaver's LEAVE rows in that epoch and the leaves carried into it). When that
+  source is dropped, the leave is un-recorded in that epoch, and no other source can keep it: along the same walk a
+  source with a smaller key is accepted whenever one with a larger key is (rounds 8 and 10).
+- A LEFT record (§7.2) carries the stored time of its LEAVE row and, when it names the row's own epoch, the row's
+  position. A leave taken from one (§11.4 step 5) is decided by this walk exactly as the row would be: the walk starts
+  at the record's epoch, and the equal-time cut applies only to a record that carries a position (a carried record's
+  position is NONE, which is never before a cut). So a claim that drops the row un-records the leave on a restored
+  device too (round 9). Every device keeps the least source per epoch and member, whatever the order in which it
+  learned the sources, and its LEFT record names that source (§6.9, §7.3), so live and restored views agree whenever
+  the record was written (round 10).
 
 ### 6.9 Leave and remove
 
@@ -1058,9 +1127,21 @@ If the walk ends without a removal, accept.
   itself, is not lost. Senders still never choose a copy in which they have seen the recipient's LEAVE as a WELCOME
   channel (§6.12). Receivers record the leave in e and in the consecutive later epochs e+1, e+2, … that they hold, up
   to the first that does not list the leaver; so a leaver who is dropped and later re-added is not recorded as left in
-  the epochs of the re-add. Each epoch in which a receiver records the leave gets a LEFT record (§7.3), so a reload does
-  not forget it. A LEAVE row of a member already recorded as left in its epoch changes nothing and shows no second
-  line.
+  the epochs of the re-add. Each epoch in which a receiver records the leave gets a LEFT record with the row's stored
+  time and, for the row's own epoch, its position (NONE for an epoch the leave was carried into; §7.3), so a reload
+  does not forget the leave and decides it by §6.8 as it would decide the row (rounds 9 and 10).
+- **Several sources** (round 10). A member can be recorded as left in one epoch k from several **sources**: each of
+  its LEAVE rows in k (with the row's stored time and position), and each leave carried into k from an earlier epoch
+  (with that row's stored time and NONE), for example the leaver's own repeat (below) in an epoch into which a racing
+  claim carried its first leave. A source's **key** is `(t, position)`, compared by t, then by position, where NONE
+  counts as after every real position (unlike the order of §3.1). Per copy, epoch and member, the receiver keeps only
+  the source with the least key, whatever the order in which it learned the sources: a source with a smaller key
+  replaces the kept one (the receiver writes its LEFT record, §7.3), and one with an equal or larger key changes
+  nothing. The leave stands in k iff §6.8 accepts the kept source; because a smaller key is accepted whenever a larger
+  one is (§6.8), the kept source is accepted whenever any source is, and every device that holds the same rows reaches
+  the same verdict. The "@x left" line belongs to one LEAVE row per leave: a kept source that §6.8 accepts, in an
+  epoch into which no leave of x was carried (§11.9; round 12). A claim's removed and rotated lines follow the leave
+  state (§6.6 step 5), so they too depend on the rows held, not on the order in which they arrived (round 11).
 - **The leaver's own state.** A copy's leave is **current** while the copy has a LEAVE record and no skip re-add
   followed it: an EPOCH record with flag bit1 (§6.7 step 5) for an epoch above the latest LEAVE record's epoch ends the
   leave. The latest LEAVE record is the one with the highest e, whatever the order of the records (§7.3). While the
@@ -1080,9 +1161,13 @@ If the walk ends without a removal, accept.
   `2^32 − 2` (§11.3). Clients MAY rotate proactively: the remaining member of rank r (by index among non-leavers) waits
   `r × 30 s + random(0..10 s)` after seeing the leave, and aborts if a claim appears first. A member added by a commit
   that raced the LEAVE (its committer built `D′` before the row reached it, so `D′` still lists the leaver) holds no
-  epoch of that row and does not see it. It learns of the leave when the leaver's device repeats it in an epoch the new
-  member holds (above), or when a member who saw it rotates; its texts sent before then are readable with the
-  leaver's keys, although the leaver's own client shows none of them.
+  epoch of that row and does not see it. It records the leave only when the leaver's device repeats it in an epoch
+  the new member holds (above). Until then, a claim that drops the leaver (a member who saw the leave rotating) is a
+  removal to it: it shows "`who(by)` removed `who(x)`" where the members who saw the leave show "keys rotated after
+  `who(x)` left", and if that claim froze the conversation it refuses texts there while they may still send (§6.6
+  steps 5–6). Members that hold different rows can thus show different lines and gates (round 11). Its texts sent
+  before the leaver is dropped are readable with the leaver's keys, although the leaver's own client shows none of
+  them.
 - **Add.** An add commit drops every member who has left. Re-adding a leaver who is still listed takes two commits:
   first drop the leavers, then add.
 - **Remove.** A remove commit drops the removed member and every leaver. A member cannot remove itself (it must leave).
@@ -1221,7 +1306,8 @@ body = aeadSeal(kS, pad(S, CLASSES), aad = enc("segv.sh/v2/self", u16 E, label))
 - A record with an unknown `rtype` is skipped by its `len` (forward compatibility).
 - A known record's content has exactly the length its layout gives and obeys its row in §7.2: CONV_JOIN and REQUEST
   `via ∈ 1..5`; EPOCH `e ≥ 1`, only flag bit1 allowed, `(claimE, claimK)` a position; LINK only flag bits 0–1; PREFS
-  `len ≥ 1`; the counts of §7.2; DESC and REQUEST `224 ≤ dlen ≤ 2960`; MEMBER's handle; SNAP's `(Eh, nh)` a position.
+  `len ≥ 1`; the counts of §7.2; DESC and REQUEST `224 ≤ dlen ≤ 2960`; MEMBER's handle; LEFT's `(E, n)` a position
+  (round 9); SNAP's `(Eh, nh)` a position.
 - A row at `Lself` MUST NOT hold a SNAP. A row at `Lsnap` MUST hold exactly one known record, a SNAP. Writers write
   `count = 1` and prev fields NONE / `ZERO16` there; readers do not use a pointer row's prev fields.
 - S2 (§7.4) is malformed unless, after removing the padmé padding, it is `"SGS2"`, `ver = 1`, `(Eh, nh)` a position,
@@ -1237,7 +1323,7 @@ body = aeadSeal(kS, pad(S, CLASSES), aad = enc("segv.sh/v2/self", u16 E, label))
 | rtype | name | content |
 | ----- | ---- | ------- |
 | 0x01 | CONV_JOIN | `conv[16] | root[32] | u32 e | EK[32] | bundleId[32] | u32 bundleSize | rootBy[16] | u8 via` (137 B). An accepted copy. `via`: 1 = created, 2 = inbox, 3 = welcome, 4 = hello, 5 = request accepted. |
-| 0x02 | EPOCH | `conv[16] | root[32] | u32 e | EK[32] | bundleId[32] | u32 bundleSize | u16 claimE | u32 claimK | u8 flags` (127 B). Epoch e ≥ 1 of this copy. `(claimE, claimK)` is the position of the winning claim on `Lctl_{e−1}`, or NONE for a skip re-add. `flags`: bit1 = accepted by a skip join (0 for an epoch derived from the account's own bundle entry). Every other bit, bit0 included, is 0. |
+| 0x02 | EPOCH | `conv[16] | root[32] | u32 e | EK[32] | bundleId[32] | u32 bundleSize | u16 claimE | u32 claimK | u8 flags` (127 B). Epoch e ≥ 1 of this copy. `(claimE, claimK)` is the position of the final winning claim that ended the copy's previous held epoch: the claim on `Lctl_{e−1}`, or, for a skip re-add, the claim on `Lctl_k` that removed or dropped self from the epoch k the copy held before (§6.7 step 5; round 11, was NONE), so every held epoch above the root names the claim that a walk below it needs (§6.8). The record does not name k: it is the highest held epoch below e, and a restore holds every held epoch (§11.4 step 5; round 12). `flags`: bit1 = accepted by a skip join (0 for an epoch derived from the account's own bundle entry). Every other bit, bit0 included, is 0. |
 | 0x03 | EPOCH_PENDING | `conv[16] | root[32] | u32 e | EK[32] | bundleId[32] | u32 bundleSize | u32 t_reg | u8 a | uid[16] × a` (125 + 16a B). Creation (e = 0) or commit intent: the uids that need J. |
 | 0x04 | LEAVE | `conv[16] | root[32] | u32 e` (52 B) |
 | 0x05 | CONTACT | `uid[16] | pin[32]` (48 B). TOFU pin of the bundle (§2.2). |
@@ -1249,7 +1335,7 @@ body = aeadSeal(kS, pad(S, CLASSES), aad = enc("segv.sh/v2/self", u16 E, label))
 | 0x0B | REQUEST | `conv[16] | root[32] | u32 e | EK[32] | bundleId[32] | u32 bundleSize | u32 t_reg | rootBy[16] | u8 via | u16 dlen | desc[dlen]` (143 + dlen B), where `desc = D ‖ dsig` of epoch e. A request copy (§11.5). |
 | 0x0C | DESC | `conv[16] | root[32] | u32 e | u16 dlen | desc[dlen]` (54 + dlen B, `dlen ≤ 2960`), `desc = D ‖ dsig`. The descriptor of epoch e of the copy, so a restore needs no bundle fetch for it. |
 | 0x0D | MEMBER | `uid[16] | sigPk[32] | kh[32] | pin[32] | u8 hlen | handle[hlen]` (113 + hlen B). `handle` matches `^[a-z0-9_]{3,20}$` (§2.1), so `3 ≤ hlen ≤ 20` and the handle is ASCII; any other handle makes the record malformed. A co-member's directory bundle as self verified it: its `sigPk`, `kh = H(enc("segv.sh/v2/kh", kemPk))` of its `kemPk` (§5.1), and `pin` (§2.2), so restores need no directory lookup for that member (§11.4). |
-| 0x0E | LEFT | `conv[16] | root[32] | u32 e | uid[16]` (68 B). Another member's leave as self recorded it: `uid` is recorded as left in epoch e of the copy (§6.9). Written as §7.3 says, so a restore does not need the LEAVE row. |
+| 0x0E | LEFT | `conv[16] | root[32] | u32 e | uid[16] | u32 t | u16 E | u32 n` (78 B; round 9). Another member's leave as self recorded it: `uid` is recorded as left in epoch e of the copy (§6.9). `t` is the stored time of the LEAVE row R of the leave's kept source (§6.9; round 10), and `(E, n)`, a position field (§3.1), is R's position when e is R's own epoch, or NONE when the leave was carried into e from an earlier epoch. Written as §7.3 says, so a restore does not need R and decides the leave as R would be decided (§6.8). |
 | 0x20 | SNAP | `blobId[32] | key[32] | u32 size | u16 Eh | u32 nh` (74 B). Allowed only in rows at `Lsnap`. |
 
 **Counts.**
@@ -1308,7 +1394,7 @@ records are idempotent:
 | DESC | `(conv, root, e)` | the first one wins |
 | MEMBER | `uid` | the first one wins (see the pin check below) |
 | LEAVE | `(conv, root, e)` | every record is kept; the copy's *latest* LEAVE record is the one with the highest e (§6.9) |
-| LEFT | `(conv, root, e, uid)` | every record is kept |
+| LEFT | `(conv, root, e, uid)` | the record with the least `(t, (E, n))` wins, NONE counting as after every real position (the key of §6.9), so identical records count once and the fold holds at most one record per key; it stands for its LEAVE row and is decided by §6.8 (rounds 9–10) |
 | CONTACT | `uid` | the first one wins (see the pin check below) |
 | LINK | `s` | |
 | CONFIRMED | `(conv, root)` | |
@@ -1339,13 +1425,21 @@ these records (§7.4), so every device numbers copies the same way.
 - A device writes a record when it causes the event: a creation (CONV_JOIN and EPOCH_PENDING in one row), a commit
   (EPOCH_PENDING, later DELIVERED), an accepted join (CONV_JOIN, REQUEST or EPOCH), a leave, a corroboration
   (CONFIRMED, written before any CONV_JOIN in the same row), or an accepted request (CONV_JOIN with `via = 5`). New
-  CONTACT, MEMBER and LEFT records ride in the next HEADS row; the device uses them locally at once. The MEMBER for a
-  request's `D.by` rides in the REQUEST's row.
+  CONTACT and MEMBER records ride in the next HEADS row, and LEFT records in every HEADS row or snapshot that holds an
+  entry for their epoch (below; round 8); the device uses them locally at once. The MEMBER for a request's `D.by` rides
+  in the REQUEST's row.
 - **Others' leaves.** For every member uid that the device records as left in epoch e of a copy (§6.9: by applying its
-  LEAVE row, or by carrying the leave into a later epoch), it writes `LEFT{conv, root, e, uid}`. No HEADS entry for
-  epoch e (in a self row or a snapshot) is written unless a LEFT record for every member the device records as left in
-  e lies in the same row or snapshot, or in an earlier row that is CAS OK. A restore therefore learns the leaves of its
-  HEADS epoch from these records (§11.4 step 5), and lane positions may pass the LEAVE rows.
+  LEAVE row R, by carrying the leave into a later epoch, or at restore from a LEFT record, §11.4 step 5), it writes
+  `LEFT{conv, root, e, uid, t, E, n}` for the source it keeps for uid in e (§6.9; round 10), where `t` is that
+  source's LEAVE row R's stored time and `(E, n)` is R's position when e is R's own epoch, or NONE when the leave was
+  carried into e (round 9). When a source with a smaller key replaces the kept one, the device writes the new source's
+  record (round 10). A LEFT record stands for R: a leave taken from it is decided by §6.8 as R would be, so a claim
+  that drops R un-records the leave on a live and on a restored device alike, however long before that claim the
+  record was written (round 9). Every HEADS entry for epoch e, in a self row or a snapshot, MUST be accompanied **in the
+  same row or snapshot** by a LEFT record naming the kept source of every member that the device writing the row or
+  snapshot records as left in e (rounds 8 and 10; an earlier row does not count, because a snapshot may have compacted
+  it away). Whichever HEADS entry a restore uses thus has the LEFT records of its epoch beside it, whatever snapshots or
+  sibling rows came between, and lane positions may pass the LEAVE rows.
 - Epochs accepted through the account's own bundle entry are **not** written as self rows: restore re-derives them from
   the control lane (§11.4), and snapshots carry them. So no self row follows a claim observed from another member
   (§13.1).
@@ -1362,7 +1456,7 @@ these records (§7.4), so every device numbers copies the same way.
 - **HEADS** is written in every snapshot; as a self row at most every 30 minutes (after a random delay of up to 5
   minutes), when processed positions advanced or new CONTACT, MEMBER or LEFT records wait; and once right after
   registration, with the cursor at the current inbox slot. A writer splits HEADS over several records and rows so that
-  each row fits cls 3.
+  each row fits cls 3, keeping each entry in the same row as the LEFT records of its epoch (above; round 8).
 - Writes use CAS at the first empty slot of era `max(E_now, the era of the self-lane head)`, never below the head's
   era. On CONFLICT the device applies the occupant (if it opens under `kS`) and retries at `n+1`. On WRONG_ERA it
   writes at `(E', 0)`.
@@ -1381,14 +1475,19 @@ blob = aeadSeal(skey, padme(S2), aad = utf8("segv.sh/v2/snapshot")); skey = rand
   `MISS(sealed = 1)`.
 - The records are the compacted state, with CONV_JOIN and REQUEST records in their original self-lane order:
   - per accepted copy: its CONV_JOIN, an EPOCH for every held epoch **above the copy's root epoch** (the CONV_JOIN
-    carries the root epoch's key, and EPOCH requires `e ≥ 1`, §7.1), a DESC for the current epoch and for the previous
-    one (whose lanes may be followed, §11.2), every EPOCH_PENDING that is neither dead nor complete (every listed uid
-    covered) with its DELIVERED records, its LEAVE record with the highest e (if any), CONFIRMED, the latest HEADS
-    entry, and the LEFT records naming that entry's epoch. Every held epoch above the root was reached either through
-    the account's own bundle entry, whose EPOCH has flags 0 and `(claimE, claimK)` = the position of the winning claim
-    the device processed, or through a skip join, whose EPOCH has flag bit1 and NONE. A complete or dead EPOCH_PENDING
-    and its DELIVERED records are dropped: nothing reads them, and the EPOCH or CONV_JOIN record already carries the
-    epoch key;
+    carries the root epoch's key, and EPOCH requires `e ≥ 1`, §7.1), a DESC for the current epoch and for the copy's
+    previous held epoch, if any (e−1, whose lanes may be followed, §11.2, or, below a skip re-add, the epoch k self was
+    removed from; either one's history may be loaded at restore, §11.4 step 6; round 12), every EPOCH_PENDING that
+    is neither dead nor complete (every listed uid covered) with its DELIVERED records, its LEAVE record with the
+    highest e (if any), CONFIRMED, the latest HEADS entry, and the LEFT records naming that entry's epoch: for each
+    member that the fold or the snapshot's writer records as left in that epoch, exactly one, the least of the fold's record (the row that held the entry held one,
+    §7.3) and the writer's kept source (§6.9), as §7.3 requires (rounds 8–10: a snapshot holds at most one LEFT record
+    per member, so repeated HEADS rows and snapshots never pile up copies). Every held epoch above the root was
+    reached either through the account's own bundle entry, whose EPOCH has flags 0 and `(claimE, claimK)` = the
+    position of the winning claim the device processed, or through a skip join, whose EPOCH has flag bit1 and the
+    position of the claim that removed or dropped self from the previous held epoch (§7.2; round 11). A complete or
+    dead EPOCH_PENDING and its DELIVERED records are dropped: nothing reads them, and the EPOCH or CONV_JOIN record
+    already carries the epoch key;
   - the live REQUESTs (at most 64);
   - every CONTACT;
   - the MEMBER record, where one exists, of every uid listed in a D carried by a DESC or a live REQUEST, or held as a
@@ -1512,7 +1611,8 @@ row and is internal (no RPC returns it); it exists so that closing a batch never
 - **Batch size.** A batch holds every row put during its Δ window. Stage 1 sets no bound on the rows or bytes of a
   batch: the shard's request rate (`RL_WRITE`, the PoW of `put`, about 1 000 requests/s per DO) and FULL bound it.
   Closing a batch costs O(n) reads of `(label, cls, bh)`, and the feed streams batches of any size, charging one
-  `RL_READ` token per started 4 MiB of page (§10.9).
+  `RL_READ` token per started 4 MiB of the page's batches (without the page header), at least 1 and at most 64 (§10.9;
+  rounds 8, 11 and 12).
 
 **`put(E, i, rows: {v, label, cls, body}[])`** returns one result per row.
 
@@ -1565,7 +1665,7 @@ This is the public enumeration of the database.
 
 **Retention and capacity.** Old era DOs are kept and stay readable. Paging into R2 and deletion come in stage 2. A DO
 stores at most 10 GB, and one object handles about 1 000 requests/s, so a single shard per era bounds stage 1 (§13.2
-item 13). The CheckpointDO logs (`logErr`) when a shard's `size` passes 4 GiB. The emergency path is S = 2 by
+item 13). The CheckpointDO logs (§9.7) when a shard's `size` passes 4 GiB. The emergency path is S = 2 by
 parameter for the next era, since routing by `v` already exists (stage-2 work).
 
 ### 9.2 BlobRegDO (`blobreg/v2`, SQLite, one instance)
@@ -1768,7 +1868,7 @@ Worker calls the DO's `ensure()` at most once per isolate (a module-level flag),
   the list of a checkpoint: the one built from this collection, or, when `hd` equals the previous `hd` and no
   checkpoint is made, checkpoint q−1, whose list is identical.
 - Sort the list by cid (byte order).
-- Log (`logErr`) when a shard reports `size` above 4 GiB.
+- Log (§9.7) when a shard reports `size` above 4 GiB.
 
 **Building and signing.**
 
@@ -1862,7 +1962,11 @@ These carry over from v1:
   immutable and which the Worker passes on unchanged (§10.1), as v1's `finalize` does;
 - `workers_dev: false` and `preview_urls: false`;
 - Workers invocation logs disabled;
-- `console.error` lines redact ids and addresses (`logErr`);
+- **Logs** (round 10): `console.error` lines carry no request bodies, client addresses or headers, uids, handles,
+  labels, eids, topics, blob ids or credential ids, and error messages, which may quote such values, are redacted
+  before they are logged (this implementation's `logErr`); public values (deployment parameters, the era of the
+  object that logs, a route label without path parameters, counts and sizes) may appear. Their text, keys and format
+  are implementation-defined (preamble);
 - an `HttpError` cancels any request body that was not read;
 - a rate limiter error fails closed with 503;
 - request bodies are capped by both the declared and the actual length: above the endpoint cap → 413, and an actual
@@ -1883,7 +1987,7 @@ New in stage 1:
   on the response it returns, after the cache lookup (§10.1). A feed page streamed because its one batch exceeds
   4 MiB (§10.9) is not stored in `caches.default` (copying the stream would buffer the whole batch); it is sent
   without Content-Length and with the same `cache-control` as any other page, and costs one `RL_READ` token per
-  started 4 MiB (§10.9).
+  started 4 MiB of the page's batches (without the page header), at most 64 (§10.9; rounds 8 and 11).
 
 The Worker passes Durable Objects only what they need. Client addresses and headers never reach a DO; the RealtimeDO
 gets the opaque client tag only.
@@ -1940,7 +2044,7 @@ gets the opaque client tag only.
 | 426 | `/api/v2/rt` without an upgrade |
 | 429 | rate limited, or too many sockets from this client (`retry-after`) |
 | 503 | rate limiter or D1 unavailable, global socket cap, server misconfigured (missing secrets, invalid parameters), a failed Durable Object call on put or get (`retry-after: 5`) |
-| 500 | internal error (other routes MAY answer 500 for a failed DO call; clients treat every 5xx alike) |
+| 500 | internal error (other routes MAY answer 500, or 503 `{error: "storage unavailable"}`, for a failed Durable Object or R2 call; clients treat every 5xx alike; round 10) |
 
 **Order of checks.** The Worker answers with the first check that fails, in this order:
 
@@ -1963,7 +2067,11 @@ gets the opaque client tag only.
 For endpoints whose PoW digest is `H(body)`, step 6 reads the whole body before step 7. A blob PUT reads its body only
 while streaming it into R2, after its PoW and its registry check (§10.7). Where this list does not order two checks
 (for example two parameter checks, or a parameter check of a non-cacheable GET against the rate limit), either answer
-conforms. Example: a put with Content-Length 263 346 gets 413 without a PoW check.
+conforms. Example: a put with Content-Length 263 346 gets 413 without a PoW check. Within step 9, a check that needs
+stored state and the 5xx of a failed D1, Durable Object or R2 call are not ordered against each other either: during a
+D1 failure, an isolate that holds a cached `P` (§9.6) answers 409 for a prefix lookup whose `p` is out of range, and
+one without answers 503; both conform, and a client that gets 409 and then 503 on its one retry fails the lookup as
+transient (§10.6; round 10).
 
 ### 10.2 Proof of work and rate limits
 
@@ -1971,7 +2079,7 @@ conforms. Example: a put with Content-Length 263 346 gets 413 without a PoW chec
 window = ⌊serverNowMs / 600000⌋
 pre    = H(enc("segv.sh/v2/pow", scope, u32 window, digest))
 valid  ⇔ leadingZeroBits(H(pre ‖ u64 nonce)) ≥ powDifficulty(scope, base, bytes)
-header   x-segv-pow: "<window>.<nonce>"      (^\d{1,12}\.\d{1,16}$; window ∈ {current, current−1})
+header   x-segv-pow: "<window>.<nonce>"      (^\d{1,12}\.\d{1,16}$; window ∈ {current, current−1}; nonce ≤ 2^53 − 1)
 powDifficulty(scope, base, bytes) = base + ⌈log2(bytes / unit)⌉ if bytes > unit else base
 ```
 
@@ -1984,7 +2092,15 @@ powDifficulty(scope, base, bytes) = base + ⌈log2(bytes / unit)⌉ if bytes > u
 | `blob` | raw 32-byte id | Content-Length | 1 MiB | 18 (`POW_BLOB`) |
 
 Overrides must match `^\d{1,2}$` and be ≤ 64. Clients refuse a base above 26. On 403 a client retries once with fresh
-params.
+params. The nonce is the decimal value of the `u64` that is hashed; the server answers 403 "malformed proof of work"
+for a nonce above 2^53 − 1 (round 8). Clients search nonces upward within that bound, both halves of the `u64`
+included, so the search is bounded by time only (round 9). A proof is accepted only while its window is the current
+or the previous one, 10 to 20 minutes (round 10): a client searches with the window that is current by its estimated
+server time, and when that window stops being current before a nonce is found, it MUST restart the search with the
+new window (a new `pre`), so it never sends a proof that is already stale. Restarting loses nothing, because every
+nonce is an independent trial. The expected work is `2^difficulty` hashes: at the highest base a client accepts (26), a
+full put (33 bits) expects about 8.6·10^9 hashes, over an hour in a browser tab, and a deployment that raises the base
+that far accepts that cost.
 
 **Per-IP rate limits.** The key is the IPv4 address or the IPv6 /64 (an IPv4-mapped address counts as IPv4). Keys are
 never stored.
@@ -1994,7 +2110,7 @@ never stored.
 | `RL_WRITE` | 60 / 60 s | register, wraps, put |
 | `RL_INBOX` | 10 / 60 s | inbox post (one token per POST of up to 32 invites) |
 | `RL_BLOB` | 20 / 60 s | blob PUT |
-| `RL_READ` | 600 / 60 s | get, inbox read, directory reads, dirlog, blob GET and meta, ckpt, feed (one token per started 4 MiB of page, §10.9), era, rt upgrade |
+| `RL_READ` | 600 / 60 s | get, inbox read, directory reads, dirlog, blob GET and meta, ckpt, feed (one token per started 4 MiB of the page's batches, without the page header, at least 1 and at most 64, §10.9; rounds 8, 11 and 12), era, rt upgrade |
 
 `/api/v2/params` is not rate limited (§9.5: it never reaches the CheckpointDO per request). Responses served from
 `caches.default` (§9.7) are not counted.
@@ -2348,10 +2464,19 @@ A page holds the closed batches with `t > after`, ascending: whole batches while
 another closed batch follows the page. Batches are never split, so a page whose first batch alone exceeds 4 MiB holds
 only that batch and is as large as it; the Worker streams such a page, pulling the batch's rows from the DO in
 label-ordered chunks of at most 4 MiB (§9.1), and does not store it in `caches.default` (§9.7). A feed request that
-is not answered from `caches.default` MUST take `⌈bytes / 4 194 304⌉` `RL_READ` tokens (at least 1), where `bytes` is
-the encoded size of its page: the Worker takes the first token in step 5 of §10.1 and the others after `feedBatches`
-returned the batch sizes, before it sends the first byte, and answers 429 with `retry-after` if one is refused. So no
-request makes the shard read more than 4 MiB of rows per token, the rate of an uncached tail page. Page composition is
+is not answered from `caches.default` MUST take `min(⌈bytes / 4 194 304⌉, 64)` `RL_READ` tokens (at least 1), where
+`bytes` is the sum of the encodings of the page's batches, without the 5-byte page header (round 8). So every page that
+is not streamed (its batches fit the 4 MiB budget; the empty page included) takes one token, and a streamed page of
+one batch of b bytes takes `min(⌈b / 4 194 304⌉, 64)` (round 10). The Worker takes the first token in step 5 of §10.1
+and the others after `feedBatches` returned the batch sizes, before it sends the first byte, and answers 429 with
+`retry-after` if one is refused. So up to 256 MiB of batches no request makes the shard read more than 4 MiB of rows
+per token, the rate of an uncached tail page. The cap keeps every page readable by one address within one `RL_READ`
+window, with room to spare for an address that other readers share and for a limiter that counts approximately; a
+deployment MUST keep its `RL_READ` limit per window (600, §10.2) above 64 (rounds 8 and 10). Above 256 MiB a token
+buys `bytes / 64` of shard reads. Such a batch needs about 1 021 maximal puts (263 056 B of feed encoding each) within
+one Δ, and every further 4 MiB per token about 1 021 more; at the production Δ = 10 the shard's ~1 000 requests/s
+(§9.1) bound a batch near 2.5 GB, so a token buys at most about 10 times the tail-page rate, and only after a flood
+that took the shard's whole write capacity for a Δ (round 10). Page composition is
 deterministic for a given `after`. A page whose `more = 1`, or any page of a sealed era, is immutable; the tail page is
 `no-store`. If a streamed page fails part-way, the response ends abnormally: it is truncated, never altered. Feed
 readers MUST reject a page whose bytes end before its `nb` batches and their `n` rows are complete, and fetch it again.
@@ -2393,7 +2518,7 @@ slot, so its first restore does not scan the inbox from the start of the era.
 | item | contents |
 | ---- | -------- |
 | identity | `(conv, root)`, `rootBy`, `confirmed`, `request` |
-| epochs `e → {EK, keys, D, H(D), bundleId, E_start, …}` | For each lane ℓ: the dense-prefix position, the processed position, the last valid row (for `prev`/`prevh`), and the rows seen. For the control lane: the position `(E_c, cnt_c)`, the evaluated rows and their e-validity (valid, not valid, undecided), the winning claim with its finality and processing state, and the sealed eras observed. Also the set of members who left (kept in LEFT records, §7.3). |
+| epochs `e → {EK, keys, D, H(D), bundleId, E_start, …}` | For each lane ℓ: the dense-prefix position, the processed position, the last valid row (for `prev`/`prevh`), and the rows seen. For the control lane: the position `(E_c, cnt_c)`, the evaluated rows and their e-validity (valid, not valid, undecided), the winning claim with its finality and processing state, and the sealed eras observed. Also the set of members who left in e, each with its kept source (§6.9): the stored time of the LEAVE row it comes from and, when e is that row's epoch, the row's position (NONE for a leave carried into e), kept in LEFT records (§7.3; rounds 8–10). |
 | current epoch | `removed`, `left` (the copy's leave is current; a skip re-add clears it, §6.9), `frozen` (with its cause, for the warning text: own entry not opened, or `D'` invalid; §6.6 steps 4 and 6) |
 | followed lanes | the lane of epoch c−1 of each member silent in c (below) |
 | messages | message list, `unread`, `lastTs` |
@@ -2468,16 +2593,18 @@ WELCOME).
      WELCOME, last bullet);
    - if the wait timed out: fail with "the conversation is changing membership; try again in a moment" (the v1 text).
      Writing into e now could reach a member that the pending claim removes;
-   - if self is frozen in e, the winning claim of e has an `rm` bit for a member who had not left, and the type is
-     TEXT or IMAGE: fail with "a removed member could still read this conversation; start a new conversation"
-     (§6.6 step 6);
+   - if self is frozen in e, the winning claim of e has an `rm` bit for a member who had not left (by the leave state
+     when this check runs, §6.6 step 5; round 11), and the type is TEXT or IMAGE: fail with "a removed member could
+     still read this conversation; start a new conversation" (§6.6 step 6);
    - if the type is WELCOME and the current epoch (the one the row would be built in) does not meet every condition of
      §6.12 step 1 (a copy that self left or was removed from never does): put nothing; the recipient gets an inbox
      invite instead (§6.12 steps 1–2). A WELCOME is thus never written in an epoch that lists anyone but self and its
      recipient.
 
    Otherwise a frozen member sends normally in e. The view's `canSend` is false whenever this step would fail for a
-   TEXT.
+   TEXT, and follows the leave state as it changes (round 11). For an undecided slot, or a winner not yet final or
+   processed, the view cannot know whether a wait would time out, so `canSend` turns false only once the slot or
+   winner has stayed so for 30 s, until it is settled; a send made before then waits here (round 9).
 
    **The send's epoch.** The epoch this step last checked is the send's epoch e. Steps 4–8 build, put and judge the row
    in e, also when the copy has meanwhile switched to a later epoch through §11.6 or a catch-up; only a re-run of steps
@@ -2568,9 +2695,14 @@ Every unlock restores. There is no persisted local cache in stage 1.
      only when there is none, from its bundle. Signatures need no directory (§5.1). Members' handles come from MEMBER
      records (§7.2); only members of a held D that have none are looked up by prefix, batched per prefix and cached
      for the session, and the result is written as a MEMBER record. Restore never fetches `kemPk`.
-   - **Control lane.** From the latest HEADS position (trusted, §7.2), or from `(E_start, 0)`, probe and process claims
-     as in §6.4–§6.6. Repeat for each new epoch: each costs one bundle fetch, the rule-(g) `blob/meta` request and at
-     most 32 entry recomputations (§6.6 step 4). `E_start` of an epoch (§4.2) comes from the `meta` answer that
+   - **Control lane.** The restore holds every held epoch of the copy (round 12). It starts at the copy's highest epoch
+     whose key a snapshot record gives (its root epoch when there is none), or at the HEADS epoch when that is lower
+     (the root epoch for a copy without a HEADS entry, as for its lanes below), and probes and processes the claims of
+     each epoch it reaches as in §6.4–§6.6: the HEADS epoch from its HEADS position (trusted, §7.2), every other from
+     `(E_start, 0)`. So it re-derives every held epoch that no record gives (one reached through the account's own
+     entry after the snapshot, or any without a snapshot, §7.3), those below a skip re-add included, and holds the
+     claim that ended each held epoch below the current one (processed, or named by an EPOCH record, §6.8). Each new
+     epoch costs one bundle fetch, the rule-(g) `blob/meta` request and at most 32 entry recomputations (§6.6 step 4). `E_start` of an epoch (§4.2) comes from the `meta` answer that
      accepted it, from an EPOCH_PENDING or REQUEST record, or else from one `GET /api/v2/blob/{id}/meta`, made only when
      a claim of that epoch must be evaluated (§6.4(f)) or its lanes probed from the start.
    - **Skip re-adds.** When the control lane of epoch k shows self removed (`rm` bit 1) and the self lane holds an
@@ -2585,17 +2717,28 @@ Every unlock restores. There is no persisted local cache in stage 1.
      followed lanes (epoch c−1 of each member silent in c) come out the same. For the HEADS epoch itself, the followed
      lanes are exactly those its HEADS entry lists, processed from their recorded positions; every other member of
      both `D_c` and `D_{c−1}` counts as having a valid row in that epoch, as it had for the device that wrote the entry
-     (rows before the recorded positions are not fetched again, so this restore cannot see them itself). A HEADS entry
-     that §7.2 says to ignore counts as absent. The members recorded as left in the HEADS epoch are those its LEFT
-     records name (§7.3); a LEAVE found here is applied as a live one is (§6.9), and the switch to a later epoch
-     carries the leaves over (§6.6 step 4). Rows applied during restore never count as unread.
+     (rows before the recorded positions are not fetched again, so this restore cannot see them itself). The senders of
+     the followed lanes' rows are listed in `D_c`, so §6.8 decides those rows with s's bit in `C_{c−1}` read from
+     `D_c` (0), continuing at c, without `C_{c−1}`; a row stored after a claim of c (or later) that removed its sender
+     is dropped as it is live (round 10). A restore that took `EK_c` from a snapshot's EPOCH record never processes
+     `C_{c−1}`; one that re-derived c (without a snapshot, or for an epoch reached after it) processed it on its way to
+     c (Control lane, above), and decides those rows the same way (rounds 11–12). A HEADS entry that §7.2 says to
+     ignore counts as absent. The members recorded as left in the HEADS epoch are those its LEFT records name (§7.3:
+     per member the record with the least key), each decided by §6.8 with the record's time and position, as its
+     LEAVE row would be, when a claim of that epoch or a later one is processed (round 9); a LEAVE found here is
+     applied as a live one is (§6.9: it replaces the kept source only when its key is smaller; round 10), and the
+     switch to a later epoch carries the leaves over (§6.6 step 4). Rows applied during restore never count as unread.
    - **Frozen copies** re-derive their freeze from the control lane and the bundle (§6.6). The freeze itself posts
      nothing (LEAVEs that §6.9 repeats are still put).
    - **Unfinished deliveries** (§6.11), and LEAVEs that §6.9 repeats.
 6. **Initial history.** For the `HISTORY_COPIES` copies with the newest `lastTs` (from HEADS), also fetch the last
    `HISTORY_INITIAL` slots of each lane of the current epoch (body mode), and, if the epoch has fewer than 30 rows,
-   rows of the previous epoch up to its winner's time (its lane heads found as §11.10 says for an epoch this session
-   never swept, never from the claim's cuts). Other copies load their history when they are opened (§11.10).
+   rows of the copy's previous held epoch (the highest held epoch below it, step 5 and §11.10: e−1, or the epoch self
+   was removed from before a skip re-add; none below the root epoch; rounds 11–12) up to the time of the claim that
+   ended it (its lane heads found as §11.10 says for an epoch this session never swept, never from the claim's cuts;
+   that claim read at the position the current epoch's EPOCH record names when the restore did not process it, §6.8;
+   rounds 10–11). These rows are processed as §11.10 says for rows found by scrollback (round 12). Other copies load
+   their history when they are opened (§11.10).
    Build the views, ordered by §11.8.
 7. **Inbox.** Read from the HEADS cursor (§11.5).
 8. **Requests** (§11.5): probe each live REQUEST copy once.
@@ -2610,10 +2753,14 @@ Requests are paced to `RL_READ`: on 429 the client waits for `retry-after` and c
 
 - `copies × (members × P0 + 2)` probe keys, plus `members × P0` keys per epoch changed since HEADS, plus up to one
   followed lane per member, plus a gallop per lane that moved;
-- one bundle (23–81 KB) per epoch that has no DESC record, which in practice means the epochs since the snapshot;
-- per epoch changed since HEADS, up to two `blob/meta` requests (rule (g), and `E_start` when no record holds it) and
-  at most 32 X-Wing encapsulations (the entry recomputations and the key checks of added members, §6.6 step 4, a few
-  ms each);
+- one bundle (23–81 KB) per epoch that the restore re-derives (step 5) or whose D it needs and has no DESC record for,
+  which in practice means the epochs since the snapshot (every held epoch without one; a snapshot's DESC records cover
+  its current and previous held epochs, §7.4; round 12);
+- one claim row (in a batched `get`) per older epoch whose ending claim the initial history or a removed sender's row
+  needs and the restore did not process (§6.8; round 10);
+- per epoch re-derived (changed since HEADS, or since the snapshot, step 5; round 12), up to two `blob/meta` requests
+  (rule (g), and `E_start` when no record holds it) and at most 32 X-Wing encapsulations (the entry recomputations
+  and the key checks of added members, §6.6 step 4, a few ms each);
 - the rows written since the account's last HEADS, in bodies, in every epoch since HEADS;
 - `HISTORY_COPIES × lanes × HISTORY_INITIAL` rows of initial history;
 - `MAX_REQUESTS × (2 · members + 3)` keys for requests (§11.5);
@@ -2749,6 +2896,20 @@ These strings are kept from v1. `who(u)` is "you" for self and `@handle` otherwi
 
 The rename lines compare the names as displayed (§5.1): a name that fails the reader's `validName` counts as no name.
 
+Lines that depend on others' leaves are derived from the leave state (§6.9), not latched when an event is processed
+(round 11). A LEAVE row R of x in epoch k shows "`@x` left" while it is the kept source of x's leave in k, §6.8
+accepts it, and x is not recorded as left in k−1 (a leave carried into k shows its line at its source in an earlier
+epoch), so one leave shows one line. R loses its line when a source with a smaller key replaces it, when §6.8 drops it,
+or when x becomes recorded as left in k−1 (round 12). A claim's "removed" and "keys rotated" lines are derived again
+whenever the leave state of its epoch changes (§6.6 step 5). The same rows thus give the same lines, whatever the order
+in which they arrived.
+
+After a reload the device holds fewer rows (§6.6 step 5): a LEAVE row before the HEADS positions shows its line only
+once the initial history or scrollback loads it (§11.4 step 6, §11.10), and the leave state of an epoch below the HEADS
+epoch is rebuilt only from the rows they load. Until they load a leave's source, its "@x left" line is missing and a
+claim below the HEADS epoch can show a removal where the live view showed "keys rotated". A claim that history reads
+without processing it (§6.8) shows its lines as a processed claim would (round 12).
+
 ### 11.10 Scrollback
 
 When a conversation is opened (`markRead`, which the UI calls every time it opens a conversation pane), the client
@@ -2759,8 +2920,11 @@ and session; later calls are no-ops.
 - At `n = 0`, move to the previous era that has rows: follow `prev` of the oldest loaded valid row, and also probe the
   dense-prefix end of each earlier era down to `prev`'s era, so rows that are not on the `prev` chain (a sibling's row
   written across an era boundary) are found too.
-- Below the first row of an epoch, continue in epoch e−1, using its keys from the self lane (its DESC, or its bundle
-  for `D_{e−1}`). On entering a lane of an older epoch e, which the winning claim C ended, first find the lane's head:
+- Below the first row of an epoch, continue in the copy's previous held epoch, the highest held epoch below it, using
+  its keys from the self lane or the restore (§11.4 step 5) and its DESC, or its bundle, for its D: e−1, or, below an
+  epoch reached by a skip re-add, the epoch k that self was removed from; the history ends below the copy's root epoch
+  (rounds 11–12). On entering a lane of an older epoch e, which the winning claim C ended, first find the lane's head (a session that did not process C reads it at the position that
+  the EPOCH record of the next held epoch names: e+1, or the skip epoch for k; §6.8; rounds 10–11):
   - for an epoch this session swept, probe the `W` slots after the head the sweep recorded (galloping on hits), and
     slot 0 of every later era up to the era after C's era (at most `E_now`), galloping on hits;
   - for an epoch this session never swept (one before the HEADS epoch of the restore), probe slot 0 of every era from
@@ -2774,8 +2938,8 @@ and session; later calls are no-ops.
   `(E, n−32..n−1)` and the earlier eras) then starts from the heads found.
 
 Rows found by scrollback are processed like any other (a WELCOME that lies before the processed position was already
-processed and is not applied twice; a LEAVE is applied whenever the local state lacks it, §6.9). Older rows are never
-counted as unread.
+processed and is not applied twice; a LEAVE is applied as §6.9 says: it records a leave the local state lacks, and
+replaces the kept source only when its key is smaller; round 10). Older rows are never counted as unread.
 
 ### 11.11 Engine operations
 
@@ -2910,7 +3074,7 @@ are kept. Critical warnings are kept until sign-out.
 Never stored anywhere: topics, subscriptions, IPs, RESUME rings, rate-limit keys, arrival order inside a Δ batch, and
 inbox jitter.
 
-### 13.2 Properties of v1 (docs/DESIGN.md §3) that stage 1 weakens
+### 13.2 Properties of v1 (v1's docs/DESIGN.md §3, at 3de5f5e) that stage 1 weakens
 
 Each item is a deliberate trade-off that stage 2 or 3 addresses. None is silent.
 
@@ -2974,7 +3138,9 @@ Each item is a deliberate trade-off that stage 2 or 3 addresses. None is silent.
 8. **History on a fresh device.** v1 replayed everything (all history available at once, at O(global) cost). Stage 1
    shows the last 30 rows per lane of the 20 most recently active conversations at once, and loads up to 500 per
    conversation when it is opened. Older history stays reachable through `prev`, but the UI has no "load older"
-   control (unchanged view cap of 500).
+   control (unchanged view cap of 500). The leave state of an epoch below the restore's HEADS epoch comes only from
+   the rows loaded, so until they include a leave's LEAVE row, a claim that dropped the leaver can read as a removal
+   and the "@x left" line is missing (§11.9; round 12).
 9. **One more size class.** The 256 class is back. With binary payloads it is the *common* class (short texts,
    images, leaves, welcomes), so it no longer singles out rare rows. P still learns whether a text is ≤ 129 B. That
    is coarser than v1's per-batch shapes, but it is new per-row information.
@@ -3368,11 +3534,12 @@ MEMBER self record (§7.2). Where a finding offered alternatives, the entry name
 
 Round 5 verified the round-4 changes (mainly the fresh probe and late rows of §11.3, MEMBER with `kh`, the D′ parse
 check and scrollback after a reload) and §5–§7 and §11 again. Every finding was checked against this spec, DD and the
-v1 code (`src/lib/proto.ts` `validName` and `parseDescriptor`, `docs/PROTOCOL.md` §3.1 and §3.3); every trace was
-reproduced on the text before the change. All six findings were accepted; none overlaps another, but READV5-1 and
-READV5-3 share one edit (the fresh probe of §11.3 step 6 now re-runs steps 1–3, and step 2 holds the WELCOME check).
-No e-validity or D′ rule changed meaning; the one change to what M1 implements is that `parseD` no longer applies
-`validName` (READV5-2). Wire formats of §1–§4 and §8–§10, and every record layout, are unchanged.
+v1 code (`src/lib/proto.ts` `validName` and `parseDescriptor`, `docs/PROTOCOL.md` §3.1 and §3.3, all as at commit
+3de5f5e); every trace was reproduced on the text before the change. All six findings were accepted; none overlaps
+another, but READV5-1 and READV5-3 share one edit (the fresh probe of §11.3 step 6 now re-runs steps 1–3, and step 2
+holds the WELCOME check). No e-validity or D′ rule changed meaning; the one change to what M1 implements is that
+`parseD` no longer applies `validName` (READV5-2). Wire formats of §1–§4 and §8–§10, and every record layout, are
+unchanged.
 
 | id | decision and change |
 | --- | --- |
@@ -3443,11 +3610,190 @@ and 67 changed (Appendix D).
 | VADV-4 | **Accepted**, the first option. Trace confirmed: a streamed page of one oversized batch is never cached and cost one `RL_READ` token, so each token could make the era's only shard read the whole batch. Change (§10.9, §10.2, §9.7, §9.1): a feed request that misses `caches.default` takes `⌈bytes / 4 MiB⌉` tokens, the extra ones after `feedBatches` and before the first byte, so a token never buys more than the 4 MiB an uncached tail page already costs. Not adopted: materialising the batch (more storage paths) and a row bound per batch (an attacker filling every batch would block honest puts). Delta M4: the feed handler; answer 63 changed. Plan M4 table and test. |
 | VADV-5 | **Accepted** (merged with VQA-4). §10.6: clients use `P* = max(P, ⌊log2(dirSeq / 2080)⌋)` in place of `P`, which is never above the true `P`; the params re-read becomes a MAY; a 409 retry uses `min(P*, P′)` without raising it again. §10.9 points to it. Answers 4, 11 and 67 changed. Plan: M6 `api.ts`, test 16 variant. |
 
+## Appendix C - Review changelog (round 8)
+
+Round 8 checked the round-7 changes, the plan and the delta against this spec, DD and the repository at 8092e98 (read
+only), where v2 replaced v1 in place. All 43 findings were accepted; duplicates share one change (R8ADV-1 and
+R8CONS-1; R8ADV-5 and part of R8CONS-9; R8ADV-3 and R8CONS-6; R8CONS-3, R8PLAN-3 and R8NAMES-1; the R8NAMES findings
+and the R8PLAN rewrite). Where a finding offered alternatives, the entry names the one taken and why. There is no wire
+change: LEFT stays 68 B (0x0E) and was rechecked, so it can be implemented now. Answers 16, 49, 56, 61 and 63 changed
+(Appendix D). The plan was rewritten for the in-place replacement; its milestone names and test numbers are kept.
+
+| id | decision and change |
+| --- | --- |
+| R8ADV-1 | **Accepted** (high), the finding's first fix; R8CONS-1 is the same hole. Both traces confirmed: a snapshot keeps only the LEFT records of its own HEADS entry's epoch, and §7.3 let a later HEADS entry rely on a LEFT record "in an earlier row that is CAS OK", which that snapshot had compacted away (a parked J pinning the entry to an older epoch, or a sibling device's older entry being the latest). Change §7.3: every HEADS entry for epoch e MUST sit in the same self row or snapshot as a LEFT record for every member the writer records as left in e; "When to write" and HEADS splitting say so, and §7.4 notes why its LEFT set is then complete. Cost: 71 B per listed leaver per entry, only while a leaver is listed. Not adopted: keeping the LEFT records of every later epoch in snapshots (covers one direction only, and grows) and R8CONS-1's "earlier row after the latest snapshot" (ambiguous when siblings snapshot). Plan: M6 `selflane.ts`, M7 test 31 snapshot variants (a) and (b). Delta M6 items 8–9, M7 item 7. |
+| R8ADV-2 | **Accepted** (medium), the finding's option (a). Trace confirmed: a LEFT record carries no time or position, so a leave written before the claim that decides its LEAVE row under §6.8 could never be undone, and the frozen-with-removal gate of §11.3 step 2 then differed between members and between a live device and its restore. Change: §7.3 defines a **final** leave (the copy is frozen, or a probe of its current epoch's control lane answered with `x-segv-now` at least `(t_R + Δ + SKEW)·1000` ms after T0 found no claim stored at or before `t_R` that is undecided or e-valid); LEFT records are written only for final leaves, and while a leave of a copy is not final the device writes no HEADS entry for that copy, so a restore reads the row again. §6.8: a dropped LEAVE row un-records the leave in its epoch and in every epoch it was carried into. §6.9 and §11.2 say LEFT is written once final. LEFT records thus record facts every device agrees on. Not adopted: option (b), a 78-byte LEFT with the row's time and position (a carried LEFT would also need the row's epoch, and a restore would need the times of claims before its HEADS epoch). Plan: M6 `conv.ts` and `selflane.ts` rows, M7 test 31 retracted-leave variant. Delta M6 item 8, M7 item 4. |
+| R8ADV-3 | **Accepted** (medium), the second option. Confirmed: a page needing more than the 600 tokens of one `RL_READ` window could never be read, and §9.1 bounds a batch only by the shard's request rate and FULL. Change §10.9 (and §9.1, §9.7, §10.2): a feed request takes `min(⌈bytes / 4 MiB⌉, 64)` tokens. Up to 256 MiB of page a token still buys at most 4 MiB of shard reads; above that, at most `bytes / 64`, and such a batch needs about 1 000 maximal puts within one Δ. Not adopted: reading an oversized batch in parts with a label parameter (a new query parameter and a partial-batch encoding in an implemented codec and in the e2e audit), and a per-batch size bound at the shard (an attacker filling a batch would block honest puts, as VADV-4 noted). Answer 63 changed. Delta M4; plan M4 route and test rows (a pure token-count helper is tested instead of building a 2.5 GB batch). |
+| R8ADV-4 | **Accepted** (medium). Confirmed: round 7 gave the harness three clocks (world, engine monotonic, engine wall) but no API that moves them together, so skipping a commit wait broke under either reading of "advance the fake clock". Change (plan §2.1–§2.2): `world.tick(ms)` moves the world and every engine's clocks and fires due engine timers, and `settle` uses it; `world.advance`/`advanceEra` move the server only; `I(e).clock` has `advance(ms, {mono?, wall?})`, `pauseMono()` and `resumeMono()`; engine timers run on the engine's monotonic clock. Added beyond the finding: the `EngineOptions` test hook `beforePutAttempt()`, awaited after the proof of work and before the fresh-probe check, so tests 22 (d), 22 (h) and 30 (b) can place the clock change between the probe and the put. Delta M6 item 17. |
+| R8ADV-5 | **Accepted** (low); the same as the second half of R8CONS-9. Confirmed: lee's own repeat in e+1 (§6.9) reaches xena, who then drops lee. Plan M7 test 31 two-claim variant: lee's engine is logged out right after her LEAVE is OK, and when it returns it repeats the LEAVE in e+2. Delta M7 item 7. |
+| R8CONS-1 | **Accepted**, merged into R8ADV-1 (same hole, same change). Its test variant is snapshot variant (a). |
+| R8CONS-2 | **Accepted.** Confirmed at 8092e98: `proto-conv.test.ts:1482` and `:1506` use 0x0E as an unknown rtype, `RT` stops at MEMBER 0x0d, and the snapshot and S codecs need no change. Delta M1 items 10–11 name the two tests (use 0x10 or 0x30 instead), add LEFT to the `records` table, and list the real edits (`RT`, `LeftRec` in `SelfRecord`, `recordContent`, `parseRecord`). |
+| R8CONS-3 | **Accepted**, merged with R8PLAN-3 and R8NAMES-1: the M9 greps name the allowed negative tests. |
+| R8CONS-4 | **Accepted**, with R8PLAN-1 and R8NAMES-3: plan §0.1 and the delta's Paths say every v1 file the plan ports is read at 3de5f5e; M6 acceptance drops "the v1 engine specs are still green"; M7's run-time bound is measured once from a worktree of 3de5f5e. |
+| R8CONS-5 | **Accepted.** Confirmed: `world.advance` closes every socket by default (`test/engine/fake/world.ts:338-345`), and with the engine's monotonic clock held still every sample has `rtt = 0`. Plan M6 test 15 uses `advanceEra(1, {keepSockets: true})` and gives the first new sample a larger `rtt`; M7 test 22 (h) uses `world.tick` with sockets open, drops the claims' frames to zed and asserts his copy is still in e. Delta M6 item 16, M7 item 7. |
+| R8CONS-6 | **Accepted**, the first option, merged with R8ADV-3: `bytes` is the sum of the page's batch encodings, without the 5-byte page header, so an inline page takes one token as answer 63 and the code said. |
+| R8CONS-7 | **Accepted.** Delta M3: the `dirmeta` row is already in `0001_init.sql` (no change); M4: the 101 exemption is already implemented by `stampResponse`, and `finalize` is dead code; summary item 5 no longer lists the INSERT. |
+| R8CONS-8 | **Accepted.** Answer 56 and Appendix D 56: as 41, confirmed except the ShardDO pin log. Row 65 is unchanged. |
+| R8CONS-9 | **Accepted.** Plan M6 test 17 adds a late row's LEAVE(5) after LEAVE(7), so the highest-e record is not the last; test 31's two-claim variant keeps lee offline (R8ADV-5). |
+| R8CONS-10 | **Accepted.** Delta M1 item 7 and answer 16: add `!isBadSigPk(pk)` to the existing guarded `verify`, keeping its length checks and try/catch. |
+| R8CONS-11 | **Accepted**, the first option (the spec follows the server): §10.2 bounds the nonce by 2^53 − 1 (403 above it) and clients search below 2^32; §1.2 no longer lists the nonce as unbounded. Answer 61 and Appendix D 61. No code change. |
+| R8CONS-12 | **Accepted.** Plan M6 test 16 and the delta: the 409 is `{p: 0}`; the retry asks `p = 0` and is not raised again. |
+| R8PLAN-1 | **Accepted** (high). Plan §0.1 rewritten as the in-place strategy, as proposed, with one bullet naming the old paths and identifiers (R8NAMES-2). |
+| R8PLAN-2 | **Accepted** (high). M9 is documentation and cleanup: `git mv docs/PROTOCOL-v2.md docs/PROTOCOL.md` (after `git rm` of the v1 file), its references and the `vite.config.ts` `fmt.ignorePatterns` entry; `docs/DESIGN.md`; README; nothing deleted; no DO tag or D1 migration added. Added: stale v1 comments, and `docs/STAGE1-PLAN.md` keeps its name (R8NAMES-6). Spec text: Appendix C round 5 and the §13.2 heading name v1's files at 3de5f5e, since `docs/PROTOCOL.md` will be this spec. |
+| R8PLAN-3 | **Accepted** (high), merged with R8CONS-3 and R8NAMES-1: M9 acceptance runs the header's checks and greps that allow `src/lib/proto.test.ts` 816, 1070, 1086, 1722 and `test/worker/api.spec.ts` 1832, 1835 (lines at 8092e98; round 9 names the tests instead, V8ADV-7); `LogDO` joins the stale-name grep. |
+| R8PLAN-4 | **Accepted** (high). Confirmed: `src/routes/plugin@csp.ts` sends `require-trusted-types-for 'script'` with `trusted-types 'none'`, under which `new Worker(url)` throws. Plan §0.4: `trusted-types segv-worker` and a policy that accepts only the bundled worker URL (M6c); M6 `inbox.ts` row and list item. The spec keeps the Web Worker (§11.5 step 2). |
+| R8PLAN-5 | **Accepted.** Plan §5 rewritten: generated secrets and v2 vars, readiness on `/api/v2/params`, steps per milestone (M6b, M6c, M7), `wire.ts` made strippable for the audit, named secrets; §0.5 points to it. Delta M6 item 20, M8. |
+| R8PLAN-6 | **Accepted.** Plan §0.3: three additive view fields (`blocked`, `frozen`, `request`) instead of four meanings of `canSend`; `mock-engine.ts`; §0.4: composer, members, conversation list; new doc-comment rows. Q9 decided. |
+| R8PLAN-7 | **Accepted.** M6 lands as M6a (sign-in), M6b (minimal end-to-end path, e2e rewritten) and M6c (the rest); the M6, M7 and M8 acceptance lines and M8's E2E paragraph no longer depend on v1 or a build flag. |
+| R8PLAN-8 | **Accepted**, merged with R8NAMES-5: the plan header names the checks (`vp check`, `vp test run`, the two extra tsc configs, `npm run build`, a deploy dry run after a `wrangler.jsonc` change, e2e from M6b) and the period without a working app. |
+| R8PLAN-9 | **Accepted.** Plan §0.5 describes the baseline (one tag `v1`, one `0001_init.sql`); later changes add tags or migrations. |
+| R8PLAN-10 | **Accepted**, with the §0.6 part of R8NAMES-8: §0.6 marks existing files and lists `env.ts`, `batch.ts`, `types.ts` and the new `inbox-worker.ts`. |
+| R8PLAN-11 | **Accepted**, with R8NAMES-2 and R8NAMES-3: every path and identifier of M6–M10 and §2–§4 is current, and v1 sources are cited at 3de5f5e. |
+| R8PLAN-12 | **Accepted**, with R8NAMES-7: M0–M5 are marked done, with current names and acceptance lines. |
+| R8PLAN-13 | **Accepted.** §3 preface names the 3de5f5e specs; §3.1 is two sentences. |
+| R8PLAN-14 | **Accepted.** Risk 2's mitigation and a new risk 9 (no working app until M6b); Q1, Q7, Q9 and Q10 restated. |
+| R8PLAN-15 | **Accepted.** §2 heading, intro, browser globals, helper list, settle step 2, the transport in `EngineOptions` and `junkRow`'s signature follow the harness at 8092e98. A fresh checkpoint uses `world.tick(CKPT_PERIOD_MS)` (R8ADV-4) rather than the harness comment's server-only `advance`. |
+| R8PLAN-16 | **Accepted.** Delta: Paths, a new "Plan strategy (in place)" section, M6 item 20, M8, M9 and the text-only list. |
+| R8PLAN-17 | **Accepted** as the summary of R8PLAN-1–16; nothing beyond them. |
+| R8NAMES-1 | **Accepted**, merged with R8PLAN-3. |
+| R8NAMES-2 | **Accepted**, merged with R8PLAN-1 and R8PLAN-11: the plan uses only current names; §0.1 lists the old ones once and says `/api/v2/` and `segv.sh/v2/` are unchanged. |
+| R8NAMES-3 | **Accepted**, merged with R8PLAN-11 and R8CONS-4; the done `session.ts` and `dh.ts` sub-bullets are dropped. |
+| R8NAMES-4 | **Accepted**, merged with R8PLAN-2, R8PLAN-7, R8PLAN-9 and R8PLAN-10. |
+| R8NAMES-5 | **Accepted**, merged with R8PLAN-8; M2 acceptance is `npm run build` plus `wrangler deploy --dry-run`. |
+| R8NAMES-6 | **Accepted**, merged with R8PLAN-2. The plan header names `docs/PROTOCOL-v2.md` as SPEC's in-repository copy. |
+| R8NAMES-7 | **Accepted.** Answer 49 names `stampResponse` only; the plan uses `checkBundleShape`/`checkRecordShape`, `handleApi`, `dirRegister`/`dirAddWrap`/`dirByPrefix`/`dirByUid`/`dirWrapsById`/`dirlogPage`/`dirlogHead`, `makeAccount`/`registerOk`, `dirlogRefUser`/`dirlogRefWrap` and `PowScope` from `src/lib/proto.ts`. |
+| R8NAMES-8 | **Accepted.** Delta M1 item 10 range `1069-1092`; delta M4 `finalize` wording; plan §0.5 and §0.6 rewritten (R8PLAN-9, R8PLAN-10). |
+
+## Appendix C - Review changelog (round 9)
+
+Round 9 checked the round-8 changes, the plan and the delta against this spec, DD and the repository (read only) at
+c993e83 ("Stage 1: apply spec revision sent-2a to M0–M5"), which follows 8092e98 and implements every "Affects M0–M5"
+item of `sent-2a/` except the LEFT record. All 18 findings were accepted. V8ADV-1 to V8ADV-5 share one change: the
+LEFT record carries its LEAVE row's stored time and position, and round 8's finality rule and HEADS hold are deleted.
+V8ADV-7 and V8LAY-3 share one change (line references). The only wire change is LEFT (0x0E, not yet implemented),
+which grows from 68 to 78 B. Answer 61 changed (Appendix D). The plan, the delta and `changes-since-sent-2a.md` cite
+the repository at c993e83.
+
+| id | decision and change |
+| --- | --- |
+| V8ADV-1 | **Accepted** (medium). Both traces confirmed: round 8's finality probe sees only the dense prefix, so a claim stored beyond a hole with a time before `t_R`, or a claim stored on `Lctl_{e+1}` before the rename that kept the leaver, could still drop R after its LEFT record was written; a restore then took the leave as a fact while the live device dropped it. Neither offered fix was taken. The root fix (an effective claim time over the control prefix) needs the times of the control rows before a HEADS control position, which a restore does not fetch, so a restored device could compute another time than a live one. The minimal fix (LEFT records only from the entry's own row, superseded by the next HEADS) leaves a window in which a reload restores the stale leave, and the restored device then writes it again. Change instead: round 8's option (b), whose objections do not hold. LEFT is `conv | root | e | uid | u32 t | u16 E | u32 n` (78 B, §7.2), with R's stored time and, for R's own epoch, R's position (NONE for a carried leave; a position field, §3.1). A leave taken from a LEFT record is decided by §6.8 as R would be, with the walk starting at the record's epoch (every earlier claim kept the leaver, or the leave would not have been carried, so no older claim times are needed). A restore processes every claim of its HEADS epoch from the HEADS control position, which never passes an e-valid claim, and every claim after it, so it drops the leave wherever a live device drops R (§3.1, §6.8, §6.9, §7.1–§7.4, §11.2, §11.4 step 5). Deleted: the finality rule, the per-copy HEADS hold, and "no LEFT record exists for it". `acceptOldRow` needs no change: a carried record's NONE position is never before a cut, which is §6.8's rule for later epochs. Plan: M1 table and tests 2 and 4; M6 `selflane.ts`, `conv.ts` and `restore.ts`; M7 claims bullet and test 31 (retracted-leave variants (a) undecided claim, (b) a claim beyond a hole, (c) a pre-stored next claim). Delta M1 items 2, 3, 10 and 11, M6 items 8, 9 and 11, M7 items 4, 6 and 7. |
+| V8ADV-2 | **Accepted** (medium), resolved by V8ADV-1's change. Confirmed: a removed copy was never final, so its HEADS stayed before a leaver's flood. Without a finality rule or a HEADS hold, a removed or frozen copy writes LEFT records and HEADS entries like any copy, and lane positions pass the flood. Plan M7 test 31 removed-copy flood variant. |
+| V8ADV-3 | **Accepted** (medium), resolved by V8ADV-1's change. Confirmed: a leave restored from a LEFT record had no `t_R`, so it could never become final. Now the record carries the time, the restored device writes it again (with NONE once carried into a later epoch), and nothing waits for finality. Plan M7 test 31 two-claim variant: a second reload before the text also holds lee as left. |
+| V8ADV-4 | **Accepted** (low). Confirmed against round 8's text. Without the finality rule a writer can always write the LEFT records; §7.3's MUST now names the device that writes the row or snapshot, and §7.4 keeps the fold's LEFT records of the copied entry's epoch plus one for every other member the snapshot's writer records as left in it. Plan M6 `selflane.ts`; delta M6 item 9. |
+| V8ADV-5 | **Accepted** (low), moot after V8ADV-1: no probe waits for `t_R + Δ + SKEW` any more, so `settle` needs no new timer, and M7 test 31 no longer waits for finality. |
+| V8ADV-6 | **Accepted** (low), the third option. Confirmed: at base 26 a full put needs 33 bits, and `powSolve` throws when nonces below 2^32 hold no solution (about 61%). §10.2: clients search upward from 0 up to 2^53 − 1, both halves of the `u64` included, so the search cannot run out. Delta M1 item 12: `powSolve` sets the high word; a test starts below 2^32 and crosses it. Answer 61 and Appendix D 61 changed. Not adopted: a retry with the next window (it can run out again) and a client bound of 30 bits (a new rule that refuses deployable params). |
+| V8ADV-7 | **Accepted** (low), merged with V8LAY-3: the plan, the delta and `changes-since-sent-2a.md` cite tests by name, give line numbers at c993e83 and mark older ones "at 8092e98"; R8PLAN-3 above is qualified. |
+| V8LAY-1 | **Accepted** (medium). Confirmed with Node 26.10's `stripTypeScriptTypes` on copies of both files: `class Rd` in `src/lib/proto.ts` also has parameter properties, so `run.mjs` fails on its first import. Plan §5 preamble and step 3, delta "Plan strategy" and M6 item 20: explicit fields in `Rd` and `Reader`, `from "./proto.ts"` in `wire.ts`, and a unit test in `src/lib/wire.test.ts` that strips both files with `stripTypeScriptTypes` (`node:module`), so a later parameter property cannot break e2e again. |
+| V8LAY-2 | **Accepted** (medium), option (b). §11.3 step 2: for an undecided slot or an unfinal winner, `canSend` turns false only once it has stayed so for 30 s, until it settles; a send made before then waits in step 2. Plan §0.3 (`pending`, the `canSend` comment) and M7 test 12; delta M6 item 0 and M7 item 7. Not adopted: option (a), which would hide the composer whenever a claim is in flight, although a send then normally succeeds after a short wait. |
+| V8LAY-3 | **Accepted**, merged with V8ADV-7. `changes-since-sent-2a.md` (a) says what is left against c993e83: the LEFT record (now 78 B) with its test edits, the round-8 feed-token change and the round-9 `powSolve` change; the `verify` wording, the test range, the 101 exemption and the `dirmeta` row are done there. |
+| V8LAY-4 | **Accepted.** Plan M1–M5 headings use one form, "done at c993e83", naming the open delta items (M1: LEFT and `powSolve`; M4: the round-8 feed-token change). The M5 knobs and the M3 `dirmeta` test landed at c993e83, not 8092e98. |
+| V8LAY-5 | **Accepted**, the first option. Plan §2.3 marks every builder except `junkRow` as to be added: `signEpoch`, `buildBundleFor`, `forgeJoin` and `buildMessage` in M6c (M6 tests 10, 13 and 18, `images.spec.ts` #61), and `commitChange`, `buildClaim`, `readableWith` and `entryOutcome` in M7. The §2 heading and the M6c and M7 lists say so. |
+| V8LAY-6 | **Accepted.** Plan M6b updates the README as e2e turns green (the status note, the `src/client/` and `test/engine/` rows, the e2e row and the e2e remark); M9 keeps only the `docs/PROTOCOL.md` link and the `docs/DESIGN.md` remark. |
+| V8LAY-7 | **Accepted**, both parts. Plan §0.4, §0.6, §2.2 and M6c: the `?worker&url` import lives in `src/client/inbox-worker-url.ts`, which starts with `/// <reference types="vite/client" />`; the engine creates the worker through `EngineOptions.inboxWorker` (a factory whose default imports that module dynamically), and the engine tests pass `null`, so they always use the same-thread path. Delta M6 item 20. |
+| V8LAY-8 | **Accepted.** Plan M6 test 15: the new sample's `rtt` is bumped by 1 s, the test asserts that every earlier sample's `rtt` was smaller and that the estimate uses the new sample (`I(e).timeSample`, new in §2.3); the equal-`rtt` pair is taken with the monotonic clock paused (`rtt = 0`), 500 ms of server time apart (below the 1 s discard margin). Delta M6 item 16. |
+| V8LAY-9 | **Accepted**, the second option. Plan §5 step 3: the audit decodes every page with the strict `decodeFeed` (an incomplete page is rejected); the streamed 9 MiB page and truncation stay in the Worker and `wire` tests. Delta M8. |
+| V8LAY-10 | **Accepted.** The listed round-8 items carry "(round 8)" (spec §6.8, §7.3, §9.1, §9.7, §10.2; plan M7 heading and tests 9, 22 (d)/(h), 30 (b), §2.2 settle, §2.3 `junkRow`), text rewritten in round 9 carries "(round 9)", and the §13.2 heading stays listed in the delta's text-only list. The delta's M7 test 9 line gains the `blocked`/`frozen` assertion. `changes-since-sent-2a.md` says that every delta item is marked and the changed spec and plan sections are listed in the delta, and calls Q1 "decided (restated)". |
+| V8LAY-11 | **Accepted.** Plan §3.1 (the `wire` round trips are in `src/lib/wire.test.ts`), M1 test 2 (`_setRandomForTests`, already in `src/lib/proto.ts`), §2.2 `engineFor` (as v1's did at 3de5f5e); delta M1 item 10 (the `records` table at line 1632 at c993e83, 1287 at 8092e98). |
+
+## Appendix C - Review changelog (round 10)
+
+Round 10 checked the round-9 changes, the plan and the delta against this spec, DD and the repository at c993e83 (read
+only), and answered the questions R8-1 to R8-10 that the implementing session asked while it applied `sent-2a/`
+(Appendix D, `answers.md`). All 18 findings were accepted; R10ADV-1 and R10ADV-3 share one change. There is no wire
+change: LEFT stays 78 B (0x0E). New M0–M5 code changes: `acceptOldRow` (R10ADV-2) and a way to stop `powSolve`
+(R10ADV-5); the questions add none (R8-2 and R8-3 confirm round 8's open feed-token change). Answers 61 and 63 changed.
+
+| id | decision and change |
+| --- | --- |
+| R10ADV-1 | **Accepted** (high), the finding's fix. Trace confirmed: a member can be recorded as left in one epoch both from a LEAVE row there (typically the leaver's own §6.9 repeat in an epoch that a racing claim carried its leave into) and from the leave carried in from the previous epoch. Round 9 kept whichever arrived first ("changes nothing"), and §6.8 can drop one source while it accepts the other, so two honest members holding the same rows, or one device live and after a reload, reached opposite frozen-send gates. Change (§6.8, new §6.9 "Several sources", §7.2 LEFT row, §7.3 fold row and "Others' leaves", §7.4, §11.2, §11.4 step 5, §11.10): per copy, epoch and member a receiver keeps only the source with the least key `(t, position)`, NONE counting as after every real position; a source with a smaller key replaces the kept one and is written as a new LEFT record, and one with an equal or larger key changes nothing; the leave stands iff §6.8 accepts the kept source. Along one walk §6.8 accepts a smaller key whenever it accepts a larger one (a smaller t is accepted first, and at equal t only a real position before the cut is), so the least source is accepted whenever any source is, in every order, and dropping it un-records the leave with no fallback. Nothing is added beyond a comparison, and the fold's LEFT rule becomes "least wins" (R10ADV-3). Plan: M6 `conv.ts`, `selflane.ts` and `restore.ts` rows (implemented with M7, R10COH-7); M7 test 31 source-order variant. Delta M6 items 8, 9 and 11; M7 items 4, 6 and 7. |
+| R10ADV-2 | **Accepted** (high); the finding's two options become one rule. Trace confirmed: a restore that starts at HEADS epoch c with `EK_c` from a snapshot's EPOCH record never processes `C_{c−1}` (round 11, V10CON-1: one without a snapshot processes it on its way to c), so `acceptOldRow` got `claim = null` for a row on a followed lane of c−1 and accepted it without reaching `C_c`; a LEAVE or TEXT stored after a claim of c that removed its sender was shown after a reload but dropped live, so round 9's "drops the leave wherever a live device drops R" did not hold here. Change §6.8: the walk goes on while the receiver holds `D_{j+1}` or `C_j`; a receiver that holds `D_{j+1}` reads s's bit from it (`rm` has bit 0 exactly for the members `D_{j+1}` lists, §6.6 step 4) and needs `C_j` only at a step whose bit is 1; where it holds `D_{j+1}` but did not process `C_j` (restore, scrollback) it reads `C_j` at its EPOCH record's position before deciding, and it never accepts a row because it lacks `C_j`. Rows on the followed lanes of c−1 thus need no fetch (§11.4 step 5); the initial history and scrollback read an ending claim where a removed sender's row needs it (§11.4 step 6 and cost, §11.10). Code (M1): `acceptOldRow` continues by membership when `epochs[j].claim` is null and `epochs[j+1]` exists, and throws when the sender is not listed there (its caller must read `C_j` first). Plan: M1 test 10 rows; M6 `restore.ts` and `history.ts` rows; M7 test 31 followed-lane variant. Delta M1 item 13 (new), M6 items 11 and 14, M7 item 6. |
+| R10ADV-3 | **Accepted** (medium), merged with R10ADV-1. Confirmed: with "every record is kept" and records that may differ per key, every HEADS row and snapshot re-copied all of them, without bound in a frozen copy that keeps leavers listed. Change §7.3: per key `(conv, root, e, uid)` the least record wins, so identical records count once; §7.4 copies exactly one record per member left in the entry's epoch. Plan M6 `selflane.ts`. |
+| R10ADV-4 | **Accepted** (low). §6.9, §11.2, the plan's `conv.ts` row and delta M7 item 4 say "the row's stored time and, for the row's own epoch, its position (NONE for an epoch the leave was carried into)", as §7.2 and §7.3 already did. Plan M7 test 31 asserts NONE in a carried record. |
+| R10ADV-5 | **Accepted** (low). Confirmed: a nonce at or above 2^32 is reached only after 2^32 hashes (36–48 min in a tab), longer than the 10–20 min a proof's window is accepted, so round 9's full-range search could not make a 33-bit put succeed, and its rationale was wrong. Change §10.2: a client MUST restart the search with the new window when the window it searches in stops being current (each nonce is an independent trial, so nothing is lost), and never sends a stale proof; the expected work at base 26 (about 8.6·10^9 hashes for a full put, over an hour in a tab) is stated as the cost of raising the base that far. The full-range search stays (the search is bounded by time only); "so a search never runs out" is dropped. Not adopted: splitting puts by difficulty (a new client rule for an operator setting). Code: `powSolve` gets a way to stop (delta M1 item 12); M6a `api.ts` restarts it at the window roll. Answer 61 changed. |
+| R10COH-1 | **Accepted**, option (a): a name at creation (`validName` on the new name, D's name, the "# name" display) moves into M6b, so the e2e group step and the team-name needle keep their intent, and M6b also takes the flows "group # names" and "name sanitisation"; rename display lands with M7 (corrected in round 11, V10CON-2: this row said M6c kept them). |
+| R10COH-2 | **Accepted.** `changes-since-sent-2a.md` lists M1 test 10's NONE row as a to-do (a1), and the delta's status names it. |
+| R10COH-3 | **Accepted.** `answers.md` answers R8-1 to R8-10 (Appendix D); drafts R8-2 and R8-3 are superseded by round 8's cap of 64 (R8-3 below), and R8-1 needs no code change. |
+| R10COH-4 | **Accepted.** Plan M6 test 8 delivers the J of a creation by WELCOME (its add variant lands with M7); test 10's era variant and test 17's epoch-2 and LEAVE-record parts land with M7 ("and LEAVE-record", round 11, V10CON-2). |
+| R10COH-5 | **Accepted.** At c993e83 `docs/STAGE1-PLAN.md` is the `sent-1/` plan and `docs/PROTOCOL-v2.md` the `sent-2a/` spec. The plan header, M9 and `changes-since-sent-2a.md` (d) say that the implementing session copies each revision verbatim (this spec over `docs/PROTOCOL-v2.md`, the plan over `docs/STAGE1-PLAN.md`) in a commit of its own, the first one before M6a. |
+| R10COH-6 | **Accepted**, the first option: M6b includes the first batched inbox post, the padded DELIVERED row and the 409 rebuild; M6c adds WELCOMEs, retry and resume. |
+| R10COH-7 | **Accepted**, the first option: the LEFT codec is M1; writing LEFT records, their place beside HEADS entries and in snapshots, the kept-source rule and their use at restore land in M7 with leave. M6 writes HEADS entries without LEFT records, since no M6 path records a leave. |
+| R10COH-8 | **Accepted.** Delta M5 status: the FakeWorld items landed at c993e83; the builders and the `I(e)`, `settle` and `EngineOptions` items land with M6a–M7. |
+| R10COH-9 | **Accepted.** Plan M6a and the note: rewrite the `settle` doc comment in `test/engine/harness.ts` to use `world.tick`. |
+| R10COH-10 | **Accepted.** The note and the delta say that dropping the header term affects streamed pages only (a batch of exactly k·4 MiB takes k tokens, not k+1), that c993e83 charges inline pages one token and streamed pages `⌈(5 + bytes)/4 MiB⌉` without a cap, and that the route uses the pure helper (8 388 608 B gives 2). |
+| R10COH-11 | **Accepted**, the first option: plan M6 test 15 asserts `I(e).timeSample.rtt < 1000` just before the jump, and afterwards that `timeSample` is the new sample with `rtt ≥ 1000`. |
+| R10COH-12 | **Accepted.** Delta M6 item 10 qualifies `canSend` with the 30-s wait; plan §0.3's comment row uses §11.3 step 2's full condition. |
+| R10COH-13 | **Accepted.** Plan §2.1: `failGet` in the `blobs` row; §0.4 and §2.2: `inboxWorker?: (() => Promise<Worker \| null>) \| null`, where `null` means no worker. |
+| R8-1 | §10.1 status table: other routes MAY answer 500 or 503 "storage unavailable" for a failed Durable Object or R2 call. No code change: clients treat every 5xx alike, so a uniform 503 would change no client behaviour. |
+| R8-2 | §10.9: a page that is not streamed takes one token, and a streamed page of b bytes `min(⌈b / 4 MiB⌉, 64)`. This is round 8's rule (no page header); c993e83 still adds the header term for streamed pages. |
+| R8-3 | §10.9: the cap stays 64 (round 8), not the draft's 600, and a deployment MUST keep `RL_READ` above it. At the production Δ = 10 the shard's ~1 000 requests/s bound a batch near 2.5 GB, so 64 lets a token buy at most about 10 times the 4 MiB tail-page rate, and only after a Δ of saturating maximal puts (about 10 000, which already deny every honest put of that Δ); each further multiple costs about 1 021 maximal puts more within the Δ (the critique's arithmetic is accepted). A cap of 600 would keep that near 1.05×, but a page above 256 MiB would then need up to every token of a window: an auditor behind a shared address, or one reading checkpoints from the same address, would be refused, each refused attempt burns the tokens it took, and the Workers rate-limit binding counts per location and approximately, so a cost equal to the whole limit may never be granted, which is the unreadable page R8ADV-3 closed. Per-address limits do not bound an attacker with many addresses under either cap, so readability decides. |
+| R8-4 | §9.7 "Logs" (a content rule), §3.1, §9.1 and §9.5 drop `logErr`; log text and keys are implementation-defined (preamble). |
+| R8-6 | §10.1 order of checks: a check that needs stored state and the 5xx of a failed storage call are not ordered (a cached or missing `P`). |
+| R8-7 | §6.6 step 4: a throw of a kept entry's `sealDet` recomputation is a failure of the `pks` check. |
+| R8-9 | §6.6 step 4 "Check order", with the critique's correction: the explicit orders of this spec stay normative (the `rm` bit first, the own entry, (g) before (h), §6.7 step 1, §10.1). |
+| R8-10 | Preamble "Implementation vocabulary" (merged with R8-4): names, failure codes, unstated check orders and log formats are implementation-defined. |
+
+## Appendix C - Review changelog (round 11)
+
+Round 11 checked the round-10 changes, the plan, the delta, the answers and `changes-since-sent-2a.md` against this
+spec, DD and the repository at c993e83 (read only). All 11 findings were accepted; none duplicates another. There is
+no layout change: LEFT stays 78 B (0x0E), and EPOCH keeps its 127 B, but a skip's EPOCH now names the claim that
+removed self instead of NONE (the codec already accepts any position with flag bit1). New M0–M5 code changes: none
+beyond two doc comments in M1 (`acceptOldRow`'s list contract and `EpochRec.claim`) and the 9 MiB test's comment in M4
+(`test/worker/api.spec.ts:2343`, V10CON-3; this sentence corrected in round 12, V11CON-8); the open items stay the
+LEFT record, the feed tokens, `powSolve` and `acceptOldRow`. Answers R8-2 and R8-9 changed, and the sections of
+Appendix D row R8-3 were corrected.
+
+| id | decision and change |
+| --- | --- |
+| V10ADV-1 | **Accepted** (medium). Trace confirmed: after a skip re-add from k to e′ > k+1, a restore from a snapshot whose HEADS entry is at e′ holds `D_k` but neither `D_{k+1}` nor `C_k`, no record named `C_k` (the skip's EPOCH carried NONE), and §11.4 step 6 and §11.10 stepped to "e−1", which is not held; an implementation that stepped back to k ended the §6.8 walk without a removal and showed rows that a member removed by `C_k` stored after it, which the live device had dropped. Neither offered fix was taken as is. Stopping history at a skip loses the pre-removal history that §0.3 item 7 promises, and processing k's control lane from its start re-evaluates every claim and junk row of k. Change instead, reusing round 10's mechanism: a skip's EPOCH record names the position of the claim of k that removed self (§7.2, §7.4, §6.7 step 7), so every held epoch above the root names the claim that ended the previous held epoch; §6.8 states that the walk's epochs are consecutive (a skip never continues it), that a receiver removed at j+1 needs `C_j` at step j, and that one that did not process it reads it at the position named by the next held epoch's EPOCH record; §11.4 step 6 and §11.10 step into the previous held epoch (k below a skip) and end below the root. No codec change (`parseRecord` accepts any position with flag bit1); doc comments of `EpochRec.claim` and `acceptOldRow` (consecutive epochs, the caller passes the claim that ended the last listed epoch). Plan: M1 claims and self-lane rows, M6 `selflane.ts`, `restore.ts`, `conv.ts` and `history.ts` rows, M7 claims bullet and test 16 history variant. Delta M1 items 13–14, M6 items 3, 9, 11 and 14, M7 items 5–7. |
+| V10ADV-2 | **Accepted** (medium), the first fix. Trace confirmed: round 10 made the leave verdict independent of arrival order, but §6.6 step 5 picked a claim's removed/rotated line, and step 6 the frozen-with-removal gate, from the leave state at the moment the claim was processed, and nothing re-derived them when a source arrived later; the "@x left" lines also depended on order. Change: §6.6 steps 5–6 and §11.3 step 2 derive the lines and the gate from the current leave state and re-derive them when a source is added, replaced or dropped; §11.9: a LEAVE row shows "@x left" while it is a kept source in some epoch; §6.9 "Several sources" points there. Plan: §0.3 `canSend` comment, M6 `conv.ts` row, M7 claims bullet, test 31 source-order variant run in both orders for alice (claim first, then the sources; and the sources first), asserting the settled lines and gates. Delta M7 items 2, 4 and 7. |
+| V10ADV-3 | **Accepted** (low). §9.1, §9.7 and the §10.2 `RL_READ` row say "one token per started 4 MiB of the page's batches (without the page header), at most 64", as §10.9 does; §10.9's "256 MiB of page" reads "of batches". Text only (the open code change of delta M4 is unchanged). |
+| V10ADV-4 | **Accepted** (low), the first fix. Confirmed: §6.4 ordered only (g) before (h), while (f) and (g) each make a request, so two conforming evaluators made different requests for the same junk claim, against the preamble. Change §6.4 "Order of requests": no request before (a)–(e), and (f) when the reader holds `t_reg` of e's own bundle, have passed; then (f)'s `meta` if needed, (g)'s only after (f), (h)'s blob only after (g). §6.6 step 4 "Check order" lists it among the explicit orders. A claim that fails a local rule thus costs no request. No M0–M5 code change (`claimShapeValid` is local). Answer R8-9 and Appendix D R8-9. Plan: M7 e-validity bullet, and §3 row 27 asserts no `blob/meta` for a bad csig; delta M7 item 2. |
+| V10ADV-5 | **Accepted** (low), the first fix. Confirmed: a member added by a commit that raced a LEAVE has no source for the leave, so a rotation by a member who saw it is a removal to it ("@alice removed @lee"), and a freezing one would refuse its texts where the others may send. §6.9 now says so instead of "learns of the leave … when a member who saw it rotates". Plan M7 test 31 two-claim variant asserts xena's line. |
+| V10CON-1 | **Accepted** (medium). Confirmed: a restore without a snapshot re-derives `EK_c` by processing `C_{c−1}` (§7.3), so the followed-lane variant passed with c993e83's `acceptOldRow`. Plan M7 test 31 followed-lane variant forces a snapshot carrying EPOCH(c) and HEADS(c) before the LEAVE is stored and asserts that the reload processes no claim of c−1. "Never processes `C_{c−1}`" is qualified in §11.4 step 5, §6.8, Appendix C R10ADV-2, the plan's `restore.ts` row, delta M6 item 11 and the note. |
+| V10CON-2 | **Accepted.** Appendix C R10COH-1 says M6b takes the flows "group # names" and "name sanitisation" and rename display lands with M7; R10COH-4 adds test 17's LEAVE-record part. |
+| V10CON-3 | **Accepted.** Plan M4 feed-token row adds the helper value 64 for 600·4 MiB + 1 B and the `countingLimiter(63)` case (429 after 64 limiter calls, no `feedRows`), and tells the implementer to reword the comment at `test/worker/api.spec.ts:2343` to ⌈9 MiB / 4 MiB⌉ = 3. Answer R8-2 and the note (a2) say so. |
+| V10CON-4 | **Accepted.** The delta's round-10 plan text list names the `deliver.ts` row; Appendix D R8-3 lists §10.9 only. |
+| V10CON-5 | **Accepted.** `answers.md`'s header lists every open M0–M5 item as the delta's status line does, and the R10ADV-1 bullet moves under "M6/M7". |
+| V10CON-6 | **Accepted.** Delta M3 cites `test/worker/directory.spec.ts:222-223` (c993e83). |
+
+## Appendix C - Review changelog (round 12)
+
+Round 12 checked the round-11 changes, the plan, the delta, the answers and `changes-since-sent-2a.md` against this
+spec, DD and the repository at c993e83 (read only). All 14 findings were accepted. V11ADV-2, V11CON-2 and V11CON-4
+share one change (the "@x left" rule), as do V11ADV-5 and V11CON-3 (§6.4 "Order of requests"). There is no layout
+change. New M0–M5 code change: `claimShapeValid` rejects `B < m` (M1, V11CON-3); the open items are now the LEFT
+record, the feed tokens, `powSolve`, `acceptOldRow` and this check. Answer R8-9 changed.
+
+| id | decision and change |
+| --- | --- |
+| V11ADV-1 | **Accepted** (medium), the second fix (narrow the claim). Trace confirmed: a snapshot or HEADS row carries LEFT records only for its HEADS epoch (§7.4), so after a reload the leave state of an older epoch is rebuilt only from the rows that the initial history and scrollback load, and a claim below the HEADS epoch that dropped a leaver can show "removed" where the live view showed "keys rotated"; the "@x left" line of a LEAVE row before the HEADS positions is likewise missing until loaded. Persisting LEFT records for the previous epoch was not taken: it would cover only one epoch below the HEADS epoch, while scrollback reaches deeper claims and "@x left" lines belong to rows that must be loaded anyway, and it would add records and a second LEFT rule to snapshots and HEADS rows. The verdicts and the send gate are unaffected: they depend on the current epoch, whose leave state the LEFT records carry. Change: §6.6 step 5 drops "and after a reload" and states what a reload shows; §11.9 adds a paragraph (and says that a claim history reads without processing it shows its lines as a processed one would, so restores do not differ by whether a line exists); §11.4 step 6 processes the initial history's rows as scrollback's (V11CON-6); §13.2 item 8 records the effect. Plan: M6 `history.ts` row, M7 test 31 restore comparison (V11CON-6). Delta M6 items 11 and 14, M7 item 4. |
+| V11ADV-2 | **Accepted** (low), the finding's fix, merged with V11CON-2 and V11CON-4. Trace confirmed: a repeat R′ in e+1 stored in the same Δ batch as R1 in e has the key (t, position), which sorts before the carried (t, NONE), so R′ became the kept source of e+1 while R1 stayed that of e, and round 11's rule gave both an "@x left" line. Change §11.9: a LEAVE row R of x in epoch k shows the line while it is the kept source of x's leave in k, §6.8 accepts it, and x is not recorded as left in k−1 (a leave carried into k shows its line at its source in the earlier epoch), so one leave shows one line; §6.9 "Several sources" points there. Plan: M6 `conv.ts` row, M7 test 31 equal-time repeat. Delta M7 item 4. |
+| V11ADV-3 | **Accepted** (low), the finding's fix. Trace confirmed: a skip's EPOCH names `(claimE, claimK)` but not k, and §11.4 step 5 let a restore start at "the latest HEADS position", so a restore that took `EK_{e′}` from a skip's EPOCH record (without a snapshot, or with one older than the epochs reached through own entries before k) never derived those epochs, and the initial history or scrollback could step into the wrong epoch below the skip. Change §11.4 step 5 "Control lane": the restore starts at the copy's highest epoch whose key a snapshot record gives (its root epoch when there is none), or at the HEADS epoch when that is lower, and processes each epoch's control lane (the HEADS epoch from its position, every other from `(E_start, 0)`), so it holds every held epoch; §6.8, §7.2 (EPOCH row), §11.4 step 6 and §11.10 define the previous held epoch as the highest held epoch below; the cost list counts re-derived epochs. Plan: M6 `restore.ts` and `history.ts` rows, M7 test 16 post-snapshot variant. Delta M6 items 11 and 14, M7 item 5. |
+| V11ADV-4 | **Accepted** (low). Confirmed: §7.4 kept a DESC for "the previous one" (e′−1 below a skip, which the copy never held), so the initial history below a skip fetched k's bundle. Change §7.4: a DESC for the current epoch and for the copy's previous held epoch (e−1, or k below a skip); §11.4 cost line. Plan: M6 `selflane.ts` row, M7 test 16 asserts no blob GET of k's bundle. Delta M6 item 9. |
+| V11ADV-5 | **Accepted** (low), merged with V11CON-3. Confirmed: "no request for a row before (a)–(e) have passed" forbade the body `get` that (a) needs and did not place the `get` that (g) needs for `t_row` after a realtime frame. Change §6.4 "Order of requests": the paragraph orders only `blob/meta` requests and blob fetches; the `get` that supplies the row's body, or its `t_row`, is not ordered by it. Answer R8-9. |
+| V11ADV-6 | **Accepted** (low). Confirmed: the §10.2 row's formula gave 0 tokens for an empty page, against §10.9's "at least 1"; c993e83 charges it one. §9.1 and the §10.2 `RL_READ` row say "at least 1 and at most 64". Text only. Delta M4. |
+| V11CON-1 | **Accepted.** Confirmed at c993e83: `dropPublish` (`test/engine/fake/rt.ts:182`) loses a matching publish for every subscriber, and alice's catch-ups fetch R1 from her followed lane, so order (i) could pass as the R1-first case and order (ii)'s intermediate assertion fails. Plan M7 test 31 source-order variant hides R1 from alice with `world.shard.hide(E, label(R1), "alice")` (`shard.ts:210`) and releases it with `unhide` (`shard.ts:218`): in (i) after she has applied R′ (her sweep of lee's followed lane then records a head before R1, and her first `markRead`'s scrollback finds it), in (ii) after she has processed C_{e+1} (her next catch-up of the followed lane finds it). Plan §2.1 names `unhide`. Delta M7 item 7. |
+| V11CON-2 | **Accepted**, merged with V11ADV-2. Delta M7 item 4 drops "no new line" and "still without a second line" and states the round-12 rule (the line moves to a smaller source when that is a LEAVE row of k). |
+| V11CON-3 | **Accepted**, the first fix, merged with V11ADV-5. Confirmed: (g)'s `bundleSize` clause and (h)'s `B ≥ |D_e|` follow from `bundleSize` alone, and c993e83's `claimShapeValid` checks the first but not the second (`bundleShapeValid` checks `B < m` after the download). Change §6.4: the local rules are (a)–(e), the `bundleSize` clause, `B ≥ |D_e|`, and (f) when `t_reg` is held; §6.6 step 4 "Check order" names them. Code (M1): `claimShapeValid` rejects `B < m`. Plan: M1 claims row and test 10, M7 e-validity bullet. Delta M1 item 15 (new), M7 item 2. Answer R8-9. |
+| V11CON-4 | **Accepted**, merged with V11ADV-2: §11.9, §6.9 "Several sources", the plan's `conv.ts` row and delta M7 item 4 say "and §6.8 accepts it". |
+| V11CON-5 | **Accepted.** Plan M7 test 16 asserts the read of C_k anywhere between the reload and the settled `markRead` (the initial history steps into k first), and the followed-lane variant asserts "no blob GET of epoch c's bundle during the reload" instead of an `I(e)` field. Delta M7 item 7. |
+| V11CON-6 | **Accepted**, with V11ADV-1. Plan M7 test 31: the restores give the same verdict, send gate and C_{e+1} line as live; the "@lee left" line at R1 is asserted after each restore's settled `markRead`. §11.4 step 6: the initial history's rows are processed as §11.10 says. |
+| V11CON-7 | **Accepted.** Confirmed: at c993e83 `src/lib/proto.ts:1793` is `acceptOldRow`'s first line and the null-claim check is line 1797. Delta M1 item 13 and `changes-since-sent-2a.md` a4 cite 1797. |
+| V11CON-8 | **Accepted.** The plan header, the delta header, Appendix C round 11's intro and `answers.md`'s summary name round 11's M4 test-comment fix (`test/worker/api.spec.ts:2343`); delta M6 item 0 says the `canSend` comment follows the current leave state (round 11's rule, as plan §0.3 has it). |
+
 ## Appendix D - Implementation questions (M0–M5)
 
 The implementing session asked 67 questions while building M0–M5 from `sent-1/`. The full answers, with the code to
 change, are in `answers.md`; this list gives each decision and the sections it changed. Round 7 changed answers 4, 11,
-24, 41, 43, 62, 63 and 67 (Appendix C round 7).
+24, 41, 43, 62, 63 and 67 (Appendix C round 7). Round 8 changed answers 16 (wording of the code change), 49 (the
+function name), 56, 61 and 63 (Appendix C round 8). Round 9 changed answer 61 (Appendix C round 9). Round 10 changed
+answers 61 (restart at the window roll) and 63 (the cap of 64 confirmed against 600), and added the questions R8-1 to
+R8-10 that the implementing session asked while applying `sent-2a/` (rows R8-1 to R8-10 at the end; Appendix C round
+10). Round 11 changed answers R8-2 (the 9 MiB test's comment drops the header term, V10CON-3) and R8-9 (§6.4 now
+orders e-validity's requests, V10ADV-4), and corrected the sections of row R8-3 (V10CON-4; Appendix C round 11).
+Round 12 changed answer R8-9 (the local rules include the `bundleSize` clause of (g) and `B ≥ |D_e|` of (h), so
+`claimShapeValid` gains `B ≥ m`; the row's own `get` is not ordered; V11CON-3, V11ADV-5; Appendix C round 12).
 
 | n | decision | sections |
 | --- | --- | --- |
@@ -3506,15 +3852,25 @@ change, are in `answers.md`; this list gives each decision and the sections it c
 | 53 | confirmed: the internal `bh` column; no batch bound | §9.1, App. A18 |
 | 54 | confirmed: feed RPCs in chunks; pages of one large batch | §9.1, §10.9 |
 | 55 | confirmed: Δ divides 604 800; parameter bounds; client check | §3.1, §6.4(g) |
-| 56 | confirmed (as 41) | §3.1 |
+| 56 | as 41: confirmed, except the ShardDO pin log (round 7, delta M2) | §3.1 |
 | 57 | confirmed (as 29); `closed` is monotonic | §9.3 |
 | 58 | confirmed: the early window counts against the era's first day; 14 000 / 56 000 | §9.3, §13.2 |
 | 59 | confirmed: the two defensive GAP cases | §9.4, §10.8, App. A20 |
 | 60 | confirmed (as 12) | §9.6 |
-| 61 | confirmed (merged with 19 and 20; the u64 bound covers only time and sequence fields) | §1.2, §3.1, §3.3 |
+| 61 | confirmed (merged with 19 and 20); round 8: the PoW nonce is bounded by 2^53 − 1 too, as the server already does; only the routing value is not; round 9: clients search the whole range, so `powSolve` changes; round 10: the search restarts with the new window when its window stops being current | §1.2, §3.1, §3.3, §10.2 |
 | 62 | spec clarification: clock samples by minimum RTT; round 7: stale samples discarded, ties to the newest, the wall clock in §11.3 steps 6 and 8 | §3.1, §10.1, §11.3 |
-| 63 | confirmed: streamed feed pages are not cached; truncation is detectable; round 7: **change the implementation**: one `RL_READ` token per started 4 MiB | §9.1, §9.7, §10.2, §10.9 |
+| 63 | confirmed: streamed feed pages are not cached; truncation is detectable; round 7: **change the implementation**: one `RL_READ` token per started 4 MiB; round 8: of the batches' bytes (no page header), at most 64 tokens; round 10: the cap of 64 confirmed (R8-3) | §9.1, §9.7, §10.2, §10.9 |
 | 64 | confirmed: `put` hashes before its synchronous transaction | §9.1 |
 | 65 | confirmed (as 41): BlobReg `'delta'`, InboxDO `'slot'` | §9.2, §9.3 |
 | 66 | confirmed: body length mismatches; malformed If-None-Match ignored | §9.7, §10.7 |
 | 67 | confirmed (server): params never fails on D1; round 7: clients use `P* = max(P, ⌊log2(dirSeq/2080)⌋)`, the re-read is a MAY | §9.6, §10.6, §10.9 |
+| R8-1 | confirmed: other routes MAY answer 500 (or 503 "storage unavailable") for a failed DO or R2 call; no code change | §10.1 |
+| R8-2 | **change the implementation** (round 8's rule): a page that is not streamed takes one token, a streamed page `min(⌈b / 4 MiB⌉, 64)`, without the page header; round 11: the 9 MiB test's comment drops the header term too | §10.9 (round 11: §9.1, §9.7 and §10.2 worded alike) |
+| R8-3 | **change the implementation** (round 8's rule): the cap stays 64, not 600; a deployment keeps `RL_READ` above it | §10.9 (round 11: was listed as §10.2, §10.9) |
+| R8-4 | spec clarification: logs follow a content rule; their text and keys are implementation-defined; no code change | preamble, §3.1, §9.1, §9.5, §9.7 |
+| R8-5 | confirmed: `wrongEraOnce(reported?)` defaults to the inbox clock's era; plan knob text and M6 test 7 variant | none (plan §2.1, M6 test 7) |
+| R8-6 | confirmed: a stored-state check and a storage 5xx are not ordered; the fake's order conforms | §10.1 |
+| R8-7 | confirmed: an unusable kept key reports `"pks"`; a throw of the recomputation fails the check | §6.6 |
+| R8-8 | confirmed: a D with more members than B in a join reports `"pks"`; codes are diagnostics | none |
+| R8-9 | confirmed: the D′ checks may run in any order; explicit orders stay normative; round 11: §6.4 orders e-validity's requests (none before the local rules pass, then (f), (g), (h)); round 12: **change the implementation**: the local rules include (g)'s `bundleSize` clause and (h)'s `B ≥ |D_e|`, so `claimShapeValid` checks `B ≥ m`; the `get` of the row itself is not ordered | §6.6, §6.4 (rounds 11–12) |
+| R8-10 | confirmed: helper names and failure codes are implementation-defined | preamble |
