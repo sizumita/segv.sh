@@ -59,12 +59,30 @@ export interface MembershipHost {
   failOwn(c: Copy, key: string): void;
   /** the copy's own leave is current: a LEAVE record and no skip re-add above the latest one (§6.9) */
   leaveCurrent(c: Copy): boolean;
+  /** self had left in epoch k: the copy is left now, or a LEAVE record at or below k with no skip re-add between */
+  leftAt(c: Copy, k: number): boolean;
 }
 
 const who = (h: MembershipHost, c: Copy, ep: Epoch, j: number): string =>
   P.equalBytes(ep.D.members[j].uid, h.selfUid) ? "you" : "@" + h.handleOf(c, ep, j);
 
 // ───────────────────────── lines ─────────────────────────
+
+/** Like putLine, but a line already shown moves to `order` when that sorts earlier (one line at its earliest row). */
+function putLineEarliest(c: Copy, key: string, order: number[], render: () => string): void {
+  const had = c.order.get(key);
+  if (had && cmpOrder(had, order) <= 0) return;
+  if (had) dropLine(c, key);
+  putLine(c, key, order, render);
+}
+
+function cmpOrder(a: number[], b: number[]): number {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const d = (a[i] ?? -1) - (b[i] ?? -1);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
 
 /** Inserts a system line whose text is rendered again later (handles resolve, leave state changes). */
 function putLine(c: Copy, key: string, order: number[], render: () => string): void {
@@ -189,8 +207,9 @@ export function onLeave(
     const skipAbove = [...c.epochs.values()].some((x) => x.viaSkip && x.e > ep.e);
     if (!skipAbove) {
       c.left = true;
+      // One line per leave, at the earliest own LEAVE row held (repeats add none; answer R11-5).
       const since = Math.max(0, ...[...c.epochs.values()].filter((x) => x.viaSkip).map((x) => x.e));
-      putLine(c, `sys:you-left:${since}`, src.order, () => YOU_LEFT);
+      putLineEarliest(c, `sys:you-left:${since}`, src.order, () => YOU_LEFT);
     }
     h.ownLeave(c, ep.e);
     h.changed();
@@ -255,19 +274,20 @@ export async function processWinner(
       await h.sweep([...ep.lanes.map((_, j) => ({ c, ep, lane: j })), ...unsweptBelow(c, ep)]);
     for (const l of ep.lanes) l.swept = true;
     for (const t of unsweptBelow(c, ep)) t.ep.lanes[t.lane as number].swept = true;
+    // "@by removed you" is decided at k (a self-leaver gets none) and stays when a skip re-add follows (R11-2).
+    if (!h.leftAt(c, ep.e))
+      putLine(
+        c,
+        `sys:${ep.e}:rmyou`,
+        claimOrder(h, ep, w, 0),
+        () => `@${h.handleOf(c, ep, w.from)} removed you`,
+      );
     const skip = await h.skipAfter(c, ep.e);
     if (skip) {
       skip.viaSkip = true;
       enterEpoch(h, c, skip);
       c.left = h.leaveCurrent(c); // a skip re-add above the latest LEAVE record ends the leave (§6.9)
     } else {
-      if (!c.left)
-        putLine(
-          c,
-          `sys:${ep.e}:rmyou`,
-          claimOrder(h, ep, w, 0),
-          () => `@${h.handleOf(c, ep, w.from)} removed you`,
-        );
       c.removed = true;
       if (h.live() && byOthers) c.unread++;
     }

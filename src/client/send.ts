@@ -45,6 +45,8 @@ export interface SendCtx {
   rotate?: (c: Copy) => Promise<void>;
   /** a LEAVE repeated by §6.9: step 2's "you left" refusal does not apply */
   repeatLeave?: boolean;
+  /** the `ck` fields of a new row: the latest verified checkpoint (§12.4) */
+  ck?: () => { ckq: number; ck16: Bytes };
   /** waits on a protocol timer */
   wait(ms: number): Promise<void>;
   /** applies a row of this device's own lane (or a sibling's) found by the send */
@@ -200,8 +202,7 @@ export async function sendRow(ctx: SendCtx, c: Copy, content: P.MBody): Promise<
       prev: last ? { E: last.E, n: last.n } : P.NONE,
       prevh: last ? P.prevh(last.label, last.body) : P.ZERO16,
       ts: Math.max(0, Math.floor(ctx.clock.wall())),
-      ckq: 0,
-      ck16: P.ZERO16,
+      ...(ctx.ck?.() ?? { ckq: 0, ck16: P.ZERO16 }),
       ...content,
     } as P.Msg;
     let row: ReturnType<typeof P.buildRow>;

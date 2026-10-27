@@ -59,6 +59,10 @@ export interface Lane {
    * "Sweeping"). A lane that is not swept is a followed lane, or one still to sweep once more.
    */
   swept: boolean;
+  /** prevh(label, body) of the rows of this lane this session holds, by "E:n" (§12.2 "Every row") */
+  prevhs: Map<string, Bytes>;
+  /** the prevh a held row expects of the row at "E:n", which this session has not loaded yet (§12.2) */
+  expect: Map<string, Bytes>;
 }
 
 /** A stored row: its slot, label, stored time (seconds since T0) and body. */
@@ -213,6 +217,8 @@ export function newLane(start: Slot): Lane {
     oldest: null,
     head: null,
     swept: false,
+    prevhs: new Map(),
+    expect: new Map(),
   };
 }
 
@@ -422,8 +428,11 @@ export function walkEpochs(c: Copy, e: number): P.WalkEpoch[] {
  * needs and this device does not hold never makes it accept.
  */
 export function acceptedOld(c: Copy, e: number, i: number, pos: P.Pos, t: number): boolean {
+  const list = walkEpochs(c, e);
+  const last = c.epochs.get(e + list.length - 1);
+  const selfRemoved = !!last?.ended && last.myIndex >= 0 && P.rmHas(last.ended.rm, last.myIndex);
   try {
-    return P.acceptOldRow({ i, E: pos.E, n: pos.n, t }, walkEpochs(c, e));
+    return P.acceptOldRow({ i, E: pos.E, n: pos.n, t }, list, selfRemoved);
   } catch {
     return false;
   }

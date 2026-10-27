@@ -48,6 +48,8 @@ export interface CommitHost {
   pksOf(c: Copy, ep: Epoch): Promise<Bytes>;
   /** §6.3 step 10: the first delivery attempt of J (the rest in the background) */
   deliver(c: Copy, J: P.Join, to: DirUser[]): Promise<void>;
+  /** the `ck` fields of the claim: the latest verified checkpoint (§6.2, §12.4) */
+  ck(): { ckq: number; ck16: Bytes };
 }
 
 /** The refusals before a commit: removed, left, frozen, or the last epoch (§6.3, §6.6 step 6, §6.10). */
@@ -256,8 +258,7 @@ async function claimAndDecide(
       prev: P.NONE,
       prevh: P.ZERO16,
       ts: Math.max(0, Math.floor(h.clock.wall())),
-      ckq: 0,
-      ck16: P.ZERO16,
+      ...h.ck(),
       claim: {
         prevD: ep.D.hash,
         hD: b.D.hash,

@@ -406,6 +406,10 @@ export interface EngineI {
     registered?: { now: number | null } | null,
   ): Promise<void>;
   views(): ConversationView[];
+  /** the checkpoint chain the session verified (§12.3) */
+  ckpt: { latest: { q: number; C: Uint8Array } | null; verify(): Promise<void> } | null;
+  /** the session's API client (its row memory, §12.1) */
+  api: { get(keys: W.GetKey[]): Promise<W.GetStatus[]> };
 }
 
 /** White-box access to an engine's private state. */

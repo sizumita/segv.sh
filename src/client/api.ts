@@ -2,6 +2,7 @@
 // from clock samples (§10.1), proof of work (§10.2), the binary put and get (§10.3, §10.4), and the directory (§10.6).
 // One instance per engine: the transport and the clock come from the engine's options.
 import * as P from "~/lib/proto";
+import { BAD_RECEIPT, RowMemory, type CkptLatest, type CkptRange } from "./integrity";
 import * as W from "~/lib/wire";
 import type { EngineClock } from "./options";
 
@@ -268,6 +269,8 @@ export interface ApiOptions {
   clock: EngineClock;
   /** noise warnings (the directory's short answers) */
   warn?: (text: string) => void;
+  /** critical warnings (a changed stored row, an invalid receipt, §12.1, §12.5) */
+  critical?: (text: string) => void;
 }
 
 async function readError(res: Response): Promise<ApiError> {
@@ -288,9 +291,13 @@ async function readError(res: Response): Promise<ApiError> {
 
 export class Api {
   readonly time: ServerClock;
+  /** every row this session fetched, received or wrote (§12.1) */
+  readonly rows: RowMemory;
   private readonly fetchFn: typeof fetch;
   private readonly clock: EngineClock;
   private readonly warn: (text: string) => void;
+  private readonly critical: (text: string) => void;
+  private receiptWarned = false;
   private paramsCache: { p: Params; at: number } | null = null;
   private paramsPending: Promise<Params> | null = null;
   private dirSeqPending: Promise<number> | null = null;
@@ -301,6 +308,8 @@ export class Api {
     this.clock = opts.clock;
     this.time = new ServerClock(opts.clock);
     this.warn = opts.warn ?? (() => {});
+    this.critical = opts.critical ?? (() => {});
+    this.rows = new RowMemory(this.critical);
   }
 
   /** The estimated server time (ms); call `params()` once before. */
@@ -489,7 +498,30 @@ export class Api {
       throw new ApiError(0, "malformed put response");
     }
     if (out.length !== count) throw new ApiError(0, "malformed put response");
+    this.checkPut(body, out);
     return out;
+  }
+
+  /** §12.5 receipts of OK rows under the server key, and §12.1 for every stored row the answer names. */
+  private checkPut(body: Bytes, out: W.PutResult[]): void {
+    let rows: W.PutRow[];
+    try {
+      rows = W.decodePutRequest(body);
+    } catch {
+      return;
+    }
+    const key = this.cachedParams ? P.fromB64u(this.cachedParams.srvKey) : null;
+    out.forEach((r, i) => {
+      const row = rows[i];
+      if (!row) return;
+      if (r.s === "ok") {
+        if (key && !P.verify(r.receipt, P.receiptMsg(row.E, row.label, row.body, r.t), key)) {
+          if (!this.receiptWarned) this.critical(BAD_RECEIPT);
+          this.receiptWarned = true;
+        }
+        this.rows.observe(row.E, row.label, r.t, row.cls, row.body);
+      } else if (r.s === "conflict") this.rows.observe(row.E, row.label, r.t, r.cls, r.body);
+    });
   }
 
   /**
@@ -516,13 +548,72 @@ export class Api {
       }
       const skipped: number[] = [];
       batch.forEach((i, k) => {
-        if (st[k].s === "skipped") skipped.push(i);
-        else out[i] = st[k];
+        const x = st[k];
+        if (x.s === "skipped") skipped.push(i);
+        else out[i] = x;
+        if (x.s === "hit") this.rows.observe(keys[i].E, keys[i].label, x.t, x.cls, x.body ?? null);
       });
       if (skipped.length === batch.length) throw new ApiError(0, "the server skipped every key");
       todo = [...skipped, ...todo.slice(batch.length)];
     }
     return out as W.GetStatus[];
+  }
+
+  // ── checkpoints (§10.9) ──
+
+  /** `GET /api/v2/ckpt/latest`: the latest checkpoint, or null while there is none (404). */
+  async ckptLatest(): Promise<CkptLatest | null> {
+    const res = await this.request("/api/v2/ckpt/latest", { cache: "no-store" });
+    if (res.status === 404) return null;
+    if (!res.ok) throw await readError(res);
+    const j = await this.json<Record<string, unknown>>(res);
+    if (
+      !isInt(j.q, 1, 0xffffffff) ||
+      !isInt(j.sec, 0, 0xffffffff) ||
+      !isB64u(j.C, 32) ||
+      !isB64u(j.sig, 64)
+    )
+      throw new ApiError(0, "malformed checkpoint");
+    return { q: j.q, sec: j.sec, C: P.fromB64u(j.C), sig: P.fromB64u(j.sig) };
+  }
+
+  /** `GET /api/v2/ckpt/range?after=…&limit=…`; null on 404 (none yet, or `after` above the latest). */
+  async ckptRange(after: number, limit: number): Promise<CkptRange | null> {
+    const res = await this.request(`/api/v2/ckpt/range?after=${after}&limit=${limit}`, {
+      cache: "no-store",
+    });
+    if (res.status === 404) return null;
+    if (!res.ok) throw await readError(res);
+    const j = await this.json<Record<string, unknown>>(res);
+    const from = j.from as Record<string, unknown> | undefined;
+    const latest = j.latest as Record<string, unknown> | undefined;
+    const entries = j.entries;
+    if (
+      !isObj(from) ||
+      !isObj(latest) ||
+      !Array.isArray(entries) ||
+      !isInt(from.q, 0, 0xffffffff) ||
+      !isB64u(from.C, 32) ||
+      !isInt(latest.q, 1, 0xffffffff) ||
+      !isB64u(latest.C, 32) ||
+      !isB64u(latest.sig, 64)
+    )
+      throw new ApiError(0, "malformed checkpoint range");
+    const es = entries.map((e: unknown) => {
+      if (
+        !isObj(e) ||
+        !isInt(e.q, 1, 0xffffffff) ||
+        !isInt(e.sec, 0, 0xffffffff) ||
+        !isB64u(e.hd, 32)
+      )
+        throw new ApiError(0, "malformed checkpoint range");
+      return { q: e.q, sec: e.sec, hd: P.fromB64u(e.hd) };
+    });
+    return {
+      from: { q: from.q, C: P.fromB64u(from.C) },
+      entries: es,
+      latest: { q: latest.q, C: P.fromB64u(latest.C), sig: P.fromB64u(latest.sig) },
+    };
   }
 
   // ── blobs (§10.7) ──

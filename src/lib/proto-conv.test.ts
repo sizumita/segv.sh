@@ -1599,6 +1599,23 @@ describe("acceptOldRow: the §6.8 walk (test 10)", () => {
     expect(P.acceptOldRow(r, epochs)).toBe(want);
   });
 
+  // answer R11-6: a receiver removed by the last listed claim ends that epoch at the claim for every sender
+  const removedTable: [string, P.WalkRow, P.WalkEpoch[], boolean][] = [
+    ["removed receiver: a kept member's row before the claim", row(2, 99), [e0], true],
+    ["removed receiver: a kept member's row after the claim", row(2, 101), [e0], false],
+    ["removed receiver: equal t, before the kept member's cut", row(2, 100, 5, 6), [e0], true],
+    ["removed receiver: equal t, at the kept member's cut", row(2, 100, 5, 7), [e0], false],
+    ["removed receiver: a removed member's row keeps its rule", row(1, 101), [e0], false],
+    ["removed receiver: a later claim ends a later epoch", row(2, 150), [e0, { ...e1, claim: { ...Ce1, rm: 1 } }], true],
+    ["removed receiver: after the later claim", row(2, 250), [e0, { ...e1, claim: { ...Ce1, rm: 1 } }], false],
+    ["removed receiver: a carried NONE source at equal t", row(2, 100, 0xffff, 0xffffffff), [e0], false],
+    ["no claim on the last epoch: accept", row(2, 5000), [{ ...e0, claim: null }], true],
+  ];
+
+  it.each(removedTable)("%s", (_, r, epochs, want) => {
+    expect(P.acceptOldRow(r, epochs, true)).toBe(want);
+  });
+
   it("throws when the claim that ended an epoch is needed but not passed (§6.8 \"The bit without C_j\")", () => {
     // B (index 1 of e) is not listed in D_{e+1}: its bit in C_e is 1, and C_e is needed for t(C_e) and the cut
     for (const t of [50, 100, 5000]) {

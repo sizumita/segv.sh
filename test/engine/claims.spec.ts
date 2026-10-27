@@ -333,6 +333,62 @@ describe("cuts (test 11)", () => {
   });
 });
 
+describe("a removed receiver's epoch ends at the claim (answer R11-6)", () => {
+  it("drops a kept member's row stored after the claim, live and after a reload; keeps earlier rows", async () => {
+    const {
+      users: [alice, bob, rita],
+      engines: [A, B, R],
+      id,
+    } = await group(["alice", "bob", "rita"]);
+    await B.sendText(id, "before the claim");
+    await settle(A, B, R);
+    const ep = epoch(A, id);
+    const bi = P.memberIndex(ep.D, bob.uid);
+    const lane = conv(B, id).epochs.get(0)!.lanes[bi];
+    const r = await commitChange(alice, ep, [alice, bob], undefined, { hideFrom: ["rita"] });
+    // bob's row stored in e0 after the claim (as a device that had not seen it would write it)
+    server().tick(1001);
+    postRow(
+      ep,
+      buildMessage(
+        bob,
+        ep,
+        { E: lane.next.E, n: lane.next.n },
+        { type: P.MT.TEXT, text: "after the claim" },
+      ),
+    );
+    await I(R).catchUp();
+    expect(chat(R, id)).toContain("bob: after the claim");
+    server().shard.unhide(r.claim.E, r.claim.label);
+    await settle(A, B, R);
+    expect(systemLines(R, id).at(-1)).toBe("@alice removed you");
+    expect(chat(R, id)).toEqual(["bob: before the claim"]);
+    const R2 = await engineFor(rita);
+    R2.markRead(id);
+    await settle(R2);
+    expect(chat(R2, id)).toEqual(["bob: before the claim"]);
+    expect(systemLines(R2, id)).toContain("@alice removed you");
+  });
+
+  it("a frozen receiver still accepts a kept member's late row", async () => {
+    const {
+      users: [alice, bob, mallory],
+      engines: [A, B, M],
+      id,
+    } = await group(["alice", "bob", "mallory"]);
+    const ep = epoch(A, id);
+    const bi = P.memberIndex(ep.D, bob.uid);
+    await commitChange(mallory, ep, [alice, bob, mallory], undefined, { patchBlob: garbleDesc });
+    await settle(A, B, M);
+    expect(mustView(A, id).frozen).toBe(true);
+    server().tick(1001);
+    postRow(ep, buildMessage(bob, ep, { E: server().era, n: 0 }, { type: P.MT.TEXT, text: "late" }));
+    await settle(A, B, M);
+    expect(chat(A, id)).toEqual(["bob: late"]);
+    void bi;
+  });
+});
+
 describe("bundle shape and undecided claims (test 12)", () => {
   it("a claim naming a large blob, a bad header or too small a B is e-invalid without fetching it", async () => {
     const {

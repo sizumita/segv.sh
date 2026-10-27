@@ -1841,7 +1841,9 @@ export class MissingClaimError extends Error {
 }
 
 /**
- * §6.8 old-epoch acceptance. `epochs` are consecutive held epochs: `epochs[0]` is D_e (the row's epoch) and
+ * §6.8 old-epoch acceptance. `selfRemoved`: the claim that ended the last listed epoch removed or dropped the receiver
+ * itself (its own rm bit is 1), so the receiver holds no later epoch through it (answer R11-6).
+ * `epochs` are consecutive held epochs: `epochs[0]` is D_e (the row's epoch) and
  * `epochs[k]` is D_{e+k}, so the list stops before an epoch reached by a skip re-add, and a frozen receiver's at its
  * frozen epoch. The caller passes the claim that ended each listed epoch whenever one exists, read at the position
  * of the next held epoch's EPOCH record when it did not process it (for the epoch before a skip: the claim that
@@ -1850,14 +1852,22 @@ export class MissingClaimError extends Error {
  * C_j"); when D_{j+1} does not list the sender, the bit is 1 and the claim is needed, so the call throws
  * `MissingClaimError`. A row is never accepted for lack of a claim.
  */
-export function acceptOldRow(row: WalkRow, epochs: readonly WalkEpoch[]): boolean {
+export function acceptOldRow(row: WalkRow, epochs: readonly WalkEpoch[], selfRemoved = false): boolean {
   let idx = row.i;
   for (let j = 0; j < epochs.length; j++) {
     const { members, claim } = epochs[j];
     if (idx < 0 || idx >= members.length) return true;
     if (!claim || !rmHas(claim.rm, idx)) {
       const next = epochs[j + 1];
-      if (!next) return true;
+      if (!next) {
+        // A receiver that this claim removed or dropped holds no later epoch: its epoch ends at the claim, as a removed
+        // sender's rows end there (answer R11-6). A frozen receiver stops and accepts.
+        if (!claim || !selfRemoved) return true;
+        if (row.t < claim.t) return true;
+        if (j > 0 || row.t !== claim.t) return false;
+        const cut = claim.cuts[row.i];
+        return cut !== undefined && cutBefore(cut, row.E, row.n);
+      }
       const key = uidKey(members[idx]);
       idx = next.members.findIndex((u) => uidKey(u) === key);
       if (!claim && idx < 0) throw new MissingClaimError(j);

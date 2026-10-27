@@ -43,6 +43,13 @@ export interface SyncCtx {
   onValidRow(c: Copy, ep: Epoch, j: number): void;
   /** the local echo waiting for this row (rowKey), if any */
   takeEcho(key: string): { c: Copy; echoKey: string } | undefined;
+  /**
+   * §12.2 and §12.4 for a valid row of lane j: its `ck` against the verified checkpoints, and its `prev` against the
+   * row this session holds there (checked later when it holds none).
+   */
+  checkRow(c: Copy, ep: Epoch, j: number, row: FoundRow, msg: P.Msg, quiet: boolean): void;
+  /** a row above this one named it with another prevh (§12.2) */
+  prevMismatch(c: Copy, ep: Epoch, j: number): void;
   /** a valid LEAVE row of member j at `row`, stored at `t` (§6.9) */
   onLeave(
     c: Copy,
@@ -306,6 +313,13 @@ export function applyLaneRow(
   if (!lane.oldest || P.posCmp({ E: r.E, n: r.n }, lane.oldest) < 0)
     lane.oldest = { E: r.E, n: r.n, prev: { ...m.prev } };
   lane.seen = true;
+  const here = `${r.E}:${r.n}`;
+  const ph = P.prevh(r.label, r.body);
+  lane.prevhs.set(here, ph);
+  const expected = lane.expect.get(here);
+  lane.expect.delete(here);
+  ctx.checkRow(c, ep, j, r, m, quiet);
+  if (expected && !P.equalBytes(expected, ph)) ctx.prevMismatch(c, ep, j);
   ctx.onValidRow(c, ep, j);
   const mine = P.equalBytes(ep.D.members[j].uid, ctx.selfUid);
   const ts = clampTs(m.ts, r.t, ctx.delta());

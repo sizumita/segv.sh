@@ -24,8 +24,13 @@ export const Chat = component$(() => {
           </span>
         )}
         {ui.notice && <span role="status">{ui.notice}</span>}
-        <span class="dim push" title={state.head.h ? `head ${state.head.h}` : undefined}>
-          log #{state.head.seq}
+        <span
+          class="dim push"
+          title={
+            state.head.h ? `verified checkpoint ${state.head.h}` : "no checkpoint verified yet"
+          }
+        >
+          checkpoint #{state.head.seq}
         </span>
       </header>
 

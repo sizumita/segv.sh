@@ -112,7 +112,12 @@ export class SegvEngine implements Engine {
   }
 
   private newApi(): Api {
-    return new Api({ fetch: this.fetchFn, clock: this.clock, warn: (t) => this.warn(t) });
+    return new Api({
+      fetch: this.fetchFn,
+      clock: this.clock,
+      warn: (t) => this.warn(t),
+      critical: (t) => this.warn(t, true),
+    });
   }
 
   // ───────────── public API ─────────────
@@ -255,6 +260,11 @@ export class SegvEngine implements Engine {
     return this.msg?.copies ?? new Map();
   }
 
+  /** the checkpoint chain the session verified (§12.3) */
+  get ckpt(): Messaging["ckpt"] | null {
+    return this.msg?.ckpt ?? null;
+  }
+
   /** decrypted images of the session, by `id.k` */
   get imageCache(): Map<string, Promise<string>> {
     return this.msg?.imageCache ?? new Map();
@@ -394,6 +404,7 @@ export class SegvEngine implements Engine {
       enqueue: (fn) => this.enqueue(fn),
       track: (p) => this.track(p),
       setConnected: (on) => this.patch({ connected: on }),
+      setHead: (q, C) => this.patch({ head: { seq: q, h: P.b64u(C) } }),
     };
   }
 

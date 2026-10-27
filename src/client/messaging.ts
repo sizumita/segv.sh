@@ -37,6 +37,7 @@ import {
   type Decrypt,
   type InboxCursor,
 } from "./inbox";
+import { Checkpoints, different, hiding } from "./integrity";
 import { acceptJoin, secondCopyWarning, type JoinCtx, type NewCopy, type SkipJoin } from "./join";
 import type {
   EngineClock,
@@ -102,6 +103,8 @@ export interface MessagingHost {
   /** counts an in-flight action (settle waits for it) */
   track<T>(p: Promise<T>): Promise<T>;
   setConnected(on: boolean): void;
+  /** the latest verified checkpoint (EngineState.head, §12.3) */
+  setHead(q: number, C: Bytes): void;
 }
 
 export class Messaging {
@@ -142,8 +145,27 @@ export class Messaging {
   private readonly settleTimers = new Set<string>();
   /** LEAVE records being written, by copy key and epoch (one write per session, §6.9) */
   private readonly leaveWrites = new Map<string, Promise<void>>();
+  /** the checkpoint chain this session verified (§12.3, §12.4) */
+  readonly ckpt: Checkpoints;
+  /** rows whose `prev` this session does not hold yet: fetched and compared after the walk (§12.2) */
+  private prevChecks: { c: Copy; ep: Epoch; j: number; prev: P.Pos; prevh: Bytes }[] = [];
+  /** omission warnings already raised, per kind and sender (§12.2) */
+  private readonly omissionWarned = new Set<string>();
 
   constructor(private readonly h: MessagingHost) {
+    this.ckpt = new Checkpoints({
+      api: h.api,
+      storage: () => {
+        try {
+          return typeof localStorage === "undefined" ? null : localStorage;
+        } catch {
+          return null;
+        }
+      },
+      wall: () => h.clock.wall(),
+      critical: (t) => h.warn(t, true),
+      onHead: (q, C) => h.setHead(q, C),
+    });
     this.deliveries = new Deliveries({
       api: h.api,
       params: () => this.params(),
@@ -172,6 +194,7 @@ export class Messaging {
    * the initial history, the inbox, the subscriptions. Rows applied here never count as unread.
    */
   async restore(): Promise<void> {
+    await this.ckpt.verify().catch(() => {}); // §11.1: checkpoints first; a failure is retried at catch-up
     const f = this.h.self.fold;
     this.cursor = f.cursor;
     const Enow = P.era(this.h.api.serverNow());
@@ -179,6 +202,8 @@ export class Messaging {
     for (const [k, rec] of f.requests(Enow))
       if (!this.byKey(k)) await this.materialize(k, rec, true);
     await this.syncCopies([...this.copies.values()], true);
+    // The own leave state comes from the LEAVE records (and a skip re-add above the latest one ends it, §6.9).
+    for (const c of this.copies.values()) if (!c.removed) c.left = c.left || this.leaveCurrent(c);
     // A HEADS entry whose epoch the control lanes never reached is ignored: the current epoch's lanes start at E_start.
     const late = [...this.copies.values()].filter((c) => {
       const ep = c.epochs.get(c.current);
@@ -259,6 +284,7 @@ export class Messaging {
    * inbox, and a HEADS row when positions moved.
    */
   async catchUp(): Promise<void> {
+    await this.ckpt.verify().catch(() => {});
     await this.h.enqueue(async () => {
       this.h.check();
       await this.h.self.catchUp({ E: this.h.acc.regEra, n: 0 });
@@ -282,6 +308,7 @@ export class Messaging {
     let todo = copies.filter((c) => c.epochs.has(c.current));
     for (let round = 0; round < 64 && todo.length; round++) {
       await syncLanes(this.syncCtx(quiet), targetsOf(todo), quiet);
+      await this.checkPrevs();
       const moved: Copy[] = [];
       for (const c of todo) if (await settleControl(this.controlHost(quiet), c)) moved.push(c);
       todo = moved;
@@ -357,6 +384,7 @@ export class Messaging {
       leftChanged: () => this.markHeads(),
       failOwn: (c, key) => this.markEcho(c, key, "failed"),
       leaveCurrent: (c) => this.leaveCurrent(c),
+      leftAt: (c, k) => c.left || this.leftAt(c, k),
     };
   }
 
@@ -842,7 +870,125 @@ export class Messaging {
         return x ? { c: x.c, echoKey: x.echoKey } : undefined;
       },
       onLeave: (c, ep, j, src) => onLeave(this.membershipHost(quiet), c, ep, j, src),
+      checkRow: (c, ep, j, row, msg, q) => this.checkRow(c, ep, j, row, msg, q),
+      prevMismatch: (c, ep, j) => this.omission("diff", "@" + this.handleOf(c, ep, j)),
     };
+  }
+
+  // ───────────────────────── integrity (§12.2, §12.4) ─────────────────────────
+
+  private omission(kind: "hide" | "diff", who: string): void {
+    const k = `${kind}:${who}`;
+    if (this.omissionWarned.has(k)) return;
+    this.omissionWarned.add(k);
+    this.h.warn(kind === "hide" ? hiding(who) : different(who), true);
+  }
+
+  /**
+   * A valid row of lane j: its `ck` against the session's verified checkpoints (§12.4), and its `prev` against the row
+   * this session holds there (§12.2 "Every row"). A row it does not hold is fetched after the walk; for rows loaded
+   * as history (`quiet`), whose prev the history loads next, the comparison waits until that row is loaded.
+   */
+  private checkRow(
+    c: Copy,
+    ep: Epoch,
+    j: number,
+    _row: FoundRow,
+    msg: P.Msg,
+    quiet: boolean,
+  ): void {
+    const who = "@" + this.handleOf(c, ep, j);
+    this.ckpt.checkCk(who, msg.ckq, msg.ck16);
+    if (P.isNone(msg.prev)) return;
+    const at = `${msg.prev.E}:${msg.prev.n}`;
+    const lane = ep.lanes[j];
+    const held = lane.prevhs.get(at);
+    if (held) {
+      if (!P.equalBytes(held, msg.prevh)) this.omission("diff", who);
+      return;
+    }
+    lane.expect.set(at, msg.prevh);
+    if (!quiet && this.prevChecks.length < 4096)
+      this.prevChecks.push({ c, ep, j, prev: { ...msg.prev }, prevh: msg.prevh });
+  }
+
+  /** Fetches the rows that `prev` fields name and this session does not hold, in one batched get (§12.2). */
+  private async checkPrevs(): Promise<void> {
+    const todo = this.prevChecks.filter(
+      (x) => !x.ep.lanes[x.j].prevhs.has(`${x.prev.E}:${x.prev.n}`),
+    );
+    const held = this.prevChecks.filter((x) => !todo.includes(x));
+    this.prevChecks = [];
+    for (const x of held)
+      if (!P.equalBytes(x.ep.lanes[x.j].prevhs.get(`${x.prev.E}:${x.prev.n}`)!, x.prevh))
+        this.omission("diff", "@" + this.handleOf(x.c, x.ep, x.j));
+    if (todo.length === 0) return;
+    const keys = todo.map((x) => ({
+      E: x.prev.E,
+      label: P.Lmsg(x.ep.keys.rk, x.j, x.prev.E, x.prev.n),
+      mode: 0 as const,
+    }));
+    let st: Awaited<ReturnType<Api["get"]>>;
+    try {
+      st = await this.h.api.get(keys);
+    } catch {
+      return; // checked again when the rows come up again
+    }
+    todo.forEach((x, i) => {
+      const s = st[i];
+      const who = "@" + this.handleOf(x.c, x.ep, x.j);
+      const at = `${x.prev.E}:${x.prev.n}`;
+      x.ep.lanes[x.j].expect.delete(at);
+      if (s.s === "hit" && s.body) {
+        const h = P.prevh(keys[i].label, s.body);
+        x.ep.lanes[x.j].prevhs.set(at, h);
+        if (!P.equalBytes(h, x.prevh)) this.omission("diff", who);
+      } else if (s.s === "miss") this.omission("hide", who);
+    });
+  }
+
+  /**
+   * §12.2 "Rows beyond a hole": a valid realtime row past its lane's known prefix. Its `prev` chain is walked back to
+   * the prefix (a MISS on it: "hiding messages"; another body: "showing different messages"), then the row and the
+   * rows chained to it are applied, and the lane continues after it.
+   */
+  private async beyondHole(
+    c: Copy,
+    ep: Epoch,
+    j: number,
+    row: FoundRow,
+    msg: P.Msg,
+  ): Promise<void> {
+    const lane = ep.lanes[j];
+    if (c.order.has(rowKey(row.E, row.label)) || P.posCmp(row, lane.next) < 0) return;
+    const who = "@" + this.handleOf(c, ep, j);
+    const chain: FoundRow[] = [row];
+    let cur = msg;
+    for (let i = 0; i < 256 && !P.isNone(cur.prev) && P.posCmp(cur.prev, lane.next) >= 0; i++) {
+      const at = cur.prev;
+      const label = P.Lmsg(ep.keys.rk, j, at.E, at.n);
+      const [s] = await this.h.api.get([{ E: at.E, label, mode: 0 }]);
+      if (s.s === "miss") {
+        this.omission("hide", who);
+        break;
+      }
+      if (s.s !== "hit" || !s.body) break;
+      const v = P.acceptRow(
+        { keys: ep.keys, conv: c.conv, e: ep.e, members: ep.D.members },
+        at.E,
+        label,
+        s.body,
+      );
+      if (!v.ok || v.msg.from !== j || !P.equalBytes(P.prevh(label, s.body), cur.prevh)) {
+        this.omission("diff", who);
+        break;
+      }
+      chain.unshift({ E: at.E, n: at.n, label, t: s.t, body: s.body });
+      cur = v.msg;
+    }
+    const ctx = this.syncCtx(false);
+    for (const r of chain) applyLaneRow(ctx, c, ep, j, r, false);
+    if (P.posCmp({ E: row.E, n: row.n + 1 }, lane.next) > 0) lane.next = { E: row.E, n: row.n + 1 };
   }
 
   // ───────────────────────── own leaves (§6.9) ─────────────────────────
@@ -862,6 +1008,18 @@ export class Messaging {
       if (key.startsWith(prefix) && rec.e > latest.e && (rec.flags & P.EPOCH_SKIP) !== 0)
         return false;
     return true;
+  }
+
+  /** Self had left in epoch k by the records: a LEAVE record at or below k and no skip re-add in between (§6.6). */
+  private leftAt(c: Copy, k: number): boolean {
+    const f = this.h.self.fold;
+    const prefix = `${copyKeyOf(c)}:`;
+    const skips: number[] = [];
+    for (const [key, rec] of f.epochs)
+      if (key.startsWith(prefix) && (rec.flags & P.EPOCH_SKIP) !== 0) skips.push(rec.e);
+    return (f.leaves.get(copyKeyOf(c)) ?? []).some(
+      (r) => r.e <= k && !skips.some((s) => s > r.e && s <= k),
+    );
   }
 
   /** Writes the LEAVE record of an own LEAVE row of epoch e unless the account has one (§6.9). */
@@ -959,8 +1117,11 @@ export class Messaging {
   private onRows(rows: { topic: Bytes; E: number; label: Bytes; t: number; body: Bytes }[]): void {
     const tself = P.b64u(P.topicSelf(this.h.acc.id.nS));
     const stale = new Set<Copy>();
+    const beyond: { c: Copy; ep: Epoch; j: number; row: FoundRow; msg: P.Msg }[] = [];
     let self = false;
     for (const r of rows) {
+      const cls = P.BODY_LENS.indexOf(r.body.length);
+      if (cls >= 0) this.h.api.rows.observe(r.E, r.label, r.t, cls, r.body); // §12.1
       const topic = P.b64u(r.topic);
       if (topic === tself) {
         self = true;
@@ -989,7 +1150,17 @@ export class Messaging {
           false,
         );
         lane.next = { E: r.E, n: v.msg.n + 1 };
-      } else if (!x.c.order.has(rowKey(r.E, r.label))) stale.add(x.c);
+      } else if (!x.c.order.has(rowKey(r.E, r.label))) {
+        stale.add(x.c);
+        if (lane && v.msg.from === v.msg.lane && P.posCmp({ E: r.E, n: v.msg.n }, lane.next) > 0)
+          beyond.push({
+            c: x.c,
+            ep: x.ep,
+            j: v.msg.lane,
+            row: { E: r.E, n: v.msg.n, label: r.label, t: r.t, body: r.body },
+            msg: v.msg,
+          });
+      }
     }
     if (self || stale.size)
       void this.h
@@ -1000,6 +1171,9 @@ export class Messaging {
               await this.absorbFold();
             }
             if (stale.size) await this.syncCopies([...stale], false);
+            // A row the walk did not reach lies beyond a hole in its lane (§12.2).
+            for (const b of beyond) await this.beyondHole(b.c, b.ep, b.j, b.row, b.msg);
+            if (beyond.length) await this.checkPrevs();
           }),
         )
         .catch(() => {});
@@ -1539,6 +1713,7 @@ export class Messaging {
         await this.h.enqueue(() => this.h.self.write([rec]));
       },
       pksOf: (c, ep) => this.epochPks(c, ep),
+      ck: () => this.ckpt.ck(),
       deliver: async (c, J, to) => {
         const job = this.deliveries.enqueue({
           key: jobKey(copyKeyOf(c), J.e, J.bundleId),
@@ -1751,6 +1926,7 @@ export class Messaging {
       probeControl: (cc) => this.h.enqueue(() => this.probeCopy(cc)),
       settle: (cc) => this.h.enqueue(() => this.settleCopy(cc)),
       rotate: (cc) => this.rotate(cc),
+      ck: () => this.ckpt.ck(),
       wait: (ms) => this.h.wait(ms),
       applyOwn: (cc, ep, row) => this.applyOwn(cc, ep, row),
       expectEcho: (key) => {
