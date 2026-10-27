@@ -24,7 +24,7 @@
     {
       "binding": "DB",
       "database_name": "segv",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "6a771a84-e88a-4daa-a66d-1a3c0bed025d",
       "migrations_dir": "migrations",
     },
   ],
@@ -87,4 +87,5 @@
     "logs": { "enabled": true, "invocation_logs": false },
     "traces": { "enabled": false },
   },
+  "routes": [{ "pattern": "segv.sh", "custom_domain": true }],
 }
