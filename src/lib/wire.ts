@@ -2,7 +2,7 @@
 // Shared by the Worker, the client and the engine test fake, so none of them can drift from the spec.
 // Every decoder is strict: exact lengths, known enums, counts within limits, no trailing bytes.
 // Keep this file free of DOM / Workers APIs.
-import { BODY_LENS, INBOX_BODY_LEN, MAX_CLS } from "./proto2";
+import { BODY_LENS, INBOX_BODY_LEN, MAX_CLS } from "./proto";
 
 export type Bytes = Uint8Array;
 

@@ -1,29 +1,22 @@
-/**
- * Abuse control: proof of work (v1: docs/PROTOCOL.md §4.3, v2: docs/PROTOCOL-v2.md §10.2) and per-IP rate
- * limiting. Nothing here is persisted.
- */
+/** Abuse control: proof of work (docs/PROTOCOL-v2.md §10.2) and per-IP rate limiting. Nothing here is persisted. */
 import { HMAC, POW_WINDOW_MS, hex, powCheck, powDifficulty, powPre, utf8, type PowScope } from "../lib/proto";
-import * as P2 from "../lib/proto2";
 import { HttpError, logErr } from "./http";
 
-type AnyScope = PowScope | P2.PowScope;
-
-const POW_DEFAULTS: Readonly<Record<AnyScope, number>> = { register: 20, wrap: 18, append: 16, blob: 18, put: 16, inbox: 18 };
-const POW_VARS: Readonly<Record<AnyScope, string>> = {
+const POW_DEFAULTS: Readonly<Record<PowScope, number>> = { register: 20, wrap: 18, put: 16, inbox: 18, blob: 18 };
+const POW_VARS: Readonly<Record<PowScope, string>> = {
   register: "POW_REGISTER",
   wrap: "POW_WRAP",
-  append: "POW_APPEND",
-  blob: "POW_BLOB",
   put: "POW_PUT",
   inbox: "POW_INBOX",
+  blob: "POW_BLOB",
 };
 
 /**
  * Base difficulty (leading zero bits) for `scope` from env vars; invalid / missing values fall back to the
- * defaults. This is what GET /api/params reports; the required difficulty grows with the request size
+ * defaults. This is what GET /api/v2/params reports; the required difficulty grows with the request size
  * (proto.powDifficulty).
  */
-export function powBase(env: Env, scope: AnyScope): number {
+export function powBase(env: Env, scope: PowScope): number {
   const raw = (env as unknown as Record<string, unknown>)[POW_VARS[scope]];
   const s = typeof raw === "number" ? String(raw) : raw;
   if (typeof s === "string" && /^\d{1,2}$/.test(s)) {
@@ -33,15 +26,8 @@ export function powBase(env: Env, scope: AnyScope): number {
   return POW_DEFAULTS[scope];
 }
 
+/** The params "pow" object (§10.9). */
 export const powParams = (env: Env): Record<PowScope, number> => ({
-  register: powBase(env, "register"),
-  wrap: powBase(env, "wrap"),
-  append: powBase(env, "append"),
-  blob: powBase(env, "blob"),
-});
-
-/** v2 params "pow" object (§10.9). */
-export const powParamsV2 = (env: Env): Record<P2.PowScope, number> => ({
   register: powBase(env, "register"),
   wrap: powBase(env, "wrap"),
   put: powBase(env, "put"),
@@ -66,25 +52,13 @@ function powHeader(request: Request, now: number): { window: number; nonce: numb
 }
 
 /**
- * v2 proof of work (docs/PROTOCOL-v2.md §10.2): pre = H(enc("segv.sh/v2/pow", scope, u32 window, digest)),
- * difficulty = P2.powDifficulty(scope, base, bytes). `digest` = H(body), or the raw blob id for blobs.
+ * Proof of work (§10.2): pre = H(enc("segv.sh/v2/pow", scope, u32 window, digest)), difficulty =
+ * proto.powDifficulty(scope, base, bytes). `digest` = H(body), or the raw 32-byte blob id for blobs; `bytes`
+ * is the request body length (blobs: the declared Content-Length). Accepts the current and the previous
+ * window. Throws HttpError(403).
  */
-export function checkPowV2(request: Request, env: Env, scope: P2.PowScope, digest: Uint8Array, bytes: number, now = Date.now()): void {
+export function checkPow(request: Request, env: Env, scope: PowScope, digest: Uint8Array, bytes: number, now = Date.now()): void {
   const { window, nonce } = powHeader(request, now);
-  const need = P2.powDifficulty(scope, powBase(env, scope), bytes);
-  if (!P2.powCheck(P2.powPre(scope, window, digest), nonce, need)) {
-    throw new HttpError(403, `insufficient proof of work (${need} bits required)`);
-  }
-}
-
-/**
- * Checks `x-segv-pow: <window>.<nonce>` against `digest` (SHA-256 of the raw request body, or the raw
- * 32-byte blob id). `bytes` is the size of what the request stores (the raw request body; for blobs the
- * declared Content-Length): the required difficulty is proto.powDifficulty(scope, base, bytes).
- * Accepts the current and the previous window. Throws HttpError(403).
- */
-export function checkPow(request: Request, env: Env, scope: PowScope, digest: Uint8Array, bytes: number): void {
-  const { window, nonce } = powHeader(request, Date.now());
   const need = powDifficulty(scope, powBase(env, scope), bytes);
   if (!powCheck(powPre(scope, window, digest), nonce, need)) {
     throw new HttpError(403, `insufficient proof of work (${need} bits required)`);
@@ -161,7 +135,7 @@ export async function rateLimit(binding: RateLimit | undefined, scope: string, r
 
 /**
  * Opaque per-client tag (hex, 128 bits) for counting a client's WebSockets: HMAC(key, clientKey). The key is
- * a random secret held by the LogDO, so the tag cannot be reversed to an address by enumeration without it.
+ * a random secret held by the RealtimeDO, so the tag cannot be reversed to an address by enumeration without it.
  * Tags only live on open sockets (acceptWebSocket tags); they are never written to storage.
  */
 export const clientTag = (key: Uint8Array, request: Request): string =>

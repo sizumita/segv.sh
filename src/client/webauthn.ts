@@ -1,4 +1,4 @@
-// Passkeys with the WebAuthn PRF extension (docs/PROTOCOL.md §2.4–2.5). Browser only.
+// Passkeys with the WebAuthn PRF extension (docs/PROTOCOL-v2.md §2.3–2.5). Browser only.
 // The PRF output never leaves this module's callers; nothing here talks to the server.
 import * as P from "~/lib/proto";
 

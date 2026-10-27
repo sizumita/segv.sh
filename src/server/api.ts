@@ -1,10 +1,52 @@
 /**
- * HTTP API (docs/PROTOCOL.md §5). Plain fetch, no Qwik; runs before Qwik Router in the Worker entry.
+ * HTTP + WebSocket API (docs/PROTOCOL-v2.md §10). Plain fetch, no Qwik; the Worker entry routes every /api/*
+ * path here. Every endpoint is under /api/v2/; any other /api/* path is a 404.
  *
- * Everything the server stores is public. Writes are anonymous and gated by proof of work + per-IP rate
- * limits. The LogDO Durable Object is the authoritative log; D1 is a derived index for lookups.
+ * Everything the server stores is public and writes are anonymous: abuse control is proof of work plus
+ * per-IP rate limits (src/server/abuse.ts). Durable Objects get only what they need (never client
+ * addresses or headers). Hardening of §9.7:
+ *  - era bounds are checked with the Worker's clock before any per-era DO is addressed, so nobody can
+ *    instantiate (and arm alarms in) arbitrary era objects;
+ *  - immutable responses and the short-lived inbox tail are served from caches.default before the rate
+ *    limiter;
+ *  - every response carries a fresh `x-segv-now` stamped on the object actually returned (never stored in
+ *    caches.default, §10.1).
  */
-import { BLOB_MAX, HANDLE_RE, MAX_ID_LEN, NONCE_LEN, POW_WINDOW_MS, TAG_LEN, fromB64u, parseBundle, utf8, userTag, wrapTag } from "../lib/proto";
+import {
+  BLOB_MAX,
+  BLOB_MIN,
+  BODY_LENS,
+  ERA_MS,
+  INBOX_BODY_LEN,
+  MAX_ID_LEN,
+  T0_MS,
+  eraEnd,
+  eraStart,
+  receiptMsg,
+  routeV,
+  shardOf,
+  type Bytes,
+} from "../lib/proto";
+import {
+  GET_BODY_BUDGET,
+  GET_MAX_BYTES,
+  GET_MAX_KEYS,
+  INBOX_MAX_BYTES,
+  INBOX_READ_MAX_LIMIT,
+  PUT_MAX_BYTES,
+  PUT_MAX_ROWS,
+  RT_MAX_TOPICS,
+  WireError,
+  decodeGetRequest,
+  decodeInboxPost,
+  decodePutRequest,
+  encodeFeed,
+  encodeGetResponse,
+  encodeInboxRead,
+  encodePutResponse,
+  type GetStatus,
+  type PutResult,
+} from "../lib/wire";
 import { checkPow, clientTag, powParams, rateLimit } from "./abuse";
 import { dec64, enc64 } from "./b64";
 import {
@@ -12,49 +54,96 @@ import {
   SECURITY_HEADERS,
   contentLength,
   errorResponse,
-  exactKeys,
-  finalize,
   intParam,
-  joinStreams,
   json,
   logErr,
   parseJsonObject,
   readBody,
   sha256,
+  HSTS,
 } from "./http";
-import type { LogDO } from "./log-do";
-import { blobGetOptions } from "./v2/api";
-import { BATCH_MAX, LOG_PAGE_MAX, type AppendResult, type AppendRow, type Conflict, type LogPage, type PageCheck } from "./types";
 import {
-  checkAppendRows,
-  checkBundleShape,
-  checkRecordShape,
-  userBody,
-  verifyBundleSig,
-  verifyRecordSig,
-  wrapBody,
-} from "./validate";
+  _resetDirectoryCacheForTests,
+  currentP,
+  dirAddWrap,
+  dirByPrefix,
+  dirByUid,
+  dirRegister,
+  dirWrapsById,
+  dirlogPage,
+} from "./directory";
+import {
+  INBOX_BATCH,
+  INBOX_DAY_CAP,
+  INBOX_RETENTION,
+  eraBounds,
+  kcommitFor,
+  krouteFor,
+  serverKeys,
+  srvSign,
+  v2Params,
+  v2ParamsValid,
+  type ServerKeys,
+  type V2Params,
+} from "./env";
+import {
+  blobRegStub,
+  ckptStub,
+  inboxStub,
+  rtStub,
+  shardStub,
+  type BlobMeta,
+  type CkptRecord,
+  type RtPublishRow,
+  type ShardFeedBatches,
+  type ShardFeedRow,
+  type ShardFeedRows,
+  type ShardGetKey,
+  type ShardGetResult,
+  type ShardPutResult,
+  type ShardPutRow,
+} from "./types";
 
-/** Request body caps (bytes). */
+/** Request body caps (bytes, §10.3–§10.6). */
 export const MAX_REGISTER_BODY = 64 * 1024;
 export const MAX_WRAP_BODY = 16 * 1024;
-/** The largest legal batch (one 16 KiB-class kind-4 row + 39 invites) is ~192 KB of JSON. */
-export const MAX_APPEND_BODY = 256 * 1024;
-const MAX_WRAPS_PER_REGISTER = 4;
-const MAX_WRAPS_PER_ID = 64;
-/** Smallest possible encrypted blob: nonce + AEAD tag + at least one padded byte. */
-const BLOB_MIN = NONCE_LEN + TAG_LEN + 1;
+/** Page budget of the public feed (§10.9). */
+const FEED_BUDGET = 4 * 1024 * 1024;
+const TEXT_MAX = 12_000;
+/** Stage 1 runs one shard per era (s_E = 0). */
+const SHARD_BITS = 0;
+const SHARDS = 1;
 
-type Ctx = { request: Request; env: Env; ctx: ExecutionContext; url: URL };
+const IMMUTABLE = "public, max-age=31536000, immutable";
+const OCTET = "application/octet-stream";
 
-/** The single, global log sequencer. */
-export function logStub(env: Env): DurableObjectStub<LogDO> {
-  // `wrangler types` cannot see the class (wrangler.jsonc "main" is the build output): narrow here.
-  return (env.LOG as unknown as DurableObjectNamespace<LogDO>).getByName("global");
+interface Ctx {
+  request: Request;
+  env: Env;
+  ctx: ExecutionContext;
+  url: URL;
+  now: number;
+  params: V2Params;
+  keys: ServerKeys;
 }
 
-const rl = (env: Env, name: "RL_WRITE" | "RL_BLOB" | "RL_READ"): RateLimit | undefined =>
+/** An HttpError whose JSON body carries extra fields (e.g. `{error, era}`, `{error, p}`, `{error, now}`). */
+export class ApiError extends HttpError {
+  constructor(
+    status: number,
+    message: string,
+    readonly extra: Record<string, unknown>,
+    headers?: Record<string, string>,
+  ) {
+    super(status, message, headers);
+  }
+}
+
+const rl = (env: Env, name: "RL_WRITE" | "RL_BLOB" | "RL_READ" | "RL_INBOX"): RateLimit | undefined =>
   (env as unknown as Record<string, RateLimit | undefined>)[name];
+
+const readLimit = (c: Ctx) => rateLimit(rl(c.env, "RL_READ"), "read", c.request);
+const writeLimit = (c: Ctx) => rateLimit(rl(c.env, "RL_WRITE"), "write", c.request);
 
 function methods(c: Ctx, allowed: string[]): void {
   if (!allowed.includes(c.request.method)) {
@@ -62,105 +151,11 @@ function methods(c: Ctx, allowed: string[]): void {
   }
 }
 
-const CONFLICT_MESSAGES: Record<Conflict, string> = {
-  tag: "tag already used",
-  handle: "handle already taken",
-  uid: "uid already registered",
-};
-
-async function append(env: Env, rows: AppendRow[]): Promise<Extract<AppendResult, { ok: true }>> {
-  const res = (await logStub(env).append(rows)) as AppendResult;
-  if (!res.ok) throw new HttpError(409, CONFLICT_MESSAGES[res.conflict] ?? "conflict");
-  return res;
-}
-
-// ───────────── handlers ─────────────
-
-function params(c: Ctx): Response {
-  const now = Date.now();
-  return json({
-    now,
-    window: Math.floor(now / POW_WINDOW_MS),
-    pow: powParams(c.env),
-    limits: { batch: BATCH_MAX, blobMax: BLOB_MAX },
+function binary(body: Bytes, cacheControl = "no-store"): Response {
+  return new Response(body as BodyInit, {
+    headers: { "content-type": OCTET, "cache-control": cacheControl, ...SECURITY_HEADERS },
   });
 }
-
-async function register(c: Ctx): Promise<Response> {
-  await rateLimit(rl(c.env, "RL_WRITE"), "write", c.request);
-  const bytes = await readBody(c.request, MAX_REGISTER_BODY);
-  checkPow(c.request, c.env, "register", await sha256(bytes), bytes.length);
-  const body = exactKeys(parseJsonObject(bytes), ["bundle", "sig", "wraps"], "register");
-
-  const user = checkBundleShape(body.bundle, body.sig);
-  const wraps = body.wraps;
-  if (!Array.isArray(wraps) || wraps.length < 1 || wraps.length > MAX_WRAPS_PER_REGISTER) {
-    throw new HttpError(400, `wraps: expected 1..${MAX_WRAPS_PER_REGISTER} wrap records`);
-  }
-  const records = wraps.map((w: unknown, i) => {
-    const o = exactKeys(w, ["record", "sig"], `wraps[${i}]`);
-    const rec = checkRecordShape(o.record, o.sig);
-    if (rec.uid !== user.uid) throw new HttpError(400, `wraps[${i}]: uid does not match the bundle`);
-    return rec;
-  });
-  const sigOk = await Promise.all([verifyBundleSig(user), ...records.map((r) => verifyRecordSig(r, user.sigPk))]);
-  if (!sigOk[0]) throw new HttpError(400, "bad bundle signature");
-  const badWrap = sigOk.indexOf(false, 1);
-  if (badWrap > 0) throw new HttpError(400, `wraps[${badWrap - 1}]: bad signature`);
-
-  const rows: AppendRow[] = [
-    { kind: 1, tag: userTag(fromB64u(user.uid)), body: userBody(user), handle: user.handle, uid: user.uid },
-    ...records.map((r) => ({ kind: 2, tag: wrapTag(r.record), body: wrapBody(r) })),
-  ];
-  const tags = new Set(rows.map((r) => enc64(r.tag)));
-  if (tags.size !== rows.length) throw new HttpError(400, "duplicate wrap records");
-
-  const res = await append(c.env, rows);
-  return json({ seq: res.rows[0].seq });
-}
-
-/** Looks up a registered user's bundle: D1 index first, the authoritative log as fallback. */
-async function findUser(env: Env, uid: string) {
-  let text: { bundle: string; sig: string } | null = null;
-  try {
-    text = await env.DB.prepare("SELECT bundle, sig FROM users WHERE uid = ?1").bind(uid).first<{ bundle: string; sig: string }>();
-  } catch (e) {
-    console.error(JSON.stringify({ msg: "d1 users lookup failed; using log", error: logErr(e) }));
-  }
-  if (!text) {
-    const row = await logStub(env).userRow(uid);
-    if (row === null) return null;
-    text = JSON.parse(row) as { bundle: string; sig: string };
-  }
-  return parseBundle(text.bundle, text.sig); // server-validated at registration
-}
-
-async function postWrap(c: Ctx): Promise<Response> {
-  await rateLimit(rl(c.env, "RL_WRITE"), "write", c.request);
-  const bytes = await readBody(c.request, MAX_WRAP_BODY);
-  checkPow(c.request, c.env, "wrap", await sha256(bytes), bytes.length);
-  const body = exactKeys(parseJsonObject(bytes), ["record", "sig"], "wrap");
-  const rec = checkRecordShape(body.record, body.sig);
-  const owner = await findUser(c.env, rec.uid);
-  if (!owner) throw new HttpError(404, "unknown uid");
-  if (!(await verifyRecordSig(rec, owner.sigPk))) throw new HttpError(400, "bad wrap signature");
-  const res = await append(c.env, [{ kind: 2, tag: wrapTag(rec.record), body: wrapBody(rec) }]);
-  return json({ seq: res.rows[0].seq });
-}
-
-async function postAppend(c: Ctx): Promise<Response> {
-  await rateLimit(rl(c.env, "RL_WRITE"), "write", c.request);
-  const bytes = await readBody(c.request, MAX_APPEND_BODY);
-  // Priced by size: every client downloads every row forever (proto.powDifficulty).
-  checkPow(c.request, c.env, "append", await sha256(bytes), bytes.length);
-  const body = exactKeys(parseJsonObject(bytes), ["rows"], "append");
-  const rows = checkAppendRows(body.rows);
-  const res = await append(c.env, rows);
-  return json({ seqs: res.rows.map((r) => r.seq) });
-}
-
-/** A page that can never change (it ends below the head) may be cached by anyone, forever. */
-const IMMUTABLE = "public, max-age=31536000, immutable";
 
 /** caches.default when the runtime has it (Workers; it only stores anything on custom domains). */
 function edgeCache(): Cache | null {
@@ -168,214 +163,447 @@ function edgeCache(): Cache | null {
   return c?.default ?? null;
 }
 
-function logResponse(body: BodyInit, immutable: boolean): Response {
-  return new Response(body, {
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": immutable ? IMMUTABLE : "no-store",
-      ...SECURITY_HEADERS,
+async function cacheGet(key: string): Promise<Response | null> {
+  const cache = edgeCache();
+  if (!cache) return null;
+  return (await cache.match(key).catch(() => undefined)) ?? null;
+}
+
+/** Stores a copy (without x-segv-now: it is stamped later, on the returned object only). */
+function cachePut(c: Ctx, key: string, res: Response): void {
+  const cache = edgeCache();
+  if (!cache || res.status !== 200) return;
+  const copy = res.clone();
+  copy.headers.delete("x-segv-now");
+  c.ctx.waitUntil(
+    cache.put(key, copy).catch((e: unknown) => {
+      console.error(JSON.stringify({ msg: "cache put failed", error: logErr(e) }));
+    }),
+  );
+}
+
+function decimal(s: string, max: number, what: string): number {
+  if (!/^(0|[1-9]\d{0,9})$/.test(s)) throw new HttpError(400, `invalid ${what}`);
+  const n = Number(s);
+  if (n > max) throw new HttpError(400, `invalid ${what}`);
+  return n;
+}
+
+function b64uParam(s: string | null, minLen: number, maxLen: number, what: string): Bytes {
+  let b: Bytes;
+  try {
+    b = dec64(s);
+  } catch {
+    throw new HttpError(400, `invalid ${what}`);
+  }
+  if (b.length < minLen || b.length > maxLen) throw new HttpError(400, `invalid ${what}`);
+  return b;
+}
+
+// ───────────── params, eras ─────────────
+
+/** CheckpointDO.ensure() at most once per isolate, never per request (§9.5). */
+let ckptEnsured = false;
+
+async function params(c: Ctx): Promise<Response> {
+  if (!ckptEnsured) {
+    ckptEnsured = true;
+    c.ctx.waitUntil(
+      ckptStub(c.env)
+        .ensure()
+        .catch((e: unknown) => {
+          ckptEnsured = false;
+          console.error(JSON.stringify({ msg: "ckpt ensure failed", error: logErr(e) }));
+        }),
+    );
+  }
+  // Never throws: while D1 fails this is the last good P (or 0), logged and retried by currentP itself.
+  const p = await currentP(c.env);
+  const E = eraBounds(c.now, c.params.skew).now;
+  return json({
+    v: 2,
+    now: c.now,
+    T0: T0_MS,
+    eraMs: ERA_MS,
+    era: E,
+    delta: c.params.delta,
+    skew: c.params.skew,
+    inboxSlot: c.params.inboxSlot,
+    inboxRetention: INBOX_RETENTION,
+    inboxDayCap: INBOX_DAY_CAP,
+    inboxBatch: INBOX_BATCH,
+    shards: SHARDS,
+    p,
+    efirst: c.params.eFirst,
+    kcommit: enc64(kcommitFor(c.keys, E)),
+    srvKey: enc64(c.keys.srvPk),
+    pow: powParams(c.env),
+    limits: {
+      putRows: PUT_MAX_ROWS,
+      putBytes: PUT_MAX_BYTES,
+      getKeys: GET_MAX_KEYS,
+      topics: RT_MAX_TOPICS,
+      blobMax: BLOB_MAX,
+      textMax: TEXT_MAX,
     },
   });
 }
 
-/**
- * GET /api/log?after=&limit= → {rows, head}. A page may hold fewer than `limit` rows while more exist (byte
- * budget): clients page until the last row's seq >= head.seq. `head` is always the current head.
- *
- * Pages that end below the head never change, so their rows are kept in the edge cache (keyed by the
- * canonical URL) and answered without making the sequencer read and encode megabytes again; the live head
- * is spliced in from a cheap lookup that also checks the cached rows still belong to this log (hash of
- * the page's last row). Tail pages are never cached (no-store).
- */
-async function getLog(c: Ctx): Promise<Response> {
-  await rateLimit(rl(c.env, "RL_READ"), "read", c.request);
-  const q = c.url.searchParams;
-  const after = intParam(q.get("after"), 0, 0, Number.MAX_SAFE_INTEGER, "after");
-  const limit = intParam(q.get("limit"), LOG_PAGE_MAX, 1, LOG_PAGE_MAX, "limit");
-  const stub = logStub(c.env);
-  const cache = edgeCache();
-  // Canonical key: junk / reordered query parameters cannot multiply cache entries.
-  const key = `${c.url.origin}/api/log?after=${after}&limit=${limit}`;
-
-  if (cache) {
-    const hit = await cache.match(key).catch(() => undefined);
-    if (hit?.body) {
-      const lastSeq = Number(hit.headers.get("x-segv-last-seq"));
-      const lastH = hit.headers.get("x-segv-last-h");
-      const check = (await stub.pageCheck(lastSeq)) as PageCheck;
-      if (check.h !== null && check.h === lastH && lastSeq < check.head.seq) {
-        const body = joinStreams([utf8('{"rows":'), hit.body, utf8(`,"head":${JSON.stringify(check.head)}}`)]);
-        return logResponse(body, true);
-      }
-      await hit.body.cancel().catch(() => {}); // stale (another log, e.g. a wiped dev database): rebuild
-    }
-  }
-
-  const page = (await stub.page(after, limit)) as LogPage;
-  const immutable = page.last !== null && page.last.seq < page.head.seq;
-  if (immutable && cache) {
-    const entry = new Response(page.rows, {
-      headers: {
-        "content-type": "application/json; charset=utf-8",
-        "cache-control": IMMUTABLE,
-        "x-segv-last-seq": String(page.last!.seq),
-        "x-segv-last-h": page.last!.h,
-      },
-    });
-    c.ctx.waitUntil(
-      cache.put(key, entry).catch((e: unknown) => {
-        console.error(JSON.stringify({ msg: "log page cache put failed", error: logErr(e) }));
-      }),
-    );
-  }
-  return logResponse(`{"rows":${page.rows},"head":${JSON.stringify(page.head)}}`, immutable);
+function sealedByClock(c: Ctx, E: number): boolean {
+  return c.now >= eraEnd(E) + c.params.skew * 1000;
 }
 
-async function getUser(c: Ctx, handle: string): Promise<Response> {
-  await rateLimit(rl(c.env, "RL_READ"), "read", c.request);
-  if (!HANDLE_RE.test(handle)) throw new HttpError(400, "invalid handle");
-  let row: { uid: string; handle: string; bundle: string; sig: string; seq: number } | null = null;
-  try {
-    row = await c.env.DB.prepare("SELECT uid, handle, bundle, sig, seq FROM users WHERE handle = ?1")
-      .bind(handle)
-      .first<{ uid: string; handle: string; bundle: string; sig: string; seq: number }>();
-  } catch (e) {
-    console.error(JSON.stringify({ msg: "d1 users lookup failed; using log", error: logErr(e) }));
-  }
-  if (!row) {
-    // The D1 index can lag the log (outbox not drained yet): the log is authoritative.
-    const u = await logStub(c.env).userByHandle(handle);
-    if (!u) throw new HttpError(404, "no such user");
-    const text = JSON.parse(u.body) as { bundle: string; sig: string };
-    row = { uid: u.uid, handle, bundle: text.bundle, sig: text.sig, seq: u.seq };
-  }
-  return json({ uid: row.uid, handle: row.handle, bundle: row.bundle, sig: row.sig, seq: row.seq });
+async function eraInfo(c: Ctx, E: number): Promise<Response> {
+  await readLimit(c);
+  const { hi } = eraBounds(c.now, c.params.skew);
+  if (E > hi || E < c.params.eFirst) throw new HttpError(404, "no such era");
+  const sealed = sealedByClock(c, E);
+  return json(
+    {
+      era: E,
+      start: eraStart(E),
+      end: eraEnd(E),
+      delta: c.params.delta,
+      shards: SHARDS,
+      kcommit: enc64(kcommitFor(c.keys, E)),
+      sealed,
+    },
+    200,
+    sealed ? { "cache-control": IMMUTABLE } : undefined,
+  );
 }
 
-async function getWraps(c: Ctx, id: string): Promise<Response> {
-  await rateLimit(rl(c.env, "RL_READ"), "read", c.request);
-  let len: number;
-  try {
-    len = dec64(id).length;
-  } catch {
-    throw new HttpError(400, "invalid id");
+// ───────────── rows: put / get (§10.3, §10.4) ─────────────
+
+interface Routed<T> {
+  E: number;
+  i: number;
+  idx: number[];
+  items: T[];
+}
+
+function group<T>(entries: { E: number; i: number; idx: number; item: T }[]): Routed<T>[] {
+  const m = new Map<string, Routed<T>>();
+  for (const e of entries) {
+    const k = `${e.E}/${e.i}`;
+    let g = m.get(k);
+    if (!g) m.set(k, (g = { E: e.E, i: e.i, idx: [], items: [] }));
+    g.idx.push(e.idx);
+    g.items.push(e.item);
   }
-  if (len < 1 || len > MAX_ID_LEN) throw new HttpError(400, "invalid id");
-  // Credential ids are public, so anyone can file wraps under a victim's id with their own uid.
-  // Clients that know the uid (the WebAuthn userHandle) filter by it to skip that noise.
-  const uid = c.url.searchParams.get("uid");
-  if (uid !== null) {
-    let uidLen = 0;
+  return [...m.values()];
+}
+
+async function publish(c: Ctx, rows: RtPublishRow[]): Promise<void> {
+  for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      uidLen = dec64(uid).length;
-    } catch {
-      /* invalid */
+      await rtStub(c.env).publish(rows);
+      return;
+    } catch (e) {
+      if (attempt === 1) console.error(JSON.stringify({ msg: "realtime publish failed", error: logErr(e) }));
     }
-    if (uidLen !== 16) throw new HttpError(400, "invalid uid");
   }
-  const stmt =
-    uid === null
-      ? c.env.DB.prepare("SELECT seq, uid, record, sig FROM wraps WHERE id = ?1 ORDER BY seq LIMIT ?2").bind(id, MAX_WRAPS_PER_ID)
-      : c.env.DB.prepare("SELECT seq, uid, record, sig FROM wraps WHERE id = ?1 AND uid = ?3 ORDER BY seq LIMIT ?2").bind(
-          id,
-          MAX_WRAPS_PER_ID,
-          uid,
-        );
-  const { results } = await stmt.all<{ seq: number; uid: string; record: string; sig: string }>();
-  return json({ wraps: results.map((r) => ({ seq: r.seq, uid: r.uid, record: r.record, sig: r.sig })) });
 }
+
+async function put(c: Ctx): Promise<Response> {
+  await writeLimit(c);
+  const bytes = await readBody(c.request, PUT_MAX_BYTES);
+  checkPow(c.request, c.env, "put", await sha256(bytes), bytes.length, c.now);
+  let rows;
+  try {
+    rows = decodePutRequest(bytes);
+  } catch (e) {
+    if (e instanceof WireError) throw new HttpError(400, `bad put request: ${e.message}`);
+    throw e;
+  }
+  const { now: Enow, lo, hi } = eraBounds(c.now, c.params.skew);
+  const results: (ShardPutResult | null)[] = rows.map((r) => (r.E < lo || r.E > hi ? { s: "wrong_era", era: Enow } : null));
+  const routed = group(
+    rows.flatMap((r, idx) => {
+      if (results[idx] !== null) return [];
+      const v = routeV(krouteFor(c.keys, r.E), r.label);
+      return [{ E: r.E, i: shardOf(v, SHARD_BITS), idx, item: { v, label: r.label, cls: r.cls, body: r.body } as ShardPutRow }];
+    }),
+  );
+  await Promise.all(
+    routed.map(async (g) => {
+      let out: ShardPutResult[];
+      try {
+        out = (await shardStub(c.env, g.E, g.i).put(g.E, g.i, g.items)) as ShardPutResult[];
+      } catch (e) {
+        console.error(JSON.stringify({ msg: "shard put failed", error: logErr(e) }));
+        throw new HttpError(503, "storage unavailable", { "retry-after": "5" });
+      }
+      g.idx.forEach((idx, k) => (results[idx] = out[k]));
+    }),
+  );
+  const wire: PutResult[] = await Promise.all(
+    results.map(async (r, idx): Promise<PutResult> => {
+      if (r === null) throw new Error("unrouted row");
+      if (r.s !== "ok") return r;
+      const row = rows[idx];
+      return { s: "ok", t: r.t, receipt: await srvSign(c.keys, receiptMsg(row.E, row.label, row.body, r.t)) };
+    }),
+  );
+  const pub: RtPublishRow[] = [];
+  wire.forEach((r, idx) => {
+    const row = rows[idx];
+    if (r.s === "ok" && row.topic.some((b) => b !== 0)) {
+      pub.push({ topic: row.topic, E: row.E, label: row.label, t: r.t, cls: row.cls, body: row.body });
+    }
+  });
+  if (pub.length > 0) c.ctx.waitUntil(publish(c, pub));
+  return binary(encodePutResponse(wire));
+}
+
+async function get(c: Ctx): Promise<Response> {
+  await readLimit(c);
+  const bytes = await readBody(c.request, GET_MAX_BYTES);
+  let keys;
+  try {
+    keys = decodeGetRequest(bytes);
+  } catch (e) {
+    if (e instanceof WireError) throw new HttpError(400, `bad get request: ${e.message}`);
+    throw e;
+  }
+  const { hi } = eraBounds(c.now, c.params.skew);
+  const out: (GetStatus | null)[] = keys.map((k) =>
+    k.E > hi ? { s: "no_era" } : k.E < c.params.eFirst ? { s: "miss", sealed: true } : null,
+  );
+  const routed = group(
+    keys.flatMap((k, idx) => {
+      if (out[idx] !== null) return [];
+      const v = routeV(krouteFor(c.keys, k.E), k.label);
+      return [{ E: k.E, i: shardOf(v, SHARD_BITS), idx, item: { v, label: k.label, mode: k.mode } as ShardGetKey }];
+    }),
+  );
+  await Promise.all(
+    routed.map(async (g) => {
+      let res: ShardGetResult[];
+      try {
+        res = (await shardStub(c.env, g.E, g.i).get(g.E, g.i, g.items)) as ShardGetResult[];
+      } catch (e) {
+        console.error(JSON.stringify({ msg: "shard get failed", error: logErr(e) }));
+        throw new HttpError(503, "storage unavailable", { "retry-after": "5" });
+      }
+      g.idx.forEach((idx, k) => (out[idx] = res[k]));
+    }),
+  );
+  // Response budget: every body-mode key after 4 MiB of bodies is SKIPPED (the client asks again).
+  let budget = GET_BODY_BUDGET;
+  let exhausted = false;
+  const statuses = out.map((s, idx): GetStatus => {
+    if (s === null) throw new Error("unrouted key");
+    if (keys[idx].mode !== 0) return s;
+    if (exhausted) return { s: "skipped" };
+    if (s.s === "hit" && s.body) {
+      if (s.body.length > budget) {
+        exhausted = true;
+        return { s: "skipped" };
+      }
+      budget -= s.body.length;
+    }
+    return s;
+  });
+  return binary(
+    encodeGetResponse(
+      statuses,
+      keys.map((k) => k.mode),
+    ),
+  );
+}
+
+// ───────────── inbox (§10.5) ─────────────
+
+async function inboxPost(c: Ctx): Promise<Response> {
+  await rateLimit(rl(c.env, "RL_INBOX"), "inbox", c.request);
+  const bytes = await readBody(c.request, INBOX_MAX_BYTES);
+  checkPow(c.request, c.env, "inbox", await sha256(bytes), bytes.length, c.now);
+  let post;
+  try {
+    post = decodeInboxPost(bytes);
+  } catch (e) {
+    if (e instanceof WireError) throw new HttpError(400, `bad inbox post: ${e.message}`);
+    throw e;
+  }
+  if (post.bucket !== 0) throw new HttpError(400, "unknown bucket");
+  const { now: Enow, lo, hi } = eraBounds(c.now, c.params.skew);
+  if (post.E < lo || post.E > hi) throw new ApiError(409, "wrong era", { era: Enow });
+  const res = await inboxStub(c.env, post.E, 0).post(post.E, 0, post.bucket, post.rows);
+  if (res.s === "wrong_era") throw new ApiError(409, "wrong era", { era: res.era });
+  return json({ results: res.results });
+}
+
+async function inboxRead(c: Ctx, E: number, bucket: number): Promise<Response> {
+  if (bucket !== 0) throw new HttpError(400, "unknown bucket");
+  const { now: Enow, hi } = eraBounds(c.now, c.params.skew);
+  if (E > hi) throw new HttpError(400, "era is in the future");
+  if (E < Enow - (INBOX_RETENTION - 1)) throw new HttpError(410, "inbox era no longer served");
+  if (E < c.params.eFirst) throw new HttpError(404, "no such era");
+  const q = c.url.searchParams;
+  const after = intParam(q.get("after"), 0, 0, 0xffffffff, "after");
+  const limit = intParam(q.get("limit"), INBOX_READ_MAX_LIMIT, 1, INBOX_READ_MAX_LIMIT, "limit");
+  // Canonical key: junk / reordered query parameters cannot multiply cache entries.
+  const key = `${c.url.origin}/api/v2/inbox/${E}/${bucket}?after=${after}&limit=${limit}`;
+  const hit = await cacheGet(key);
+  if (hit) return hit;
+  await readLimit(c);
+  const r = await inboxStub(c.env, E, 0).read(E, 0, bucket, after, limit);
+  for (const row of r.rows) if (row.body.length !== INBOX_BODY_LEN) throw new Error("inbox: bad stored body");
+  const cc = r.ended && !r.more ? IMMUTABLE : `public, max-age=${c.params.inboxSlot}`;
+  const res = binary(encodeInboxRead({ closed: r.closed, more: r.more, rows: r.rows }), cc);
+  cachePut(c, key, res);
+  return res;
+}
+
+// ───────────── blobs (§10.7, §8.2) ─────────────
 
 /** R2's error when the `sha256` put option does not match the bytes received (code 10037, BadDigest). */
 const R2_BAD_DIGEST = /checksum you specified did not match|BadDigest|\(10037\)/i;
+/** FixedLengthStream's errors for a body shorter / longer than the Content-Length it was made with (workerd). */
+const SHORT_BODY = /did not see all expected bytes/i;
+const LONG_BODY = /too many bytes/i;
+const LENGTH_MISMATCH = "body length does not match content-length";
+/** workerd's error when the client went away while its request body was being read. */
+const CLIENT_GONE = /client disconnected|read from request stream/i;
+const BODY_NOT_RECEIVED = "request body was not received";
+
+const errText = (e: unknown): string => String((e as Error)?.message ?? e);
 
 /**
- * PUT /api/blob/:id. The body is streamed straight into R2 (never buffered): R2 checks it against the id
- * (`sha256` option) and stores nothing on a mismatch. The PoW is over the id and priced by Content-Length.
+ * The client's error when an R2 put failed because the body did not have its declared length (§9.7: bodies are
+ * capped by both lengths): 413 for too many bytes, 400 for too few; null for any other failure. A long body fails
+ * both the put and the pipe into the FixedLengthStream, a short one only the put.
  */
-async function putBlob(c: Ctx, id: string, idBytes: Uint8Array): Promise<Response> {
+function bodyLengthError(putErr: unknown, pipeErr: unknown): HttpError | null {
+  if (LONG_BODY.test(errText(putErr)) || (pipeErr !== null && LONG_BODY.test(errText(pipeErr)))) {
+    return new HttpError(413, LENGTH_MISMATCH);
+  }
+  if (SHORT_BODY.test(errText(putErr))) return new HttpError(400, LENGTH_MISMATCH);
+  // The client disconnected mid-upload: not an internal error (and nobody is left to read the answer).
+  if (CLIENT_GONE.test(errText(putErr)) || (pipeErr !== null && CLIENT_GONE.test(errText(pipeErr)))) {
+    return new HttpError(400, BODY_NOT_RECEIVED);
+  }
+  return null;
+}
+
+function sameDigest(obj: R2Object, idBytes: Bytes): boolean {
+  const d = obj.checksums.sha256;
+  return d !== undefined && enc64(new Uint8Array(d)) === enc64(idBytes);
+}
+
+/**
+ * PUT /api/v2/blob/{id}: registered ids answer at once without reading the body. Otherwise the body is
+ * streamed into R2 (which checks it against the id) and registered only after R2 stored it, so a
+ * registered id always has its object; re-uploading after a crash in between registers it.
+ */
+async function putBlob(c: Ctx, id: string, idBytes: Bytes): Promise<Response> {
   await rateLimit(rl(c.env, "RL_BLOB"), "blob", c.request);
   const declared = contentLength(c.request);
   if (declared === null) throw new HttpError(411, "content-length required");
   if (declared > BLOB_MAX) throw new HttpError(413, "blob too large");
   if (declared < BLOB_MIN) throw new HttpError(400, "blob too small");
-  checkPow(c.request, c.env, "blob", idBytes, declared);
+  checkPow(c.request, c.env, "blob", idBytes, declared, c.now);
 
-  const key = `b/${id}`;
-  const existing = await c.env.BLOBS.head(key);
-  if (existing) {
+  const reg = blobRegStub(c.env);
+  const meta = (await reg.meta(idBytes)) as BlobMeta;
+  if (meta.hit) {
     await c.request.body?.cancel().catch(() => {});
-    await recordBlob(c.env, id, existing.size);
-    return json({ id, size: existing.size }, 201);
+    return json({ id, size: meta.size, t: meta.t }, 201);
   }
-  if (c.request.body === null) throw new HttpError(400, "blob too small");
-  // Known-length stream of exactly `declared` bytes (R2 needs the length up front; a body that is
-  // shorter or longer than its Content-Length errors the stream and the put).
-  const fixed = new FixedLengthStream(declared);
-  // Not awaited inline: if R2 rejects early the pipe settles on its own (the readable gets cancelled).
-  c.ctx.waitUntil(c.request.body.pipeTo(fixed.writable).catch(() => {}));
-  try {
-    await c.env.BLOBS.put(key, fixed.readable, {
-      httpMetadata: { contentType: "application/octet-stream" },
-      sha256: idBytes.slice().buffer as ArrayBuffer,
-    });
-  } catch (e) {
-    if (R2_BAD_DIGEST.test(String((e as Error)?.message ?? e))) throw new HttpError(400, "blob id does not match its content");
-    // A concurrent upload of the same content may have won (R2 allows ~1 write/s per key): only an
-    // object whose hash is the id counts. Anything else (client went away, R2 failure) is an error.
-    const now = await c.env.BLOBS.head(key);
-    if (!now || !sameDigest(now, idBytes)) throw e;
+  const key = `b/${id}`;
+  let size = declared;
+  const existing = await c.env.BLOBS.head(key);
+  if (existing && sameDigest(existing, idBytes)) {
+    await c.request.body?.cancel().catch(() => {});
+    size = existing.size;
+  } else {
+    if (c.request.body === null) throw new HttpError(400, "blob too small");
+    const fixed = new FixedLengthStream(declared);
+    // The pipe's failure is kept (a body longer than declared fails it), but the pipe is never awaited: it may
+    // be waiting on reads the failed put will not make.
+    let pipeErr: unknown = null;
+    c.ctx.waitUntil(c.request.body.pipeTo(fixed.writable).catch((e: unknown) => void (pipeErr = e ?? "pipe failed")));
+    try {
+      await c.env.BLOBS.put(key, fixed.readable, {
+        httpMetadata: { contentType: OCTET },
+        sha256: idBytes.slice().buffer as ArrayBuffer,
+      });
+    } catch (e) {
+      if (R2_BAD_DIGEST.test(errText(e))) throw new HttpError(400, "blob id does not match its content");
+      // A concurrent upload of the same content may have won: only an object whose hash is the id counts.
+      const now = await c.env.BLOBS.head(key);
+      if (!now || !sameDigest(now, idBytes)) throw bodyLengthError(e, pipeErr) ?? e;
+      size = now.size;
+    }
   }
-  await recordBlob(c.env, id, declared);
-  return json({ id, size: declared }, 201);
+  const r = await reg.register(idBytes, size);
+  return json({ id, size: r.size, t: r.t }, 201);
 }
 
-function sameDigest(obj: R2Object, idBytes: Uint8Array): boolean {
-  const d = obj.checksums.sha256;
-  return d !== undefined && enc64(new Uint8Array(d)) === enc64(idBytes);
-}
-
-const DAY_MS = 86_400_000;
+/** RFC 9110 If-None-Match: "*" or a list of entity-tags, empty list elements allowed (§13.1.2, §5.6.1); ASCII etagc. */
+const ETAG = String.raw`(?:W/)?"[\x21\x23-\x7e]*"`;
+const IF_NONE_MATCH = new RegExp(String.raw`^(?:\*|(?:,[ \t]*)*${ETAG}(?:[ \t]*,(?:[ \t]*${ETAG})?)*)$`);
 
 /**
- * Blob registry in D1 (for quotas / GC later). Best effort: the R2 object is what matters. Not public data
- * and not derivable from the log: only the day of the upload is kept, so the registry cannot be matched
- * to the (second-precise) kind-4 row that references the blob.
+ * R2 get options for a blob GET: only If-None-Match is honoured (304); other conditionals are ignored
+ * rather than mis-answered. An If-None-Match that is not valid RFC 9110 syntax is ignored as well (unconditional
+ * get), since the R2 binding throws on it.
  */
-async function recordBlob(env: Env, id: string, size: number): Promise<void> {
-  try {
-    const day = Math.floor(Date.now() / DAY_MS) * DAY_MS;
-    await env.DB.prepare("INSERT OR IGNORE INTO blobs (id, size, created_at) VALUES (?1, ?2, ?3)").bind(id, size, day).run();
-  } catch (e) {
-    console.error(JSON.stringify({ msg: "d1 blob registry insert failed", error: logErr(e) }));
-  }
+export function blobGetOptions(inm: string | null): R2GetOptions | undefined {
+  return inm !== null && IF_NONE_MATCH.test(inm) ? { onlyIf: new Headers({ "if-none-match": inm }) } : undefined;
 }
 
-async function getBlob(c: Ctx, id: string): Promise<Response> {
-  await rateLimit(rl(c.env, "RL_READ"), "read", c.request);
-  // Only a well-formed If-None-Match is honoured (304); other conditionals are ignored rather than mis-answered.
-  const obj = await c.env.BLOBS.get(`b/${id}`, blobGetOptions(c.request.headers.get("if-none-match")));
-  if (!obj) throw new HttpError(404, "no such blob");
-  const headers = new Headers({
+function blobHeaders(etag: string): Headers {
+  return new Headers({
     ...SECURITY_HEADERS,
-    "content-type": "application/octet-stream",
-    "cache-control": "public, max-age=31536000, immutable",
-    etag: obj.httpEtag,
+    "content-type": OCTET,
+    "cache-control": IMMUTABLE,
+    etag,
     "content-disposition": "attachment",
     "content-security-policy": "default-src 'none'; sandbox",
     "cross-origin-resource-policy": "same-origin",
   });
-  if (!("body" in obj)) return new Response(null, { status: 304, headers }); // If-None-Match hit
-  headers.set("content-length", String(obj.size));
-  return new Response(obj.body, { status: 200, headers });
 }
 
-/** The LogDO's WebSocket tag key, cached per isolate (the value, never a cross-request promise). */
-let wsKey: Uint8Array | null = null;
+async function getBlob(c: Ctx, id: string): Promise<Response> {
+  const key = `${c.url.origin}/api/v2/blob/${id}`;
+  const inm = c.request.headers.get("if-none-match");
+  const hit = await cacheGet(key);
+  if (hit) {
+    const etag = hit.headers.get("etag");
+    if (inm !== null && etag !== null && inm === etag) {
+      await hit.body?.cancel().catch(() => {});
+      return new Response(null, { status: 304, headers: blobHeaders(etag) });
+    }
+    return hit;
+  }
+  await readLimit(c);
+  const obj = await c.env.BLOBS.get(`b/${id}`, blobGetOptions(inm));
+  if (!obj) throw new HttpError(404, "no such blob");
+  const headers = blobHeaders(obj.httpEtag);
+  if (!("body" in obj)) return new Response(null, { status: 304, headers });
+  headers.set("content-length", String(obj.size));
+  const res = new Response(obj.body, { status: 200, headers });
+  cachePut(c, key, res);
+  return res;
+}
 
-async function ws(c: Ctx): Promise<Response> {
+async function blobMeta(c: Ctx, idBytes: Bytes): Promise<Response> {
+  await readLimit(c);
+  const m = (await blobRegStub(c.env).meta(idBytes)) as BlobMeta;
+  if (!m.hit) throw new ApiError(404, "unregistered", { now: m.now });
+  return json({ t: m.t, size: m.size });
+}
+
+// ───────────── realtime (§10.8) ─────────────
+
+/** The RealtimeDO's client-tag key, cached per isolate (the value, never a cross-request promise). */
+let wsKey: Bytes | null = null;
+
+async function rt(c: Ctx): Promise<Response> {
   if (c.request.headers.get("upgrade")?.toLowerCase() !== "websocket") throw new HttpError(426, "expected websocket");
-  // Browsers always send Origin on WebSocket handshakes: refuse pages on other sites (they could otherwise
-  // recruit their visitors to hold sockets). Non-browser clients send none.
+  // Browsers always send Origin on WebSocket handshakes: refuse pages on other sites.
   const origin = c.request.headers.get("origin");
   if (origin !== null) {
     let host: string | null = null;
@@ -386,11 +614,11 @@ async function ws(c: Ctx): Promise<Response> {
     }
     if (host !== c.url.host) throw new HttpError(403, "cross-origin websocket refused");
   }
-  await rateLimit(rl(c.env, "RL_READ"), "read", c.request);
-  const stub = logStub(c.env);
+  await readLimit(c);
+  const stub = rtStub(c.env);
   wsKey ??= new Uint8Array(await stub.wsTagKey());
   // Hand the DO a minimal request: the upgrade plus an opaque per-client tag, never client headers / IPs.
-  const res = await stub.fetch("https://log.internal/ws", {
+  const res = await stub.fetch("https://rt.internal/rt", {
     headers: { upgrade: "websocket", "x-segv-client": clientTag(wsKey, c.request) },
   });
   if (res.status === 101) return res;
@@ -405,74 +633,378 @@ async function ws(c: Ctx): Promise<Response> {
   throw new HttpError(res.status, error, retry === null ? undefined : { "retry-after": retry });
 }
 
+// ───────────── checkpoints, feed (§10.9) ─────────────
+
+function ckptJson(r: CkptRecord) {
+  return {
+    q: r.q,
+    sec: r.sec,
+    hd: enc64(r.hd),
+    C: enc64(r.C),
+    sig: enc64(r.sig),
+    heads: r.heads.map((h) => ({ cid: h.cid, head: enc64(h.head) })),
+  };
+}
+
+async function ckptLatest(c: Ctx): Promise<Response> {
+  await readLimit(c);
+  const r = await ckptStub(c.env).latest();
+  if (!r) throw new HttpError(404, "no checkpoint yet");
+  return json(ckptJson(r));
+}
+
+async function ckptAt(c: Ctx, q: number): Promise<Response> {
+  const key = `${c.url.origin}/api/v2/ckpt/${q}`;
+  const hit = await cacheGet(key);
+  if (hit) return hit;
+  await readLimit(c);
+  const r = await ckptStub(c.env).get(q);
+  if (!r) throw new HttpError(404, "no such checkpoint");
+  const res = json(ckptJson(r), 200, { "cache-control": IMMUTABLE });
+  cachePut(c, key, res);
+  return res;
+}
+
+async function ckptRange(c: Ctx): Promise<Response> {
+  await readLimit(c);
+  const q = c.url.searchParams;
+  const after = intParam(q.get("after"), 0, 0, 0xffffffff, "after");
+  const limit = intParam(q.get("limit"), 1440, 1, 1440, "limit");
+  const r = await ckptStub(c.env).range(after, limit);
+  if (!r) throw new HttpError(404, "no such checkpoint range");
+  return json({
+    from: { q: r.from.q, C: enc64(r.from.C) },
+    entries: r.entries.map((e) => ({ q: e.q, sec: e.sec, hd: enc64(e.hd) })),
+    latest: { q: r.latest.q, C: enc64(r.latest.C), sig: enc64(r.latest.sig) },
+  });
+}
+
+async function feed(c: Ctx, E: number, i: number): Promise<Response> {
+  const { hi } = eraBounds(c.now, c.params.skew);
+  if (E > hi || E < c.params.eFirst || i >= SHARDS) throw new HttpError(404, "no such shard");
+  const after = intParam(c.url.searchParams.get("after"), 0, 0, 0xffffffff, "after");
+  const key = `${c.url.origin}/api/v2/feed/${E}/${i}?after=${after}`;
+  const hit = await cacheGet(key);
+  if (hit) return hit;
+  await readLimit(c);
+  const shard = shardStub(c.env, E, i);
+  const page = await shard.feedBatches(E, i, after, FEED_BUDGET);
+  const immutable = page.more || page.sealed;
+  const cacheControl = immutable ? IMMUTABLE : "no-store";
+  const inline = page.batches.flatMap((b) => (b.rows ? [{ ...b, rows: b.rows }] : []));
+  if (inline.length === page.batches.length) {
+    // The page fits FEED_BUDGET: the shard sent every row with the batch list.
+    const res = binary(encodeFeed({ more: page.more, batches: inline }), cacheControl);
+    if (immutable) cachePut(c, key, res);
+    return res;
+  }
+  // A batch larger than the page budget: still one whole batch on the wire (§10.9), streamed, with its rows pulled
+  // from the shard ≤ FEED_BUDGET per RPC. The first pull happens before the 200 so that a shard failure is a 5xx.
+  // Not stored in caches.default: a tee of the stream would buffer the whole batch for the slower reader.
+  const big = page.batches.find((b) => !b.rows)!;
+  const first = await shard.feedRows(E, i, big.t, null, FEED_BUDGET);
+  return new Response(feedStream(shard, E, i, page, first), {
+    headers: { "content-type": OCTET, "cache-control": cacheControl, ...SECURITY_HEADERS },
+  });
+}
+
+/** §10.9 batch header: u32 t | u32 n | root[32] | head[32]. */
+function feedBatchHeader(t: number, n: number, root: Bytes, head: Bytes): Bytes {
+  if (root.length !== 32 || head.length !== 32) throw new Error("feed: malformed batch from the shard");
+  const out = new Uint8Array(72);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, t);
+  dv.setUint32(4, n);
+  out.set(root, 8);
+  out.set(head, 40);
+  return out;
+}
+
+/** §10.9 rows: (label[16] | u8 cls | body[CLASSES[cls] + 40]) × rows, in the order given. */
+function feedRowBytes(rows: ShardFeedRow[]): Bytes {
+  let len = 0;
+  for (const r of rows) {
+    if (r.label.length !== 16 || r.body.length !== BODY_LENS[r.cls]) {
+      throw new Error("feed: malformed row from the shard");
+    }
+    len += 17 + r.body.length;
+  }
+  const out = new Uint8Array(len);
+  let o = 0;
+  for (const r of rows) {
+    out.set(r.label, o);
+    out[o + 16] = r.cls;
+    out.set(r.body, o + 17);
+    o += 17 + r.body.length;
+  }
+  return out;
+}
+
+/**
+ * Streams a feed page (§10.9: u8 more | u32 nb | batch × nb) whose batches are not all inline. Inline batches are
+ * encoded as they are; any other batch's rows are pulled with repeated feedRows calls (`first` is the first pull of
+ * the first such batch), so the Worker holds about one FEED_BUDGET chunk at a time. Every batch is sent whole and
+ * its row count is checked against n; a failure mid-way errors the stream (a truncated body, never a wrong one).
+ */
+function feedStream(
+  shard: ReturnType<typeof shardStub>,
+  E: number,
+  i: number,
+  page: ShardFeedBatches,
+  first: ShardFeedRows,
+): ReadableStream<Uint8Array> {
+  let pending: ShardFeedRows | null = first;
+  async function* chunks(): AsyncGenerator<Bytes> {
+    const top = new Uint8Array(5);
+    top[0] = page.more ? 1 : 0;
+    new DataView(top.buffer).setUint32(1, page.batches.length);
+    yield top;
+    for (const b of page.batches) {
+      yield feedBatchHeader(b.t, b.n, b.root, b.head);
+      if (b.rows) {
+        if (b.rows.length !== b.n) throw new Error("feed: batch row count mismatch");
+        yield feedRowBytes(b.rows);
+        continue;
+      }
+      let sent = 0;
+      let afterLabel: Bytes | null = null;
+      for (;;) {
+        const part: ShardFeedRows = pending ?? (await shard.feedRows(E, i, b.t, afterLabel, FEED_BUDGET));
+        pending = null;
+        if (part.rows.length > 0) {
+          yield feedRowBytes(part.rows);
+          sent += part.rows.length;
+          afterLabel = part.rows[part.rows.length - 1].label;
+        }
+        if (part.done) break;
+        if (part.rows.length === 0) throw new Error("feed: no progress from the shard");
+      }
+      if (sent !== b.n) throw new Error("feed: batch row count mismatch");
+    }
+  }
+  const it = chunks();
+  return new ReadableStream<Uint8Array>({
+    async pull(ctrl) {
+      try {
+        const r = await it.next();
+        if (r.done) ctrl.close();
+        else ctrl.enqueue(r.value);
+      } catch (e) {
+        console.error(JSON.stringify({ msg: "feed stream failed", error: logErr(e) }));
+        ctrl.error(e);
+      }
+    },
+    async cancel() {
+      await it.return(undefined);
+    },
+  });
+}
+
+// ───────────── directory (§10.6) ─────────────
+
+async function register(c: Ctx): Promise<Response> {
+  await writeLimit(c);
+  const bytes = await readBody(c.request, MAX_REGISTER_BODY);
+  checkPow(c.request, c.env, "register", await sha256(bytes), bytes.length, c.now);
+  return json(await dirRegister(c.env, parseJsonObject(bytes), c.now));
+}
+
+async function postWrap(c: Ctx): Promise<Response> {
+  await writeLimit(c);
+  const bytes = await readBody(c.request, MAX_WRAP_BODY);
+  checkPow(c.request, c.env, "wrap", await sha256(bytes), bytes.length, c.now);
+  return json(await dirAddWrap(c.env, parseJsonObject(bytes)));
+}
+
+async function dirPrefix(c: Ctx, kind: "h" | "u", pS: string, xS: string): Promise<Response> {
+  await readLimit(c);
+  const p = decimal(pS, 32, "prefix bits");
+  const x = decimal(xS, 2 ** p - 1, "prefix value");
+  const afterS = c.url.searchParams.get("after");
+  if (afterS !== null) b64uParam(afterS, 16, 16, "after");
+  return json(await dirByPrefix(c.env, kind, p, x, afterS));
+}
+
+async function dirUid(c: Ctx, uid: string): Promise<Response> {
+  await readLimit(c);
+  b64uParam(uid, 16, 16, "uid");
+  const user = await dirByUid(c.env, uid);
+  if (!user) throw new HttpError(404, "no such user");
+  return json({ user });
+}
+
+async function dirWraps(c: Ctx, id: string): Promise<Response> {
+  await readLimit(c);
+  b64uParam(id, 1, MAX_ID_LEN, "id");
+  const uid = c.url.searchParams.get("uid");
+  if (uid !== null) b64uParam(uid, 16, 16, "uid");
+  return json({ wraps: await dirWrapsById(c.env, id, uid) });
+}
+
+async function dirlog(c: Ctx): Promise<Response> {
+  await readLimit(c);
+  const q = c.url.searchParams;
+  const after = intParam(q.get("after"), 0, 0, Number.MAX_SAFE_INTEGER, "after");
+  const limit = intParam(q.get("limit"), 1000, 1, 1000, "limit");
+  return json(await dirlogPage(c.env, after, limit));
+}
+
 // ───────────── router ─────────────
 
-const BLOB_PATH = /^\/api\/blob\/([A-Za-z0-9_-]{43})$/;
-const USER_PATH = /^\/api\/users\/([^/]{1,64})$/;
-const WRAPS_PATH = /^\/api\/wraps\/([^/]{1,1400})$/;
+const P = "/api/v2";
+const ERA_PATH = /^\/api\/v2\/era\/(\d{1,6})$/;
+const INBOX_PATH = /^\/api\/v2\/inbox\/(\d{1,6})\/(\d{1,10})$/;
+const BLOB_PATH = /^\/api\/v2\/blob\/([A-Za-z0-9_-]{43})(\/meta)?$/;
+const CKPT_PATH = /^\/api\/v2\/ckpt\/(\d{1,10})$/;
+const FEED_PATH = /^\/api\/v2\/feed\/(\d{1,6})\/(\d{1,6})$/;
+const DIR_PREFIX_PATH = /^\/api\/v2\/dir\/(h|u)\/(\d{1,2})\/(\d{1,10})$/;
+const DIR_UID_PATH = /^\/api\/v2\/dir\/uid\/([^/]{1,64})$/;
+const DIR_WRAPS_PATH = /^\/api\/v2\/dir\/wraps\/([^/]{1,1400})$/;
 
 async function route(c: Ctx): Promise<Response> {
   const path = c.url.pathname;
   switch (path) {
-    case "/api/params":
+    case `${P}/params`:
       methods(c, ["GET"]);
       return params(c);
-    case "/api/register":
+    case `${P}/put`:
+      methods(c, ["POST"]);
+      return put(c);
+    case `${P}/get`:
+      methods(c, ["POST"]);
+      return get(c);
+    case `${P}/inbox`:
+      methods(c, ["POST"]);
+      return inboxPost(c);
+    case `${P}/rt`:
+      methods(c, ["GET"]);
+      return rt(c);
+    case `${P}/ckpt/latest`:
+      methods(c, ["GET"]);
+      return ckptLatest(c);
+    case `${P}/ckpt/range`:
+      methods(c, ["GET"]);
+      return ckptRange(c);
+    case `${P}/register`:
       methods(c, ["POST"]);
       return register(c);
-    case "/api/wraps":
+    case `${P}/wraps`:
       methods(c, ["POST"]);
       return postWrap(c);
-    case "/api/append":
-      methods(c, ["POST"]);
-      return postAppend(c);
-    case "/api/log":
+    case `${P}/dirlog`:
       methods(c, ["GET"]);
-      return getLog(c);
-    case "/api/ws":
-      methods(c, ["GET"]);
-      return ws(c);
+      return dirlog(c);
   }
-  let m = USER_PATH.exec(path);
+  let m = ERA_PATH.exec(path);
   if (m) {
     methods(c, ["GET"]);
-    return getUser(c, m[1]);
+    return eraInfo(c, decimal(m[1], 0xfffe, "era"));
   }
-  m = WRAPS_PATH.exec(path);
+  m = INBOX_PATH.exec(path);
   if (m) {
     methods(c, ["GET"]);
-    return getWraps(c, m[1]);
+    return inboxRead(c, decimal(m[1], 0xfffe, "era"), decimal(m[2], 0xffffffff, "bucket"));
   }
-  if (path.startsWith("/api/blob/")) {
-    methods(c, ["GET", "PUT"]);
+  if (path.startsWith(`${P}/blob/`)) {
     m = BLOB_PATH.exec(path);
-    let idBytes: Uint8Array | null = null;
+    const isMeta = m?.[2] !== undefined;
+    methods(c, isMeta ? ["GET"] : ["GET", "PUT"]);
+    let idBytes: Bytes | null = null;
     try {
       if (m) idBytes = dec64(m[1]);
     } catch {
       /* non-canonical */
     }
     if (!m || !idBytes || idBytes.length !== 32) throw new HttpError(400, "invalid blob id");
+    if (isMeta) return blobMeta(c, idBytes);
     return c.request.method === "PUT" ? putBlob(c, m[1], idBytes) : getBlob(c, m[1]);
+  }
+  m = CKPT_PATH.exec(path);
+  if (m) {
+    methods(c, ["GET"]);
+    const q = decimal(m[1], 0xffffffff, "checkpoint");
+    if (q < 1) throw new HttpError(404, "no such checkpoint");
+    return ckptAt(c, q);
+  }
+  m = FEED_PATH.exec(path);
+  if (m) {
+    methods(c, ["GET"]);
+    return feed(c, decimal(m[1], 0xfffe, "era"), decimal(m[2], 0xffff, "shard"));
+  }
+  m = DIR_PREFIX_PATH.exec(path);
+  if (m) {
+    methods(c, ["GET"]);
+    return dirPrefix(c, m[1] as "h" | "u", m[2], m[3]);
+  }
+  m = DIR_UID_PATH.exec(path);
+  if (m) {
+    methods(c, ["GET"]);
+    return dirUid(c, m[1]);
+  }
+  m = DIR_WRAPS_PATH.exec(path);
+  if (m) {
+    methods(c, ["GET"]);
+    return dirWraps(c, m[1]);
   }
   throw new HttpError(404, "not found");
 }
 
-/** Path for logs without the ids / handles in it. */
-function routeLabel(path: string): string {
-  if (path.startsWith("/api/blob/")) return "/api/blob/:id";
-  if (USER_PATH.test(path)) return "/api/users/:handle";
-  if (WRAPS_PATH.test(path)) return "/api/wraps/:id";
-  return ["/api/params", "/api/register", "/api/wraps", "/api/append", "/api/log", "/api/ws"].includes(path) ? path : "/api/*";
+/** Path for logs without ids, handles, prefixes or eras in it. */
+export function routeLabel(path: string): string {
+  if (ERA_PATH.test(path)) return `${P}/era/:E`;
+  if (INBOX_PATH.test(path)) return `${P}/inbox/:E/:bucket`;
+  if (path.startsWith(`${P}/blob/`)) return path.endsWith("/meta") ? `${P}/blob/:id/meta` : `${P}/blob/:id`;
+  if (CKPT_PATH.test(path)) return `${P}/ckpt/:q`;
+  if (FEED_PATH.test(path)) return `${P}/feed/:E/:i`;
+  if (DIR_PREFIX_PATH.test(path)) return `${P}/dir/:kind/:p/:x`;
+  if (DIR_UID_PATH.test(path)) return `${P}/dir/uid/:uid`;
+  if (DIR_WRAPS_PATH.test(path)) return `${P}/dir/wraps/:id`;
+  const fixed = ["params", "put", "get", "inbox", "rt", "ckpt/latest", "ckpt/range", "register", "wraps", "dirlog"];
+  return fixed.some((f) => path === `${P}/${f}`) ? path : `${P}/*`;
+}
+
+/**
+ * Stamps `x-segv-now` and HSTS (https only) on the response actually returned (after any cache lookup).
+ * Responses from caches.default have immutable headers, so they are copied. 101 (WebSocket) responses are left
+ * alone: their HELLO frame carries the server time. The Worker entries also apply it to the 421 of host pinning
+ * on /api/v2/* paths, which never reaches handleApi (§10.1: every /api/v2/* response carries x-segv-now).
+ */
+export function stampResponse(res: Response, url: URL, now = Date.now()): Response {
+  if (res.status === 101) return res;
+  const stamp = (r: Response): Response => {
+    r.headers.set("x-segv-now", String(now));
+    if (url.protocol === "https:") r.headers.set("strict-transport-security", HSTS);
+    return r;
+  };
+  try {
+    return stamp(res);
+  } catch {
+    return stamp(new Response(res.body, res));
+  }
+}
+
+/** The extra JSON fields of an HttpError subclass (`extra: {…}`), or null. `error` cannot be overridden. */
+function errorExtra(e: HttpError): Record<string, unknown> | null {
+  const x = (e as { extra?: unknown }).extra;
+  return typeof x === "object" && x !== null && !Array.isArray(x) ? (x as Record<string, unknown>) : null;
 }
 
 export async function handleApi(request: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
+  const now = Date.now();
   let res: Response;
   try {
-    res = await route({ request, env, ctx, url });
+    const keys = serverKeys(env);
+    // Missing secrets, or a deployment var that is present but invalid (e.g. a Δ that does not divide 604 800).
+    if (!keys || !v2ParamsValid(env)) throw new HttpError(503, "server misconfigured");
+    res = await route({ request, env, ctx, url, now, params: v2Params(env), keys });
   } catch (e) {
     if (e instanceof HttpError) {
-      res = errorResponse(e.status, e.message, e.headers);
+      // Any HttpError with an object `extra` (ApiError here, PrefixBitsError in the directory) answers
+      // {error, ...extra}, e.g. {error, era} or {error, p}.
+      const extra = errorExtra(e);
+      res = extra
+        ? json(Object.assign({ error: e.message }, extra, { error: e.message }), e.status, e.headers)
+        : errorResponse(e.status, e.message, e.headers);
       // Refused before the body was read (PoW, size, rate limit): release it instead of leaving it pending.
       if (request.body !== null && !request.bodyUsed) ctx.waitUntil(request.body.cancel().catch(() => {}));
     } else {
@@ -481,5 +1013,13 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
       res = errorResponse(500, "internal error");
     }
   }
-  return finalize(res, url);
+  return stampResponse(res, url, now);
 }
+
+/** Test hook: forget the per-isolate caches (ckpt ensure flag, client-tag key, the directory's cached P). */
+export function _resetApiForTests(): void {
+  ckptEnsured = false;
+  wsKey = null;
+  _resetDirectoryCacheForTests();
+}
+

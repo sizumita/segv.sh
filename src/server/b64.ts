@@ -3,7 +3,7 @@
  *
  * Byte-for-byte identical to proto.b64u / proto.fromB64u, but uses the native
  * Uint8Array.prototype.toBase64 / Uint8Array.fromBase64 when the runtime has them (workerd does):
- * GET /api/log and WebSocket broadcasts encode megabytes of row bodies, and the JS fallback is
+ * feed pages and realtime frames carry megabytes of row bodies, and the JS fallback is
  * far too slow for the Workers CPU budget.
  */
 import { b64u as jsEncode, fromB64u as jsDecode } from "../lib/proto";

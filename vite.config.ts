@@ -57,16 +57,10 @@ export default defineConfig(({ command, mode }) => {
       projects: [
         { test: { name: "unit", include: ["src/**/*.test.ts"], environment: "node" } },
         "test/worker/vitest.config.ts",
-        // The real client engine (src/client/engine.ts) against an in-memory fake Worker (test/engine/harness.ts).
+        // The client engine (src/client/engine.ts) against the in-memory FakeWorld (test/engine/harness.ts).
         {
           resolve: { alias: { "~": `${import.meta.dirname}/src` } },
           test: { name: "engine", include: ["test/engine/**/*.spec.ts"], environment: "node", testTimeout: 120_000, hookTimeout: 60_000 },
-        },
-        // Protocol v2 engine (src/client/v2/) against the FakeWorld harness (test/engine2/harness.ts).
-        // Renamed to "engine" at the cut-over (docs/STAGE1-PLAN.md M9).
-        {
-          resolve: { alias: { "~": `${import.meta.dirname}/src` } },
-          test: { name: "engine2", include: ["test/engine2/**/*.spec.ts"], environment: "node", testTimeout: 120_000, hookTimeout: 60_000 },
         },
       ],
     },

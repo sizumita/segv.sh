@@ -11,19 +11,16 @@ import {
   type PlatformCloudflarePages,
 } from "@qwik.dev/router/middleware/cloudflare-pages";
 import render from "./entry.ssr";
-import { handleApi } from "./server/api";
+import { handleApi, stampResponse } from "./server/api";
 import { pinHost } from "./server/hosts";
-import { handleApiV2, stampV2 } from "./server/v2/api";
 
-// Durable Object classes must be exported from the Worker's main module.
-// LogDO = the single sequencer of the public hash-chained log (env.LOG.getByName("global")).
-export { LogDO } from "./server/log-do";
-// Protocol v2 (docs/PROTOCOL-v2.md §9): per-era shards and inboxes, blob registry, realtime, checkpoints.
-export { ShardDO } from "./server/v2/shard-do";
-export { BlobRegDO } from "./server/v2/blobreg-do";
-export { InboxDO } from "./server/v2/inbox-do";
-export { RealtimeDO } from "./server/v2/realtime-do";
-export { CheckpointDO } from "./server/v2/ckpt-do";
+// Durable Object classes must be exported from the Worker's main module (docs/PROTOCOL-v2.md §9): per-era
+// shards and inboxes, the blob registry, realtime WebSockets and checkpoints.
+export { ShardDO } from "./server/shard-do";
+export { BlobRegDO } from "./server/blobreg-do";
+export { InboxDO } from "./server/inbox-do";
+export { RealtimeDO } from "./server/realtime-do";
+export { CheckpointDO } from "./server/ckpt-do";
 
 export interface PlatformCloudflareWorkers extends PlatformCloudflarePages {
   env: Env;
@@ -44,13 +41,10 @@ export default {
     const url = new URL(request.url);
     // The passkey RP ID is the hostname: never serve the app (or the log) on a non-canonical host.
     const pinned = pinHost(env, url);
-    // §10.1: the 421 on /api/v2/* carries x-segv-now (and HSTS) like every other v2 response.
-    if (pinned) return url.pathname.startsWith("/api/v2/") ? stampV2(pinned, url) : pinned;
-    // v2 runs next to v1 until the cut-over (docs/STAGE1-PLAN.md §0.1).
-    if (url.pathname.startsWith("/api/v2/")) return handleApiV2(request, env, ctx, url);
-    if (url.pathname.startsWith("/api/")) {
-      return handleApi(request, env, ctx, url);
-    }
+    // §10.1: the 421 on /api/* carries x-segv-now (and HSTS) like every other API response.
+    if (pinned) return url.pathname.startsWith("/api/") ? stampResponse(pinned, url) : pinned;
+    // Every endpoint is under /api/v2/; any other /api/* path is a 404 from the same router (§10.1).
+    if (url.pathname.startsWith("/api/")) return handleApi(request, env, ctx, url);
     return qwikRouter(request, env as unknown as QwikEnv, ctx);
   },
 } satisfies ExportedHandler<Env>;

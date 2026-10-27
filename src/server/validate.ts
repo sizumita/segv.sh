@@ -1,41 +1,46 @@
-/** Server-side validation of log rows (docs/PROTOCOL.md §4.2). */
+/**
+ * Server-side shape checks of the signed directory JSON (docs/PROTOCOL-v2.md §1.2, §2.2, §2.4, §10.6).
+ * Signatures are checked separately with WebCrypto.
+ */
 import {
-  INV_BODY_LENS,
-  MSG_BODY_LENS,
+  BUNDLE_KEYS,
+  WRAP_KEYS,
   bundleSigMsg,
-  checkUserKeys,
   fromB64u,
   parseBundle,
   parseWrap,
-  utf8,
   wrapSigMsg,
   type User,
   type WrapRecord,
 } from "../lib/proto";
-import { b64Len, dec64 } from "./b64";
-import { HttpError, ed25519Verify, exactKeys } from "./http";
-import { BATCH_MAX, BATCH_MAX_KIND4, type AppendRow } from "./types";
+import { HttpError, ed25519Verify } from "./http";
 
-/** Signed texts are tiny (a bundle is ~1.9 KB, a record ~3.3 KB); anything larger is not ours. */
-const MAX_SIGNED_TEXT = 8 * 1024;
+/**
+ * Signed texts are small: a bundle is ~1.9 KB and a record at most ~4.7 KB (a 1023-byte credential id).
+ * Anything larger is not ours.
+ */
+export const MAX_SIGNED_TEXT = 8 * 1024;
 
+/** Never echoes JSON parser messages (they quote input). */
 const detail = (e: unknown): string => (e instanceof Error && !(e instanceof SyntaxError) ? e.message : "malformed JSON");
 
 /**
- * The signed JSON must be exactly what JSON.stringify produces for the spec's key order: no unknown or
- * duplicate keys, no whitespace. Everyone (server, D1, every client) therefore reads the same values.
+ * §1.2 canonical form: the keys appear in the spec's order, there are no extra (or duplicate) keys, and
+ * `JSON.stringify(JSON.parse(text)) === text` (no whitespace, no alternative number or string spellings).
  */
-function canonical(text: string, keys: readonly string[]): boolean {
+export function canonical(text: string, keys: readonly string[]): boolean {
   const o = JSON.parse(text) as Record<string, unknown>;
-  const c: Record<string, unknown> = {};
-  for (const k of keys) c[k] = o[k];
-  return JSON.stringify(c) === text;
+  if (typeof o !== "object" || o === null || Array.isArray(o)) return false;
+  const got = Object.keys(o);
+  if (got.length !== keys.length || got.some((k, i) => k !== keys[i])) return false;
+  return JSON.stringify(o) === text;
 }
 
-const BUNDLE_KEYS = ["v", "uid", "handle", "sig", "kem", "scan", "ts"] as const;
-const RECORD_KEYS = ["v", "uid", "kind", "id", "kem", "wrap", "ts"] as const;
-
-/** Shape-checks a bundle + signature (not the signature itself). */
+/**
+ * Shape-checks a v2 bundle + signature (not the signature itself, not checkUserKeys): string types, size,
+ * canonical JSON in the order {v, uid, handle, sig, kem, ts}, v = 2, uid 16 B, sig 32 B, kem 1216 B, handle
+ * `^[a-z0-9_]{3,20}$`, ts a safe non-negative integer, signature 64 B; every b64u value canonical.
+ */
 export function checkBundleShape(bundle: unknown, sig: unknown): User {
   if (typeof bundle !== "string" || typeof sig !== "string") throw new HttpError(400, "bundle: expected strings");
   if (bundle.length > MAX_SIGNED_TEXT) throw new HttpError(400, "bundle: too large");
@@ -46,17 +51,14 @@ export function checkBundleShape(bundle: unknown, sig: unknown): User {
     throw new HttpError(400, `invalid bundle (${detail(e)})`);
   }
   if (!canonical(bundle, BUNDLE_KEYS)) throw new HttpError(400, "invalid bundle (not canonical JSON)");
-  // Reject keys that clients would refuse (small-order signing key: WebCrypto's Ed25519 accepts a
-  // universal forgery for it; low-order scan key / invalid ML-KEM key: nobody could invite this user).
-  try {
-    checkUserKeys(u);
-  } catch (e) {
-    throw new HttpError(400, `invalid bundle (${detail(e)})`);
-  }
   return u;
 }
 
-/** Shape-checks a wrap record + signature (not the signature itself). */
+/**
+ * Shape-checks a v2 wrap record + signature (not the signature itself): string types, size, canonical JSON
+ * in the order {v, uid, kind, id, kem, wrap, ts}, v = 2, kind passkey | recovery, uid 16 B, id 1..1023 B
+ * (recovery: 16 B), kem 1216 B, wrap 1192 B, ts, signature 64 B; every b64u value canonical.
+ */
 export function checkRecordShape(record: unknown, sig: unknown): WrapRecord {
   if (typeof record !== "string" || typeof sig !== "string") throw new HttpError(400, "wrap: expected strings");
   if (record.length > MAX_SIGNED_TEXT) throw new HttpError(400, "wrap: too large");
@@ -66,62 +68,16 @@ export function checkRecordShape(record: unknown, sig: unknown): WrapRecord {
   } catch (e) {
     throw new HttpError(400, `invalid wrap record (${detail(e)})`);
   }
-  if (!canonical(record, RECORD_KEYS)) throw new HttpError(400, "invalid wrap record (not canonical JSON)");
+  if (!canonical(record, WRAP_KEYS)) throw new HttpError(400, "invalid wrap record (not canonical JSON)");
   return w;
 }
 
+/** bundleSig over enc("segv.sh/v2/bundle", bundleBytes), via WebCrypto. */
 export async function verifyBundleSig(u: User): Promise<boolean> {
   return ed25519Verify(u.sigPk, fromB64u(u.bundleSig), bundleSigMsg(u.bundle));
 }
 
+/** recordSig over enc("segv.sh/v2/wrap", recordBytes) under the owner's bundle key, via WebCrypto. */
 export async function verifyRecordSig(w: WrapRecord, ownerSigPk: Uint8Array): Promise<boolean> {
   return ed25519Verify(ownerSigPk, fromB64u(w.sig), wrapSigMsg(w.record));
-}
-
-/** Server-built row bodies for kinds 1 and 2. */
-export const userBody = (u: User): Uint8Array => utf8(JSON.stringify({ bundle: u.bundle, sig: u.bundleSig }));
-export const wrapBody = (w: WrapRecord): Uint8Array => utf8(JSON.stringify({ record: w.record, sig: w.sig }));
-
-// ───────────── /api/append rows (kinds 3 and 4) ─────────────
-
-const BODY_LENS: Readonly<Record<number, readonly number[]>> = { 3: INV_BODY_LENS, 4: MSG_BODY_LENS };
-const BODY_B64_LENS: Readonly<Record<number, readonly number[]>> = {
-  3: INV_BODY_LENS.map(b64Len),
-  4: MSG_BODY_LENS.map(b64Len),
-};
-const TAG_B64_LEN = b64Len(16);
-
-/**
- * Validates `{rows:[{kind, tag, body}]}`: kinds 3|4, 16-byte tags, exact body lengths, ≤ 40 rows, distinct
- * tags, and at most one kind-4 row (a batch is one message, or one claim + its invites, or invites only).
- */
-export function checkAppendRows(rows: unknown): AppendRow[] {
-  if (!Array.isArray(rows)) throw new HttpError(400, "rows: expected an array");
-  if (rows.length < 1 || rows.length > BATCH_MAX) throw new HttpError(400, `rows: expected 1..${BATCH_MAX} rows`);
-  const kind4 = rows.filter((r: unknown) => typeof r === "object" && r !== null && (r as { kind?: unknown }).kind === 4).length;
-  if (kind4 > BATCH_MAX_KIND4) throw new HttpError(400, `rows: at most ${BATCH_MAX_KIND4} kind-4 row (message or claim) per batch`);
-  const tags = new Set<string>();
-  return rows.map((r: unknown, i): AppendRow => {
-    const o = exactKeys(r, ["kind", "tag", "body"], `rows[${i}]`);
-    const { kind, tag, body } = o;
-    if (kind !== 3 && kind !== 4) throw new HttpError(400, `rows[${i}]: kind must be 3 or 4`);
-    if (typeof tag !== "string" || tag.length !== TAG_B64_LEN) throw new HttpError(400, `rows[${i}]: tag must be 16 bytes`);
-    // Cheap length check before decoding up to 23 KB of base64.
-    if (typeof body !== "string" || !BODY_B64_LENS[kind].includes(body.length)) {
-      throw new HttpError(400, `rows[${i}]: bad body length for kind ${kind}`);
-    }
-    let t: Uint8Array;
-    let b: Uint8Array;
-    try {
-      t = dec64(tag);
-      b = dec64(body);
-    } catch {
-      throw new HttpError(400, `rows[${i}]: invalid base64url`);
-    }
-    if (t.length !== 16) throw new HttpError(400, `rows[${i}]: tag must be 16 bytes`);
-    if (!BODY_LENS[kind].includes(b.length)) throw new HttpError(400, `rows[${i}]: bad body length for kind ${kind}`);
-    if (tags.has(tag)) throw new HttpError(400, `rows[${i}]: duplicate tag in batch`);
-    tags.add(tag);
-    return { kind, tag: t, body: b };
-  });
 }

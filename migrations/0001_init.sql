@@ -1,31 +1,31 @@
--- segv.sh D1 schema (docs/PROTOCOL.md §4–§5).
--- users / wraps are a DERIVED, idempotently rebuilt index of the public log. The authoritative log lives
--- in the LogDO Durable Object (SQLite); every users / wraps row can be recomputed from it. The blobs
--- registry is the exception: it is server-side bookkeeping that the log does not contain (see 0002).
--- Binary values are stored as base64url TEXT (D1 returns BLOB columns as number[]).
+-- segv.sh D1 schema: the directory (docs/PROTOCOL-v2.md §9.6). Authoritative: there is no outbox and no log fallback.
+-- Binary values are stored as base64url TEXT; dirseq = the dirlog seq of the row.
 
--- kind-1 rows: one per registered account.
-CREATE TABLE IF NOT EXISTS users (
-  uid TEXT PRIMARY KEY,          -- b64u(16-byte uid)
-  handle TEXT NOT NULL UNIQUE,   -- ^[a-z0-9_]{3,20}$
-  bundle TEXT NOT NULL,          -- exact signed bundle text
-  sig TEXT NOT NULL,             -- b64u(Ed25519 signature)
-  seq INTEGER NOT NULL           -- log seq of the kind-1 row
+-- One row per registered account (the exact signed bundle text and its signature).
+CREATE TABLE IF NOT EXISTS user (
+  uid TEXT PRIMARY KEY,            -- b64u(16 B)
+  upre INTEGER NOT NULL,           -- u32, §2.5
+  handle TEXT NOT NULL UNIQUE,
+  hpre INTEGER NOT NULL,           -- u32
+  bundle TEXT NOT NULL, sig TEXT NOT NULL,   -- exact signed text, b64u signature
+  reg_era INTEGER NOT NULL,        -- era(server time) at registration
+  dirseq INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS user_upre ON user (upre);
+CREATE INDEX IF NOT EXISTS user_hpre ON user (hpre);
 
--- kind-2 rows: passkey / recovery key wraps (several per id are allowed).
-CREATE TABLE IF NOT EXISTS wraps (
-  seq INTEGER PRIMARY KEY,       -- log seq of the kind-2 row
-  id TEXT NOT NULL,              -- b64u(credential id | recovery id)
-  uid TEXT NOT NULL,             -- b64u(owner uid)
-  record TEXT NOT NULL,          -- exact signed record text
-  sig TEXT NOT NULL              -- b64u(Ed25519 signature)
+-- Passkey and recovery wrap records (several uids may share an id; at most 64 per uid).
+CREATE TABLE IF NOT EXISTS wrap (
+  uid TEXT NOT NULL, id TEXT NOT NULL,       -- b64u
+  record TEXT NOT NULL, sig TEXT NOT NULL, dirseq INTEGER NOT NULL,
+  PRIMARY KEY (uid, id)
 );
-CREATE INDEX IF NOT EXISTS wraps_id ON wraps (id);
+CREATE INDEX IF NOT EXISTS wrap_id ON wrap (id, dirseq);
 
--- Encrypted, content-addressed blobs in R2 (key "b/<id>").
-CREATE TABLE IF NOT EXISTS blobs (
-  id TEXT PRIMARY KEY,           -- b64u(SHA-256(blob))
-  size INTEGER NOT NULL,         -- bytes
-  created_at INTEGER NOT NULL    -- UTC day of the first upload, as ms at 00:00:00Z (0002)
-);
+-- The public audit log of the directory: h_seq = H(enc("segv.sh/v2/dirlog", h_{seq-1}, u64 seq, u8 kind, ref)),
+-- kind 1 = user, 2 = wrap; ref and h are b64u. Seqs are contiguous from 1 (explicit seqs, optimistic retries).
+CREATE TABLE IF NOT EXISTS dirlog (seq INTEGER PRIMARY KEY, kind INTEGER NOT NULL, ref TEXT NOT NULL, h TEXT NOT NULL);
+
+-- 'users': the number of user rows (P is derived from it, never from count(*)).
+CREATE TABLE IF NOT EXISTS dirmeta (k TEXT PRIMARY KEY, v INTEGER NOT NULL);
+INSERT OR IGNORE INTO dirmeta (k, v) VALUES ('users', 0);

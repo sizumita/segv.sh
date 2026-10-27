@@ -8,7 +8,7 @@
 //   5. fuzz — a seeded loop: decoders either return a value that re-encodes to the same bytes, or throw WireError.
 import { describe, expect, it } from "vite-plus/test";
 import * as W from "./wire";
-import { BODY_LENS, INBOX_BODY_LEN } from "./proto2";
+import { BODY_LENS, INBOX_BODY_LEN } from "./proto";
 
 type B = Uint8Array;
 

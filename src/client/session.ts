@@ -48,7 +48,7 @@ export async function saveSession(uid: string, AK: Uint8Array): Promise<void> {
   ]);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv, additionalData: new TextEncoder().encode(`segv.sh/v1/session/${uid}`) },
+    { name: "AES-GCM", iv, additionalData: new TextEncoder().encode(`segv.sh/v2/session/${uid}`) },
     key,
     AK as BufferSource,
   );
@@ -64,7 +64,7 @@ export async function loadSession(): Promise<{ uid: string; AK: Uint8Array } | n
       {
         name: "AES-GCM",
         iv: v.iv as BufferSource,
-        additionalData: new TextEncoder().encode(`segv.sh/v1/session/${v.uid}`),
+        additionalData: new TextEncoder().encode(`segv.sh/v2/session/${v.uid}`),
       },
       v.key,
       v.ct,

@@ -16,7 +16,6 @@
   "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "segv-blobs-test" }],
   "durable_objects": {
     "bindings": [
-      { "name": "LOG", "class_name": "LogDO" },
       { "name": "SHARD", "class_name": "ShardDO" },
       { "name": "BLOBREG", "class_name": "BlobRegDO" },
       { "name": "INBOX", "class_name": "InboxDO" },
@@ -25,9 +24,8 @@
     ],
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["LogDO"] },
     {
-      "tag": "v2",
+      "tag": "v1",
       "new_sqlite_classes": ["ShardDO", "BlobRegDO", "InboxDO", "RealtimeDO", "CheckpointDO"],
     },
   ],
@@ -41,7 +39,6 @@
   "vars": {
     "POW_REGISTER": "6",
     "POW_WRAP": "5",
-    "POW_APPEND": "4",
     "POW_BLOB": "5",
     "POW_PUT": "4",
     "POW_INBOX": "4",

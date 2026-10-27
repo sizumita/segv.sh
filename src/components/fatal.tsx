@@ -11,10 +11,7 @@ export const Fatal = component$(() => {
       <p class="alert" role="alert">
         {state.error || "an unrecoverable error occurred."}
       </p>
-      <p>
-        the client stopped to protect you. reload to try again. if this keeps happening, the server
-        may be serving a tampered log — do not ignore it.
-      </p>
+      <p>the client stopped. reload to try again.</p>
       <p>
         <button type="button" onClick$={() => location.reload()}>
           reload

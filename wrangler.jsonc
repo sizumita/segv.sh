@@ -19,7 +19,7 @@
     // API + websocket paths always hit the Worker (never the asset server).
     "run_worker_first": ["/api/*"],
   },
-  // Derived index of the public log (users, wraps) + blob registry. See migrations/.
+  // The directory (accounts, key wraps, the dirlog hash chain; docs/PROTOCOL-v2.md §9.6). See migrations/.
   "d1_databases": [
     {
       "binding": "DB",
@@ -30,13 +30,10 @@
   ],
   // Client-side-encrypted, content-addressed blobs: key "b/<b64u(sha256(blob))>".
   "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "segv-blobs" }],
-  // v1: the single sequencer of the public hash-chained log (env.LOG.getByName("global")); removed at the
-  // v2 cut-over (docs/STAGE1-PLAN.md M9).
-  // v2 (docs/PROTOCOL-v2.md §9): SHARD "shard/v2/{E}/{i}" and INBOX "inbox/v2/{E}/{g}" per era, BLOBREG
+  // docs/PROTOCOL-v2.md §9: SHARD "shard/v2/{E}/{i}" and INBOX "inbox/v2/{E}/{g}" per era, BLOBREG
   // "blobreg/v2", RT "rt/v2/0" (realtime WebSockets), CKPT "ckpt/v2" (signed checkpoints every 60 s).
   "durable_objects": {
     "bindings": [
-      { "name": "LOG", "class_name": "LogDO" },
       { "name": "SHARD", "class_name": "ShardDO" },
       { "name": "BLOBREG", "class_name": "BlobRegDO" },
       { "name": "INBOX", "class_name": "InboxDO" },
@@ -44,10 +41,10 @@
       { "name": "CKPT", "class_name": "CheckpointDO" },
     ],
   },
+  // One migration: nothing was deployed before protocol v2.
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["LogDO"] },
     {
-      "tag": "v2",
+      "tag": "v1",
       "new_sqlite_classes": ["ShardDO", "BlobRegDO", "InboxDO", "RealtimeDO", "CheckpointDO"],
     },
   ],
@@ -56,22 +53,22 @@
     { "name": "RL_WRITE", "namespace_id": "1001", "simple": { "limit": 60, "period": 60 } },
     { "name": "RL_BLOB", "namespace_id": "1002", "simple": { "limit": 20, "period": 60 } },
     { "name": "RL_READ", "namespace_id": "1003", "simple": { "limit": 600, "period": 60 } },
-    // v2 inbox posts (one token per POST of up to 32 invites).
+    // Inbox posts (one token per POST of up to 32 invites).
     { "name": "RL_INBOX", "namespace_id": "1004", "simple": { "limit": 10, "period": 60 } },
   ],
   "vars": {
-    // Proof-of-work base difficulty (leading zero bits) per scope, docs/PROTOCOL.md §4.3. Appends and
-    // blobs need more for larger bodies (proto.powDifficulty).
+    // Proof-of-work base difficulty (leading zero bits) per scope, docs/PROTOCOL-v2.md §10.2. Puts, inbox
+    // posts and blobs need more for larger bodies (proto.powDifficulty).
     "POW_REGISTER": "20",
     "POW_WRAP": "18",
-    "POW_APPEND": "16",
-    "POW_BLOB": "18",
-    // v2 scopes (docs/PROTOCOL-v2.md §10.2); register / wrap / blob share the vars above.
     "POW_PUT": "16",
     "POW_INBOX": "18",
-    // v2 deployment parameters (docs/PROTOCOL-v2.md §3.1, §9.3, §9.7). Must not change within an era.
-    // DELTA_S = Δ (row time granularity), SKEW_S = bound on clock differences between server components,
-    // INBOX_SLOT_S = Δin, E_FIRST = the era of the first deploy (lower eras are never instantiated).
+    "POW_BLOB": "18",
+    // Deployment parameters (docs/PROTOCOL-v2.md §3.1, §9.3, §9.7). Treat them as constants of the
+    // deployment (the Durable Objects pin Δ and Δin at their first write).
+    // DELTA_S = Δ (row time granularity; must divide 604800, else the API answers 503), SKEW_S = bound on
+    // clock differences between server components, INBOX_SLOT_S = Δin, E_FIRST = the era of the first deploy
+    // (lower eras are never instantiated).
     // Secrets (wrangler secret put; .dev.vars for vp dev): ROUTE_KEY (32 B b64u), SRV_KEY (Ed25519 seed b64u).
     "DELTA_S": "10",
     "SKEW_S": "2",

@@ -1,36 +1,34 @@
-// Test suite for src/lib/proto.ts (protocol v1, docs/PROTOCOL.md).
+// Test suite for the core of src/lib/proto.ts (protocol v2, stage 1, docs/PROTOCOL-v2.md): everything above the
+// "conversation codecs" banner. The codecs below the banner are tested in proto-conv.test.ts.
 //
-// Layout:
-//   1. reference helpers   — an independent re-implementation of the spec's encoding/KDF/hash rules on
-//                            top of node:crypto, used to cross-check proto.ts byte-for-byte.
-//   2. round trips         — every primitive and record type.
-//   3. tamper / misuse     — bit flips in every region of every ciphertext, wrong AAD contexts,
-//                            cross-protocol confusion, signature binding.
-//   4. fuzz                — decoders never hang and only ever throw `Error`s.
-//   5. known answers       — pinned outputs of every deterministic function, so any accidental
-//                            change to the wire format fails the build.
-import { describe, expect, it } from 'vite-plus/test';
+// Layout (as in proto.test.ts):
+//   1. reference helpers — an independent re-implementation of the spec's encoding / KDF / hash / commitment rules on
+//                          top of node:crypto (plus BigInt arithmetic), used to cross-check proto.ts byte for byte.
+//   2. cross-checks and round trips — time, classes, sealing, accounts, derivations, routing, commitments, PoW,
+//                          directory prefixes, blobs.
+//   3. tamper / misuse — bit flips, wrong contexts, attacker-filed wraps, throwing decapsulation (§1.1).
+//   4. fuzz — parsers only ever throw Error.
+//   5. known answers — pinned outputs, with deterministic randomness through _setRandomForTests.
+import { describe, expect, it } from "vite-plus/test";
 import {
   createHash,
   createHmac,
   createPrivateKey,
   createPublicKey,
-  diffieHellman,
   hkdfSync,
-  randomBytes,
+  sign as nodeSign,
   verify as nodeVerify,
-} from 'node:crypto';
-import { x25519 } from '@noble/curves/ed25519.js';
-import { ml_kem768_x25519 as xwing } from '@noble/post-quantum/hybrid.js';
-import { xchacha20poly1305 } from '@noble/ciphers/chacha.js';
-import * as P from './proto';
+} from "node:crypto";
+import { ml_kem768_x25519 as xwing } from "@noble/post-quantum/hybrid.js";
+import { xchacha20poly1305 } from "@noble/ciphers/chacha.js";
+import * as P from "./proto";
 
 type B = Uint8Array;
 
 // ───────────────────────── 1. reference helpers (independent of proto.ts) ─────────────────────────
 
 const te = new TextEncoder();
-const s2b = (x: B | string): B => (typeof x === 'string' ? te.encode(x) : x);
+const s2b = (x: B | string): B => (typeof x === "string" ? te.encode(x) : x);
 const cat = (...xs: B[]): B => {
   const out = new Uint8Array(xs.reduce((a, x) => a + x.length, 0));
   let o = 0;
@@ -40,6 +38,7 @@ const cat = (...xs: B[]): B => {
   }
   return out;
 };
+const be8 = (n: number): B => Uint8Array.of(n);
 const be16 = (n: number): B => {
   const b = Buffer.alloc(2);
   b.writeUInt16BE(n);
@@ -50,49 +49,23 @@ const be32 = (n: number): B => {
   b.writeUInt32BE(n);
   return new Uint8Array(b);
 };
-const be64 = (n: number): B => {
+const be64n = (n: bigint): B => {
   const b = Buffer.alloc(8);
-  b.writeBigUInt64BE(BigInt(n));
+  b.writeBigUInt64BE(n);
   return new Uint8Array(b);
 };
-/** Spec §1: enc(a, b, ...) = lp(a) || lp(b) || ... with lp(b) = u32(len(b)) || b. */
+const be64 = (n: number): B => be64n(BigInt(n));
+const beToBig = (b: B): bigint => b.reduce((acc, x) => (acc << 8n) | BigInt(x), 0n);
+/** §1.2: enc(a, b, …) = lp(a) ‖ lp(b) ‖ … with lp(b) = u32(len(b)) ‖ b; strings are UTF-8 first. */
 const refEnc = (...xs: (B | string)[]): B => cat(...xs.flatMap((x) => [be32(s2b(x).length), s2b(x)]));
-const sha = (b: B): B => new Uint8Array(createHash('sha256').update(b).digest());
-const hmacN = (k: B, m: B | string): B => new Uint8Array(createHmac('sha256', k).update(s2b(m)).digest());
+const sha = (b: B): B => new Uint8Array(createHash("sha256").update(b).digest());
+const hmacN = (k: B, m: B | string): B => new Uint8Array(createHmac("sha256", k).update(s2b(m)).digest());
 const hkdfN = (ikm: B, salt: B | string, info: B | string, len = 32): B =>
-  new Uint8Array(hkdfSync('sha256', ikm, s2b(salt), s2b(info), len));
-/** Spec §3.7 pad. */
-const refPad = (x: B, classes: readonly number[]): B => {
-  const t = classes.find((c) => c >= x.length + 1);
-  if (t === undefined) throw new Error('too large');
-  const o = new Uint8Array(t);
-  o.set(x);
-  o[x.length] = 0x80;
-  return o;
-};
-/** Spec §3.7 Padmé, computed with exact integer arithmetic (no floating-point log2). */
-const refPadmeLength = (L: number): number => {
-  if (L < 2) return L;
-  const E = BigInt(L).toString(2).length - 1; // floor(log2 L)
-  const S = E.toString(2).length; // floor(log2 E) + 1
-  const z = BigInt(E - S);
-  const mask = (1n << z) - 1n;
-  return Number((BigInt(L) + mask) & ~mask);
-};
-/**
- * PoW difficulty (§4.3), integer-only: append = base + ceil(log2(bytes / 4 KiB)) above 4 KiB,
- * blob = base + ceil(log2(bytes / 1 MiB)) above 1 MiB, register / wrap = base. "ceil(log2(x))" is the
- * smallest k with unit * 2^k >= bytes.
- */
-const refPowDifficulty = (scope: string, base: number, bytes: number): number => {
-  const unit = scope === 'append' ? 4096n : scope === 'blob' ? 1n << 20n : 0n;
-  if (unit === 0n || BigInt(bytes) <= unit) return base;
-  let k = 0;
-  while (unit << BigInt(k) < BigInt(bytes)) k++;
-  return base + k;
-};
-const toHex = (b: B): string => Buffer.from(b).toString('hex');
-const fromHex = (h: string): B => new Uint8Array(Buffer.from(h, 'hex'));
+  new Uint8Array(hkdfSync("sha256", ikm, s2b(salt), s2b(info), len));
+const tr16 = (b: B): B => b.slice(0, 16);
+const toHex = (b: B): string => Buffer.from(b).toString("hex");
+const fromHex = (h: string): B => new Uint8Array(Buffer.from(h, "hex"));
+const b64uN = (b: B): string => Buffer.from(b).toString("base64url");
 const fill = (n: number, v: number): B => new Uint8Array(n).fill(v);
 const seqBytes = (n: number, start = 0): B => Uint8Array.from({ length: n }, (_, i) => (start + i) & 0xff);
 const flip = (b: B, i: number, bit = 0): B => {
@@ -100,20 +73,67 @@ const flip = (b: B, i: number, bit = 0): B => {
   c[i] ^= 1 << bit;
   return c;
 };
+const bitLength = (n: number): number => (n <= 0 ? 0 : BigInt(n).toString(2).length);
 
-// node:crypto Ed25519 / X25519 from raw keys (PKCS#8 / SPKI DER prefixes, RFC 8410).
-const ED_PKCS8 = fromHex('302e020100300506032b657004220420');
-const ED_SPKI = fromHex('302a300506032b6570032100');
-const X_PKCS8 = fromHex('302e020100300506032b656e04220420');
-const X_SPKI = fromHex('302a300506032b656e032100');
-const nodePrivKey = (prefix: B, sk: B) => createPrivateKey({ key: Buffer.from(cat(prefix, sk)), format: 'der', type: 'pkcs8' });
-const nodePubKey = (prefix: B, pk: B) => createPublicKey({ key: Buffer.from(cat(prefix, pk)), format: 'der', type: 'spki' });
-const nodeRawPub = (prefix: B, sk: B): B =>
-  new Uint8Array(Buffer.from(createPublicKey(nodePrivKey(prefix, sk)).export({ format: 'jwk' }).x!, 'base64url'));
-const nodeEdVerify = (sig: B, msg: B, pk: B): boolean => nodeVerify(null, msg, nodePubKey(ED_SPKI, pk), sig);
-/** X25519 via OpenSSL — stands in for a WebCrypto-backed `dh` callback. */
-const nodeX25519 = (sk: B, pk: B): B =>
-  new Uint8Array(diffieHellman({ privateKey: nodePrivKey(X_PKCS8, sk), publicKey: nodePubKey(X_SPKI, pk) }));
+// node:crypto Ed25519 from raw keys (PKCS#8 / SPKI DER prefixes, RFC 8410).
+const ED_PKCS8 = fromHex("302e020100300506032b657004220420");
+const ED_SPKI = fromHex("302a300506032b6570032100");
+const edPriv = (sk: B) => createPrivateKey({ key: Buffer.from(cat(ED_PKCS8, sk)), format: "der", type: "pkcs8" });
+const edPubRaw = (sk: B): B =>
+  new Uint8Array(Buffer.from(createPublicKey(edPriv(sk)).export({ format: "jwk" }).x!, "base64url"));
+const edSign = (msg: B, sk: B): B => new Uint8Array(nodeSign(null, msg, edPriv(sk)));
+const edVerify = (sig: B, msg: B, pk: B): boolean =>
+  nodeVerify(null, msg, createPublicKey({ key: Buffer.from(cat(ED_SPKI, pk)), format: "der", type: "spki" }), sig);
+
+// Twisted Edwards arithmetic over BigInt (RFC 8032 §5.1), only to classify test keys independently of noble.
+const Pq = 2n ** 255n - 19n;
+const md = (a: bigint): bigint => ((a % Pq) + Pq) % Pq;
+const pw = (b: bigint, e: bigint): bigint => {
+  let r = 1n;
+  let x = md(b);
+  for (let k = e; k > 0n; k >>= 1n) {
+    if (k & 1n) r = (r * x) % Pq;
+    x = (x * x) % Pq;
+  }
+  return r;
+};
+const inv = (a: bigint): bigint => pw(a, Pq - 2n);
+const Dq = md(-121665n * inv(121666n));
+const SQRTM1 = pw(2n, (Pq - 1n) / 4n);
+type Pt = [bigint, bigint];
+const le32 = (n: bigint): B => Uint8Array.from({ length: 32 }, (_, i) => Number((n >> BigInt(8 * i)) & 0xffn));
+/** RFC 8032 §5.1.3 point decoding; null when the encoding is not a canonical point. */
+function edDecode(b: B): Pt | null {
+  let y = 0n;
+  for (let i = 31; i >= 0; i--) y = (y << 8n) | BigInt(b[i]);
+  const sign = y >> 255n;
+  y &= (1n << 255n) - 1n;
+  if (y >= Pq) return null;
+  const u = md(y * y - 1n);
+  const v = md(Dq * y * y + 1n);
+  let x = md(u * pw(v, 3n) * pw(u * pw(v, 7n), (Pq - 5n) / 8n));
+  const vx2 = md(v * x * x);
+  if (vx2 === md(-u)) x = md(x * SQRTM1);
+  else if (vx2 !== u) return null;
+  if (x === 0n && sign === 1n) return null;
+  if ((x & 1n) !== sign) x = md(-x);
+  return [x, y];
+}
+const edEncode = ([x, y]: Pt): B => {
+  const b = le32(y);
+  if (x & 1n) b[31] |= 0x80;
+  return b;
+};
+const edAdd = ([x1, y1]: Pt, [x2, y2]: Pt): Pt => {
+  const t = md(Dq * x1 * x2 * y1 * y2);
+  return [md((x1 * y2 + y1 * x2) * inv(1n + t)), md((y1 * y2 + x1 * x2) * inv(md(1n - t)))];
+};
+/** [8]P = identity. */
+const edSmallOrder = (p: Pt): boolean => {
+  let q = p;
+  for (let i = 0; i < 3; i++) q = edAdd(q, q);
+  return q[0] === 0n && q[1] === 1n;
+};
 
 /** Deterministic PRNG (mulberry32) so fuzz failures are reproducible. */
 function prng(seed: number) {
@@ -127,6 +147,7 @@ function prng(seed: number) {
   };
   return {
     int: (n: number): number => next() % n,
+    u32: (): number => next(),
     bytes: (n: number): B => {
       const b = new Uint8Array(n);
       for (let i = 0; i < n; i++) b[i] = next() & 0xff;
@@ -135,17 +156,70 @@ function prng(seed: number) {
   };
 }
 
-/** Flips the lowest set-able bit of the last base64url character so the leftover bits become non-zero. */
-const nonCanonical = (s: string): string => {
-  const A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
-  const v = A.indexOf(s[s.length - 1]);
-  return s.slice(0, -1) + A[v ^ 1];
+/** Deterministic byte stream for _setRandomForTests: SHA-256(seed ‖ u32 counter) blocks, one fresh block per call. */
+function detRandom(seed: string): (n: number) => B {
+  let ctr = 0;
+  return (n) => {
+    const out = new Uint8Array(n);
+    for (let o = 0; o < n; o += 32) out.set(sha(cat(s2b(seed), be32(ctr++))).subarray(0, Math.min(32, n - o)), o);
+    return out;
+  };
+}
+/** Runs f with the injected RNG and always restores the CSPRNG. */
+function withRandom<T>(rnd: (n: number) => B, f: () => T): T {
+  P._setRandomForTests(rnd);
+  try {
+    return f();
+  } finally {
+    P._setRandomForTests(null);
+  }
+}
+/** An injected RNG that records every call. */
+const recording = (rnd: (n: number) => B, calls: B[]) => (n: number) => {
+  const b = rnd(n);
+  calls.push(b);
+  return b;
 };
 
-/**
- * Flips one bit at sampled positions of every region and returns the positions where `open` did NOT
- * throw (must be empty). `every` regions are flipped at every byte.
- */
+/** §1.4 sealing, independently: k = HKDF(ss, H(kct), enc("segv.sh/v2/seal", label, ctx)), aad = enc(label, ctx). */
+const refSealKey = (ss: B, kct: B, label: string, ctx: B): B => hkdfN(ss, sha(kct), refEnc("segv.sh/v2/seal", label, ctx));
+function refSeal(pk: B, label: string, ctx: B, pt: B, encapRand: B, nonce: B): B {
+  const { cipherText: kct, sharedSecret: ss } = xwing.encapsulate(pk, encapRand);
+  return cat(kct, nonce, xchacha20poly1305(refSealKey(ss, kct, label, ctx), nonce, refEnc(label, ctx)).encrypt(pt));
+}
+function refOpen(sk: B, label: string, ctx: B, box: B): B {
+  const kct = box.subarray(0, 1120);
+  const ss = xwing.decapsulate(kct, sk);
+  return xchacha20poly1305(refSealKey(ss, kct, label, ctx), box.subarray(1120, 1144), refEnc(label, ctx)).decrypt(
+    box.subarray(1144),
+  );
+}
+
+/** RFC 6962 MTH, computed bottom-up (pair neighbours, promote an odd last node): equivalent to the recursive split. */
+const refLeaf = (d: B): B => sha(cat(Uint8Array.of(0), d));
+const refNode = (l: B, r: B): B => sha(cat(Uint8Array.of(1), l, r));
+function refMth(leafHashes: B[]): B {
+  let level = leafHashes;
+  while (level.length > 1) {
+    const next: B[] = [];
+    for (let i = 0; i + 1 < level.length; i += 2) next.push(refNode(level[i], level[i + 1]));
+    if (level.length % 2) next.push(level[level.length - 1]);
+    level = next;
+  }
+  return level[0];
+}
+
+/** §10.2 difficulty with integers only: base + the smallest k with unit·2^k ≥ bytes, above the unit. */
+const POW_UNIT_REF: Record<P.PowScope, bigint> = { register: 0n, wrap: 0n, put: 4096n, inbox: 4096n, blob: 1n << 20n };
+const refPowDifficulty = (scope: P.PowScope, base: number, bytes: number): number => {
+  const unit = POW_UNIT_REF[scope];
+  if (unit === 0n || BigInt(bytes) <= unit) return base;
+  let k = 0;
+  while (unit << BigInt(k) < BigInt(bytes)) k++;
+  return base + k;
+};
+
+/** Flips one bit at sampled positions of every region; returns the positions where `open` did NOT throw. */
 function survivors(
   body: B,
   regions: { name: string; start: number; end: number; every?: boolean }[],
@@ -167,10 +241,9 @@ function survivors(
     }
     for (const p of pos) {
       const bit = (p * 3 + seed) % 8;
-      const mutated = flip(body, reg.start + p, bit);
       let threw = false;
       try {
-        open(mutated);
+        open(flip(body, reg.start + p, bit));
       } catch (e) {
         threw = e instanceof Error;
       }
@@ -189,9 +262,16 @@ const throwsError = (fn: () => unknown): boolean => {
   }
 };
 
+const nonCanonical = (s: string): string => {
+  const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  return s.slice(0, -1) + A[A.indexOf(s[s.length - 1]) ^ 1];
+};
+
 // ───────────────────────── fixtures ─────────────────────────
 
-const TS = 1_700_000_000_000;
+const TS = 1_780_000_000_000;
+const T0 = 1767639600000;
+const ERA = 604_800_000;
 
 interface TUser {
   AK: B;
@@ -212,888 +292,923 @@ function mkUser(seed: number, handle: string): TUser {
   return { AK, id, uid, uidS: P.b64u(uid), handle, bundle, sig, user: P.verifyBundle(bundle, sig) };
 }
 
-const alice = mkUser(0xa1, 'alice');
-const bob = mkUser(0xb2, 'bob');
-const carol = mkUser(0xc3, 'carol');
+const alice = mkUser(0xa1, "alice");
+const bob = mkUser(0xb2, "bob");
+const carol = mkUser(0xc3, "carol");
 
-const CONV_A = fill(16, 0x0a);
-const CONV_B = fill(16, 0x0b);
-const EK0 = fill(32, 0xe0);
-const EK1 = fill(32, 0xe1);
-const H32 = P.b64u(fill(32, 0x33));
+const CONV = seqBytes(16, 0x60);
+const EK = fill(32, 0xe0);
+const LBL = "segv.sh/v2/test";
 
-function dObj(over: Record<string, unknown> = {}): Record<string, unknown> {
-  return { v: 1, conv: P.b64u(CONV_A), e: 0, members: [alice.uidS, bob.uidS], prev: null, by: alice.uidS, ts: TS, ...over };
-}
-const dText = (over: Record<string, unknown> = {}): string => JSON.stringify(dObj(over));
+/** A real X-Wing ciphertext whose X25519 component (the last 32 bytes) is replaced by `u` (little-endian). */
+const realKct = xwing.encapsulate(bob.id.kemPk, seqBytes(64, 0x10)).cipherText;
+const withX25519 = (u: bigint): B => {
+  const c = realKct.slice();
+  c.set(le32(u), 1088);
+  return c;
+};
+/** Curve25519 u-coordinates of small order (and non-canonical encodings of them), RFC 7748 §7. */
+const LOW_ORDER_U: [string, bigint][] = [
+  ["0 (order 4)", 0n],
+  ["1 (order 1)", 1n],
+  ["p-1 (order 2)", Pq - 1n],
+  ["order 8 (a)", 325606250916557431795983626356110631294008115727848805560023387167927233504n],
+  ["order 8 (b)", 39382357235489614581723060781553021112529911719440698176882885853963445705823n],
+  ["p (= 0, non-canonical)", Pq],
+  ["p+1 (= 1, non-canonical)", Pq + 1n],
+  ["0 with bit 255 set", 1n << 255n],
+];
 
-const payload = (over: Partial<P.Payload> = {}): P.Payload => ({
-  v: 1,
-  t: 'text',
-  conv: P.b64u(CONV_A),
-  e: 0,
-  from: alice.uidS,
-  n: 0,
-  ts: TS + 123,
-  text: 'hello',
-  head: { seq: 1, h: H32 },
-  ...over,
-});
+// ═════════════════════════ 2. cross-checks and round trips ═════════════════════════
 
-const uidN = (i: number): string => P.b64u(Uint8Array.from({ length: 16 }, (_, j) => (j === 0 ? i : 0x77)));
-
-// ═════════════════════════ 2. round trips ═════════════════════════
-
-describe('encoding: integers', () => {
-  it('u8/u16/u32/u64 are big-endian and fixed width', () => {
-    expect(toHex(P.u8(0))).toBe('00');
-    expect(toHex(P.u8(255))).toBe('ff');
-    expect(toHex(P.u16(0x0102))).toBe('0102');
-    expect(toHex(P.u16(0xffff))).toBe('ffff');
-    expect(toHex(P.u32(0xdeadbeef))).toBe('deadbeef');
-    expect(toHex(P.u32(0))).toBe('00000000');
-    expect(toHex(P.u64(0))).toBe('0000000000000000');
-    expect(toHex(P.u64(2 ** 32 + 5))).toBe('0000000100000005');
-    expect(toHex(P.u64(Number.MAX_SAFE_INTEGER))).toBe('001fffffffffffff');
-  });
-
-  it('rejects out-of-range / non-integer values instead of silently truncating', () => {
-    for (const x of [-1, 256, 1.5, NaN, Infinity]) expect(() => P.u8(x), `u8(${x})`).toThrow(Error);
-    for (const x of [-1, 65536, 1.5, NaN]) expect(() => P.u16(x), `u16(${x})`).toThrow(Error);
-    for (const x of [-1, 2 ** 32, 1.5, NaN]) expect(() => P.u32(x), `u32(${x})`).toThrow(Error);
-    for (const x of [-1, 2 ** 53, 1.5, NaN]) expect(() => P.u64(x), `u64(${x})`).toThrow(Error);
-  });
-});
-
-describe('encoding: enc / dec', () => {
-  it('matches hand-computed bytes', () => {
-    expect(toHex(P.enc())).toBe('');
-    expect(toHex(P.enc(''))).toBe('00000000');
-    expect(toHex(P.enc('segv'))).toBe('0000000473656776');
-    expect(toHex(P.enc('a', Uint8Array.of(1, 2)))).toBe('0000000161000000020102');
-    expect(toHex(P.enc('é'))).toBe('00000002c3a9'); // strings are UTF-8 encoded
-    expect(toHex(P.lp(Uint8Array.of(0xff)))).toBe('00000001ff');
-    expect(toHex(P.enc(new Uint8Array(0), new Uint8Array(0)))).toBe('0000000000000000');
-  });
-
-  it('matches the reference encoder', () => {
+describe("encoding (§1.2) and the shared primitives", () => {
+  it("enc matches the spec example and the reference encoder", () => {
+    expect(toHex(P.enc("L", P.u16(5)))).toBe("000000014c000000020005");
     const r = prng(7);
     for (let t = 0; t < 200; t++) {
       const parts = Array.from({ length: r.int(5) }, () => r.bytes(r.int(300)));
       expect(toHex(P.enc(...parts))).toBe(toHex(refEnc(...parts)));
     }
+    expect(toHex(P.enc("é", ""))).toBe(toHex(refEnc("é", "")));
   });
 
-  it('dec inverts enc for any field count', () => {
-    const r = prng(8);
-    for (let t = 0; t < 200; t++) {
-      const parts = Array.from({ length: r.int(6) }, () => r.bytes(r.int(100)));
-      const got = P.dec(P.enc(...parts), parts.length);
-      expect(got.map(toHex)).toEqual(parts.map(toHex));
-    }
+  it("t16 / t8 copy the first 16 / 8 bytes; ZERO16 / ZERO32", () => {
+    const x = seqBytes(32);
+    expect(toHex(P.t16(x))).toBe(toHex(seqBytes(16)));
+    expect(toHex(P.t8(x))).toBe(toHex(seqBytes(8)));
+    P.t16(x)[0] = 0xff;
+    P.t8(x)[0] = 0xff;
+    expect(x[0]).toBe(0);
+    expect(toHex(P.ZERO16)).toBe("00".repeat(16));
+    expect(toHex(P.ZERO32)).toBe("00".repeat(32));
   });
 
-  it('dec works on a subarray with a non-zero byteOffset', () => {
-    const inner = P.enc('abc', Uint8Array.of(9));
-    const outer = cat(Uint8Array.of(0xaa, 0xbb, 0xcc), inner, Uint8Array.of(0xdd));
-    const view = outer.subarray(3, 3 + inner.length);
-    expect(P.dec(view, 2).map(toHex)).toEqual(['616263', '09']);
+  it("primitive sizes and a SHA-256 vector (§1.1)", () => {
+    expect(toHex(P.H(s2b("abc")))).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    expect([P.KEM_PK_LEN, P.KEM_CT_LEN, P.NONCE_LEN, P.TAG_LEN, P.WRAP_LEN]).toEqual([1216, 1120, 24, 16, 1192]);
   });
 
-  it('dec rejects malformed input', () => {
-    const good = P.enc('ab', 'c');
-    expect(() => P.dec(good, 1)).toThrow(/trailing/); // too few fields requested
-    expect(() => P.dec(good, 3)).toThrow(/truncated/); // too many fields requested
-    expect(() => P.dec(good.subarray(0, good.length - 1), 2)).toThrow(/truncated/);
-    expect(() => P.dec(cat(good, Uint8Array.of(0)), 2)).toThrow(/trailing/);
-    expect(() => P.dec(Uint8Array.of(0, 0, 0), 1)).toThrow(/truncated/); // short length prefix
-    expect(() => P.dec(Uint8Array.of(0xff, 0xff, 0xff, 0xff, 1), 1)).toThrow(/truncated/); // 4 GiB length
-    expect(() => P.dec(Uint8Array.of(0, 0, 0, 5, 1, 2), 1)).toThrow(/truncated/);
-    expect(P.dec(new Uint8Array(0), 0)).toEqual([]);
-    expect(() => P.dec(Uint8Array.of(0), 0)).toThrow(/trailing/);
-  });
-});
-
-describe('encoding: b64u', () => {
-  it('RFC 4648 §10 vectors (url alphabet, no padding)', () => {
-    const v: [string, string][] = [
-      ['', ''],
-      ['f', 'Zg'],
-      ['fo', 'Zm8'],
-      ['foo', 'Zm9v'],
-      ['foob', 'Zm9vYg'],
-      ['fooba', 'Zm9vYmE'],
-      ['foobar', 'Zm9vYmFy'],
-    ];
-    for (const [plain, enc] of v) {
-      expect(P.b64u(s2b(plain))).toBe(enc);
-      expect(P.fromUtf8(P.fromB64u(enc))).toBe(plain);
-    }
-    // url-safe characters: 0xfb 0xef 0xbe -> 111110 111110 111110 111110 -> "----"
-    expect(P.b64u(Uint8Array.of(0xfb, 0xef, 0xbe))).toBe('----');
-    expect(P.b64u(Uint8Array.of(0xff, 0xff, 0xff))).toBe('____');
-    expect(P.b64u(Uint8Array.of(0xfb, 0xff))).toBe('-_8');
-  });
-
-  it('round-trips every length 0..64 and agrees with Node base64url', () => {
-    const r = prng(9);
-    for (let n = 0; n <= 64; n++) {
-      for (let t = 0; t < 4; t++) {
-        const b = t === 0 ? fill(n, 0xff) : t === 1 ? new Uint8Array(n) : r.bytes(n);
-        const s = P.b64u(b);
-        expect(s).toBe(Buffer.from(b).toString('base64url'));
-        expect(s).toMatch(/^[A-Za-z0-9_-]*$/);
-        expect(toHex(P.fromB64u(s))).toBe(toHex(b));
-      }
-    }
-  });
-
-  it('rejects non-canonical encodings, padding and bad characters', () => {
-    expect(() => P.fromB64u('Zh')).toThrow(); // 'f' is "Zg": leftover bits must be zero
-    expect(() => P.fromB64u('Zm9')).toThrow(); // "fo" is "Zm8"
-    expect(() => P.fromB64u('Zg==')).toThrow(); // padding
-    expect(() => P.fromB64u('Zg=')).toThrow();
-    expect(() => P.fromB64u('Z')).toThrow(); // length % 4 == 1
-    expect(() => P.fromB64u('Zm9vY')).toThrow();
-    for (const bad of ['Zm+v', 'Zm/v', 'Zm v', 'Zm\nv', 'Zm.v', 'Zm9v\0', 'Zmé9', 'Z\u{1F600}', 'Ｚｇ']) {
-      expect(() => P.fromB64u(bad), JSON.stringify(bad)).toThrow();
-    }
-    for (const notString of [null, undefined, 5, {}, []]) expect(() => P.fromB64u(notString as unknown as string)).toThrow();
-    for (let n = 1; n <= 40; n++) {
-      if (n % 3 === 0) continue; // no leftover bits
-      const s = P.b64u(seqBytes(n, 0x10));
-      expect(() => P.fromB64u(nonCanonical(s)), `len ${n}`).toThrow();
-    }
-  });
-});
-
-describe('encoding: misc helpers', () => {
-  it('hex, equalBytes, concat, trunc16', () => {
-    expect(P.hex(Uint8Array.of(0, 15, 255))).toBe('000fff');
-    expect(P.equalBytes(Uint8Array.of(1, 2), Uint8Array.of(1, 2))).toBe(true);
-    expect(P.equalBytes(Uint8Array.of(1, 2), Uint8Array.of(1, 3))).toBe(false);
-    expect(P.equalBytes(Uint8Array.of(1, 2), Uint8Array.of(1, 2, 0))).toBe(false);
-    expect(P.equalBytes(new Uint8Array(0), new Uint8Array(0))).toBe(true);
-    expect(toHex(P.concat(Uint8Array.of(1), new Uint8Array(0), Uint8Array.of(2, 3)))).toBe('010203');
-    const t = P.trunc16(seqBytes(32));
-    expect(toHex(t)).toBe(toHex(seqBytes(16)));
-    const src = seqBytes(32);
-    P.trunc16(src)[0] = 0xff; // trunc16 copies
-    expect(src[0]).toBe(0);
-  });
-
-  it('utf8 / fromUtf8 round trip and reject invalid UTF-8', () => {
-    for (const s of ['', 'abc', 'é', '日本語', '\u{1F600}', 'a\u0000b']) expect(P.fromUtf8(P.utf8(s))).toBe(s);
-    expect(() => P.fromUtf8(Uint8Array.of(0xff))).toThrow(Error);
-    expect(() => P.fromUtf8(Uint8Array.of(0xc3))).toThrow(Error); // truncated sequence
-    expect(() => P.fromUtf8(Uint8Array.of(0xed, 0xa0, 0x80))).toThrow(Error); // lone surrogate
-    expect(() => P.fromUtf8(Uint8Array.of(0xc0, 0xaf))).toThrow(Error); // overlong '/'
-  });
-});
-
-describe('primitives match standards / node:crypto', () => {
-  it('H = SHA-256 (FIPS 180 "abc")', () => {
-    expect(toHex(P.H(s2b('abc')))).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
-  });
-
-  it('HMAC = HMAC-SHA-256 (RFC 4231 case 2)', () => {
-    expect(toHex(P.HMAC(s2b('Jefe'), s2b('what do ya want for nothing?')))).toBe(
-      '5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843',
-    );
-  });
-
-  it('HKDF = HKDF-SHA-256 (RFC 5869 case 1) and matches node for empty salt', () => {
-    const okm = P.HKDF(fill(22, 0x0b), seqBytes(13), seqBytes(10, 0xf0), 42);
-    expect(toHex(okm)).toBe('3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865');
-    expect(toHex(okm)).toBe(toHex(hkdfN(fill(22, 0x0b), seqBytes(13), seqBytes(10, 0xf0), 42)));
-    expect(toHex(P.HKDF(seqBytes(32), '', 'segv.sh/v1/id/ed25519'))).toBe(toHex(hkdfN(seqBytes(32), '', 'segv.sh/v1/id/ed25519')));
-    expect(P.HKDF(seqBytes(32), '', 'x').length).toBe(32);
-  });
-
-  it('Ed25519 sign/verify = RFC 8032 test 1 and agrees with node', () => {
-    const sk = fromHex('9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60');
-    const pk = P.sigPub(sk);
-    expect(toHex(pk)).toBe('d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a');
-    const sig = P.sign(new Uint8Array(0), sk);
-    expect(toHex(sig)).toBe(
-      'e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b',
-    );
-    expect(P.verify(sig, new Uint8Array(0), pk)).toBe(true);
-    expect(nodeEdVerify(sig, new Uint8Array(0), pk)).toBe(true);
-  });
-
-  it('verify() fails closed on malformed inputs', () => {
-    const msg = s2b('m');
-    const sig = P.sign(msg, alice.id.sigSk);
-    expect(P.verify(sig.subarray(0, 63), msg, alice.id.sigPk)).toBe(false);
-    expect(P.verify(cat(sig, Uint8Array.of(0)), msg, alice.id.sigPk)).toBe(false);
-    expect(P.verify(sig, msg, alice.id.sigPk.subarray(0, 31))).toBe(false);
-    expect(P.verify(sig, msg, fill(32, 0xff))).toBe(false); // not a point
-    expect(P.verify(new Uint8Array(64), msg, alice.id.sigPk)).toBe(false);
-  });
-
-  it('X25519 = RFC 7748 §6.1', () => {
-    const a = fromHex('77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a');
-    const b = fromHex('5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb');
-    expect(toHex(x25519.getPublicKey(a))).toBe('8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a');
-    const s = '4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742';
-    expect(toHex(x25519.getSharedSecret(a, x25519.getPublicKey(b)))).toBe(s);
-    expect(toHex(nodeX25519(b, x25519.getPublicKey(a)))).toBe(s);
-  });
-
-  it('AEAD is XChaCha20-Poly1305 with layout nonce || ct || tag (draft-irtf-cfrg-xchacha A.3.1)', () => {
-    const key = seqBytes(32, 0x80);
-    const nonce = seqBytes(24, 0x40);
-    const aad = fromHex('50515253c0c1c2c3c4c5c6c7');
-    const pt =
-      "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
-    const ct =
-      'bd6d179d3e83d43b9576579493c0e939572a1700252bfaccbed2902c21396cbb731c7f1b0b4aa6440bf3a82f4eda7e39ae64c6708c54c216cb96b72e1213b4522f8c9ba40db5d945b11b69b982c1bb9e3f3fac2bc369488f76b2383565d3fff921f9664c97637da9768812f615c68b13b52e';
-    const tag = 'c0875924c1c7987947deafd8780acf49';
-    expect(P.fromUtf8(P.aeadOpen(key, cat(nonce, fromHex(ct + tag)), aad))).toBe(pt);
-  });
-
-  it('aeadSeal uses a fresh random 24-byte nonce', () => {
+  it("_setRandomForTests drives random(), aeadSeal nonces, KEM encapsulation and recovery codes; null restores", () => {
     const k = fill(32, 1);
-    const a = P.aeadSeal(k, s2b('x'), new Uint8Array(0));
-    const b = P.aeadSeal(k, s2b('x'), new Uint8Array(0));
-    expect(a.length).toBe(24 + 1 + 16);
-    expect(toHex(a.subarray(0, 24))).not.toBe(toHex(b.subarray(0, 24)));
-    expect(toHex(P.aeadOpen(k, a, new Uint8Array(0)))).toBe('78');
-    expect(() => P.aeadOpen(k, a.subarray(0, 39), new Uint8Array(0))).toThrow(/short/);
-    expect(() => P.aeadOpen(k, a, Uint8Array.of(0))).toThrow();
-  });
-
-  it('kemKeygen is deterministic X-Wing with the documented sizes', () => {
-    const a = P.kemKeygen(fill(32, 1));
-    const b = P.kemKeygen(fill(32, 1));
-    const c = P.kemKeygen(fill(32, 2));
-    expect(a.pk.length).toBe(P.KEM_PK_LEN);
-    expect(a.sk.length).toBe(32);
-    expect(toHex(a.pk)).toBe(toHex(b.pk));
-    expect(toHex(a.pk)).not.toBe(toHex(c.pk));
-    const { cipherText, sharedSecret } = xwing.encapsulate(a.pk);
-    expect(cipherText.length).toBe(P.KEM_CT_LEN);
-    expect(toHex(xwing.decapsulate(cipherText, a.sk))).toBe(toHex(sharedSecret));
+    const kp = P.kemKeygen(fill(32, 2));
+    withRandom(
+      (n) => fill(n, 0x42),
+      () => {
+        expect(toHex(P.random(3))).toBe("424242");
+        expect(toHex(P.newRecoveryCode())).toBe("42".repeat(20));
+        const box = P.aeadSeal(k, s2b("x"), new Uint8Array(0));
+        expect(toHex(box.subarray(0, 24))).toBe("42".repeat(24));
+        expect(toHex(P.aeadOpen(k, box, new Uint8Array(0)))).toBe("78");
+        const { kct, ss } = P.kemEncap(kp.pk);
+        const ref = xwing.encapsulate(kp.pk, fill(64, 0x42));
+        expect(toHex(kct)).toBe(toHex(ref.cipherText));
+        expect(toHex(ss)).toBe(toHex(ref.sharedSecret));
+        expect(toHex(P.kemDecap(kct, kp.sk))).toBe(toHex(ss));
+      },
+    );
+    expect(toHex(P.random(16))).not.toBe(toHex(P.random(16)));
+    expect(P.newRecoveryCode().length).toBe(20);
   });
 });
 
-describe('padding', () => {
-  it('pad picks the smallest class >= len+1 (exact boundaries)', () => {
-    const cases: [number, number][] = [
-      [0, 1024],
-      [255, 1024],
-      [256, 1024],
-      [1023, 1024],
-      [1024, 4096],
-      [4095, 4096],
-      [4096, 16384],
-      [16383, 16384],
+describe("time and eras (§3.1)", () => {
+  it("T0 is Monday 2026-01-05 19:00 UTC (Tuesday 04:00 JST); ERA_MS is one week; NONE is (0xFFFF, 0xFFFFFFFF)", () => {
+    expect(P.T0_MS).toBe(Date.UTC(2026, 0, 5, 19, 0, 0));
+    expect(P.T0_MS).toBe(T0);
+    expect(new Date(P.T0_MS).getUTCDay()).toBe(1);
+    const jst = new Date(P.T0_MS + 9 * 3600_000);
+    expect([jst.getUTCDay(), jst.getUTCHours(), jst.getUTCMinutes()]).toEqual([2, 4, 0]);
+    expect(P.ERA_MS).toBe(7 * 24 * 3600 * 1000);
+    expect([P.ERA_NONE, P.N_NONE]).toEqual([0xffff, 0xffffffff]);
+    expect({ ...P.NONE }).toEqual({ E: 0xffff, n: 0xffffffff });
+    expect(Object.isFrozen(P.NONE)).toBe(true);
+    expect(P.isNone(P.NONE)).toBe(true);
+    expect(P.isNone({ E: 0xffff, n: 0 })).toBe(false);
+    expect(P.isNone({ E: 0, n: 0xffffffff })).toBe(false);
+  });
+
+  it("era boundaries at T0, T0 + ERA_MS − 1 and T0 + ERA_MS; the reserved era and times before T0 throw", () => {
+    expect(P.era(T0)).toBe(0);
+    expect(P.era(T0 + ERA - 1)).toBe(0);
+    expect(P.era(T0 + ERA)).toBe(1);
+    expect(P.era(T0 + 2 * ERA - 1)).toBe(1);
+    expect(P.era(T0 + 2 * ERA)).toBe(2);
+    expect(P.era(T0 + 0xfffe * ERA)).toBe(0xfffe);
+    expect(P.era(T0 + 0xffff * ERA - 1)).toBe(0xfffe);
+    for (const ms of [T0 - 1, T0 - ERA, 0, T0 + 0xffff * ERA, T0 + 0x10000 * ERA, NaN, Infinity, -Infinity]) {
+      expect(() => P.era(ms), String(ms)).toThrow(/era/);
+    }
+    // start(E) = T0 + E·ERA_MS, end(E) = start(E + 1)
+    for (const E of [0, 1, 2, 41, 0xfffe]) {
+      expect(P.eraStart(E)).toBe(T0 + E * ERA);
+      expect(P.eraEnd(E)).toBe(P.eraStart(E + 1));
+      expect(P.era(P.eraStart(E))).toBe(E);
+      expect(P.era(P.eraEnd(E) - 1)).toBe(E);
+    }
+    // against a BigInt reference
+    const r = prng(31);
+    for (let i = 0; i < 500; i++) {
+      const ms = T0 + r.u32() * 1000 + r.int(1000);
+      expect(P.era(ms)).toBe(Number((BigInt(ms) - BigInt(T0)) / BigInt(ERA)));
+    }
+  });
+
+  it("sec is ⌊(ms − T0) / 1000⌋ as a u32", () => {
+    expect(P.secOf(T0)).toBe(0);
+    expect(P.secOf(T0 + 999)).toBe(0);
+    expect(P.secOf(T0 + 1000)).toBe(1);
+    expect(P.secOf(T0 + ERA)).toBe(604800);
+    expect(P.secOf(T0 + 0xffffffff * 1000 + 999)).toBe(0xffffffff);
+    for (const ms of [T0 - 1, T0 + 2 ** 32 * 1000, NaN]) expect(() => P.secOf(ms), String(ms)).toThrow(/sec/);
+    for (const s of [0, 1, 604800, 0xffffffff]) expect(P.secOf(P.msOfSec(s))).toBe(s);
+    expect(P.msOfSec(10)).toBe(T0 + 10_000);
+  });
+
+  it("tpub = ⌊sec / Δ⌋ · Δ for Δ ∈ {1, 10}", () => {
+    const cases: [number, number, number][] = [
+      [T0, 1, 0],
+      [T0, 10, 0],
+      [T0 + 999, 1, 0],
+      [T0 + 1000, 1, 1],
+      [T0 + 9999, 10, 0],
+      [T0 + 10_000, 10, 10],
+      [T0 + 19_999, 10, 10],
+      [T0 + 20_000, 10, 20],
+      [T0 + 12_345, 1, 12],
+      [T0 + 12_345, 10, 10],
+      [T0 + ERA - 1, 1, 604799],
+      [T0 + ERA - 1, 10, 604790],
+      [T0 + ERA, 1, 604800],
+      [T0 + ERA, 10, 604800],
     ];
-    for (const [n, cls] of cases) {
-      const x = fill(n, 0xab);
-      const p = P.pad(x, P.MSG_CLASSES);
-      expect(p.length, `len ${n}`).toBe(cls);
-      expect(p[n]).toBe(0x80);
-      expect(p.subarray(n + 1).every((v) => v === 0)).toBe(true);
-      expect(toHex(p)).toBe(toHex(refPad(x, P.MSG_CLASSES)));
-      expect(toHex(P.unpad(p))).toBe(toHex(x));
-    }
-    expect(() => P.pad(new Uint8Array(16384), P.MSG_CLASSES)).toThrow(/too large/);
-    // Invites have a single class: anything that needs more than 2048 bytes cannot be sent at all.
-    expect(P.pad(new Uint8Array(0), P.INV_CLASSES).length).toBe(2048);
-    expect(P.pad(new Uint8Array(2047), P.INV_CLASSES).length).toBe(2048);
-    expect(() => P.pad(new Uint8Array(2048), P.INV_CLASSES)).toThrow(/too large/);
-    expect(() => P.pad(new Uint8Array(16383), P.INV_CLASSES)).toThrow(/too large/);
-  });
-
-  it('size classes are exactly kind 4: 1024 | 4096 | 16384 (no 256), kind 3: 2048 (no 16384)', () => {
-    expect([...P.MSG_CLASSES]).toEqual([1024, 4096, 16384]);
-    expect([...P.INV_CLASSES]).toEqual([2048]);
-    expect(P.MSG_BODY_LENS).toEqual([24 + 1024 + 16, 24 + 4096 + 16, 24 + 16384 + 16]);
-    expect(P.INV_BODY_LENS).toEqual([32 + 1120 + 24 + 2048 + 16]);
-    // the retired classes are gone
-    expect(P.MSG_BODY_LENS).not.toContain(24 + 256 + 16);
-    expect(P.INV_BODY_LENS).not.toContain(32 + 1120 + 24 + 16384 + 16);
-    // the empty payload lands in the smallest class
-    expect(P.pad(new Uint8Array(0), P.MSG_CLASSES).length).toBe(1024);
-  });
-
-  it('unpad round-trips data that itself ends in 0x00 or 0x80', () => {
-    for (const x of [Uint8Array.of(0), Uint8Array.of(0x80), Uint8Array.of(1, 0x80, 0), Uint8Array.of(0x80, 0x80), new Uint8Array(0)]) {
-      expect(toHex(P.unpad(P.pad(x, P.MSG_CLASSES)))).toBe(toHex(x));
-      expect(toHex(P.unpad(P.padme(x)))).toBe(toHex(x));
-    }
-  });
-
-  it('unpad rejects missing / wrong markers', () => {
-    expect(() => P.unpad(new Uint8Array(0))).toThrow(/bad padding/);
-    expect(() => P.unpad(new Uint8Array(256))).toThrow(/bad padding/);
-    expect(() => P.unpad(Uint8Array.of(1, 2, 3))).toThrow(/bad padding/);
-    expect(() => P.unpad(Uint8Array.of(0x80, 0x01))).toThrow(/bad padding/);
-    expect(() => P.unpad(Uint8Array.of(0x80, 0x01, 0))).toThrow(/bad padding/);
-    expect(() => P.unpad(Uint8Array.of(0x81, 0))).toThrow(/bad padding/);
-    expect(toHex(P.unpad(Uint8Array.of(0x80)))).toBe('');
-  });
-
-  it('padmeLength matches the exact integer formula for every L in 0..70000', () => {
-    for (let L = 0; L <= 70000; L++) {
-      const got = P.padmeLength(L);
-      if (got !== refPadmeLength(L)) expect(got, `L=${L}`).toBe(refPadmeLength(L));
-    }
-  });
-
-  it('padmeLength is exact at power-of-two boundaries up to 2^40', () => {
-    for (let k = 1; k <= 40; k++) {
-      for (const d of [-2, -1, 0, 1, 2]) {
-        const L = 2 ** k + d;
-        if (L < 0) continue;
-        expect(P.padmeLength(L), `L=2^${k}${d >= 0 ? '+' : ''}${d}`).toBe(refPadmeLength(L));
+    for (const [ms, d, want] of cases) expect(P.tpub(ms, d), `tpub(T0 + ${ms - T0}, ${d})`).toBe(want);
+    const r = prng(32);
+    for (let i = 0; i < 500; i++) {
+      const ms = T0 + r.int(2 ** 31) * 1000 + r.int(1000);
+      for (const d of [1, 10]) {
+        const want = ((BigInt(ms) - BigInt(T0)) / 1000n / BigInt(d)) * BigInt(d);
+        expect(P.tpub(ms, d)).toBe(Number(want));
       }
     }
-    // Hand-computed: L=9: E=3,S=2,z=1 -> 10; L=100: E=6,S=3,z=3 -> 104; L=1000: E=9,S=4,z=5 -> 1024.
-    expect([0, 1, 2, 3, 9, 100, 1000, 8 * 1024 * 1024 + 1].map(P.padmeLength)).toEqual([0, 1, 2, 3, 10, 104, 1024, 8650752]);
+    for (const d of [0, -1, 1.5, 0x10000, NaN]) expect(() => P.tpub(T0, d), String(d)).toThrow(/delta/);
+    expect(P.floorDelta(19, 10)).toBe(10);
+    expect(P.floorDelta(19, 0xffff)).toBe(0);
+    expect(P.floorDelta(0x1ffff, 0xffff)).toBe(0x1fffe);
   });
 
-  it('padmeLength is monotone, idempotent and leaks at most ~12%', () => {
-    let prev = 0;
-    for (let L = 2; L <= 20000; L++) {
-      const p = P.padmeLength(L);
-      expect(p >= L && p >= prev).toBe(true);
-      expect(P.padmeLength(p)).toBe(p);
-      expect((p - L) / L).toBeLessThanOrEqual(0.12);
-      prev = p;
-    }
-  });
-
-  it('padme output length = Padmé(len+1) with a 0x80 marker', () => {
-    for (const n of [0, 1, 2, 7, 8, 9, 63, 64, 1000, 4096, 100000]) {
-      const x = fill(n, 0x5a);
-      const p = P.padme(x);
-      expect(p.length).toBe(refPadmeLength(n + 1));
-      expect(p[n]).toBe(0x80);
-      expect(toHex(P.unpad(p))).toBe(toHex(x));
-    }
-  });
-});
-
-describe('accounts: identity derivation', () => {
-  it('is deterministic and follows §2.1 exactly', () => {
-    const AK = seqBytes(32);
-    const a = P.deriveIdentity(AK);
-    const b = P.deriveIdentity(AK.slice());
-    for (const k of ['sigSk', 'sigPk', 'kemSk', 'kemPk', 'scanSk', 'scanPk'] as const) expect(toHex(a[k])).toBe(toHex(b[k]));
-    expect(toHex(a.sigSk)).toBe(toHex(hkdfN(AK, '', 'segv.sh/v1/id/ed25519')));
-    expect(toHex(a.scanSk)).toBe(toHex(hkdfN(AK, '', 'segv.sh/v1/id/scan')));
-    expect(toHex(a.kemPk)).toBe(toHex(xwing.keygen(hkdfN(AK, '', 'segv.sh/v1/id/xwing')).publicKey));
-    expect(toHex(a.sigPk)).toBe(toHex(nodeRawPub(ED_PKCS8, a.sigSk)));
-    expect(toHex(a.scanPk)).toBe(toHex(nodeRawPub(X_PKCS8, a.scanSk)));
-    expect([a.sigSk.length, a.sigPk.length, a.kemSk.length, a.kemPk.length, a.scanSk.length, a.scanPk.length]).toEqual([
-      32, 32, 32, 1216, 32, 32,
-    ]);
-  });
-
-  it('different AKs give unrelated keys; the three secrets are distinct', () => {
-    const a = P.deriveIdentity(fill(32, 1));
-    const b = P.deriveIdentity(flip(fill(32, 1), 31, 7));
-    expect(toHex(a.sigPk)).not.toBe(toHex(b.sigPk));
-    expect(toHex(a.kemPk)).not.toBe(toHex(b.kemPk));
-    expect(toHex(a.scanPk)).not.toBe(toHex(b.scanPk));
-    expect(new Set([toHex(a.sigSk), toHex(a.scanSk), toHex(a.kemSk)]).size).toBe(3);
-  });
-
-  it('rejects AKs that are not 32 bytes', () => {
-    for (const n of [0, 16, 31, 33, 64]) expect(() => P.deriveIdentity(new Uint8Array(n))).toThrow(/32 bytes/);
-  });
-});
-
-describe('accounts: bundles', () => {
-  it('make -> verify -> parse round trip with the exact §2.2 JSON', () => {
-    const u = alice.user;
-    expect(u.uid).toBe(alice.uidS);
-    expect(u.handle).toBe('alice');
-    expect(toHex(u.sigPk)).toBe(toHex(alice.id.sigPk));
-    expect(toHex(u.kemPk)).toBe(toHex(alice.id.kemPk));
-    expect(toHex(u.scanPk)).toBe(toHex(alice.id.scanPk));
-    expect(u.bundle).toBe(alice.bundle);
-    expect(u.bundleSig).toBe(alice.sig);
-    expect(u.ts).toBe(TS + 0xa1);
-    expect(alice.bundle).toBe(
-      JSON.stringify({
-        v: 1,
-        uid: alice.uidS,
-        handle: 'alice',
-        sig: P.b64u(alice.id.sigPk),
-        kem: P.b64u(alice.id.kemPk),
-        scan: P.b64u(alice.id.scanPk),
-        ts: TS + 0xa1,
-      }),
-    );
-    // Signature is over enc("segv.sh/v1/bundle", bundleBytes), checked with an independent verifier.
-    expect(nodeEdVerify(P.fromB64u(alice.sig), refEnc('segv.sh/v1/bundle', alice.bundle), alice.id.sigPk)).toBe(true);
-    expect(P.parseBundle(alice.bundle, alice.sig).uid).toBe(alice.uidS);
-  });
-
-  it('makeBundle validates its inputs', () => {
-    const id = alice.id;
-    for (const h of ['al', 'Alice', 'a'.repeat(21), 'al-ice', 'al ice', 'ålice', 'alice\n', '', 'al.ice']) {
-      expect(() => P.makeBundle(alice.uid, h, id, TS), JSON.stringify(h)).toThrow(/handle/);
-    }
-    for (const h of ['abc', 'a'.repeat(20), 'a_b_9', '___', '012']) expect(() => P.makeBundle(alice.uid, h, id, TS)).not.toThrow();
-    expect(() => P.makeBundle(new Uint8Array(15), 'alice', id, TS)).toThrow(/uid/);
-    expect(() => P.makeBundle(new Uint8Array(17), 'alice', id, TS)).toThrow(/uid/);
-  });
-
-  it('parseBundle rejects every malformed field', () => {
-    const base = JSON.parse(alice.bundle) as Record<string, unknown>;
-    const mut = (over: Record<string, unknown>) => JSON.stringify({ ...base, ...over });
-    const bad: [string, string, string?][] = [
-      ['not JSON', '{'],
-      ['array', '[]'],
-      ['null', 'null'],
-      ['v=2', mut({ v: 2 })],
-      ['v missing', mut({ v: undefined })],
-      ['uid 15 bytes', mut({ uid: P.b64u(new Uint8Array(15)) })],
-      ['uid non-canonical', mut({ uid: nonCanonical(alice.uidS) })],
-      ['uid missing', mut({ uid: undefined })],
-      ['handle uppercase', mut({ handle: 'Alice' })],
-      ['handle short', mut({ handle: 'ab' })],
-      ['handle number', mut({ handle: 123 })],
-      ['sig 31 bytes', mut({ sig: P.b64u(new Uint8Array(31)) })],
-      ['kem 1215 bytes', mut({ kem: P.b64u(new Uint8Array(1215)) })],
-      ['scan 33 bytes', mut({ scan: P.b64u(new Uint8Array(33)) })],
-      ['scan missing', mut({ scan: undefined })],
-      ['ts negative', mut({ ts: -1 })],
-      ['ts float', mut({ ts: 1.5 })],
-      ['ts string', mut({ ts: '1' })],
-      ['ts unsafe', mut({ ts: 2 ** 53 })],
-      ['signature 63 bytes', alice.bundle, P.b64u(new Uint8Array(63))],
-      ['signature not b64u', alice.bundle, '!!'],
+  it("posCmp orders (E, n) lexicographically, with NONE before every real position", () => {
+    const N = P.NONE;
+    const real: P.Pos[] = [
+      { E: 0, n: 0 },
+      { E: 0, n: 5 },
+      { E: 0, n: 0xffffffff },
+      { E: 1, n: 0 },
+      { E: 1, n: 0xffffffff },
+      { E: 0xfffe, n: 0xffffffff },
     ];
-    for (const [name, text, sig] of bad) expect(() => P.parseBundle(text, sig ?? alice.sig), name).toThrow(Error);
-  });
-
-  it('verifyBundle: signature binds the exact bytes', () => {
-    // modified handle, re-serialised
-    const tampered = alice.bundle.replace('"handle":"alice"', '"handle":"alicf"');
-    expect(tampered).not.toBe(alice.bundle);
-    expect(() => P.parseBundle(tampered, alice.sig)).not.toThrow();
-    expect(() => P.verifyBundle(tampered, alice.sig)).toThrow(/signature/);
-    // same JSON value, different bytes (whitespace) -> must fail: nobody re-serialises signed JSON
-    const spaced = JSON.stringify(JSON.parse(alice.bundle), null, 1);
-    expect(() => P.verifyBundle(spaced, alice.sig)).toThrow(/signature/);
-    // another user's valid signature
-    expect(() => P.verifyBundle(alice.bundle, bob.sig)).toThrow(/signature/);
-    // bundle claiming alice's keys but signed by bob
-    const forged = P.b64u(P.sign(P.bundleSigMsg(alice.bundle), bob.id.sigSk));
-    expect(() => P.verifyBundle(alice.bundle, forged)).toThrow(/signature/);
-    // signature over the bundle without the domain label
-    const noLabel = P.b64u(P.sign(P.utf8(alice.bundle), alice.id.sigSk));
-    expect(() => P.verifyBundle(alice.bundle, noLabel)).toThrow(/signature/);
-  });
-
-  it('fingerprint: format and binding to every key', () => {
-    const fp = P.fingerprint(alice.user);
-    expect(fp).toMatch(/^\d{5}( \d{5}){5}$/);
-    expect(P.fingerprint(alice.user)).toBe(fp);
-    expect(P.fingerprint(bob.user)).not.toBe(fp);
-    expect(P.fingerprint({ ...alice.user, uid: bob.uidS })).not.toBe(fp);
-    expect(P.fingerprint({ ...alice.user, sigPk: bob.user.sigPk })).not.toBe(fp);
-    expect(P.fingerprint({ ...alice.user, kemPk: bob.user.kemPk })).not.toBe(fp);
-    expect(P.fingerprint({ ...alice.user, scanPk: bob.user.scanPk })).not.toBe(fp);
-    // independent computation: group k = u40(fp[5k..5k+5]) mod 100000
-    const h = sha(refEnc('segv.sh/v1/fp', alice.uid, alice.id.sigPk, alice.id.kemPk, alice.id.scanPk));
-    const groups = Array.from({ length: 6 }, (_, k) =>
-      String(BigInt('0x' + toHex(h.subarray(5 * k, 5 * k + 5))) % 100000n).padStart(5, '0'),
-    );
-    expect(fp).toBe(groups.join(' '));
+    expect(P.posCmp(N, N)).toBe(0);
+    expect(P.posCmp(N, { E: 0xffff, n: 0xffffffff })).toBe(0);
+    for (const p of real) {
+      expect(P.posCmp(N, p)).toBeLessThan(0);
+      expect(P.posCmp(p, N)).toBeGreaterThan(0);
+      expect(P.posCmp(p, { ...p })).toBe(0);
+    }
+    for (let i = 0; i < real.length; i++)
+      for (let j = 0; j < real.length; j++) expect(Math.sign(P.posCmp(real[i], real[j])), `${i} vs ${j}`).toBe(Math.sign(i - j));
+    const shuffled = [real[3], N, real[5], real[0], real[2], real[1], real[4]];
+    expect(shuffled.sort(P.posCmp)).toEqual([N, ...real]);
+    // against a BigInt reference key
+    const key = (p: P.Pos): bigint => (P.isNone(p) ? -1n : (BigInt(p.E) << 32n) | BigInt(p.n));
+    const r = prng(33);
+    const rnd = (): P.Pos => (r.int(10) === 0 ? N : { E: r.int(4), n: r.int(3) === 0 ? 0xffffffff : r.int(4) });
+    for (let i = 0; i < 500; i++) {
+      const a = rnd();
+      const b = rnd();
+      const k = key(a) - key(b);
+      expect(Math.sign(P.posCmp(a, b))).toBe(k === 0n ? 0 : k < 0n ? -1 : 1);
+    }
   });
 });
 
-describe('sealing (KEM-DEM, §2.3)', () => {
+describe("size classes (§3.2)", () => {
+  it("CLASSES, BODY_LENS = 296 / 1064 / 4136 / 16424 and the fixed object lengths", () => {
+    expect([...P.CLASSES]).toEqual([256, 1024, 4096, 16384]);
+    expect([...P.BODY_LENS]).toEqual([296, 1064, 4136, 16424]);
+    expect(P.ROW_OVERHEAD).toBe(40);
+    expect(P.MAX_CLS).toBe(3);
+    expect(P.SEAL_OVERHEAD).toBe(1120 + 24 + 16);
+    expect(P.INBOX_BODY_LEN).toBe(1416);
+    expect(P.INBOX_BODY_LEN).toBe(1120 + 24 + 256 + 16);
+    expect([P.SGB2_HEADER_LEN, P.SGB2_DESC_LEN, P.SGB2_ENTRY_LEN]).toEqual([16, 2088, 1192]);
+    expect([...P.SGB2_SIZES]).toEqual([11640, 40248]);
+    expect([P.sgb2Size(8), P.sgb2Size(32)]).toEqual([16 + 2088 + 8 * 1192, 16 + 2088 + 32 * 1192]);
+    // a key wrap and an SGB2 entry are a seal of 32 bytes
+    expect(P.SGB2_ENTRY_LEN).toBe(P.WRAP_LEN);
+    expect(P.SEAL_OVERHEAD + 32).toBe(1192);
+  });
+
+  it("clsOfBodyLen maps exactly the four body lengths", () => {
+    expect([296, 1064, 4136, 16424].map(P.clsOfBodyLen)).toEqual([0, 1, 2, 3]);
+    for (const n of [0, 40, 256, 295, 297, 1024, 1063, 1065, 1416, 4096, 16384, 16423, 16425, 11640]) {
+      expect(P.clsOfBodyLen(n), String(n)).toBe(-1);
+    }
+  });
+
+  it("clsFor picks the smallest class c with c ≥ len + 1 (exact boundaries, minCls)", () => {
+    const cases: [number, number][] = [
+      [0, 0],
+      [255, 0],
+      [256, 1],
+      [1023, 1],
+      [1024, 2],
+      [4095, 2],
+      [4096, 3],
+      [16383, 3],
+    ];
+    for (const [len, cls] of cases) {
+      expect(P.clsFor(len), `len ${len}`).toBe(cls);
+      expect(P.pad(new Uint8Array(len), P.CLASSES).length).toBe(P.CLASSES[cls]);
+    }
+    expect(() => P.clsFor(16384)).toThrow(/too large/);
+    expect(P.clsFor(0, 1)).toBe(1);
+    expect(P.clsFor(0, 3)).toBe(3);
+    expect(P.clsFor(1024, 1)).toBe(2);
+    expect(P.clsFor(16383, 3)).toBe(3);
+    for (let len = 0; len < 16384; len += 37) {
+      const ref = [256, 1024, 4096, 16384].findIndex((c) => c >= len + 1);
+      expect(P.clsFor(len)).toBe(ref);
+    }
+  });
+
+  it("the text sizes of the §3.2 table land in their class (62-byte M header + 64-byte signature)", () => {
+    const m = (text: number): number => 62 + text + 64;
+    expect(P.clsFor(m(129))).toBe(0);
+    expect(P.clsFor(m(130))).toBe(1);
+    expect(P.clsFor(m(897))).toBe(1);
+    expect(P.clsFor(m(898))).toBe(2);
+    expect(P.clsFor(m(3969))).toBe(2);
+    expect(P.clsFor(m(3970))).toBe(3);
+    expect(P.clsFor(m(12000))).toBe(3);
+  });
+});
+
+describe("sealing (KEM-DEM, §1.4)", () => {
   const kp = P.kemKeygen(fill(32, 0x5e));
   const other = P.kemKeygen(fill(32, 0x5f));
   const ctx = Uint8Array.of(1, 2, 3);
 
-  it('round trip and spec layout kct || nonce || AEAD', () => {
-    const pt = s2b('secret');
-    const box = P.seal(kp.pk, 'lbl', ctx, pt);
-    expect(box.length).toBe(1120 + 24 + pt.length + 16);
-    expect(P.fromUtf8(P.open(kp.sk, 'lbl', ctx, box))).toBe('secret');
-    // independent decryption per §2.3
-    const kct = box.subarray(0, 1120);
-    const ss = xwing.decapsulate(kct, kp.sk);
-    const k = hkdfN(ss, sha(kct), refEnc('segv.sh/v1/seal', 'lbl', ctx));
-    const pt2 = xchacha20poly1305(k, box.subarray(1120, 1144), refEnc('lbl', ctx)).decrypt(box.subarray(1144));
-    expect(P.fromUtf8(pt2)).toBe('secret');
-    // two seals of the same plaintext differ
-    expect(toHex(P.seal(kp.pk, 'lbl', ctx, pt))).not.toBe(toHex(box));
-    expect(P.open(kp.sk, 'lbl', ctx, P.seal(kp.pk, 'lbl', ctx, new Uint8Array(0))).length).toBe(0);
+  it("matches the independent construction byte for byte (fixed randomness)", () => {
+    for (const n of [0, 1, 32, 256, 1000]) {
+      const pt = seqBytes(n, n);
+      const calls: B[] = [];
+      const box = withRandom(recording(detRandom(`seal ${n}`), calls), () => P.seal(kp.pk, LBL, ctx, pt));
+      expect(calls.map((c) => c.length)).toEqual([64, 24]); // X-Wing encapsulation randomness, then the AEAD nonce
+      expect(box.length).toBe(1120 + 24 + n + 16);
+      expect(toHex(box)).toBe(toHex(refSeal(kp.pk, LBL, ctx, pt, calls[0], calls[1])));
+      expect(toHex(refOpen(kp.sk, LBL, ctx, box))).toBe(toHex(pt));
+      expect(toHex(P.open(kp.sk, LBL, ctx, box))).toBe(toHex(pt));
+      expect(toHex(P.tryOpen(kp.sk, LBL, ctx, box)!)).toBe(toHex(pt));
+    }
+    // fresh randomness: two seals of the same plaintext differ
+    expect(toHex(P.seal(kp.pk, LBL, ctx, s2b("x")))).not.toBe(toHex(P.seal(kp.pk, LBL, ctx, s2b("x"))));
   });
 
-  it('wrong key / label / ctx / short box all throw', () => {
-    const box = P.seal(kp.pk, 'lbl', ctx, s2b('secret'));
-    expect(() => P.open(other.sk, 'lbl', ctx, box)).toThrow();
-    expect(() => P.open(kp.sk, 'lbl2', ctx, box)).toThrow();
-    expect(() => P.open(kp.sk, 'lbl', Uint8Array.of(1, 2), box)).toThrow();
-    expect(() => P.open(kp.sk, 'lbl', Uint8Array.of(1, 2, 3, 0), box)).toThrow();
-    // label/ctx boundary must not be ambiguous: ("lbl", 0x01..) vs ("lbl\x01", ..)
-    expect(() => P.open(kp.sk, 'lbl\u0001', Uint8Array.of(2, 3), box)).toThrow();
-    expect(() => P.open(kp.sk, 'lbl', ctx, box.subarray(0, 1120 + 24 + 15))).toThrow(/short/);
-    expect(() => P.open(kp.sk, 'lbl', ctx, box.subarray(0, box.length - 1))).toThrow();
-    expect(() => P.open(kp.sk, 'lbl', ctx, cat(box, Uint8Array.of(0)))).toThrow();
-    expect(() => P.seal(fill(1216, 0xff), 'lbl', ctx, s2b('x'))).toThrow(); // invalid KEM pk
+  it("wrong key / label / ctx / truncation throw in open and return null in tryOpen", () => {
+    const box = P.seal(kp.pk, LBL, ctx, s2b("secret"));
+    const bad: [string, () => unknown, () => unknown][] = [
+      ["other key", () => P.open(other.sk, LBL, ctx, box), () => P.tryOpen(other.sk, LBL, ctx, box)],
+      ["other label", () => P.open(kp.sk, LBL + "x", ctx, box), () => P.tryOpen(kp.sk, LBL + "x", ctx, box)],
+      ["short ctx", () => P.open(kp.sk, LBL, ctx.subarray(0, 2), box), () => P.tryOpen(kp.sk, LBL, ctx.subarray(0, 2), box)],
+      // the label / ctx boundary is unambiguous
+      [
+        "shifted boundary",
+        () => P.open(kp.sk, LBL + "\u0001", ctx.subarray(1), box),
+        () => P.tryOpen(kp.sk, LBL + "\u0001", ctx.subarray(1), box),
+      ],
+      ["truncated", () => P.open(kp.sk, LBL, ctx, box.subarray(0, box.length - 1)), () => P.tryOpen(kp.sk, LBL, ctx, box.subarray(1))],
+      ["extended", () => P.open(kp.sk, LBL, ctx, cat(box, Uint8Array.of(0))), () => P.tryOpen(kp.sk, LBL, ctx, cat(box, Uint8Array.of(0)))],
+      ["short", () => P.open(kp.sk, LBL, ctx, box.subarray(0, 1159)), () => P.tryOpen(kp.sk, LBL, ctx, box.subarray(0, 1159))],
+      ["empty", () => P.open(kp.sk, LBL, ctx, new Uint8Array(0)), () => P.tryOpen(kp.sk, LBL, ctx, new Uint8Array(0))],
+    ];
+    for (const [name, open, tryOpen] of bad) {
+      expect(throwsError(open), name).toBe(true);
+      expect(tryOpen(), name).toBeNull();
+    }
+    expect(() => P.open(kp.sk, LBL, ctx, box.subarray(0, 1159))).toThrow(/short/);
+    expect(() => P.seal(fill(1216, 0xff), LBL, ctx, s2b("x"))).toThrow(); // not a KEM public key
   });
 
-  it('a bit flip anywhere (kct / nonce / ciphertext / tag) is rejected', () => {
-    const box = P.seal(kp.pk, 'lbl', ctx, seqBytes(40));
+  it("a bit flip anywhere (kct / nonce / ciphertext / tag) is rejected", () => {
+    const box = P.seal(kp.pk, LBL, ctx, seqBytes(40));
     const s = survivors(
       box,
       [
-        { name: 'kct', start: 0, end: 1120 },
-        { name: 'nonce', start: 1120, end: 1144, every: true },
-        { name: 'ct', start: 1144, end: 1184, every: true },
-        { name: 'tag', start: 1184, end: 1200, every: true },
+        { name: "kct", start: 0, end: 1120 },
+        { name: "kct x25519", start: 1088, end: 1120, every: true },
+        { name: "nonce", start: 1120, end: 1144, every: true },
+        { name: "ct", start: 1144, end: 1184, every: true },
+        { name: "tag", start: 1184, end: 1200, every: true },
       ],
-      (b) => P.open(kp.sk, 'lbl', ctx, b),
+      (b) => P.open(kp.sk, LBL, ctx, b),
     );
     expect(s).toEqual([]);
   });
+
+  it("dummySeal(label, ctx, n) is a real seal of random(n) to a fresh, discarded KEM key", () => {
+    const calls: B[] = [];
+    const box = withRandom(recording(detRandom("dummy"), calls), () => P.dummySeal(LBL, ctx, 100));
+    expect(box.length).toBe(1160 + 100);
+    const seed = calls.find((c) => c.length === 32)!;
+    const pt = calls.find((c) => c.length === 100)!;
+    expect(seed).toBeDefined();
+    expect(pt).toBeDefined();
+    // it opens with KEM.keygen(seed) (and nothing else): a genuine seal, indistinguishable by construction
+    expect(toHex(refOpen(xwing.keygen(seed).secretKey, LBL, ctx, box))).toBe(toHex(pt));
+    expect(P.tryOpen(kp.sk, LBL, ctx, box)).toBeNull();
+    for (const n of [0, 1, 32, 256, 1416 - 1160]) {
+      expect(P.dummySeal(LBL, ctx, n).length).toBe(P.seal(kp.pk, LBL, ctx, new Uint8Array(n)).length);
+    }
+    expect(toHex(P.dummySeal(LBL, ctx, 32))).not.toBe(toHex(P.dummySeal(LBL, ctx, 32)));
+  });
 });
 
-// ───────────────────────── wraps ─────────────────────────
+describe("throwing decapsulation (§1.1; plan M1 test 9)", () => {
+  const prf = fill(32, 0x11);
+  const credId = seqBytes(20, 0x80);
+  const cred = P.credKem(prf, credId);
+  const rec = P.recoveryKem(seqBytes(20, 0x30));
+  const r = prng(0x10e);
+  const keys: [string, B][] = [
+    ["alice identity", alice.id.kemSk],
+    ["bob identity (the encapsulation target)", bob.id.kemSk],
+    ["carol identity", carol.id.kemSk],
+    ["passkey unlock key", cred.sk],
+    ["recovery unlock key", rec.sk],
+    ...Array.from({ length: 6 }, (_, i): [string, B] => [`random #${i}`, P.kemKeygen(r.bytes(32)).sk]),
+  ];
 
-describe('passkey & recovery wraps (§2.4)', () => {
+  it("the reference: every low-order X25519 component makes X-Wing decapsulation throw, whatever the key", () => {
+    for (const [name, u] of LOW_ORDER_U) {
+      const kct = withX25519(u);
+      for (const [kname, sk] of keys) expect(() => xwing.decapsulate(kct, sk), `${name} / ${kname}`).toThrow();
+    }
+    // a normal X25519 component does not throw (implicit rejection for the wrong key)
+    for (const [kname, sk] of keys) expect(xwing.decapsulate(withX25519(9n), sk).length, kname).toBe(32);
+  });
+
+  it("tryDecap returns null, kemDecap throws, tryOpen returns null and open throws, for every recipient key", () => {
+    for (const [name, u] of LOW_ORDER_U) {
+      const kct = withX25519(u);
+      const box = cat(kct, P.seal(bob.id.kemPk, LBL, CONV, seqBytes(32)).subarray(1120));
+      for (const [kname, sk] of keys) {
+        const what = `${name} / ${kname}`;
+        expect(P.tryDecap(kct, sk), what).toBeNull();
+        expect(() => P.kemDecap(kct, sk), what).toThrow();
+        expect(P.tryOpen(sk, LBL, CONV, box), what).toBeNull();
+        expect(throwsError(() => P.open(sk, LBL, CONV, box)), what).toBe(true);
+      }
+    }
+    // the untouched ciphertext still decapsulates for its recipient
+    expect(toHex(P.tryDecap(realKct, bob.id.kemSk)!)).toBe(toHex(xwing.decapsulate(realKct, bob.id.kemSk)));
+  });
+
+  it("openWrap and unwrapAK throw on a wrap whose kct has a low-order X25519 component; a trial unlock skips it", () => {
+    const genuine = P.makeWrap(alice.uid, "passkey", credId, cred, alice.AK, alice.id, TS);
+    const g = P.verifyWrap(genuine.record, genuine.sig, alice.id.sigPk);
+    /** The client's unwrapFrom loop (§2.4): skip records that fail, including a decapsulation throw. */
+    const trialUnlock = (recs: P.WrapRecord[], key: { sk: B; auth: B }): B | null => {
+      for (const w of recs) {
+        try {
+          return P.unwrapAK(w, key, alice.id.sigPk);
+        } catch {
+          /* does not open */
+        }
+      }
+      return null;
+    };
+    for (const [name, u] of LOW_ORDER_U) {
+      const bad = { ...g, wrap: cat(withX25519(u), g.wrap.subarray(1120)) };
+      for (const key of [cred, rec, { sk: alice.id.kemSk, auth: cred.auth }]) {
+        expect(() => P.openWrap(bad, key), name).toThrow();
+        expect(() => P.unwrapAK(bad, key, alice.id.sigPk), name).toThrow();
+      }
+      expect(trialUnlock([bad], cred), name).toBeNull();
+      expect(toHex(trialUnlock([bad, g], cred)!), name).toBe(toHex(alice.AK));
+    }
+  });
+});
+
+// ───────────────────────── accounts ─────────────────────────
+
+describe("accounts: identity derivation (§2.1)", () => {
+  it("follows §2.1 with the v2 labels, including kS / rS / nS, and has no scan key", () => {
+    const AK = seqBytes(32);
+    const a = P.deriveIdentity(AK);
+    expect(toHex(a.sigSk)).toBe(toHex(hkdfN(AK, "", "segv.sh/v2/id/ed25519")));
+    expect(toHex(a.sigPk)).toBe(toHex(edPubRaw(a.sigSk)));
+    const kem = xwing.keygen(hkdfN(AK, "", "segv.sh/v2/id/xwing"));
+    expect(toHex(a.kemPk)).toBe(toHex(kem.publicKey));
+    expect(toHex(a.kemSk)).toBe(toHex(kem.secretKey));
+    expect(toHex(a.kS)).toBe(toHex(hkdfN(AK, "", "segv.sh/v2/self/aead")));
+    expect(toHex(a.rS)).toBe(toHex(hkdfN(AK, "", "segv.sh/v2/self/route")));
+    expect(toHex(a.nS)).toBe(toHex(hkdfN(AK, "", "segv.sh/v2/self/notify")));
+    expect(Object.keys(a).sort()).toEqual(["kS", "kemPk", "kemSk", "nS", "rS", "sigPk", "sigSk"]);
+    expect([a.sigSk, a.sigPk, a.kemSk, a.kemPk, a.kS, a.rS, a.nS].map((x) => x.length)).toEqual([32, 32, 32, 1216, 32, 32, 32]);
+    expect(new Set([a.sigSk, a.kemSk, a.kS, a.rS, a.nS].map(toHex)).size).toBe(5);
+    // deterministic
+    expect(toHex(P.deriveIdentity(AK.slice()).kemPk)).toBe(toHex(a.kemPk));
+  });
+
+  it("different AKs give unrelated keys; AK must be 32 bytes", () => {
+    const a = P.deriveIdentity(fill(32, 1));
+    const b = P.deriveIdentity(flip(fill(32, 1), 31, 7));
+    for (const k of ["sigPk", "kemPk", "kS", "rS", "nS"] as const) expect(toHex(a[k]), k).not.toBe(toHex(b[k]));
+    for (const n of [0, 16, 31, 33, 64]) expect(() => P.deriveIdentity(new Uint8Array(n))).toThrow(/32 bytes/);
+  });
+});
+
+describe("accounts: bundles (§2.2)", () => {
+  it("make → verify → parse with the exact v2 JSON (key order, no scan key)", () => {
+    const u = alice.user;
+    expect(u.uid).toBe(alice.uidS);
+    expect(u.handle).toBe("alice");
+    expect(toHex(u.sigPk)).toBe(toHex(alice.id.sigPk));
+    expect(toHex(u.kemPk)).toBe(toHex(alice.id.kemPk));
+    expect(u.bundle).toBe(alice.bundle);
+    expect(u.bundleSig).toBe(alice.sig);
+    expect(u.ts).toBe(TS + 0xa1);
+    const want = `{"v":2,"uid":"${b64uN(alice.uid)}","handle":"alice","sig":"${b64uN(alice.id.sigPk)}","kem":"${b64uN(alice.id.kemPk)}","ts":${TS + 0xa1}}`;
+    expect(alice.bundle).toBe(want);
+    expect(Object.keys(JSON.parse(alice.bundle) as object)).toEqual([...P.BUNDLE_KEYS]);
+    expect([...P.BUNDLE_KEYS]).toEqual(["v", "uid", "handle", "sig", "kem", "ts"]);
+    expect(alice.bundle).not.toContain("scan");
+    // canonical form: JSON.stringify(JSON.parse(text)) = text
+    expect(JSON.stringify(JSON.parse(alice.bundle))).toBe(alice.bundle);
+    // bundleSig = Sign(enc("segv.sh/v2/bundle", bundleBytes)), deterministic Ed25519, checked with node
+    const msg = refEnc("segv.sh/v2/bundle", alice.bundle);
+    expect(toHex(P.bundleSigMsg(alice.bundle))).toBe(toHex(msg));
+    expect(edVerify(P.fromB64u(alice.sig), msg, alice.id.sigPk)).toBe(true);
+    expect(b64uN(edSign(msg, alice.id.sigSk))).toBe(alice.sig);
+  });
+
+  it("makeBundle validates its inputs", () => {
+    for (const h of ["al", "Alice", "a".repeat(21), "al-ice", "al ice", "ålice", "alice\n", "", "@alice"]) {
+      expect(() => P.makeBundle(alice.uid, h, alice.id, TS), JSON.stringify(h)).toThrow(/handle/);
+    }
+    for (const h of ["abc", "a".repeat(20), "a_b_9", "___", "012"]) expect(() => P.makeBundle(alice.uid, h, alice.id, TS)).not.toThrow();
+    for (const n of [15, 17]) expect(() => P.makeBundle(new Uint8Array(n), "alice", alice.id, TS)).toThrow(/uid/);
+    for (const ts of [-1, 1.5, 2 ** 53, NaN]) expect(() => P.makeBundle(alice.uid, "alice", alice.id, ts)).toThrow(/ts/);
+  });
+
+  it("parseBundle rejects every malformed field, a v1 bundle, extra keys and a different key order", () => {
+    const base = JSON.parse(alice.bundle) as Record<string, unknown>;
+    const mut = (over: Record<string, unknown>) => JSON.stringify({ ...base, ...over });
+    const { v, uid, handle, sig, kem, ts } = base;
+    const bad: [string, string, string?][] = [
+      ["not JSON", "{"],
+      ["array", "[]"],
+      ["null", "null"],
+      ["string", '"x"'],
+      ["v=1", mut({ v: 1 })],
+      ['v="2"', mut({ v: "2" })],
+      ["v missing", mut({ v: undefined })],
+      ["scan key (v1 shape)", mut({ scan: P.b64u(new Uint8Array(32)) })],
+      ["extra key", mut({ x: 1 })],
+      ["reordered keys", JSON.stringify({ v, handle, uid, sig, kem, ts })],
+      ["ts first", JSON.stringify({ ts, v, uid, handle, sig, kem })],
+      ["uid 15 bytes", mut({ uid: P.b64u(new Uint8Array(15)) })],
+      ["uid 17 bytes", mut({ uid: P.b64u(new Uint8Array(17)) })],
+      ["uid non-canonical", mut({ uid: nonCanonical(alice.uidS) })],
+      ["uid padded", mut({ uid: alice.uidS + "==" })],
+      ["uid missing", mut({ uid: undefined })],
+      ["handle uppercase", mut({ handle: "Alice" })],
+      ["handle short", mut({ handle: "ab" })],
+      ["handle number", mut({ handle: 123 })],
+      ["sig 31 bytes", mut({ sig: P.b64u(new Uint8Array(31)) })],
+      ["sig number", mut({ sig: 1 })],
+      ["kem 1215 bytes", mut({ kem: P.b64u(new Uint8Array(1215)) })],
+      ["kem 1217 bytes", mut({ kem: P.b64u(new Uint8Array(1217)) })],
+      ["ts negative", mut({ ts: -1 })],
+      ["ts float", mut({ ts: 1.5 })],
+      ["ts string", mut({ ts: "1" })],
+      ["ts unsafe", mut({ ts: 2 ** 53 })],
+      ["signature 63 bytes", alice.bundle, P.b64u(new Uint8Array(63))],
+      ["signature 65 bytes", alice.bundle, P.b64u(new Uint8Array(65))],
+      ["signature not b64u", alice.bundle, "!!"],
+    ];
+    for (const [name, text, s] of bad) expect(() => P.parseBundle(text, s ?? alice.sig), name).toThrow(Error);
+    // a version-1 bundle is not a v2 bundle
+    expect(alice.bundle.startsWith('{"v":2,')).toBe(true);
+    expect(() => P.parseBundle(alice.bundle.replace('{"v":2,', '{"v":1,'), alice.sig)).toThrow(/version/);
+  });
+
+  it("verifyBundle: the signature binds the exact bytes and the v2 label", () => {
+    const tampered = alice.bundle.replace('"handle":"alice"', '"handle":"alicf"');
+    expect(() => P.parseBundle(tampered, alice.sig)).not.toThrow();
+    expect(() => P.verifyBundle(tampered, alice.sig)).toThrow(/signature/);
+    const spaced = JSON.stringify(JSON.parse(alice.bundle), null, 1);
+    expect(() => P.verifyBundle(spaced, alice.sig)).toThrow(Error);
+    expect(() => P.verifyBundle(alice.bundle, bob.sig)).toThrow(/signature/);
+    const forged = P.b64u(P.sign(P.bundleSigMsg(alice.bundle), bob.id.sigSk));
+    expect(() => P.verifyBundle(alice.bundle, forged)).toThrow(/signature/);
+    const noLabel = P.b64u(P.sign(s2b(alice.bundle), alice.id.sigSk));
+    expect(() => P.verifyBundle(alice.bundle, noLabel)).toThrow(/signature/);
+    const v1Label = P.b64u(P.sign(refEnc("segv.sh/v1/bundle", s2b(alice.bundle)), alice.id.sigSk));
+    expect(() => P.verifyBundle(alice.bundle, v1Label)).toThrow(/signature/);
+    const wrapLabel = P.b64u(P.sign(P.wrapSigMsg(alice.bundle), alice.id.sigSk));
+    expect(() => P.verifyBundle(alice.bundle, wrapLabel)).toThrow(/signature/);
+  });
+
+  it("fingerprint: H(enc('segv.sh/v2/fp', uid, sigPk, kemPk)) as 6 groups of 5 digits", () => {
+    const fp = P.fingerprint(alice.uid, alice.id.sigPk, alice.id.kemPk);
+    expect(fp).toMatch(/^\d{5}( \d{5}){5}$/);
+    const h = sha(refEnc("segv.sh/v2/fp", alice.uid, alice.id.sigPk, alice.id.kemPk));
+    const groups = Array.from({ length: 6 }, (_, k) => String(beToBig(h.subarray(5 * k, 5 * k + 5)) % 100000n).padStart(5, "0"));
+    expect(fp).toBe(groups.join(" "));
+    expect(P.fingerprint(bob.uid, alice.id.sigPk, alice.id.kemPk)).not.toBe(fp);
+    expect(P.fingerprint(alice.uid, bob.id.sigPk, alice.id.kemPk)).not.toBe(fp);
+    expect(P.fingerprint(alice.uid, alice.id.sigPk, bob.id.kemPk)).not.toBe(fp);
+    // zero padding of a group: a digest whose groups are small is hard to hit, so check the formatter on all users
+    for (const u of [alice, bob, carol]) {
+      const g = P.fingerprint(u.uid, u.id.sigPk, u.id.kemPk).split(" ");
+      const hh = sha(refEnc("segv.sh/v2/fp", u.uid, u.id.sigPk, u.id.kemPk));
+      g.forEach((x, k) => expect(Number(x)).toBe(Number(beToBig(hh.subarray(5 * k, 5 * k + 5)) % 100000n)));
+    }
+  });
+
+  it("pin = H(enc('segv.sh/v2/pin', bundleBytes, bundleSig))", () => {
+    const sigRaw = P.fromB64u(alice.sig);
+    expect(toHex(P.pin(alice.bundle, sigRaw))).toBe(toHex(sha(refEnc("segv.sh/v2/pin", alice.bundle, sigRaw))));
+    expect(toHex(P.pin(alice.bundle, sigRaw))).not.toBe(toHex(P.pin(bob.bundle, sigRaw)));
+    expect(toHex(P.pin(alice.bundle, sigRaw))).not.toBe(toHex(P.pin(alice.bundle, flip(sigRaw, 63))));
+  });
+});
+
+describe("checkUserKeys / isBadSigPk (§2.1)", () => {
+  // Every Ed25519 small-order encoding (the 8 torsion points, with both sign bits where a point exists) and some
+  // non-canonical / non-point encodings. The classification is checked with the BigInt reference.
+  const smallOrder: [string, string][] = [
+    ["order 4 (y = 0)", "00".repeat(32)],
+    ["order 4 (y = 0, other x)", "00".repeat(31) + "80"],
+    ["identity (order 1)", "01" + "00".repeat(31)],
+    ["order 2 (y = −1)", "ec" + "ff".repeat(30) + "7f"],
+    ["order 8 (a)", "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05"],
+    ["order 8 (a, other x)", "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85"],
+    ["order 8 (b)", "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a"],
+    ["order 8 (b, other x)", "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa"],
+  ];
+  const notPoints: [string, string][] = [
+    ["identity with the sign bit (x = 0, sign 1)", "01" + "00".repeat(30) + "80"],
+    ["y = −1 with the sign bit", "ec" + "ff".repeat(31)],
+    ["y = p (non-canonical 0)", "ed" + "ff".repeat(30) + "7f"],
+    ["y = p + 1 (non-canonical 1)", "ee" + "ff".repeat(30) + "7f"],
+    ["all ones", "ff".repeat(32)],
+  ];
+
+  it("the reference agrees with the classification", () => {
+    for (const [name, h] of smallOrder) {
+      const p = edDecode(fromHex(h));
+      expect(p, name).not.toBeNull();
+      expect(edSmallOrder(p!), name).toBe(true);
+    }
+    for (const [name, h] of notPoints) expect(edDecode(fromHex(h)), name).toBeNull();
+    for (const u of [alice, bob, carol]) expect(edSmallOrder(edDecode(u.id.sigPk)!)).toBe(false);
+  });
+
+  it("accepts real keys and rejects small-order, non-canonical and non-point signing keys", () => {
+    for (const u of [alice, bob, carol]) {
+      expect(P.isBadSigPk(u.id.sigPk)).toBe(false);
+      expect(() => P.checkUserKeys(u.id.sigPk, u.id.kemPk)).not.toThrow();
+    }
+    for (const [name, h] of [...smallOrder, ...notPoints]) {
+      expect(P.isBadSigPk(fromHex(h)), name).toBe(true);
+      expect(() => P.checkUserKeys(fromHex(h), alice.id.kemPk), name).toThrow(/signing key/);
+    }
+    // y values with no x on the curve
+    let found = 0;
+    for (let y = 2n; found < 5; y++) {
+      const b = le32(y);
+      if (edDecode(b) !== null) continue;
+      found++;
+      expect(P.isBadSigPk(b), `y = ${y}`).toBe(true);
+    }
+    for (const n of [0, 31, 33, 64]) expect(P.isBadSigPk(new Uint8Array(n)), `${n} bytes`).toBe(true);
+    // a mixed-order key (real key + an order-8 point) is not of small order: §2.1 accepts it
+    const mixed = edEncode(edAdd(edDecode(alice.id.sigPk)!, edDecode(fromHex(smallOrder[4][1]))!));
+    expect(edSmallOrder(edDecode(mixed)!)).toBe(false);
+    expect(P.isBadSigPk(mixed)).toBe(false);
+  });
+
+  it("rejects KEM keys that cannot be encapsulated to", () => {
+    const pk = alice.id.kemPk;
+    const lowX = pk.slice();
+    lowX.set(new Uint8Array(32), 1184); // the X25519 component is u = 0 (low order)
+    const lowX1 = pk.slice();
+    lowX1.set(le32(1n), 1184);
+    const badMl = pk.slice();
+    badMl.fill(0xff, 0, 2); // an ML-KEM coefficient ≥ q
+    const bad: [string, B][] = [
+      ["all 0xff", fill(1216, 0xff)],
+      ["1215 bytes", pk.subarray(0, 1215)],
+      ["1217 bytes", cat(pk, Uint8Array.of(0))],
+      ["empty", new Uint8Array(0)],
+      ["low-order X25519 u = 0", lowX],
+      ["low-order X25519 u = 1", lowX1],
+      ["ML-KEM coefficient out of range", badMl],
+    ];
+    for (const [name, k] of bad) expect(() => P.checkUserKeys(alice.id.sigPk, k), name).toThrow(/KEM key/);
+  });
+});
+
+describe("signature strictness (§1.1: RFC 8032, zip215 false)", () => {
+  const L = 2n ** 252n + 27742317777372353535851937790883648493n;
+  const fromLe = (b: B): bigint => b.reduceRight((acc, x) => (acc << 8n) | BigInt(x), 0n);
+
+  it("rejects the universal forgery under a small-order key and malleated signatures (S + L)", () => {
+    const A = fromHex("01" + "00".repeat(31)); // identity
+    const sig = cat(A, new Uint8Array(32)); // R = identity, S = 0
+    for (const m of ["bundle", "", "other"]) expect(P.verify(sig, s2b(m), A), m).toBe(false);
+    expect(() => P.verifyBundle(JSON.stringify({ ...(JSON.parse(alice.bundle) as object), sig: P.b64u(A) }), P.b64u(sig))).toThrow(
+      /signature/,
+    );
+    const msg = P.bundleSigMsg(alice.bundle);
+    const good = P.fromB64u(alice.sig);
+    expect(P.verify(good, msg, alice.id.sigPk)).toBe(true);
+    const mall = cat(good.subarray(0, 32), le32(fromLe(good.subarray(32)) + L));
+    expect(P.verify(mall, msg, alice.id.sigPk)).toBe(false);
+    expect(edVerify(good, msg, alice.id.sigPk)).toBe(true);
+  });
+});
+
+// ───────────────────────── unlock secrets and wraps ─────────────────────────
+
+describe("unlock secrets and wrap records (§2.3, §2.4)", () => {
   const prf = fill(32, 0x11);
   const credId = seqBytes(20, 0x80);
   const cred = P.credKem(prf, credId);
   const code = seqBytes(20, 0x30);
   const rec = P.recoveryKem(code);
-  const pkWrap = P.makeWrap(alice.uid, 'passkey', credId, cred, alice.AK, alice.id, TS);
-  const recWrap = P.makeWrap(alice.uid, 'recovery', rec.id, rec, alice.AK, alice.id, TS + 1);
-
-  /** Independent open per §2.3 / §2.4: seal(kemPk, "ak-wrap", ctx = enc(uid, id, auth), AK). */
-  const refOpenWrap = (box: B, sk: B, ctx: B): B => {
-    const kct = box.subarray(0, 1120);
-    const k = hkdfN(xwing.decapsulate(kct, sk), sha(kct), refEnc('segv.sh/v1/seal', 'ak-wrap', ctx));
-    return xchacha20poly1305(k, box.subarray(1120, 1144), refEnc('ak-wrap', ctx)).decrypt(box.subarray(1144));
-  };
-  /** Signs an arbitrary record as `signer` (what anyone can POST to /api/wraps for their own uid). */
+  const pkWrap = P.makeWrap(alice.uid, "passkey", credId, cred, alice.AK, alice.id, TS);
+  const recWrap = P.makeWrap(alice.uid, "recovery", rec.id, rec, alice.AK, alice.id, TS + 1);
+  const AKW = "segv.sh/v2/ak-wrap";
+  /** Signs an arbitrary record as `signer` (what anyone can POST to /api/v2/wraps for their own uid). */
   const signRecord = (raw: Record<string, unknown>, signer: TUser) => {
     const record = JSON.stringify(raw);
     return { record, sig: P.b64u(P.sign(P.wrapSigMsg(record), signer.id.sigSk)) };
   };
 
-  it('credKem / recoveryKem are deterministic and follow the spec KDFs', () => {
-    const credSeed = hkdfN(prf, credId, 'segv.sh/v1/cred/xwing');
-    expect(toHex(P.credKem(prf, credId).pk)).toBe(toHex(cred.pk));
+  it("PRF input, credKem and recoveryKem follow the v2 KDFs", () => {
+    expect(P.PRF_INPUT).toBe("segv.sh/v2/prf");
+    const credSeed = hkdfN(prf, credId, "segv.sh/v2/cred/xwing");
     expect(toHex(cred.pk)).toBe(toHex(xwing.keygen(credSeed).publicKey));
     expect(toHex(cred.sk)).toBe(toHex(xwing.keygen(credSeed).secretKey));
-    expect(toHex(cred.auth)).toBe(toHex(hkdfN(prf, credId, 'segv.sh/v1/cred/auth')));
-    expect(toHex(P.credKem(prf, credId).auth)).toBe(toHex(cred.auth));
-    expect(cred.auth.length).toBe(32);
-    expect(toHex(cred.auth)).not.toBe(toHex(cred.sk));
-    // credId is the salt of both outputs; the PRF output is the only secret
-    for (const other of [P.credKem(prf, seqBytes(20, 0x81)), P.credKem(fill(32, 0x12), credId)]) {
-      expect(toHex(other.pk)).not.toBe(toHex(cred.pk));
-      expect(toHex(other.auth)).not.toBe(toHex(cred.auth));
+    expect(toHex(cred.auth)).toBe(toHex(hkdfN(prf, credId, "segv.sh/v2/cred/auth")));
+    for (const o of [P.credKem(prf, seqBytes(20, 0x81)), P.credKem(fill(32, 0x12), credId)]) {
+      expect(toHex(o.pk)).not.toBe(toHex(cred.pk));
+      expect(toHex(o.auth)).not.toBe(toHex(cred.auth));
     }
     for (const n of [0, 31, 33]) expect(() => P.credKem(new Uint8Array(n), credId)).toThrow(/32 bytes/);
-
-    const recSeed = hkdfN(code, '', 'segv.sh/v1/recovery/xwing');
-    expect(rec.id.length).toBe(16);
-    expect(toHex(rec.id)).toBe(toHex(hkdfN(code, '', 'segv.sh/v1/recovery/id', 16)));
+    const recSeed = hkdfN(code, "", "segv.sh/v2/recovery/xwing");
     expect(toHex(rec.pk)).toBe(toHex(xwing.keygen(recSeed).publicKey));
     expect(toHex(rec.sk)).toBe(toHex(xwing.keygen(recSeed).secretKey));
-    expect(toHex(rec.auth)).toBe(toHex(hkdfN(code, '', 'segv.sh/v1/recovery/auth')));
-    expect(rec.auth.length).toBe(32);
-    const again = P.recoveryKem(code);
-    expect([again.sk, again.auth, again.id].map(toHex)).toEqual([rec.sk, rec.auth, rec.id].map(toHex));
-    // the published id, the KEM seed and the secret auth are unrelated HKDF outputs
-    expect(new Set([toHex(rec.auth), toHex(rec.sk), toHex(rec.id)]).size).toBe(3);
-    expect(toHex(rec.auth).startsWith(toHex(rec.id))).toBe(false);
-    expect(toHex(P.recoveryKem(seqBytes(20, 0x31)).auth)).not.toBe(toHex(rec.auth));
-    expect(P.PRF_INPUT).toBe('segv.sh/v1/prf');
+    expect(toHex(rec.auth)).toBe(toHex(hkdfN(code, "", "segv.sh/v2/recovery/auth")));
+    expect(toHex(rec.id)).toBe(toHex(hkdfN(code, "", "segv.sh/v2/recovery/id", 16)));
+    expect(new Set([rec.auth, rec.sk, rec.id].map(toHex)).size).toBe(3);
+    for (const n of [0, 19, 21, 32]) expect(() => P.recoveryKem(new Uint8Array(n))).toThrow(/20 bytes/);
   });
 
-  it('makeWrap -> verifyWrap -> openWrap / unwrapAK (passkey and recovery)', () => {
-    for (const [w, key, kind, id] of [
-      [pkWrap, cred, 'passkey', credId],
-      [recWrap, rec, 'recovery', rec.id],
+  it("makeWrap → verifyWrap → openWrap / unwrapAK, with the exact record and the segv.sh/v2/ak-wrap seal", () => {
+    expect(P.AK_WRAP_LABEL).toBe(AKW);
+    for (const [w, key, kind, id, ts] of [
+      [pkWrap, cred, "passkey", credId, TS],
+      [recWrap, rec, "recovery", rec.id, TS + 1],
     ] as const) {
       const r = P.verifyWrap(w.record, w.sig, alice.id.sigPk);
       expect(r.kind).toBe(kind);
       expect(r.uid).toBe(alice.uidS);
       expect(toHex(r.id)).toBe(toHex(id));
       expect(toHex(r.kemPk)).toBe(toHex(key.pk));
-      expect(r.wrap.length).toBe(P.WRAP_LEN);
+      expect(r.wrap.length).toBe(1192);
+      expect(r.ts).toBe(ts);
+      expect(w.record).toBe(
+        `{"v":2,"uid":"${alice.uidS}","kind":"${kind}","id":"${b64uN(id)}","kem":"${b64uN(key.pk)}","wrap":"${b64uN(r.wrap)}","ts":${ts}}`,
+      );
+      expect(Object.keys(JSON.parse(w.record) as object)).toEqual([...P.WRAP_KEYS]);
       expect(toHex(P.openWrap(r, key))).toBe(toHex(alice.AK));
       expect(toHex(P.unwrapAK(r, key, alice.id.sigPk))).toBe(toHex(alice.AK));
-      // independent open with the spec context enc(uid, id, auth) ...
-      expect(toHex(refOpenWrap(r.wrap, key.sk, refEnc(alice.uid, id, key.auth)))).toBe(toHex(alice.AK));
-      // ... and the pre-fix context enc(uid, id) no longer opens it
-      expect(() => refOpenWrap(r.wrap, key.sk, refEnc(alice.uid, id))).toThrow();
-      // auth is never published
+      // independent open with ctx = enc(uid, id, auth) ...
+      expect(toHex(refOpen(key.sk, AKW, refEnc(alice.uid, id, key.auth), r.wrap))).toBe(toHex(alice.AK));
+      // ... and without auth, or with the v1 label, it does not open
+      expect(() => refOpen(key.sk, AKW, refEnc(alice.uid, id), r.wrap)).toThrow();
+      expect(() => refOpen(key.sk, "ak-wrap", refEnc(alice.uid, id, key.auth), r.wrap)).toThrow();
+      // the record signature is Sign(enc("segv.sh/v2/wrap", recordBytes)), deterministic
+      const msg = refEnc("segv.sh/v2/wrap", w.record);
+      expect(toHex(P.wrapSigMsg(w.record))).toBe(toHex(msg));
+      expect(edVerify(P.fromB64u(w.sig), msg, alice.id.sigPk)).toBe(true);
+      expect(b64uN(edSign(msg, alice.id.sigSk))).toBe(w.sig);
       expect(w.record).not.toContain(P.b64u(key.auth));
     }
-    expect(P.WRAP_LEN).toBe(1192);
-    const raw = JSON.parse(pkWrap.record) as Record<string, unknown>;
-    expect(Object.keys(raw)).toEqual(['v', 'uid', 'kind', 'id', 'kem', 'wrap', 'ts']);
-    expect(nodeEdVerify(P.fromB64u(pkWrap.sig), refEnc('segv.sh/v1/wrap', pkWrap.record), alice.id.sigPk)).toBe(true);
-    // the minimal key shapes are enough: makeWrap needs {pk, auth}, openWrap / unwrapAK need {sk, auth}
-    const minimal = P.makeWrap(alice.uid, 'passkey', credId, { pk: cred.pk, auth: cred.auth }, alice.AK, alice.id, TS);
-    const m = P.verifyWrap(minimal.record, minimal.sig, alice.id.sigPk);
-    expect(toHex(P.unwrapAK(m, { sk: cred.sk, auth: cred.auth }, alice.id.sigPk))).toBe(toHex(alice.AK));
-    expect(toHex(P.openWrap({ uid: m.uid, id: m.id, wrap: m.wrap }, { sk: cred.sk, auth: cred.auth }))).toBe(toHex(alice.AK));
+    expect([...P.WRAP_KEYS]).toEqual(["v", "uid", "kind", "id", "kem", "wrap", "ts"]);
+    // a wrap built independently (fixed randomness) opens with proto
+    const box = refSeal(cred.pk, AKW, refEnc(alice.uid, credId, cred.auth), alice.AK, seqBytes(64, 1), seqBytes(24, 2));
+    expect(toHex(P.openWrap({ uid: alice.uidS, id: credId, wrap: box }, cred))).toBe(toHex(alice.AK));
   });
 
-  it('openWrap only authenticates the box; unwrapAK adds the key check', () => {
-    const otherAK = fill(32, 0x99);
-    // Owner-signed record that (mistakenly or maliciously) wraps a different AK: the box is authentic ...
-    const w = P.makeWrap(alice.uid, 'passkey', credId, cred, otherAK, alice.id, TS);
-    const r = P.verifyWrap(w.record, w.sig, alice.id.sigPk);
-    expect(toHex(P.openWrap(r, cred))).toBe(toHex(otherAK));
-    // ... but the AK does not belong to the owner: no new keys on a failed unlock
-    expect(() => P.unwrapAK(r, cred, alice.id.sigPk)).toThrow(/key check/);
-    // Correct AK but checked against the wrong owner.
-    expect(() => P.unwrapAK(P.parseWrap(pkWrap.record, pkWrap.sig), cred, bob.id.sigPk)).toThrow(/key check/);
-    // The AK inside an authentic box must be exactly 32 bytes.
-    for (const n of [0, 31, 33]) {
-      const box = P.seal(cred.pk, 'ak-wrap', P.enc(alice.uid, credId, cred.auth), new Uint8Array(n));
-      expect(() => P.openWrap({ uid: alice.uidS, id: credId, wrap: box }, cred), `AK of ${n} bytes`).toThrow(/AK length/);
-    }
+  it("makeWrap validates its inputs", () => {
+    expect(() => P.makeWrap(new Uint8Array(15), "passkey", credId, cred, alice.AK, alice.id, TS)).toThrow(/uid/);
+    expect(() => P.makeWrap(alice.uid, "passkey", new Uint8Array(0), cred, alice.AK, alice.id, TS)).toThrow(/id/);
+    expect(() => P.makeWrap(alice.uid, "passkey", new Uint8Array(1024), cred, alice.AK, alice.id, TS)).toThrow(/id/);
+    expect(() => P.makeWrap(alice.uid, "recovery", new Uint8Array(15), rec, alice.AK, alice.id, TS)).toThrow(/id/);
+    expect(() => P.makeWrap(alice.uid, "recovery", new Uint8Array(20), rec, alice.AK, alice.id, TS)).toThrow(/id/);
+    expect(() => P.makeWrap(alice.uid, "passkey", credId, cred, new Uint8Array(31), alice.id, TS)).toThrow(/AK/);
+    expect(P.parseWrap(P.makeWrap(alice.uid, "passkey", new Uint8Array(1023), cred, alice.AK, alice.id, TS).record, pkWrap.sig).id.length).toBe(1023);
+    expect(P.parseWrap(P.makeWrap(alice.uid, "passkey", new Uint8Array(1), cred, alice.AK, alice.id, TS).record, pkWrap.sig).id.length).toBe(1);
   });
 
-  it('verifyWrap rejects wrong owner / tampered record / unlabeled signature', () => {
+  it("parseWrap rejects every malformed field, a v1 record, extra keys and a different key order", () => {
+    const base = JSON.parse(pkWrap.record) as Record<string, unknown>;
+    const mut = (over: Record<string, unknown>) => JSON.stringify({ ...base, ...over });
+    const { v, uid, kind, id, kem, wrap, ts } = base;
+    const bad: [string, string][] = [
+      ["not JSON", "x"],
+      ["array", "[1]"],
+      ["v=1", mut({ v: 1 })],
+      ["v missing", mut({ v: undefined })],
+      ["extra key", mut({ x: 1 })],
+      ["reordered", JSON.stringify({ v, kind, uid, id, kem, wrap, ts })],
+      ["kind other", mut({ kind: "password" })],
+      ["kind missing", mut({ kind: undefined })],
+      ["uid 15", mut({ uid: P.b64u(new Uint8Array(15)) })],
+      ["uid missing", mut({ uid: undefined })],
+      ["id empty", mut({ id: "" })],
+      ["id 1024 bytes", mut({ id: P.b64u(new Uint8Array(1024)) })],
+      ["id number", mut({ id: 5 })],
+      ["id non-canonical", mut({ id: nonCanonical(base.id as string) })],
+      ["recovery id 15 bytes", mut({ kind: "recovery", id: P.b64u(new Uint8Array(15)) })],
+      ["recovery id 20 bytes", mut({ kind: "recovery" })],
+      ["kem short", mut({ kem: P.b64u(new Uint8Array(1215)) })],
+      ["wrap short", mut({ wrap: P.b64u(new Uint8Array(1191)) })],
+      ["wrap long", mut({ wrap: P.b64u(new Uint8Array(1193)) })],
+      ["ts float", mut({ ts: 0.5 })],
+      ["ts negative", mut({ ts: -1 })],
+      ["ts missing", mut({ ts: undefined })],
+    ];
+    for (const [name, text] of bad) expect(() => P.parseWrap(text, pkWrap.sig), name).toThrow(Error);
+    expect(() => P.parseWrap(pkWrap.record, P.b64u(new Uint8Array(65)))).toThrow();
+    expect(P.parseWrap(mut({ kind: "recovery", id: P.b64u(new Uint8Array(16)) }), pkWrap.sig).kind).toBe("recovery");
+    // a version-1 record is not a v2 record
+    expect(pkWrap.record.startsWith('{"v":2,')).toBe(true);
+    expect(() => P.parseWrap(pkWrap.record.replace('{"v":2,', '{"v":1,'), pkWrap.sig)).toThrow(/version/);
+  });
+
+  it("verifyWrap rejects the wrong owner, a tampered record and other signature labels", () => {
     expect(() => P.verifyWrap(pkWrap.record, pkWrap.sig, bob.id.sigPk)).toThrow(/signature/);
     expect(() => P.verifyWrap(pkWrap.record, recWrap.sig, alice.id.sigPk)).toThrow(/signature/);
     const tampered = pkWrap.record.replace(`"ts":${TS}`, `"ts":${TS + 1}`);
     expect(tampered).not.toBe(pkWrap.record);
     expect(() => P.verifyWrap(tampered, pkWrap.sig, alice.id.sigPk)).toThrow(/signature/);
-    const kindSwap = pkWrap.record.replace('"kind":"passkey"', '"kind":"recovery"');
-    expect(() => P.verifyWrap(kindSwap, pkWrap.sig, alice.id.sigPk)).toThrow(/signature/);
-    const noLabel = P.b64u(P.sign(P.utf8(pkWrap.record), alice.id.sigSk));
-    expect(() => P.verifyWrap(pkWrap.record, noLabel, alice.id.sigPk)).toThrow(/signature/);
-    // A bundle signature must not double as a wrap signature (distinct labels).
-    expect(() => P.verifyWrap(pkWrap.record, P.b64u(P.sign(P.bundleSigMsg(pkWrap.record), alice.id.sigSk)), alice.id.sigPk)).toThrow(
-      /signature/,
-    );
+    for (const msg of [s2b(pkWrap.record), P.bundleSigMsg(pkWrap.record), refEnc("segv.sh/v1/wrap", s2b(pkWrap.record))]) {
+      expect(() => P.verifyWrap(pkWrap.record, P.b64u(P.sign(msg, alice.id.sigSk)), alice.id.sigPk)).toThrow(/signature/);
+    }
   });
 
-  it('parseWrap rejects every malformed field', () => {
-    const base = JSON.parse(pkWrap.record) as Record<string, unknown>;
-    const mut = (over: Record<string, unknown>) => JSON.stringify({ ...base, ...over });
-    const bad: [string, string][] = [
-      ['not JSON', 'x'],
-      ['array', '[1]'],
-      ['v=2', mut({ v: 2 })],
-      ['kind other', mut({ kind: 'password' })],
-      ['kind missing', mut({ kind: undefined })],
-      ['uid 15', mut({ uid: P.b64u(new Uint8Array(15)) })],
-      ['uid missing', mut({ uid: undefined })],
-      ['id empty', mut({ id: '' })],
-      ['id 1024 bytes', mut({ id: P.b64u(new Uint8Array(1024)) })],
-      ['id number', mut({ id: 5 })],
-      ['id non-canonical', mut({ id: nonCanonical(base.id as string) })],
-      ['kem short', mut({ kem: P.b64u(new Uint8Array(1215)) })],
-      ['wrap short', mut({ wrap: P.b64u(new Uint8Array(1191)) })],
-      ['wrap long', mut({ wrap: P.b64u(new Uint8Array(1193)) })],
-      ['ts float', mut({ ts: 0.5 })],
-      ['ts missing', mut({ ts: undefined })],
-    ];
-    for (const [name, text] of bad) expect(() => P.parseWrap(text, pkWrap.sig), name).toThrow(Error);
-    expect(() => P.parseWrap(pkWrap.record, P.b64u(new Uint8Array(65)))).toThrow();
-    expect(P.parseWrap(mut({ id: P.b64u(new Uint8Array(1023)) }), pkWrap.sig).id.length).toBe(1023);
-    expect(P.parseWrap(mut({ id: P.b64u(new Uint8Array(1)) }), pkWrap.sig).id.length).toBe(1);
-  });
-
-  it('a wrap opens only with the matching auth', () => {
+  it("auth binding: a wrap opens only with the matching auth and KEM key", () => {
     const pw = P.parseWrap(pkWrap.record, pkWrap.sig);
     const rw = P.parseWrap(recWrap.record, recWrap.sig);
-    expect(toHex(P.openWrap(pw, cred))).toBe(toHex(alice.AK));
-    expect(toHex(P.openWrap(rw, rec))).toBe(toHex(alice.AK));
-    // right KEM secret key, wrong auth
     const wrongAuths: [string, B][] = [
-      ['zero', new Uint8Array(32)],
-      ['ones', fill(32, 0xff)],
-      ['empty', new Uint8Array(0)],
-      ['truncated', cred.auth.subarray(0, 31)],
-      ['extended', cat(cred.auth, Uint8Array.of(0))],
-      ['recovery auth', rec.auth],
-      ['other PRF', P.credKem(fill(32, 0x12), credId).auth],
-      ['other credId', P.credKem(prf, seqBytes(20, 0x81)).auth],
-      ['KEM seed as auth', cred.sk],
+      ["zero", new Uint8Array(32)],
+      ["empty", new Uint8Array(0)],
+      ["truncated", cred.auth.subarray(0, 31)],
+      ["extended", cat(cred.auth, Uint8Array.of(0))],
+      ["recovery auth", rec.auth],
+      ["other PRF", P.credKem(fill(32, 0x12), credId).auth],
+      ["other credId", P.credKem(prf, seqBytes(20, 0x81)).auth],
+      ["v1 auth", hkdfN(prf, credId, "segv.sh/v1/cred/auth")],
     ];
     for (const [name, auth] of wrongAuths) expect(() => P.openWrap(pw, { sk: cred.sk, auth }), name).toThrow();
     for (let i = 0; i < 32; i++) expect(() => P.openWrap(pw, { sk: cred.sk, auth: flip(cred.auth, i, i % 8) }), `auth[${i}]`).toThrow();
-    for (const [name, auth] of [
-      ['passkey auth', cred.auth],
-      ['other code', P.recoveryKem(seqBytes(20, 0x31)).auth],
-      ['zero', new Uint8Array(32)],
-      ['recovery id', rec.id],
-    ] as const) {
-      expect(() => P.openWrap(rw, { sk: rec.sk, auth }), name).toThrow();
-    }
-    // right auth, wrong KEM secret key
+    expect(() => P.openWrap(rw, { sk: rec.sk, auth: cred.auth })).toThrow();
     expect(() => P.openWrap(pw, { sk: rec.sk, auth: cred.auth })).toThrow();
-    expect(() => P.openWrap(pw, { sk: P.credKem(fill(32, 0x12), credId).sk, auth: cred.auth })).toThrow();
     expect(() => P.openWrap(rw, { sk: cred.sk, auth: rec.auth })).toThrow();
-    // unwrapAK goes through the same check
-    expect(() => P.unwrapAK(pw, { sk: cred.sk, auth: new Uint8Array(32) }, alice.id.sigPk)).toThrow();
-    expect(() => P.unwrapAK(rw, { sk: rec.sk, auth: cred.auth }, alice.id.sigPk)).toThrow();
+    expect(() => P.unwrapAK(pw, rec, alice.id.sigPk)).toThrow();
+    expect(() => P.unwrapAK(rw, cred, alice.id.sigPk)).toThrow();
   });
 
-  describe('wrap substitution under a public id (an attacker files a wrap of their own AK)', () => {
-    // Everything the attacker (carol) can see: the victim's (alice's) public wrap records.
+  it("unwrapAK adds the key check (§2.4 step 3) and the record signature check", () => {
+    const otherAK = fill(32, 0x99);
+    const ow = P.makeWrap(alice.uid, "passkey", credId, cred, otherAK, alice.id, TS);
+    const w = P.verifyWrap(ow.record, ow.sig, alice.id.sigPk);
+    expect(toHex(P.openWrap(w, cred))).toBe(toHex(otherAK));
+    expect(() => P.unwrapAK(w, cred, alice.id.sigPk)).toThrow(/key check/);
+    expect(() => P.unwrapAK(P.parseWrap(pkWrap.record, pkWrap.sig), cred, bob.id.sigPk)).toThrow(/key check/);
+    // a record whose signature does not verify (parseWrap does not check it)
+    const unsigned = P.parseWrap(pkWrap.record, P.b64u(new Uint8Array(64)));
+    expect(toHex(P.openWrap(unsigned, cred))).toBe(toHex(alice.AK));
+    expect(() => P.unwrapAK(unsigned, cred, alice.id.sigPk)).toThrow(/signature/);
+    // the AK inside an authentic box must be exactly 32 bytes
+    for (const n of [0, 31, 33]) {
+      const box = P.seal(cred.pk, AKW, P.enc(alice.uid, credId, cred.auth), new Uint8Array(n));
+      expect(() => P.openWrap({ uid: alice.uidS, id: credId, wrap: box }, cred), `AK of ${n} bytes`).toThrow(/AK length/);
+    }
+  });
+
+  it("a wrap re-labelled with another uid or id (or uid and id swapped) does not open", () => {
+    const r = P.parseWrap(pkWrap.record, pkWrap.sig);
+    expect(() => P.openWrap({ ...r, uid: bob.uidS }, cred)).toThrow();
+    expect(() => P.openWrap({ ...r, id: seqBytes(20, 0x81) }, cred)).toThrow();
+    expect(() => P.openWrap({ ...r, id: credId.subarray(0, 19) }, cred)).toThrow();
+    const rr = P.parseWrap(recWrap.record, recWrap.sig);
+    expect(() => P.openWrap({ uid: P.b64u(rr.id), id: P.fromB64u(rr.uid), wrap: rr.wrap }, rec)).toThrow();
+    expect(() => refOpen(rec.sk, AKW, refEnc(alice.uid, rec.auth, rec.id), rr.wrap)).toThrow();
+    const raw = JSON.parse(pkWrap.record) as Record<string, unknown>;
+    const moved = signRecord({ ...raw, id: P.b64u(seqBytes(20, 0x90)) }, alice);
+    expect(() => P.unwrapAK(P.verifyWrap(moved.record, moved.sig, alice.id.sigPk), cred, alice.id.sigPk)).toThrow();
+  });
+
+  describe("an attacker files a wrap of their own AK under the victim's public id", () => {
     const vRec = P.parseWrap(recWrap.record, recWrap.sig);
     const vPk = P.parseWrap(pkWrap.record, pkWrap.sig);
-    const attackerCode = seqBytes(20, 0x70);
-    const attackerPrf = fill(32, 0x77);
     /** Every "auth" the attacker can compute from public data (plus their own secrets). */
     const guesses = (w: P.WrapRecord): [string, B][] => [
-      ['zero', new Uint8Array(32)],
-      ['empty', new Uint8Array(0)],
-      ['ones', fill(32, 0xff)],
-      ['id', w.id],
-      ['victim uid', P.fromB64u(w.uid)],
-      ['H(kem pk)', sha(w.kemPk)],
-      ['H(victim box)', sha(w.wrap)],
-      ['H(record)', sha(s2b(w.record))],
-      ['victim record signature', P.fromB64u(w.sig).subarray(0, 32)],
-      ['recovery KDF on the id', hkdfN(w.id, '', 'segv.sh/v1/recovery/auth')],
-      ['recovery KDF on the kem pk', hkdfN(w.kemPk, '', 'segv.sh/v1/recovery/auth')],
-      ['cred KDF on the kem pk', hkdfN(w.kemPk, w.id, 'segv.sh/v1/cred/auth')],
-      ["attacker's own recovery auth", P.recoveryKem(attackerCode).auth],
-      ["attacker's PRF with the victim's credId", P.credKem(attackerPrf, w.id).auth],
-      ...Array.from({ length: 8 }, (_, i): [string, B] => [`random #${i}`, prng(0xa77ac + i).bytes(32)]),
+      ["zero", new Uint8Array(32)],
+      ["empty", new Uint8Array(0)],
+      ["id", w.id],
+      ["victim uid", P.fromB64u(w.uid)],
+      ["H(kem pk)", sha(w.kemPk)],
+      ["H(victim box)", sha(w.wrap)],
+      ["H(record)", sha(s2b(w.record))],
+      ["recovery KDF on the id", hkdfN(w.id, "", "segv.sh/v2/recovery/auth")],
+      ["cred KDF on the kem pk", hkdfN(w.kemPk, w.id, "segv.sh/v2/cred/auth")],
+      ["attacker's own recovery auth", P.recoveryKem(seqBytes(20, 0x70)).auth],
+      ["attacker's PRF with the victim's credId", P.credKem(fill(32, 0x77), w.id).auth],
+      ...Array.from({ length: 4 }, (_, i): [string, B] => [`random #${i}`, prng(0xa77ac + i).bytes(32)]),
     ];
 
-    it('the server would accept the forged records (they are well-formed and attacker-signed)', () => {
-      const f = P.makeWrap(carol.uid, 'recovery', vRec.id, { pk: vRec.kemPk, auth: new Uint8Array(32) }, carol.AK, carol.id, TS + 9);
+    it("the forged records are well-formed and attacker-signed, but cannot be filed under the victim's uid", () => {
+      const f = P.makeWrap(carol.uid, "recovery", vRec.id, { pk: vRec.kemPk, auth: new Uint8Array(32) }, carol.AK, carol.id, TS + 9);
       const r = P.verifyWrap(f.record, f.sig, carol.id.sigPk);
       expect(toHex(r.id)).toBe(toHex(rec.id));
-      expect(toHex(r.kemPk)).toBe(toHex(rec.pk));
-      // ... and the attacker cannot file it under the victim's uid
       const asVictim = signRecord({ ...(JSON.parse(f.record) as Record<string, unknown>), uid: alice.uidS }, carol);
       expect(() => P.verifyWrap(asVictim.record, asVictim.sig, alice.id.sigPk)).toThrow(/signature/);
     });
 
-    it("recovery: no attacker wrap opens with the victim's recoveryKem(code)", () => {
-      for (const [name, auth] of guesses(vRec)) {
-        const f = P.makeWrap(carol.uid, 'recovery', vRec.id, { pk: vRec.kemPk, auth }, carol.AK, carol.id, TS + 9);
-        const r = P.verifyWrap(f.record, f.sig, carol.id.sigPk);
-        expect(() => P.openWrap(r, rec), name).toThrow();
-        expect(() => P.unwrapAK(r, rec, carol.id.sigPk), name).toThrow();
-        expect(() => P.unwrapAK(r, rec, alice.id.sigPk), name).toThrow();
-      }
-    });
-
-    it("passkey: no attacker wrap opens with the victim's credKem(prf, credId)", () => {
-      for (const [name, auth] of guesses(vPk)) {
-        const f = P.makeWrap(carol.uid, 'passkey', vPk.id, { pk: vPk.kemPk, auth }, carol.AK, carol.id, TS + 9);
-        const r = P.verifyWrap(f.record, f.sig, carol.id.sigPk);
-        expect(() => P.openWrap(r, cred), name).toThrow();
-        expect(() => P.unwrapAK(r, cred, carol.id.sigPk), name).toThrow();
-      }
-    });
-
-    it('the pre-fix construction (ctx = enc(uid, id), no auth) no longer opens', () => {
+    it("no attacker wrap opens with the victim's recovery or passkey secret", () => {
       for (const [kind, v, key] of [
-        ['recovery', vRec, rec],
-        ['passkey', vPk, cred],
+        ["recovery", vRec, rec],
+        ["passkey", vPk, cred],
       ] as const) {
-        const box = P.seal(v.kemPk, 'ak-wrap', P.enc(carol.uid, v.id), carol.AK);
-        const f = signRecord({ v: 1, uid: carol.uidS, kind, id: P.b64u(v.id), kem: P.b64u(v.kemPk), wrap: P.b64u(box), ts: TS + 9 }, carol);
-        const r = P.verifyWrap(f.record, f.sig, carol.id.sigPk);
-        expect(() => P.openWrap(r, key), kind).toThrow();
-        expect(() => P.unwrapAK(r, key, carol.id.sigPk), kind).toThrow();
+        for (const [name, auth] of guesses(v)) {
+          const f = P.makeWrap(carol.uid, kind, v.id, { pk: v.kemPk, auth }, carol.AK, carol.id, TS + 9);
+          const r = P.verifyWrap(f.record, f.sig, carol.id.sigPk);
+          expect(() => P.openWrap(r, key), `${kind}: ${name}`).toThrow();
+          expect(() => P.unwrapAK(r, key, carol.id.sigPk), `${kind}: ${name}`).toThrow();
+        }
+        // the construction without auth (ctx = enc(uid, id)) does not open either
+        const box = P.seal(v.kemPk, AKW, P.enc(carol.uid, v.id), carol.AK);
+        const f = signRecord({ v: 2, uid: carol.uidS, kind, id: P.b64u(v.id), kem: P.b64u(v.kemPk), wrap: P.b64u(box), ts: TS + 9 }, carol);
+        expect(() => P.openWrap(P.verifyWrap(f.record, f.sig, carol.id.sigPk), key), kind).toThrow();
+        // copying the victim's box into the attacker's record does not open (bound to the victim's uid)
+        const c = signRecord({ v: 2, uid: carol.uidS, kind, id: P.b64u(v.id), kem: P.b64u(v.kemPk), wrap: P.b64u(v.wrap), ts: TS + 9 }, carol);
+        expect(() => P.openWrap(P.verifyWrap(c.record, c.sig, carol.id.sigPk), key), kind).toThrow();
       }
     });
 
-    it("copying the victim's box into the attacker's record does not open (the box is bound to the victim's uid)", () => {
-      for (const [kind, v, key] of [
-        ['recovery', vRec, rec],
-        ['passkey', vPk, cred],
-      ] as const) {
-        const f = signRecord({ v: 1, uid: carol.uidS, kind, id: P.b64u(v.id), kem: P.b64u(v.kemPk), wrap: P.b64u(v.wrap), ts: TS + 9 }, carol);
-        const r = P.verifyWrap(f.record, f.sig, carol.id.sigPk);
-        expect(() => P.openWrap(r, key), kind).toThrow();
-        expect(() => P.unwrapAK(r, key, carol.id.sigPk), kind).toThrow();
-      }
-    });
-
-    it('a recovery login (all wraps under recId, newest first, no uid filter) still finds the victim', () => {
-      const bundles = new Map([alice, bob, carol].map((u) => [u.uidS, u.user]));
-      /** Mirrors the client: try every record filed under the code's id, newest first. */
-      const recoveryLogin = (c: B, log: { record: string; sig: string }[]) => {
+    it("a recovery login over every record filed under recId still finds only the victim", () => {
+      const owners = new Map([alice, bob, carol].map((u) => [u.uidS, u.user]));
+      const login = (c: B, log: { record: string; sig: string }[]) => {
         const k = P.recoveryKem(c);
-        for (const w of [...log].reverse()) {
+        const opened: { uid: string; AK: B }[] = [];
+        for (const w of log) {
           try {
             const r = P.parseWrap(w.record, w.sig);
-            const owner = bundles.get(r.uid);
-            if (!owner || !P.equalBytes(r.id, k.id)) continue;
-            return { uid: P.verifyWrap(w.record, w.sig, owner.sigPk).uid, AK: P.unwrapAK(r, k, owner.sigPk) };
+            const owner = owners.get(r.uid);
+            if (!owner || !P.equalBytes(r.id, k.id) || r.kind !== "recovery") continue;
+            opened.push({ uid: r.uid, AK: P.unwrapAK(P.verifyWrap(w.record, w.sig, owner.sigPk), k, owner.sigPk) });
           } catch {
             /* not ours */
           }
         }
-        return null;
+        return new Set(opened.map((o) => o.uid)).size === 1 ? opened[0] : null; // §2.4 step 4
       };
-      const forged = [
-        ...guesses(vRec).map(([, auth]) => P.makeWrap(carol.uid, 'recovery', vRec.id, { pk: vRec.kemPk, auth }, carol.AK, carol.id, TS + 9)),
-        signRecord({ v: 1, uid: carol.uidS, kind: 'recovery', id: P.b64u(vRec.id), kem: P.b64u(vRec.kemPk), wrap: P.b64u(vRec.wrap), ts: TS + 9 }, carol),
-      ];
-      const got = recoveryLogin(code, [recWrap, ...forged]);
+      const forged = guesses(vRec).map(([, auth]) =>
+        P.makeWrap(carol.uid, "recovery", vRec.id, { pk: vRec.kemPk, auth }, carol.AK, carol.id, TS + 9),
+      );
+      const got = login(code, [...forged, recWrap]);
       expect(got?.uid).toBe(alice.uidS);
       expect(toHex(got!.AK)).toBe(toHex(alice.AK));
-      // without the genuine record nothing unlocks (in particular not the attacker's account)
-      expect(recoveryLogin(code, forged)).toBeNull();
-      // and the attacker's own code still opens only the attacker's own wrap
-      const ak = P.recoveryKem(attackerCode);
-      const own = P.makeWrap(carol.uid, 'recovery', ak.id, ak, carol.AK, carol.id, TS + 10);
-      expect(recoveryLogin(attackerCode, [recWrap, ...forged, own])?.uid).toBe(carol.uidS);
+      expect(login(code, forged)).toBeNull();
     });
   });
 
-  it('a wrap re-labelled with another uid or id (or with uid and id swapped) does not open', () => {
-    const r = P.parseWrap(pkWrap.record, pkWrap.sig);
-    expect(() => P.unwrapAK({ ...r, uid: bob.uidS }, cred, alice.id.sigPk)).toThrow();
-    expect(() => P.openWrap({ ...r, uid: bob.uidS }, cred)).toThrow();
-    expect(() => P.unwrapAK({ ...r, id: seqBytes(20, 0x81) }, cred, alice.id.sigPk)).toThrow();
-    expect(() => P.unwrapAK({ ...r, id: credId.subarray(0, 19) }, cred, alice.id.sigPk)).toThrow();
-    // uid and id swapped: both are 16 bytes for a recovery wrap, so only the field order tells them apart
-    const rr = P.parseWrap(recWrap.record, recWrap.sig);
-    expect(() => P.openWrap({ uid: P.b64u(rr.id), id: P.fromB64u(rr.uid), wrap: rr.wrap }, rec)).toThrow();
-    expect(() => refOpenWrap(rr.wrap, rec.sk, refEnc(rec.id, alice.uid, rec.auth))).toThrow();
-    // auth moved into another position of the context
-    expect(() => refOpenWrap(rr.wrap, rec.sk, refEnc(alice.uid, rec.auth, rec.id))).toThrow();
-    // Re-signed by the owner with a different id but the same wrap bytes: still bound to the old id.
-    const raw = JSON.parse(pkWrap.record) as Record<string, unknown>;
-    const moved = signRecord({ ...raw, id: P.b64u(seqBytes(20, 0x90)) }, alice);
-    expect(() => P.unwrapAK(P.verifyWrap(moved.record, moved.sig, alice.id.sigPk), cred, alice.id.sigPk)).toThrow();
-    // The owner moving their own box to another uid they control (bob re-signs) does not open either.
-    const toBob = signRecord({ ...raw, uid: bob.uidS }, bob);
-    expect(() => P.openWrap(P.verifyWrap(toBob.record, toBob.sig, bob.id.sigPk), cred)).toThrow();
-  });
-
-  it('recovery wrap does not open with a passkey key and vice versa', () => {
-    const rw = P.parseWrap(recWrap.record, recWrap.sig);
-    const pw = P.parseWrap(pkWrap.record, pkWrap.sig);
-    expect(() => P.unwrapAK(rw, cred, alice.id.sigPk)).toThrow();
-    expect(() => P.unwrapAK(pw, rec, alice.id.sigPk)).toThrow();
-    expect(() => P.unwrapAK(pw, P.credKem(fill(32, 0x12), credId), alice.id.sigPk)).toThrow(); // other PRF
-    expect(() => P.unwrapAK(rw, P.recoveryKem(seqBytes(20, 0x31)), alice.id.sigPk)).toThrow(); // other code
-  });
-
-  it('a bit flip in any region of the wrap is rejected', () => {
+  it("a bit flip in any region of the wrap is rejected", () => {
     const r = P.parseWrap(pkWrap.record, pkWrap.sig);
     const s = survivors(
       r.wrap,
       [
-        { name: 'kct', start: 0, end: 1120 },
-        { name: 'nonce', start: 1120, end: 1144, every: true },
-        { name: 'ct', start: 1144, end: 1176, every: true },
-        { name: 'tag', start: 1176, end: 1192, every: true },
+        { name: "kct", start: 0, end: 1120 },
+        { name: "nonce", start: 1120, end: 1144, every: true },
+        { name: "ct", start: 1144, end: 1176, every: true },
+        { name: "tag", start: 1176, end: 1192, every: true },
       ],
       (b) => P.unwrapAK({ ...r, wrap: b }, cred, alice.id.sigPk),
       2,
@@ -1102,1043 +1217,550 @@ describe('passkey & recovery wraps (§2.4)', () => {
   }, 30_000);
 });
 
-describe('recovery codes', () => {
-  /** Independent Crockford base32 (BigInt). */
-  const refCrockford = (b: B): string => {
-    const A = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
-    let v = BigInt('0x' + toHex(b));
-    let s = '';
-    for (let i = 0; i < 32; i++) {
-      s = A[Number(v & 31n)] + s;
-      v >>= 5n;
-    }
-    return s.match(/.{4}/g)!.join('-');
-  };
+describe("directory prefixes hpre / upre (§2.5)", () => {
+  const u32ref = (b: B): number => Number(beToBig(b.subarray(0, 4)));
 
-  it('format: 8 groups of 4 Crockford characters', () => {
-    expect(P.formatRecoveryCode(new Uint8Array(20))).toBe('0000-0000-0000-0000-0000-0000-0000-0000');
-    expect(P.formatRecoveryCode(fill(20, 0xff))).toBe('ZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZ');
-    const r = prng(11);
-    for (let t = 0; t < 200; t++) {
-      const c = t === 0 ? P.newRecoveryCode() : r.bytes(20);
-      const s = P.formatRecoveryCode(c);
-      expect(s).toMatch(/^[0-9A-HJKMNP-TV-Z]{4}(-[0-9A-HJKMNP-TV-Z]{4}){7}$/);
-      expect(s).toBe(refCrockford(c));
-      expect(toHex(P.parseRecoveryCode(s))).toBe(toHex(c));
+  it("are u32 of the first 4 bytes of the labelled hash, without sign bugs", () => {
+    let high = 0;
+    for (let i = 0; i < 300; i++) {
+      const handle = `user_${i}`;
+      const h = P.hpre(handle);
+      expect(h).toBe(u32ref(sha(refEnc("segv.sh/v2/dir/handle", handle))));
+      expect(Number.isInteger(h) && h >= 0 && h <= 0xffffffff).toBe(true);
+      const uid = seqBytes(16, i);
+      const u = P.upre(uid);
+      expect(u).toBe(u32ref(sha(refEnc("segv.sh/v2/dir/uid", uid))));
+      expect(Number.isInteger(u) && u >= 0 && u <= 0xffffffff).toBe(true);
+      if (h >= 2 ** 31) high++;
     }
-    expect(P.newRecoveryCode().length).toBe(20);
-    expect(toHex(P.newRecoveryCode())).not.toBe(toHex(P.newRecoveryCode()));
-    for (const n of [0, 19, 21, 32]) expect(() => P.formatRecoveryCode(new Uint8Array(n))).toThrow(/20 bytes/);
+    expect(high).toBeGreaterThan(50); // values with the top bit set stay positive
+    expect(P.hpre("alice")).not.toBe(P.upre(s2b("alice")));
+  });
+});
+
+// ───────────────────────── derivations (§4) ─────────────────────────
+
+describe("self lane labels (§4.1)", () => {
+  const { rS, nS } = alice.id;
+
+  it("Lself / Lsnap / Tself follow the spec", () => {
+    for (const [E, n] of [
+      [0, 0],
+      [3, 7],
+      [0xfffe, 0xffffffff],
+    ]) {
+      expect(toHex(P.Lself(rS, E, n))).toBe(toHex(tr16(hmacN(rS, refEnc("segv.sh/v2/lab/self", be16(E), be32(n))))));
+      expect(toHex(P.Lsnap(rS, E, n))).toBe(toHex(tr16(hmacN(rS, refEnc("segv.sh/v2/lab/snap", be16(E), be32(n))))));
+      expect(P.Lself(rS, E, n).length).toBe(16);
+    }
+    expect(toHex(P.topicSelf(nS))).toBe(toHex(tr16(hmacN(nS, "segv.sh/v2/topic/self"))));
+    expect(P.topicSelf(nS).length).toBe(16);
   });
 
-  it('parse is lenient about case, separators and look-alikes', () => {
-    // A code containing both 0 and 1 so the O->0 and I/L->1 rules matter.
-    const c = fromHex('0000108420c4000000000000000000000000ffff');
-    const s = P.formatRecoveryCode(c);
-    expect(s).toMatch(/0/);
-    expect(s).toMatch(/1/);
-    const variants = [
-      s,
-      s.toLowerCase(),
-      s.replace(/-/g, ''),
-      s.replace(/-/g, ' '),
-      ` ${s.replace(/-/g, '  ')}\n`,
-      s.replace(/-/g, '\t'),
-      s.replace(/0/g, 'O'),
-      s.replace(/0/g, 'o'),
-      s.replace(/1/g, 'I'),
-      s.replace(/1/g, 'i'),
-      s.replace(/1/g, 'L'),
-      s.replace(/1/g, 'l'),
-      s.replace(/-/g, '-').replace(/(.{4})/g, '$1-'), // extra dashes
-    ];
-    for (const v of variants) expect(toHex(P.parseRecoveryCode(v)), JSON.stringify(v)).toBe(toHex(c));
-  });
-
-  it('parse rejects wrong length and invalid characters', () => {
-    const s = P.formatRecoveryCode(seqBytes(20)).replace(/-/g, '');
-    expect(() => P.parseRecoveryCode(s.slice(1))).toThrow(/32 characters/);
-    expect(() => P.parseRecoveryCode(s + 'A')).toThrow(/32 characters/);
-    expect(() => P.parseRecoveryCode('')).toThrow(/32 characters/);
-    for (const ch of ['U', 'u', '!', '_', '.', '=', 'é', '\u0000']) {
-      expect(() => P.parseRecoveryCode(ch + s.slice(1)), JSON.stringify(ch)).toThrow(Error);
+  it("rejects E and n outside u16 / u32 instead of aliasing", () => {
+    for (const f of [P.Lself, P.Lsnap]) {
+      expect(() => f(rS, 0x10000, 0)).toThrow();
+      expect(() => f(rS, -1, 0)).toThrow();
+      expect(() => f(rS, 0, 2 ** 32)).toThrow();
+      expect(() => f(rS, 0, 0.5)).toThrow();
     }
   });
 });
 
-// ───────────────────────── epochs ─────────────────────────
-
-describe('epoch keys and tags (§3.1)', () => {
-  it('epochKeys follow the spec and rk/mk/kc are distinct', () => {
-    const k = P.epochKeys(EK0, CONV_A, 5);
-    expect(toHex(k.rk)).toBe(toHex(hkdfN(EK0, CONV_A, refEnc('segv.sh/v1/ep/route', be32(5)))));
-    expect(toHex(k.mk)).toBe(toHex(hkdfN(EK0, CONV_A, refEnc('segv.sh/v1/ep/msg', be32(5)))));
-    expect(toHex(k.kc)).toBe(toHex(hkdfN(EK0, CONV_A, refEnc('segv.sh/v1/ep/commit', be32(5)))));
-    expect(new Set([toHex(k.rk), toHex(k.mk), toHex(k.kc)]).size).toBe(3);
-    const k2 = P.epochKeys(EK0.slice(), CONV_A.slice(), 5);
-    expect(toHex(k2.mk)).toBe(toHex(k.mk));
+describe("conversation epochs (§4.2)", () => {
+  it("epochKeys rk / mk / kc / nk / dk follow the spec and are distinct", () => {
+    const k = P.epochKeys(EK, CONV, 5);
+    for (const [name, what] of [
+      ["rk", "route"],
+      ["mk", "msg"],
+      ["kc", "commit"],
+      ["nk", "notify"],
+      ["dk", "desc"],
+    ] as const) {
+      expect(toHex(k[name]), name).toBe(toHex(hkdfN(EK, CONV, refEnc(`segv.sh/v2/ep/${what}`, be32(5)))));
+    }
+    expect(Object.keys(k).sort()).toEqual(["dk", "kc", "mk", "nk", "rk"]);
+    expect(new Set(Object.values(k).map(toHex)).size).toBe(5);
+    expect(toHex(P.epochKeys(EK.slice(), CONV.slice(), 5).mk)).toBe(toHex(k.mk));
   });
 
-  it('every key changes with EK, conv and e', () => {
+  it("every key changes with EK, conv and e; bad inputs throw", () => {
     const all = new Set<string>();
     let count = 0;
-    for (const EK of [EK0, EK1])
-      for (const conv of [CONV_A, CONV_B])
-        for (const e of [0, 1, 2, 0xffffffff]) {
-          const k = P.epochKeys(EK, conv, e);
-          for (const x of [k.rk, k.mk, k.kc]) {
+    for (const ek of [EK, fill(32, 0xe1)])
+      for (const conv of [CONV, seqBytes(16, 0x61)])
+        for (const e of [0, 1, 2, P.E_MAX]) {
+          for (const x of Object.values(P.epochKeys(ek, conv, e))) {
             all.add(toHex(x));
             count++;
           }
         }
     expect(all.size).toBe(count);
+    expect(P.E_MAX).toBe(0xffffffff);
+    expect(() => P.epochKeys(new Uint8Array(31), CONV, 0)).toThrow();
+    expect(() => P.epochKeys(EK, new Uint8Array(15), 0)).toThrow();
+    expect(() => P.epochKeys(EK, CONV, -1)).toThrow();
+    expect(() => P.epochKeys(EK, CONV, 2 ** 32)).toThrow();
+    expect(() => P.epochKeys(EK, CONV, 0.5)).toThrow();
   });
 
-  it('epochKeys rejects bad inputs', () => {
-    expect(() => P.epochKeys(new Uint8Array(31), CONV_A, 0)).toThrow();
-    expect(() => P.epochKeys(EK0, new Uint8Array(15), 0)).toThrow();
-    expect(() => P.epochKeys(EK0, CONV_A, -1)).toThrow();
-    expect(() => P.epochKeys(EK0, CONV_A, 2 ** 32)).toThrow();
-    expect(() => P.epochKeys(EK0, CONV_A, 0.5)).toThrow();
+  it("ekc = H(enc('segv.sh/v2/ekc', conv, u32 e, EK))", () => {
+    expect(toHex(P.ekc(CONV, 7, EK))).toBe(toHex(sha(refEnc("segv.sh/v2/ekc", CONV, be32(7), EK))));
+    expect(toHex(P.ekc(CONV, 7, EK))).not.toBe(toHex(P.ekc(CONV, 8, EK)));
+    expect(() => P.ekc(CONV, 2 ** 32, EK)).toThrow();
   });
 
-  it('msgTag / claimTag are distinct across i, n, e and conv', () => {
+  it("Lmsg / Lctl / T_e follow the spec", () => {
+    const { rk, nk } = P.epochKeys(EK, CONV, 3);
+    for (const [l, E, n] of [
+      [0, 0, 0],
+      [3, 7, 9],
+      [31, 0xfffe, 0xffffffff],
+      [0xffff, 1, 1],
+    ]) {
+      expect(toHex(P.Lmsg(rk, l, E, n))).toBe(toHex(tr16(hmacN(rk, refEnc("segv.sh/v2/lab/msg", be16(l), be16(E), be32(n))))));
+    }
+    for (const [E, k] of [
+      [0, 0],
+      [7, 9],
+      [0xfffe, 0xffffffff],
+    ]) {
+      expect(toHex(P.Lctl(rk, E, k))).toBe(toHex(tr16(hmacN(rk, refEnc("segv.sh/v2/lab/ctl", be16(E), be32(k))))));
+    }
+    expect(toHex(P.topicConv(nk))).toBe(toHex(tr16(hmacN(nk, "segv.sh/v2/topic/conv"))));
+  });
+
+  it("labels are distinct across lane, era, slot, epoch and label kind", () => {
     const seen = new Set<string>();
     let count = 0;
-    for (const conv of [CONV_A, CONV_B])
-      for (const e of [0, 1]) {
-        const { rk } = P.epochKeys(EK0, conv, e);
-        const c = P.claimTag(rk);
-        expect(c.length).toBe(16);
-        expect(toHex(c)).toBe(toHex(hmacN(rk, 'c').subarray(0, 16)));
-        seen.add(toHex(c));
-        count++;
-        for (let i = 0; i < 32; i++)
-          for (let n = 0; n < 48; n++) {
-            const t = P.msgTag(rk, i, n);
-            expect(t.length).toBe(16);
-            seen.add(toHex(t));
-            count++;
-          }
-        expect(toHex(P.msgTag(rk, 3, 70000))).toBe(toHex(hmacN(rk, cat(s2b('m'), be16(3), be32(70000))).subarray(0, 16)));
-      }
+    const add = (b: B) => {
+      expect(b.length).toBe(16);
+      seen.add(toHex(b));
+      count++;
+    };
+    for (const e of [0, 1]) {
+      const { rk } = P.epochKeys(EK, CONV, e);
+      for (const E of [0, 1])
+        for (let n = 0; n < 16; n++) {
+          add(P.Lctl(rk, E, n));
+          for (let l = 0; l < 8; l++) add(P.Lmsg(rk, l, E, n));
+          // the same key and (E, n) under the other label kinds
+          add(P.Lself(rk, E, n));
+          add(P.Lsnap(rk, E, n));
+          add(P.Lhello(rk, E, n));
+        }
+      add(P.topicConv(rk));
+      add(P.topicSelf(rk));
+      add(P.topicLink(rk));
+    }
     expect(seen.size).toBe(count);
   });
 
-  it('msgTag rejects indices / counters outside u16 / u32 instead of aliasing', () => {
-    const { rk } = P.epochKeys(EK0, CONV_A, 0);
-    expect(() => P.msgTag(rk, 65536, 0)).toThrow(); // would alias msgTag(rk, 0, 0) if truncated
-    expect(() => P.msgTag(rk, -1, 0)).toThrow();
-    expect(() => P.msgTag(rk, 0, -1)).toThrow();
-    expect(() => P.msgTag(rk, 0, 2 ** 32)).toThrow();
+  it("rejects lane, E and n outside u16 / u16 / u32", () => {
+    const { rk } = P.epochKeys(EK, CONV, 0);
+    expect(() => P.Lmsg(rk, 0x10000, 0, 0)).toThrow();
+    expect(() => P.Lmsg(rk, 0, 0x10000, 0)).toThrow();
+    expect(() => P.Lmsg(rk, 0, 0, 2 ** 32)).toThrow();
+    expect(() => P.Lmsg(rk, -1, 0, 0)).toThrow();
+    expect(() => P.Lctl(rk, 0x10000, 0)).toThrow();
+    expect(() => P.Lctl(rk, 0, -1)).toThrow();
   });
 });
 
-describe('checkUserKeys', () => {
-  it('accepts real identities and rejects unusable keys', () => {
-    const id = P.deriveIdentity(new Uint8Array(32).fill(7));
-    expect(() => P.checkUserKeys(id)).not.toThrow();
-    const identity = new Uint8Array(32);
-    identity[0] = 1; // Ed25519 identity point (small order)
-    expect(() => P.checkUserKeys({ ...id, sigPk: identity })).toThrow(/signing key/);
-    expect(() => P.checkUserKeys({ ...id, sigPk: new Uint8Array(32).fill(0xff) })).toThrow(/signing key/);
-    expect(() => P.checkUserKeys({ ...id, scanPk: new Uint8Array(32) })).toThrow(/scan key/); // order-1 point u=0
-    const one = new Uint8Array(32);
-    one[0] = 1;
-    expect(() => P.checkUserKeys({ ...id, scanPk: one })).toThrow(/scan key/); // u=1, order 4
-    expect(() => P.checkUserKeys({ ...id, kemPk: new Uint8Array(1216).fill(0xff) })).toThrow(/KEM key/);
+describe("links (§4.3)", () => {
+  const s = seqBytes(16, 0x90);
+
+  it("linkKeys, Lhello and Tlink follow the spec", () => {
+    const k = P.linkKeys(s);
+    expect(toHex(k.kL)).toBe(toHex(hkdfN(s, "", "segv.sh/v2/link/route")));
+    expect(toHex(k.mL)).toBe(toHex(hkdfN(s, "", "segv.sh/v2/link/aead")));
+    expect(toHex(k.nL)).toBe(toHex(hkdfN(s, "", "segv.sh/v2/link/notify")));
+    expect(new Set([k.kL, k.mL, k.nL].map(toHex)).size).toBe(3);
+    for (const [E, j] of [
+      [0, 0],
+      [5, 3],
+      [0xfffe, 0xffffffff],
+    ]) {
+      expect(toHex(P.Lhello(k.kL, E, j))).toBe(toHex(tr16(hmacN(k.kL, refEnc("segv.sh/v2/lab/hello", be16(E), be32(j))))));
+    }
+    expect(toHex(P.topicLink(k.nL))).toBe(toHex(tr16(hmacN(k.nL, "segv.sh/v2/topic/link"))));
+    for (const n of [0, 15, 17, 32]) expect(() => P.linkKeys(new Uint8Array(n))).toThrow(/16 bytes/);
+  });
+
+  it("encodeLink / parseLink: https://<host>/i# + b64u(u8 2 ‖ s ‖ uid)", () => {
+    const url = P.encodeLink("segv.sh", s, alice.uid);
+    expect(url).toBe(`https://segv.sh/i#${b64uN(cat(Uint8Array.of(2), s, alice.uid))}`);
+    const p = P.parseLink(url);
+    expect(p.host).toBe("segv.sh");
+    expect(toHex(p.s)).toBe(toHex(s));
+    expect(toHex(p.uid)).toBe(toHex(alice.uid));
+    expect(toHex(P.parseLink(`  ${url}\n`).s)).toBe(toHex(s));
+    const frag = (b: B) => `https://segv.sh/i#${b64uN(b)}`;
+    const bad = [
+      frag(cat(Uint8Array.of(1), s, alice.uid)), // version 1
+      frag(cat(Uint8Array.of(3), s, alice.uid)),
+      frag(cat(Uint8Array.of(2), s, alice.uid.subarray(1))), // 32 bytes
+      frag(cat(Uint8Array.of(2), s, alice.uid, Uint8Array.of(0))), // 34 bytes
+      url.replace("https://", "http://"),
+      url.replace("/i#", "/j#"),
+      url.replace("/i#", "/i?x#"),
+      url + "=",
+      url.replace("#", "#+").slice(0, -1),
+      "",
+    ];
+    for (const u of bad) expect(() => P.parseLink(u), u).toThrow(/link/);
+    expect(() => P.encodeLink("segv.sh", s.subarray(1), alice.uid)).toThrow();
+    expect(() => P.encodeLink("segv.sh", s, alice.uid.subarray(1))).toThrow();
   });
 });
 
-describe('descriptors (§3.1)', () => {
-  it('makeDescriptor emits the §3.1 key order and parse round-trips', () => {
-    const d = P.makeDescriptor({ conv: P.b64u(CONV_A), e: 0, members: [alice.uidS, bob.uidS], prev: null, by: alice.uidS, ts: TS });
-    expect(d).toBe(dText());
-    expect(P.parseDescriptor(d)).toEqual(dObj());
-    const named = P.makeDescriptor({
-      conv: P.b64u(CONV_A),
-      e: 1,
-      members: [alice.uidS],
-      prev: H32,
-      by: alice.uidS,
-      ts: TS,
-      name: 'Team',
-    });
-    expect(Object.keys(JSON.parse(named) as object)).toEqual(['v', 'conv', 'e', 'members', 'prev', 'by', 'ts', 'name']);
-    expect(P.parseDescriptor(named).name).toBe('Team');
-    // name: undefined must be omitted, not serialised
-    const unnamed = P.makeDescriptor({ conv: P.b64u(CONV_A), e: 0, members: [alice.uidS], prev: null, by: alice.uidS, ts: TS, name: undefined });
-    expect(unnamed).not.toMatch(/name/);
+describe("server routing (§4.4)", () => {
+  const ROUTE_KEY = seqBytes(32, 0xa0);
+
+  it("kroute / kcommit follow the spec", () => {
+    for (const E of [0, 1, 41, 0xfffe]) {
+      const k = P.kroute(ROUTE_KEY, E);
+      expect(toHex(k)).toBe(toHex(hmacN(ROUTE_KEY, refEnc("segv.sh/v2/route", be16(E)))));
+      expect(toHex(P.kcommit(k))).toBe(toHex(sha(refEnc("segv.sh/v2/kroute", k))));
+    }
+    expect(toHex(P.kroute(ROUTE_KEY, 1))).not.toBe(toHex(P.kroute(ROUTE_KEY, 2)));
+    for (const n of [0, 31, 33]) expect(() => P.kroute(new Uint8Array(n), 0)).toThrow(/ROUTE_KEY/);
+    expect(() => P.kroute(ROUTE_KEY, 0x10000)).toThrow();
   });
 
-  it('accepts the documented edge cases', () => {
-    const members32 = Array.from({ length: 32 }, (_, i) => uidN(i));
-    const ok = [
-      dText({ members: members32, by: members32[31] }),
-      dText({ members: [alice.uidS], by: alice.uidS }),
-      dText({ e: 1, prev: H32 }),
-      dText({ e: 0xffffffff, prev: H32 }),
-      dText({ ts: 0 }),
-      dText({ name: 'x'.repeat(64) }),
-      dText({ name: 'チーム 🙂' }),
-      dText({ name: '\u{1F600}'.repeat(64) }), // 64 code points (128 UTF-16 units)
-    ];
-    for (const t of ok) expect(() => P.parseDescriptor(t), t.slice(0, 120)).not.toThrow();
+  it("routeV = u64(HMAC(kroute_E, label)[0..8]) >> 1 as 8 big-endian bytes", () => {
+    const k = P.kroute(ROUTE_KEY, 3);
+    const r = prng(0x7007e);
+    for (let i = 0; i < 300; i++) {
+      const label = r.bytes(16);
+      const v = P.routeV(k, label);
+      const want = beToBig(hmacN(k, label).subarray(0, 8)) >> 1n;
+      expect(v.length).toBe(8);
+      expect(toHex(v)).toBe(toHex(be64n(want)));
+      expect(v[0] & 0x80).toBe(0); // a 63-bit value
+    }
+    for (const n of [0, 15, 17, 32]) expect(() => P.routeV(k, new Uint8Array(n))).toThrow(/16 bytes/);
   });
 
-  it('rejects every §3.1 / §3.3 shape violation', () => {
-    const members33 = Array.from({ length: 33 }, (_, i) => uidN(i));
-    const bad: [string, string][] = [
-      ['not JSON', '{'],
-      ['array', '[]'],
-      ['null', 'null'],
-      ['string', '"x"'],
-      ['v missing', dText({ v: undefined })],
-      ['v = 2', dText({ v: 2 })],
-      ['v = "1"', dText({ v: '1' })],
-      ['conv missing', dText({ conv: undefined })],
-      ['conv 15 bytes', dText({ conv: P.b64u(new Uint8Array(15)) })],
-      ['conv 17 bytes', dText({ conv: P.b64u(new Uint8Array(17)) })],
-      ['conv non-canonical', dText({ conv: nonCanonical(P.b64u(CONV_A)) })],
-      ['conv padded', dText({ conv: P.b64u(CONV_A) + '==' })],
-      ['conv number', dText({ conv: 1 })],
-      ['e missing', dText({ e: undefined })],
-      ['e null', dText({ e: null })],
-      ['e negative', dText({ e: -1 })],
-      ['e fractional', dText({ e: 0.5, prev: H32 })],
-      ['e string', dText({ e: '0' })],
-      ['e = 2^32', dText({ e: 2 ** 32, prev: H32 })],
-      ['members missing', dText({ members: undefined })],
-      ['members string', dText({ members: alice.uidS })],
-      ['members object', dText({ members: { 0: alice.uidS } })],
-      ['members empty', dText({ members: [] })],
-      ['members 33', dText({ members: members33, by: members33[0] })],
-      ['member 15 bytes', dText({ members: [alice.uidS, P.b64u(new Uint8Array(15))] })],
-      ['member number', dText({ members: [alice.uidS, 5] })],
-      ['member null', dText({ members: [alice.uidS, null] })],
-      ['member non-canonical', dText({ members: [alice.uidS, nonCanonical(bob.uidS)] })],
-      ['duplicate member', dText({ members: [alice.uidS, bob.uidS, alice.uidS] })],
-      ['prev missing', dText({ prev: undefined })],
-      ['e=0 with prev', dText({ prev: H32 })],
-      ['e=1 with prev null', dText({ e: 1, prev: null })],
-      ['prev 31 bytes', dText({ e: 1, prev: P.b64u(new Uint8Array(31)) })],
-      ['prev 33 bytes', dText({ e: 1, prev: P.b64u(new Uint8Array(33)) })],
-      ['prev number', dText({ e: 1, prev: 0 })],
-      ['prev empty string', dText({ e: 1, prev: '' })],
-      ['by missing', dText({ by: undefined })],
-      ['by not a member', dText({ by: carol.uidS })],
-      ['by 15 bytes', dText({ by: P.b64u(new Uint8Array(15)) })],
-      ['ts missing', dText({ ts: undefined })],
-      ['ts negative', dText({ ts: -1 })],
-      ['ts fractional', dText({ ts: 1.5 })],
-      ['ts string', dText({ ts: String(TS) })],
-      ['ts unsafe', dText({ ts: 2 ** 53 + 2 })],
-      ['name 65 chars', dText({ name: 'x'.repeat(65) })],
-      ['name 65 code points', dText({ name: '\u{1F600}'.repeat(65) })],
-      ['name number', dText({ name: 5 })],
-      ['name null', dText({ name: null })],
-      ['name array', dText({ name: ['x'] })],
-      ['name empty', dText({ name: '' })],
-      ['name whitespace', dText({ name: '   ' })],
-      ['name newline', dText({ name: 'a\nb' })],
-      ['name NUL', dText({ name: 'a\u0000b' })],
-      ['name RLO', dText({ name: 'abc\u202Etxt.exe' })],
-      ['name LRI', dText({ name: '\u2066x' })],
-      ['name RLM', dText({ name: 'x\u200F' })],
-    ];
-    for (const [name, text] of bad) expect(() => P.parseDescriptor(text), name).toThrow(Error);
-  });
-
-  it('validName: no leading "@" (it would pose as a 1:1 with that handle) and nothing invisible', () => {
-    const rejected = [
-      '@bob',
-      ' @bob',
-      '\t@bob',
-      ' @bob', // NBSP
-      ' @bob', // em space
-      '　@bob', // ideographic space
-      '﻿@bob', // BOM (trimmed as whitespace)
-      '​@bob', // zero-width space (format character)
-      '⁠@bob', // word joiner
-      '@',
-      '@@',
-      '@ bob',
-      '@bob, @carol',
-      // invisible / blank-looking names
-      'ㅤ', // Hangul filler
-      'ᅟ',
-      'ᅠ',
-      'ﾠ',
-      '⠀', // braille blank
-      '​',
-      'a​b',
-      'x­', // soft hyphen
-      'x\u{E0041}', // tag character
-      '́', // a lone combining mark has nothing visible
-    ];
-    const accepted = ['a@b', 'bob@', 'team @bob', 'x', 'Team', 'チーム 🙂', 'a'.repeat(64), '#general', '1:1'];
-    for (const n of rejected) expect(P.validName(n), JSON.stringify(n)).toBe(false);
-    for (const n of accepted) expect(P.validName(n), JSON.stringify(n)).toBe(true);
-    for (const n of [null, undefined, 5, ['x'], {}]) expect(P.validName(n), JSON.stringify(n)).toBe(false);
-    // enforced on both ends: peers reject it and our own makeDescriptor refuses to emit it
-    expect(() => P.parseDescriptor(dText({ name: '@bob' }))).toThrow(/name/);
-    expect(() => P.parseDescriptor(dText({ name: ' @bob' }))).toThrow(/name/);
-    expect(P.parseDescriptor(dText({ name: 'a@b' })).name).toBe('a@b');
-    const base = { conv: P.b64u(CONV_A), e: 0, members: [alice.uidS], prev: null, by: alice.uidS, ts: TS };
-    expect(() => P.makeDescriptor({ ...base, name: '@bob' })).toThrow(/name/);
-    expect(() => P.makeDescriptor({ ...base, name: 'ㅤ' })).toThrow(/name/);
-  });
-
-  it('descriptor signature is bound to the exact text, kc (EK), conv, epoch and signer', () => {
-    const d = dText();
-    const k0 = P.epochKeys(EK0, CONV_A, 0);
-    const dsig = P.signDescriptor(d, k0.kc, alice.id.sigSk);
-    expect(dsig.length).toBe(64);
-    expect(P.verifyDescriptorSig(d, k0.kc, dsig, alice.id.sigPk)).toBe(true);
-    expect(nodeEdVerify(dsig, refEnc('segv.sh/v1/epoch', d, k0.kc), alice.id.sigPk)).toBe(true);
-    // same descriptor, different EK -> different kc -> must fail
-    expect(P.verifyDescriptorSig(d, P.epochKeys(EK1, CONV_A, 0).kc, dsig, alice.id.sigPk)).toBe(false);
-    expect(P.verifyDescriptorSig(d, P.epochKeys(EK0, CONV_B, 0).kc, dsig, alice.id.sigPk)).toBe(false);
-    expect(P.verifyDescriptorSig(d, P.epochKeys(EK0, CONV_A, 1).kc, dsig, alice.id.sigPk)).toBe(false);
-    expect(P.verifyDescriptorSig(d, k0.mk, dsig, alice.id.sigPk)).toBe(false);
-    expect(P.verifyDescriptorSig(d, k0.rk, dsig, alice.id.sigPk)).toBe(false);
-    // different text
-    expect(P.verifyDescriptorSig(dText({ ts: TS + 1 }), k0.kc, dsig, alice.id.sigPk)).toBe(false);
-    expect(P.verifyDescriptorSig(JSON.stringify(dObj(), null, 1), k0.kc, dsig, alice.id.sigPk)).toBe(false);
-    // different signer
-    expect(P.verifyDescriptorSig(d, k0.kc, dsig, bob.id.sigPk)).toBe(false);
-    expect(P.verifyDescriptorSig(d, k0.kc, P.signDescriptor(d, k0.kc, bob.id.sigSk), alice.id.sigPk)).toBe(false);
-    // flipped signature bytes
-    for (let i = 0; i < 64; i += 7) expect(P.verifyDescriptorSig(d, k0.kc, flip(dsig, i), alice.id.sigPk)).toBe(false);
+  it("shardOf = v >> (63 − s_E), and 0 for s_E = 0 (stage 1)", () => {
+    const k = P.kroute(ROUTE_KEY, 3);
+    const r = prng(0x54a);
+    const vs = [new Uint8Array(8), fromHex("7fffffffffffffff"), fromHex("4000000000000000"), fromHex("0000800000000000")];
+    for (let i = 0; i < 100; i++) vs.push(P.routeV(k, r.bytes(16)));
+    for (const v of vs) {
+      expect(P.shardOf(v, 0)).toBe(0);
+      for (const s of [1, 2, 8, 16]) expect(P.shardOf(v, s), `${toHex(v)} s=${s}`).toBe(Number(beToBig(v) >> BigInt(63 - s)));
+    }
+    expect(P.shardOf(fromHex("7fffffffffffffff"), 1)).toBe(1);
+    expect(P.shardOf(fromHex("7fffffffffffffff"), 16)).toBe(0xffff);
+    expect(P.shardOf(fromHex("0000800000000000"), 16)).toBe(1);
+    // a view with a non-zero byteOffset
+    const buf = cat(Uint8Array.of(0xff, 0xff), fromHex("4000000000000000"));
+    expect(P.shardOf(buf.subarray(2), 1)).toBe(1);
+    for (const s of [-1, 17, 1.5]) expect(() => P.shardOf(vs[1], s)).toThrow(/shard/);
   });
 });
 
-// ───────────────────────── invites ─────────────────────────
+// ───────────────────────── commitments (§9, §12) ─────────────────────────
 
-describe('invites (§3.2)', () => {
-  const d = dText();
-  const keys = P.epochKeys(EK0, CONV_A, 0);
-  const dsig = P.signDescriptor(d, keys.kc, alice.id.sigSk);
-  const inv = P.makeInvite(bob.user, d, EK0, dsig);
-  const vkBob = P.inviteViewKey(bob.id.scanSk, bob.id.scanPk, inv);
-  const L = inv.body.length;
+describe("commitments: leaves and RFC 6962 MTH (§9)", () => {
+  const L = (i: number): B => refLeaf(Uint8Array.of(i));
 
-  it('round trip for the recipient', () => {
-    expect(inv.kind).toBe(3);
-    expect(inv.tag.length).toBe(16);
-    expect(P.INV_BODY_LENS).toEqual([32 + 1120 + 24 + 2048 + 16]);
-    expect(L).toBe(P.INV_BODY_LENS[0]);
-    expect(vkBob).not.toBeNull();
-    const o = P.openInvite(bob.id.kemSk, vkBob!, inv);
-    expect(o.dText).toBe(d);
-    expect(toHex(o.EK)).toBe(toHex(EK0));
-    expect(toHex(o.dsig)).toBe(toHex(dsig));
-    expect(P.verifyDescriptorSig(o.dText, P.epochKeys(o.EK, CONV_A, 0).kc, o.dsig, alice.id.sigPk)).toBe(true);
+  it("leaf = H(0x00 ‖ data); node = H(0x01 ‖ l ‖ r)", () => {
+    for (const d of [new Uint8Array(0), Uint8Array.of(0), seqBytes(100)]) expect(toHex(P.leaf(d))).toBe(toHex(refLeaf(d)));
+    expect(toHex(P.mth([L(0), L(1)]))).toBe(toHex(refNode(L(0), L(1))));
   });
 
-  it('matches an independent decryption per §3.2', () => {
-    const eph = inv.body.subarray(0, 32);
-    const s = nodeX25519(bob.id.scanSk, eph);
-    const vk = hkdfN(s, cat(eph, bob.id.scanPk), 'segv.sh/v1/inv/view');
-    expect(toHex(vk)).toBe(toHex(vkBob!));
-    const check = hmacN(vk, 'check').subarray(0, 16);
-    expect(toHex(check)).toBe(toHex(inv.tag));
-    const kct = inv.body.subarray(32, 1152);
-    const k = hkdfN(cat(xwing.decapsulate(kct, bob.id.kemSk), vk), sha(kct), 'segv.sh/v1/inv/key');
-    const padded = xchacha20poly1305(k, inv.body.subarray(1152, 1176), refEnc('segv.sh/v1/inv', eph, check)).decrypt(
-      inv.body.subarray(1176),
+  it("MTH for 1, 2, 3, 5 and 7 leaves has the RFC 6962 shape", () => {
+    const l = Array.from({ length: 7 }, (_, i) => L(i));
+    const n = refNode;
+    expect(toHex(P.mth(l.slice(0, 1)))).toBe(toHex(l[0]));
+    expect(toHex(P.mth(l.slice(0, 2)))).toBe(toHex(n(l[0], l[1])));
+    expect(toHex(P.mth(l.slice(0, 3)))).toBe(toHex(n(n(l[0], l[1]), l[2])));
+    expect(toHex(P.mth(l.slice(0, 5)))).toBe(toHex(n(n(n(l[0], l[1]), n(l[2], l[3])), l[4])));
+    expect(toHex(P.mth(l.slice(0, 7)))).toBe(toHex(n(n(n(l[0], l[1]), n(l[2], l[3])), n(n(l[4], l[5]), l[6]))));
+  });
+
+  it("MTH matches the certificate-transparency reference vectors", () => {
+    // RFC 6962 reference implementation test data (leaf inputs and roots of the first n leaves).
+    const inputs = ["", "00", "10", "2021", "3031", "40414243", "5051525354555657", "606162636465666768696a6b6c6d6e6f"];
+    const roots = [
+      "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+      "fac54203e7cc696cf0dfcb42c92a1d9dbaf70ad9e621f4bd8d98662f00e3c125",
+      "aeb6bcfe274b70a14fb067a5e5578264db0fa9b51af5e0ba159158f329e06e77",
+      "d37ee418976dd95753c1c73862b9398fa2a2cf9b4ff0fdfe8b30cd95209614b7",
+      "4e3bbb1f7b478dcfe71fb631631519a3bca12c9aefca1612bfce4c13a86264d4",
+      "76e67dadbcdf1e10e1b74ddc608abd2f98dfb16fbce75277b5232a127f2087ef",
+      "ddb89be403809e325750d3d263cd78929c2942b7942a34b77e122c9594a74c8c",
+      "5dc9da79a70659a9ad559cb701ded9a2ab9d823aad2f4960cfe370eff4604328",
+    ];
+    const leaves = inputs.map((h) => P.leaf(fromHex(h)));
+    for (let n = 1; n <= 8; n++) {
+      expect(toHex(P.mth(leaves.slice(0, n))), `n = ${n}`).toBe(roots[n - 1]);
+      expect(toHex(refMth(leaves.slice(0, n))), `ref n = ${n}`).toBe(roots[n - 1]);
+    }
+  });
+
+  it("MTH matches the bottom-up reference for 1..70 leaves, does not mutate its input, rejects empty batches", () => {
+    const r = prng(0x6962);
+    for (let n = 1; n <= 70; n++) {
+      const leaves = Array.from({ length: n }, () => refLeaf(r.bytes(r.int(40))));
+      const copy = leaves.map(toHex);
+      expect(toHex(P.mth(leaves)), `n = ${n}`).toBe(toHex(refMth(leaves)));
+      expect(leaves.map(toHex)).toEqual(copy);
+    }
+    expect(() => P.mth([])).toThrow(/empty/);
+  });
+
+  it("leafShard / leafInbox / leafBlob follow the spec", () => {
+    const label = seqBytes(16, 0x30);
+    const body = seqBytes(296, 1);
+    expect(toHex(P.leafShard(7, label, 1234, 0, body))).toBe(
+      toHex(refLeaf(refEnc("segv.sh/v2/leaf", be16(7), label, be32(1234), be8(0), sha(body)))),
     );
-    expect(padded.length).toBe(2048);
-    expect(toHex(padded)).toBe(toHex(refPad(refEnc(d, EK0, dsig), [2048])));
-  });
-
-  it('opens an invite built independently from the spec text', () => {
-    const ephSk = new Uint8Array(randomBytes(32));
-    const eph = x25519.getPublicKey(ephSk);
-    const vk = hkdfN(nodeX25519(ephSk, carol.id.scanPk), cat(eph, carol.id.scanPk), 'segv.sh/v1/inv/view');
-    const check = hmacN(vk, 'check').subarray(0, 16);
-    const { cipherText: kct, sharedSecret: ss } = xwing.encapsulate(carol.id.kemPk);
-    const k = hkdfN(cat(ss, vk), sha(kct), 'segv.sh/v1/inv/key');
-    const nonce = new Uint8Array(randomBytes(24));
-    const ct = xchacha20poly1305(k, nonce, refEnc('segv.sh/v1/inv', eph, check)).encrypt(refPad(refEnc(d, EK1, dsig), [2048]));
-    const row = { tag: check, body: cat(eph, kct, nonce, ct) };
-    const vk2 = P.inviteViewKey(carol.id.scanSk, carol.id.scanPk, row);
-    expect(vk2).not.toBeNull();
-    const o = P.openInvite(carol.id.kemSk, vk2!, row);
-    expect(o.dText).toBe(d);
-    expect(toHex(o.EK)).toBe(toHex(EK1));
-  });
-
-  it('non-recipients never match', () => {
-    const invs = [inv, P.makeInvite(bob.user, d, EK0, dsig), P.makeInvite(carol.user, d, EK0, dsig)];
-    const r = prng(12);
-    const others = [alice, ...Array.from({ length: 24 }, () => P.deriveIdentity(r.bytes(32)))].map((x) => ('id' in x ? x.id : x));
-    for (const row of invs.slice(0, 2)) {
-      for (const o of [...others, carol.id]) expect(P.inviteViewKey(o.scanSk, o.scanPk, row)).toBeNull();
-      // right secret, wrong public key (the vk salt binds scanPk)
-      expect(P.inviteViewKey(bob.id.scanSk, carol.id.scanPk, row)).toBeNull();
-    }
-    for (const o of [...others, bob.id]) expect(P.inviteViewKey(o.scanSk, o.scanPk, invs[2])).toBeNull();
-    // each invite is fresh (new eph), so tags never repeat
-    expect(new Set(invs.map((x) => toHex(x.tag))).size).toBe(3);
-  });
-
-  it('works with a custom dh callback (node:crypto X25519, like WebCrypto)', () => {
-    let calls = 0;
-    const dh = (sk: B, pk: B): B => {
-      calls++;
-      return nodeX25519(sk, pk);
-    };
-    const vk = P.inviteViewKey(bob.id.scanSk, bob.id.scanPk, inv, dh);
-    expect(calls).toBe(1);
-    expect(toHex(vk!)).toBe(toHex(vkBob!));
-    expect(P.inviteViewKey(carol.id.scanSk, carol.id.scanPk, inv, dh)).toBeNull();
-    expect(P.inviteViewKey(bob.id.scanSk, bob.id.scanPk, inv, () => fill(32, 7))).toBeNull(); // wrong secret
-    expect(
-      P.inviteViewKey(bob.id.scanSk, bob.id.scanPk, inv, () => {
-        throw new Error('webcrypto failure');
-      }),
-    ).toBeNull();
-    expect(P.openInvite(bob.id.kemSk, vk!, inv).dText).toBe(d);
-  });
-
-  it('inviteViewKey ignores malformed rows (never throws)', () => {
-    expect(P.inviteViewKey(bob.id.scanSk, bob.id.scanPk, { tag: inv.tag, body: inv.body.subarray(0, 31) })).toBeNull();
-    expect(P.inviteViewKey(bob.id.scanSk, bob.id.scanPk, { tag: inv.tag.subarray(0, 15), body: inv.body })).toBeNull();
-    expect(P.inviteViewKey(bob.id.scanSk, bob.id.scanPk, { tag: cat(inv.tag, Uint8Array.of(0)), body: inv.body })).toBeNull();
-    // low-order eph points (all-zero shared secret) are rejected by the DH, not matched
-    for (const bad of [new Uint8Array(32), cat(Uint8Array.of(1), new Uint8Array(31))]) {
-      expect(P.inviteViewKey(bob.id.scanSk, bob.id.scanPk, { tag: inv.tag, body: cat(bad, inv.body.subarray(32)) })).toBeNull();
-    }
-    const r = prng(13);
-    for (let t = 0; t < 50; t++) {
-      expect(P.inviteViewKey(bob.id.scanSk, bob.id.scanPk, { tag: r.bytes(16), body: r.bytes(r.int(L + 10)) })).toBeNull();
-    }
-  });
-
-  it('openInvite rejects wrong keys, wrong lengths and a different check tag', () => {
-    expect(() => P.openInvite(carol.id.kemSk, vkBob!, inv)).toThrow(); // wrong KEM sk
-    expect(() => P.openInvite(bob.id.kemSk, fill(32, 1), inv)).toThrow(); // wrong vk
-    const vkCarol = P.inviteViewKey(carol.id.scanSk, carol.id.scanPk, P.makeInvite(carol.user, d, EK0, dsig))!;
-    expect(() => P.openInvite(bob.id.kemSk, vkCarol, inv)).toThrow();
-    // body under a different check tag (AAD = enc(label, eph, check))
-    expect(() => P.openInvite(bob.id.kemSk, vkBob!, { tag: flip(inv.tag, 0), body: inv.body })).toThrow();
-    expect(() => P.openInvite(bob.id.kemSk, vkBob!, { tag: P.makeInvite(bob.user, d, EK0, dsig).tag, body: inv.body })).toThrow();
-    const retired = 32 + 1120 + 24 + 16384 + 16; // the former 16384 class
-    for (const len of [0, 32, L - 1, L + 1, retired - 1, retired]) {
-      const body = len <= L ? inv.body.subarray(0, len) : cat(inv.body, new Uint8Array(len - L));
-      expect(() => P.openInvite(bob.id.kemSk, vkBob!, { tag: inv.tag, body }), `len ${len}`).toThrow(/bad length/);
-    }
-  });
-
-  it('splicing parts of two invites to the same recipient fails', () => {
-    const inv2 = P.makeInvite(bob.user, d, EK1, dsig);
-    const vk2 = P.inviteViewKey(bob.id.scanSk, bob.id.scanPk, inv2)!;
-    // eph/tag of inv, kct+box of inv2
-    const spliced1 = { tag: inv.tag, body: cat(inv.body.subarray(0, 32), inv2.body.subarray(32)) };
-    expect(() => P.openInvite(bob.id.kemSk, vkBob!, spliced1)).toThrow();
-    // kct of inv2, rest of inv
-    const spliced2 = { tag: inv.tag, body: cat(inv.body.subarray(0, 32), inv2.body.subarray(32, 1152), inv.body.subarray(1152)) };
-    expect(() => P.openInvite(bob.id.kemSk, vkBob!, spliced2)).toThrow();
-    expect(() => P.openInvite(bob.id.kemSk, vk2, spliced2)).toThrow();
-  });
-
-  it('a bit flip in eph / kct / nonce / ciphertext / tag is rejected', () => {
-    const regions = [
-      { name: 'eph', start: 0, end: 32, every: true },
-      { name: 'kct', start: 32, end: 1152 },
-      { name: 'nonce', start: 1152, end: 1176 },
-      { name: 'ct', start: 1176, end: L - 16 },
-      { name: 'tag', start: L - 16, end: L, every: true },
-    ];
-    // Full receive path: detection + open must not yield a payload.
-    const full = (b: B) => {
-      const row = { tag: inv.tag, body: b };
-      const vk = P.inviteViewKey(bob.id.scanSk, bob.id.scanPk, row);
-      if (vk === null) throw new Error('not for me');
-      return P.openInvite(bob.id.kemSk, vk, row);
-    };
-    expect(survivors(inv.body, regions, full, 3)).toEqual([]);
-    // Open with the original vk (as if detection were skipped): AEAD must still catch it.
-    expect(survivors(inv.body, regions, (b) => P.openInvite(bob.id.kemSk, vkBob!, { tag: inv.tag, body: b }), 4)).toEqual([]);
-  }, 60_000);
-
-  it('the X25519-ignored top bit of eph is still authenticated', () => {
-    const b = flip(inv.body, 31, 7); // X25519 masks this bit, so s is unchanged
-    expect(toHex(nodeX25519(bob.id.scanSk, b.subarray(0, 32)))).toBe(toHex(nodeX25519(bob.id.scanSk, inv.body.subarray(0, 32))));
-    expect(P.inviteViewKey(bob.id.scanSk, bob.id.scanPk, { tag: inv.tag, body: b })).toBeNull();
-    expect(() => P.openInvite(bob.id.kemSk, vkBob!, { tag: inv.tag, body: b })).toThrow();
-  });
-
-  it('one size class: the largest descriptor fits, anything bigger is refused', () => {
-    // P = enc(D, EK, dsig) = (4 + |D|) + (4 + 32) + (4 + 64) = |D| + 108, and pad needs |P| + 1 <= 2048.
-    const fits = 'x'.repeat(2048 - 1 - 108);
-    const r = P.makeInvite(bob.user, fits, EK0, dsig);
-    expect(r.body.length).toBe(P.INV_BODY_LENS[0]);
-    const vk = P.inviteViewKey(bob.id.scanSk, bob.id.scanPk, r)!;
-    expect(P.openInvite(bob.id.kemSk, vk, r).dText).toBe(fits);
-    expect(() => P.makeInvite(bob.user, fits + 'x', EK0, dsig)).toThrow(/too large/);
-    expect(() => P.makeInvite(bob.user, 'x'.repeat(3000), EK0, dsig)).toThrow(/too large/); // formerly the 16384 class
-    // The largest valid descriptors (32 members, extreme e / ts, the 64 code points with the longest JSON
-    // encoding) fit with room to spare, so real invites never need a second class.
-    const members32 = Array.from({ length: 32 }, (_, i) => uidN(i));
-    const maxOver = { e: 0xffffffff, prev: H32, members: members32, by: members32[0], ts: Number.MAX_SAFE_INTEGER };
-    for (const name of ['\u{1F600}'.repeat(64), '"'.repeat(64), '\\'.repeat(64)]) {
-      const maxD = dText({ ...maxOver, name });
-      P.parseDescriptor(maxD);
-      expect(s2b(maxD).length, JSON.stringify(name[0])).toBeLessThan(1500);
-      expect(P.makeInvite(bob.user, maxD, EK0, dsig).body.length).toBe(P.INV_BODY_LENS[0]);
-    }
-    // Upper bound for any accepted name: JSON spends at most 6 bytes per code point ("\uXXXX").
-    expect(s2b(dText(maxOver)).length + ',"name":""'.length + 6 * 64).toBeLessThanOrEqual(fits.length);
-    // An authentic invite in the retired 16384 class is refused by length before any decryption.
-    const ephSk = new Uint8Array(randomBytes(32));
-    const eph = x25519.getPublicKey(ephSk);
-    const vkOld = hkdfN(nodeX25519(ephSk, bob.id.scanPk), cat(eph, bob.id.scanPk), 'segv.sh/v1/inv/view');
-    const check = hmacN(vkOld, 'check').subarray(0, 16);
-    const { cipherText: kct, sharedSecret: ss } = xwing.encapsulate(bob.id.kemPk);
-    const nonce = new Uint8Array(randomBytes(24));
-    const k = hkdfN(cat(ss, vkOld), sha(kct), 'segv.sh/v1/inv/key');
-    const old = { tag: check, body: cat(eph, kct, nonce, xchacha20poly1305(k, nonce, refEnc('segv.sh/v1/inv', eph, check)).encrypt(refPad(refEnc(d, EK0, dsig), [16384]))) };
-    expect(old.body.length).toBe(32 + 1120 + 24 + 16384 + 16);
-    expect(toHex(P.inviteViewKey(bob.id.scanSk, bob.id.scanPk, old)!)).toBe(toHex(vkOld));
-    expect(() => P.openInvite(bob.id.kemSk, vkOld, old)).toThrow(/bad length/);
-    // invalid recipient keys fail closed
-    expect(() => P.makeInvite({ kemPk: bob.user.kemPk, scanPk: new Uint8Array(32) }, d, EK0, dsig)).toThrow();
-    expect(() => P.makeInvite({ kemPk: fill(1216, 0xff), scanPk: bob.user.scanPk }, d, EK0, dsig)).toThrow();
-  });
-
-  it('openInvite rejects authenticated payloads with bad inner shapes', () => {
-    // Build invites by hand whose AEAD is valid but whose plaintext is malformed.
-    const craft = (Pt: B) => {
-      const ephSk = new Uint8Array(randomBytes(32));
-      const eph = x25519.getPublicKey(ephSk);
-      const vk = hkdfN(nodeX25519(ephSk, bob.id.scanPk), cat(eph, bob.id.scanPk), 'segv.sh/v1/inv/view');
-      const check = hmacN(vk, 'check').subarray(0, 16);
-      const { cipherText: kct, sharedSecret: ss } = xwing.encapsulate(bob.id.kemPk);
-      const k = hkdfN(cat(ss, vk), sha(kct), 'segv.sh/v1/inv/key');
-      const nonce = new Uint8Array(randomBytes(24));
-      const ct = xchacha20poly1305(k, nonce, refEnc('segv.sh/v1/inv', eph, check)).encrypt(Pt);
-      return { vk, row: { tag: check, body: cat(eph, kct, nonce, ct) } };
-    };
-    const cases: [string, B][] = [
-      ['EK 31 bytes', refPad(refEnc(d, new Uint8Array(31), dsig), [2048])],
-      ['dsig 63 bytes', refPad(refEnc(d, EK0, new Uint8Array(63)), [2048])],
-      ['two fields', refPad(refEnc(d, EK0), [2048])],
-      ['four fields', refPad(refEnc(d, EK0, dsig, s2b('x')), [2048])],
-      ['invalid UTF-8', refPad(refEnc(Uint8Array.of(0xff), EK0, dsig), [2048])],
-      ['no padding marker', new Uint8Array(2048)],
-    ];
-    for (const [name, Pt] of cases) {
-      const { vk, row } = craft(Pt);
-      expect(toHex(P.inviteViewKey(bob.id.scanSk, bob.id.scanPk, row)!), name).toBe(toHex(vk));
-      expect(() => P.openInvite(bob.id.kemSk, vk, row), name).toThrow(Error);
-    }
-  });
-});
-
-// ───────────────────────── claims & messages ─────────────────────────
-
-describe('claims (§3.4)', () => {
-  const k0 = P.epochKeys(EK0, CONV_A, 0);
-  const d1 = dText({ e: 1, prev: P.b64u(P.H(P.utf8(dText()))) });
-  const k1 = P.epochKeys(EK1, CONV_A, 1);
-  const dsig1 = P.signDescriptor(d1, k1.kc, alice.id.sigSk);
-  const claim = P.makeClaim(k0.mk, k0.rk, d1, dsig1, alice.id.sigSk);
-
-  it('round trip, tag = claimTag(rk_e), body in the message size classes', () => {
-    expect(claim.kind).toBe(4);
-    expect(toHex(claim.tag)).toBe(toHex(P.claimTag(k0.rk)));
-    expect(P.MSG_BODY_LENS).toEqual([24 + 1024 + 16, 24 + 4096 + 16, 24 + 16384 + 16]);
-    expect(claim.body.length).toBe(P.MSG_BODY_LENS[0]);
-    const o = P.openClaim(k0.mk, claim);
-    expect(o.dText).toBe(d1);
-    expect(toHex(o.dsig)).toBe(toHex(dsig1));
-    expect(o.csig.length).toBe(64);
-    expect(P.verifyClaimSig(claim.tag, o.dText, o.dsig, o.csig, alice.id.sigPk)).toBe(true);
-    // csig = Ed25519 over enc("segv.sh/v1/claim-sig", tag, DBytes, dsig), checked with an independent verifier
-    expect(nodeEdVerify(o.csig, refEnc('segv.sh/v1/claim-sig', claim.tag, d1, dsig1), alice.id.sigPk)).toBe(true);
-    // independent decryption: C = enc(DBytes, dsig, csig), padded to the message classes
-    const pt = xchacha20poly1305(k0.mk, claim.body.subarray(0, 24), refEnc('segv.sh/v1/claim', claim.tag)).decrypt(claim.body.subarray(24));
-    expect(toHex(pt)).toBe(toHex(refPad(refEnc(d1, dsig1, o.csig), P.MSG_CLASSES)));
-  });
-
-  it('csig binds the claim slot, the descriptor text, dsig and the signer', () => {
-    const { csig } = P.openClaim(k0.mk, claim);
-    const ok = (tag: B, d: string, ds: B, cs: B, pk: B) => P.verifyClaimSig(tag, d, ds, cs, pk);
-    expect(ok(claim.tag, d1, dsig1, csig, alice.id.sigPk)).toBe(true);
-    // another slot (another epoch / conversation), another descriptor text, another dsig
-    expect(ok(P.claimTag(k1.rk), d1, dsig1, csig, alice.id.sigPk)).toBe(false);
-    expect(ok(P.claimTag(P.epochKeys(EK0, CONV_B, 0).rk), d1, dsig1, csig, alice.id.sigPk)).toBe(false);
-    expect(ok(claim.tag, dText({ e: 1, prev: H32 }), dsig1, csig, alice.id.sigPk)).toBe(false);
-    expect(ok(claim.tag, JSON.stringify(JSON.parse(d1), null, 1), dsig1, csig, alice.id.sigPk)).toBe(false);
-    expect(ok(claim.tag, d1, flip(dsig1, 0), csig, alice.id.sigPk)).toBe(false);
-    // another signer: an insider cannot pin a change on someone else
-    expect(ok(claim.tag, d1, dsig1, csig, bob.id.sigPk)).toBe(false);
-    const byBob = P.openClaim(k0.mk, P.makeClaim(k0.mk, k0.rk, d1, dsig1, bob.id.sigSk));
-    expect(ok(claim.tag, d1, dsig1, byBob.csig, alice.id.sigPk)).toBe(false);
-    expect(ok(claim.tag, d1, dsig1, byBob.csig, bob.id.sigPk)).toBe(true);
-    // neither the descriptor signature nor a message signature over the same bytes passes as a csig
-    expect(ok(claim.tag, d1, dsig1, dsig1, alice.id.sigPk)).toBe(false);
-    expect(ok(claim.tag, d1, dsig1, P.sign(P.enc('segv.sh/v1/msg-sig', claim.tag, P.utf8(d1)), alice.id.sigSk), alice.id.sigPk)).toBe(false);
-    for (let i = 0; i < 64; i += 5) expect(ok(claim.tag, d1, dsig1, flip(csig, i, i % 8), alice.id.sigPk)).toBe(false);
-  });
-
-  it('wrong mk / wrong tag / other epoch fail', () => {
-    expect(() => P.openClaim(k1.mk, claim)).toThrow();
-    expect(() => P.openClaim(P.epochKeys(EK0, CONV_B, 0).mk, claim)).toThrow();
-    expect(() => P.openClaim(k0.mk, { tag: P.claimTag(k1.rk), body: claim.body })).toThrow();
-    expect(() => P.openClaim(k0.mk, { tag: P.msgTag(k0.rk, 0, 0), body: claim.body })).toThrow();
-    expect(() => P.openClaim(k0.mk, { tag: claim.tag, body: claim.body.subarray(0, 39) })).toThrow();
-  });
-
-  it('a bit flip anywhere in the body is rejected (every byte)', () => {
-    const L = claim.body.length;
-    const s = survivors(
-      claim.body,
-      [
-        { name: 'nonce', start: 0, end: 24, every: true },
-        { name: 'ct', start: 24, end: L - 16, every: true },
-        { name: 'tag', start: L - 16, end: L, every: true },
-      ],
-      (b) => P.openClaim(k0.mk, { tag: claim.tag, body: b }),
-      5,
+    const eid = seqBytes(16, 0x50);
+    const ib = seqBytes(1416, 2);
+    expect(toHex(P.leafInbox(7, 0, 99, eid, ib))).toBe(
+      toHex(refLeaf(refEnc("segv.sh/v2/leaf/inbox", be16(7), be32(0), be32(99), eid, sha(ib)))),
     );
-    expect(s).toEqual([]);
+    const id = seqBytes(32, 0x70);
+    expect(toHex(P.leafBlob(id, 11640, 600))).toBe(toHex(refLeaf(refEnc("segv.sh/v2/leaf/blob", sha(id), be32(11640), be32(600)))));
+    // every field is bound
+    const base = toHex(P.leafShard(7, label, 1234, 0, body));
+    for (const other of [
+      P.leafShard(8, label, 1234, 0, body),
+      P.leafShard(7, flip(label, 0), 1234, 0, body),
+      P.leafShard(7, label, 1235, 0, body),
+      P.leafShard(7, label, 1234, 1, body),
+      P.leafShard(7, label, 1234, 0, flip(body, 295)),
+    ])
+      expect(toHex(other)).not.toBe(base);
+    expect(() => P.leafShard(7, label, 2 ** 32, 0, body)).toThrow();
+    expect(() => P.leafShard(7, label, 0, 256, body)).toThrow();
   });
 
-  it('rejects authenticated claims with bad inner shapes', () => {
-    const seal = (pt: B) => ({ tag: claim.tag, body: P.aeadSeal(k0.mk, pt, refEnc('segv.sh/v1/claim', claim.tag)) });
-    const { csig } = P.openClaim(k0.mk, claim);
-    const pad = (x: B) => refPad(x, P.MSG_CLASSES);
-    expect(() => P.openClaim(k0.mk, seal(pad(refEnc(d1, new Uint8Array(63), csig))))).toThrow(/signature length/);
-    expect(() => P.openClaim(k0.mk, seal(pad(refEnc(d1, dsig1, new Uint8Array(63)))))).toThrow(/signature length/);
-    expect(() => P.openClaim(k0.mk, seal(pad(refEnc(d1, dsig1, cat(csig, Uint8Array.of(0))))))).toThrow(/signature length/);
-    expect(() => P.openClaim(k0.mk, seal(pad(refEnc(d1, dsig1))))).toThrow(); // pre-csig layout
-    expect(() => P.openClaim(k0.mk, seal(pad(refEnc(d1))))).toThrow();
-    expect(() => P.openClaim(k0.mk, seal(pad(refEnc(d1, dsig1, csig, csig))))).toThrow();
-    expect(() => P.openClaim(k0.mk, seal(pad(refEnc(Uint8Array.of(0xff), dsig1, csig))))).toThrow();
-    expect(() => P.openClaim(k0.mk, seal(new Uint8Array(256)))).toThrow(/padding/);
-    // sanity: the same helper with a well-formed plaintext opens
-    expect(P.openClaim(k0.mk, seal(pad(refEnc(d1, dsig1, csig)))).dText).toBe(d1);
+  it("byteCmp orders bytes lexicographically (shorter prefix first)", () => {
+    expect(P.byteCmp(Uint8Array.of(1), Uint8Array.of(2))).toBeLessThan(0);
+    expect(P.byteCmp(Uint8Array.of(2), Uint8Array.of(1, 9))).toBeGreaterThan(0);
+    expect(P.byteCmp(Uint8Array.of(1), Uint8Array.of(1, 0))).toBeLessThan(0);
+    expect(P.byteCmp(seqBytes(16), seqBytes(16))).toBe(0);
+    expect(P.byteCmp(Uint8Array.of(0x7f), Uint8Array.of(0x80))).toBeLessThan(0);
+    const r = prng(0xb7c);
+    for (let i = 0; i < 300; i++) {
+      const a = r.bytes(r.int(4));
+      const b = r.bytes(r.int(4));
+      expect(Math.sign(P.byteCmp(a, b))).toBe(Buffer.compare(Buffer.from(a), Buffer.from(b)));
+    }
   });
 });
 
-describe('kind-4 size classes (claims and messages share them)', () => {
-  const k = P.epochKeys(EK0, CONV_A, 0);
-  const tag = P.msgTag(k.rk, 0, 0);
-  const sig = new Uint8Array(64);
-
-  it('claims: C = enc(D, dsig, csig) is |D| + 140 bytes; each class boundary is exact', () => {
-    for (const cls of P.MSG_CLASSES) {
-      const max = cls - 1 - 140;
-      const c = P.makeClaim(k.mk, k.rk, 'd'.repeat(max), sig, alice.id.sigSk);
-      expect(c.body.length, `|D| = ${max}`).toBe(24 + cls + 16);
-      expect(P.openClaim(k.mk, c).dText.length).toBe(max);
-      const next = () => P.makeClaim(k.mk, k.rk, 'd'.repeat(max + 1), sig, alice.id.sigSk).body.length;
-      if (cls < 16384) expect(next(), `|D| = ${max + 1}`).toBeGreaterThan(24 + cls + 16);
-      else expect(next).toThrow(/too large/);
-    }
+describe("commitments: batch heads, checkpoints, receipts, prev (§9, §9.5, §10.3, §3.3)", () => {
+  it("cids are decimal without padding", () => {
+    expect(P.shardCid(0, 0)).toBe("shard/0/0");
+    expect(P.shardCid(41, 0)).toBe("shard/41/0");
+    expect(P.inboxCid(7, 0)).toBe("inbox/7/0");
+    expect(P.inboxCid(65534, 12)).toBe("inbox/65534/12");
+    expect([P.BLOBREG_CID, P.DIRLOG_CID]).toEqual(["blobreg", "dirlog"]);
   });
 
-  it('messages: M = enc(payload, psig) is |payload| + 72 bytes; each class boundary is exact', () => {
-    const base = s2b(JSON.stringify(payload({ text: '' }))).length;
-    for (const cls of P.MSG_CLASSES) {
-      const n = cls - 1 - 72 - base;
-      const row = P.makeMessage(k.mk, tag, payload({ text: 'y'.repeat(n) }), alice.id.sigSk);
-      expect(row.body.length, `text ${n}`).toBe(24 + cls + 16);
-      expect(P.openMessage(k.mk, row).payload.text!.length).toBe(n);
-      if (cls < 16384) {
-        expect(P.makeMessage(k.mk, tag, payload({ text: 'y'.repeat(n + 1) }), alice.id.sigSk).body.length).toBeGreaterThan(24 + cls + 16);
-      } else {
-        expect(() => P.makeMessage(k.mk, tag, payload({ text: 'y'.repeat(n + 1) }), alice.id.sigSk)).toThrow(/too large/);
-      }
+  it("nextHead = H(enc('segv.sh/v2/head', cid, head, u32 t, u32 n, root)); a shard's batch chain from ZERO32", () => {
+    const E = 41;
+    const cid = P.shardCid(E, 0);
+    const r = prng(0x4ead);
+    let head: B = P.ZERO32;
+    let ref: B = new Uint8Array(32);
+    for (const [t, count] of [
+      [100, 1],
+      [110, 3],
+      [130, 5],
+    ]) {
+      const rows = Array.from({ length: count }, () => ({ label: r.bytes(16), cls: r.int(4), body: r.bytes(40 + r.int(50)) }));
+      // the DO sorts by label; build the leaves both ways
+      const sorted = [...rows].sort((a, b) => P.byteCmp(a.label, b.label));
+      const root = P.mth(sorted.map((x) => P.leafShard(E, x.label, t, x.cls, x.body)));
+      const refRows = [...rows].sort((a, b) => Buffer.compare(Buffer.from(a.label), Buffer.from(b.label)));
+      const refRoot = refMth(refRows.map((x) => refLeaf(refEnc("segv.sh/v2/leaf", be16(E), x.label, be32(t), be8(x.cls), sha(x.body)))));
+      expect(toHex(root)).toBe(toHex(refRoot));
+      head = P.nextHead(cid, head, t, count, root);
+      ref = sha(refEnc("segv.sh/v2/head", cid, ref, be32(t), be32(count), refRoot));
+      expect(toHex(head)).toBe(toHex(ref));
     }
+    expect(toHex(P.nextHead(cid, P.ZERO32, 1, 1, P.ZERO32))).not.toBe(toHex(P.nextHead(P.inboxCid(E, 0), P.ZERO32, 1, 1, P.ZERO32)));
   });
 
-  it('real claims and messages only ever produce the three documented body lengths', () => {
-    const seen = new Set<number>();
-    const members32 = Array.from({ length: 32 }, (_, i) => uidN(i));
-    const descriptors = [
-      dText({ e: 1, prev: H32, members: [alice.uidS], by: alice.uidS }),
-      dText({ e: 1, prev: H32 }),
-      dText({ e: 0xffffffff, prev: H32, members: members32, by: members32[0], ts: Number.MAX_SAFE_INTEGER, name: '\u{1F600}'.repeat(64) }),
+  it("ckptHd hashes the heads sorted by cid in byte order (input order does not matter)", () => {
+    const heads = [
+      { cid: "shard/9/0", head: fill(32, 1) },
+      { cid: "shard/10/0", head: fill(32, 2) },
+      { cid: "inbox/10/0", head: fill(32, 3) },
+      { cid: "inbox/9/0", head: fill(32, 4) },
+      { cid: "dirlog", head: fill(32, 5) },
+      { cid: "blobreg", head: fill(32, 6) },
     ];
-    for (const d of descriptors) seen.add(P.makeClaim(k.mk, k.rk, d, sig, alice.id.sigSk).body.length);
-    const payloads = [
-      payload({ t: 'leave', text: undefined, ts: 0, n: 0, head: { seq: 0, h: H32 } }),
-      payload({ text: 'y' }),
-      payload({ t: 'image', text: undefined, img: { id: P.b64u(fill(32, 1)), k: P.b64u(fill(32, 2)), mime: 'image/jpeg', w: 1, h: 1 } }),
-      payload({ text: 'y'.repeat(2000) }),
-      payload({ text: '日本語'.repeat(1000) }),
-      payload({ text: '\u{1F600}'.repeat(2000) }),
-    ];
-    for (const p of payloads) seen.add(P.makeMessage(k.mk, tag, p, alice.id.sigSk).body.length);
-    expect([...seen].sort((a, b) => a - b)).toEqual(P.MSG_BODY_LENS);
-    // the smallest real rows (a 1-member claim, a leave) share the smallest class with ordinary texts
-    expect(P.makeClaim(k.mk, k.rk, descriptors[0], sig, alice.id.sigSk).body.length).toBe(P.MSG_BODY_LENS[0]);
-    expect(P.makeMessage(k.mk, tag, payloads[0], alice.id.sigSk).body.length).toBe(P.MSG_BODY_LENS[0]);
+    const order = ["blobreg", "dirlog", "inbox/10/0", "inbox/9/0", "shard/10/0", "shard/9/0"]; // "1" < "9"
+    const sorted = [...heads].sort((a, b) => Buffer.compare(Buffer.from(a.cid), Buffer.from(b.cid)));
+    expect(sorted.map((h) => h.cid)).toEqual(order);
+    const want = sha(refEnc("segv.sh/v2/ckpt/heads", ...sorted.flatMap((h) => [h.cid, h.head])));
+    expect(toHex(P.ckptHd(heads))).toBe(toHex(want));
+    const r = prng(0xc4);
+    for (let i = 0; i < 20; i++) {
+      const shuffled = [...heads].sort(() => r.int(3) - 1);
+      expect(toHex(P.ckptHd(shuffled))).toBe(toHex(want));
+    }
+    expect(heads[0].cid).toBe("shard/9/0"); // not sorted in place
+    expect(toHex(P.ckptHd([]))).toBe(toHex(sha(refEnc("segv.sh/v2/ckpt/heads"))));
+    expect(toHex(P.ckptHd(heads.slice(1)))).not.toBe(toHex(want));
+    expect(toHex(P.ckptHd([{ ...heads[0], head: flip(heads[0].head, 0) }, ...heads.slice(1)]))).not.toBe(toHex(want));
+  });
+
+  it("the checkpoint chain C_q = H(enc('segv.sh/v2/ckpt', C_{q−1}, u32 q, u32 sec, hd)) from C_0 = ZERO32", () => {
+    const r = prng(0xc0c);
+    const entries = Array.from({ length: 6 }, (_, i) => ({ q: i + 1, sec: 60 * (i + 1) + r.int(10), hd: r.bytes(32) }));
+    let C: B = P.ZERO32;
+    let ref: B = new Uint8Array(32);
+    const Cs: B[] = [];
+    for (const e of entries) {
+      C = P.ckptC(C, e.q, e.sec, e.hd);
+      ref = sha(refEnc("segv.sh/v2/ckpt", ref, be32(e.q), be32(e.sec), e.hd));
+      expect(toHex(C)).toBe(toHex(ref));
+      Cs.push(C);
+    }
+    // the client's range check: recompute forward from from.C = C_2 over entries 3..6 and land on latest.C
+    let x = Cs[1];
+    for (const e of entries.slice(2)) x = P.ckptC(x, e.q, e.sec, e.hd);
+    expect(toHex(x)).toBe(toHex(Cs[5]));
+    // any change to an entry changes every later C
+    let y = Cs[1];
+    for (const e of entries.slice(2)) y = P.ckptC(y, e.q, e.q === 4 ? e.sec + 1 : e.sec, e.hd);
+    expect(toHex(y)).not.toBe(toHex(Cs[5]));
+    // the signature message and an SRV_SK signature checked with node
+    const srvSk = seqBytes(32, 0x5a);
+    const msg = P.ckptSigMsg(6, Cs[5]);
+    expect(toHex(msg)).toBe(toHex(refEnc("segv.sh/v2/ckpt-sig", be32(6), Cs[5])));
+    expect(edVerify(P.sign(msg, srvSk), refEnc("segv.sh/v2/ckpt-sig", be32(6), Cs[5]), edPubRaw(srvSk))).toBe(true);
+    expect(() => P.ckptC(P.ZERO32, 2 ** 32, 0, P.ZERO32)).toThrow();
+  });
+
+  it("receiptMsg = enc('segv.sh/v2/receipt', u16 E, label, H(body), u32 t), signed by SRV_SK (§12.5)", () => {
+    const label = seqBytes(16, 0x31);
+    const body = seqBytes(1064, 3);
+    const msg = P.receiptMsg(41, label, body, 4242);
+    expect(toHex(msg)).toBe(toHex(refEnc("segv.sh/v2/receipt", be16(41), label, sha(body), be32(4242))));
+    const srvSk = seqBytes(32, 0x5a);
+    const sig = edSign(msg, srvSk);
+    expect(P.verify(sig, msg, edPubRaw(srvSk))).toBe(true);
+    // a receipt for another E, label, body or t does not verify
+    for (const m of [
+      P.receiptMsg(42, label, body, 4242),
+      P.receiptMsg(41, flip(label, 15), body, 4242),
+      P.receiptMsg(41, label, flip(body, 0), 4242),
+      P.receiptMsg(41, label, body, 4243),
+    ])
+      expect(P.verify(sig, m, edPubRaw(srvSk))).toBe(false);
+  });
+
+  it("prevh = t16(H(enc('segv.sh/v2/prev', label_prev, body_prev)))", () => {
+    const label = seqBytes(16, 0x32);
+    const body = seqBytes(296, 4);
+    expect(toHex(P.prevh(label, body))).toBe(toHex(tr16(sha(refEnc("segv.sh/v2/prev", label, body)))));
+    expect(P.prevh(label, body).length).toBe(16);
+    expect(toHex(P.prevh(label, flip(body, 100)))).not.toBe(toHex(P.prevh(label, body)));
   });
 });
 
-describe('messages (§3.5)', () => {
-  const kA = P.epochKeys(EK0, CONV_A, 0);
-  const kB = P.epochKeys(EK0, CONV_B, 0);
-  const tag = P.msgTag(kA.rk, 0, 0);
-  const p = payload();
-  const row = P.makeMessage(kA.mk, tag, p, alice.id.sigSk);
-
-  it('round trip with the exact signed payload bytes', () => {
-    expect(row.kind).toBe(4);
-    expect(toHex(row.tag)).toBe(toHex(tag));
-    expect(row.body.length).toBe(P.MSG_BODY_LENS[0]); // smallest class is 1024
-    const o = P.openMessage(kA.mk, row);
-    expect(o.text).toBe(JSON.stringify(p));
-    expect(o.payload).toEqual(p);
-    expect(P.validPayload(o.payload)).toBe(true);
-    expect(P.verifyMessageSig(tag, o.text, o.psig, alice.id.sigPk)).toBe(true);
-    expect(nodeEdVerify(o.psig, refEnc('segv.sh/v1/msg-sig', tag, o.text), alice.id.sigPk)).toBe(true);
-    // independent decryption: M = enc(payloadBytes, psig), padded to message classes
-    const pt = xchacha20poly1305(kA.mk, row.body.subarray(0, 24), refEnc('segv.sh/v1/msg', tag)).decrypt(row.body.subarray(24));
-    expect(toHex(pt)).toBe(toHex(refPad(refEnc(o.text, o.psig), P.MSG_CLASSES)));
-  });
-
-  it('size classes 1024 / 4096 / 16384 and too-large payloads', () => {
-    // A "leave" and a short text land in the same (smallest) class, so they are indistinguishable.
-    const leave = payload({ t: 'leave', text: undefined, ts: 0, head: { seq: 1, h: H32 } });
-    const sizes = [1, 3000, 12000].map((n) => P.makeMessage(kA.mk, tag, payload({ text: 'y'.repeat(n) }), alice.id.sigSk).body.length);
-    expect(sizes).toEqual(P.MSG_BODY_LENS);
-    expect(P.makeMessage(kA.mk, tag, leave, alice.id.sigSk).body.length).toBe(P.MSG_BODY_LENS[0]);
-    const minText = payload({ text: 'y', ts: TS, n: 0, e: 0, head: { seq: 1, h: H32 } }); // realistic 13-digit ts
-    expect(P.makeMessage(kA.mk, tag, minText, alice.id.sigSk).body.length).toBe(P.MSG_BODY_LENS[0]);
-    expect(() => P.makeMessage(kA.mk, tag, payload({ text: 'y'.repeat(16384) }), alice.id.sigSk)).toThrow(/too large/);
-    const unicode = payload({ text: '日本語\u{1F600}\u0000"\\' });
-    const o = P.openMessage(kA.mk, P.makeMessage(kA.mk, tag, unicode, alice.id.sigSk));
-    expect(o.payload.text).toBe(unicode.text);
-  });
-
-  it('a message body moved to a different tag fails', () => {
-    for (const t of [P.msgTag(kA.rk, 0, 1), P.msgTag(kA.rk, 1, 0), P.claimTag(kA.rk), flip(tag, 15), tag.subarray(0, 15)]) {
-      expect(() => P.openMessage(kA.mk, { tag: t, body: row.body })).toThrow();
-    }
-  });
-
-  it("a message from conv A is not openable with conv B's (or another epoch's) mk", () => {
-    expect(() => P.openMessage(kB.mk, row)).toThrow();
-    expect(() => P.openMessage(P.epochKeys(EK0, CONV_A, 1).mk, row)).toThrow();
-    expect(() => P.openMessage(P.epochKeys(EK1, CONV_A, 0).mk, row)).toThrow();
-    expect(() => P.openMessage(kA.rk, row)).toThrow();
-    expect(() => P.openMessage(kA.kc, row)).toThrow();
-  });
-
-  it('claims and messages are not interchangeable (domain-separated AAD)', () => {
-    const d1 = dText({ e: 1, prev: H32 });
-    const claim = P.makeClaim(kA.mk, kA.rk, d1, new Uint8Array(64), alice.id.sigSk);
-    expect(() => P.openMessage(kA.mk, claim)).toThrow();
-    const msgAtClaimSlot = P.makeMessage(kA.mk, P.claimTag(kA.rk), p, alice.id.sigSk);
-    expect(() => P.openClaim(kA.mk, msgAtClaimSlot)).toThrow();
-  });
-
-  it('signature over payload A does not verify payload B, another tag or another key', () => {
-    const o = P.openMessage(kA.mk, row);
-    const other = JSON.stringify(payload({ text: 'hellp' }));
-    expect(P.verifyMessageSig(tag, other, o.psig, alice.id.sigPk)).toBe(false);
-    expect(P.verifyMessageSig(tag, JSON.stringify(p, null, 1), o.psig, alice.id.sigPk)).toBe(false);
-    expect(P.verifyMessageSig(P.msgTag(kA.rk, 0, 1), o.text, o.psig, alice.id.sigPk)).toBe(false);
-    expect(P.verifyMessageSig(P.msgTag(kB.rk, 0, 0), o.text, o.psig, alice.id.sigPk)).toBe(false);
-    expect(P.verifyMessageSig(tag, o.text, o.psig, bob.id.sigPk)).toBe(false);
-    expect(P.verifyMessageSig(tag, o.text, new Uint8Array(64), alice.id.sigPk)).toBe(false);
-    for (let i = 0; i < 64; i++) expect(P.verifyMessageSig(tag, o.text, flip(o.psig, i, i % 8), alice.id.sigPk)).toBe(false);
-    // A descriptor/bundle signature over the same bytes must not pass as a message signature.
-    expect(P.verifyMessageSig(tag, o.text, P.sign(P.utf8(o.text), alice.id.sigSk), alice.id.sigPk)).toBe(false);
-  });
-
-  it('a bit flip anywhere in the body is rejected (every byte)', () => {
-    const L = row.body.length;
-    const s = survivors(
-      row.body,
-      [
-        { name: 'nonce', start: 0, end: 24, every: true },
-        { name: 'ct', start: 24, end: L - 16, every: true },
-        { name: 'tag', start: L - 16, end: L, every: true },
-      ],
-      (b) => P.openMessage(kA.mk, { tag, body: b }),
-      6,
-    );
-    expect(s).toEqual([]);
-    expect(() => P.openMessage(kA.mk, { tag, body: row.body.subarray(0, L - 1) })).toThrow();
-    expect(() => P.openMessage(kA.mk, { tag, body: cat(row.body, Uint8Array.of(0)) })).toThrow();
-  });
-
-  it('openMessage rejects authenticated bodies with bad inner shapes', () => {
-    const seal = (pt: B) => ({ tag, body: P.aeadSeal(kA.mk, pt, refEnc('segv.sh/v1/msg', tag)) });
-    const sig = new Uint8Array(64);
-    const cases: [string, B][] = [
-      ['v=2', refPad(refEnc('{"v":2}', sig), P.MSG_CLASSES)],
-      ['null', refPad(refEnc('null', sig), P.MSG_CLASSES)],
-      ['array', refPad(refEnc('[1]', sig), P.MSG_CLASSES)],
-      ['not JSON', refPad(refEnc('{', sig), P.MSG_CLASSES)],
-      ['invalid UTF-8', refPad(refEnc(Uint8Array.of(0xff), sig), P.MSG_CLASSES)],
-      ['one field', refPad(refEnc('{"v":1}'), P.MSG_CLASSES)],
-      ['three fields', refPad(refEnc('{"v":1}', sig, sig), P.MSG_CLASSES)],
-      ['no marker', new Uint8Array(256)],
+describe("directory log chain (§9.6)", () => {
+  it("ref_user / ref_wrap and h_seq = H(enc('segv.sh/v2/dirlog', h_{seq−1}, u64 seq, u8 kind, ref)) from ZERO32", () => {
+    expect([P.DIRLOG_USER, P.DIRLOG_WRAP]).toEqual([1, 2]);
+    const prf = fill(32, 0x11);
+    const credId = seqBytes(20, 0x80);
+    const w1 = P.makeWrap(alice.uid, "passkey", credId, P.credKem(prf, credId), alice.AK, alice.id, TS);
+    const rk = P.recoveryKem(seqBytes(20, 0x30));
+    const w2 = P.makeWrap(alice.uid, "recovery", rk.id, rk, alice.AK, alice.id, TS);
+    const refUser = (b: string, s: B) => sha(refEnc("segv.sh/v2/dir/user", b, s));
+    const refWrap = (r: string, s: B) => sha(refEnc("segv.sh/v2/dir/wrap", r, s));
+    const entries: [number, B, B][] = [
+      [1, P.dirlogRefUser(alice.bundle, P.fromB64u(alice.sig)), refUser(alice.bundle, P.fromB64u(alice.sig))],
+      [2, P.dirlogRefWrap(w1.record, P.fromB64u(w1.sig)), refWrap(w1.record, P.fromB64u(w1.sig))],
+      [2, P.dirlogRefWrap(w2.record, P.fromB64u(w2.sig)), refWrap(w2.record, P.fromB64u(w2.sig))],
+      [1, P.dirlogRefUser(bob.bundle, P.fromB64u(bob.sig)), refUser(bob.bundle, P.fromB64u(bob.sig))],
     ];
-    for (const [name, pt] of cases) expect(() => P.openMessage(kA.mk, seal(pt)), name).toThrow(Error);
-  });
-
-  describe('validPayload', () => {
-    const img = (over: Partial<P.ImageRef> = {}): P.ImageRef => ({
-      id: P.b64u(fill(32, 0x42)),
-      k: P.b64u(fill(32, 0x43)),
-      mime: 'image/webp',
-      w: 640,
-      h: 480,
-      ...over,
-    });
-
-    it('accepts well-formed text / image / leave payloads', () => {
-      expect(P.validPayload(payload())).toBe(true);
-      expect(P.validPayload(payload({ t: 'leave', text: undefined }))).toBe(true);
-      expect(P.validPayload(payload({ t: 'image', text: undefined, img: img() }))).toBe(true);
-      expect(P.validPayload(payload({ t: 'image', text: undefined, img: img({ mime: 'image/jpeg', w: 8192, h: 1 }) }))).toBe(true);
-      expect(P.validPayload(payload({ e: 0xffffffff, n: 0xffffffff, ts: 0, head: { seq: 0, h: P.b64u(P.ZERO32) } }))).toBe(true);
-    });
-
-    it('rejects malformed payloads', () => {
-      const bad: [string, unknown][] = [
-        ['null', null],
-        ['array', []],
-        ['string', 'x'],
-        ['t other', payload({ t: 'file' as P.Payload['t'] })],
-        ['conv missing', payload({ conv: undefined as unknown as string })],
-        ['conv not b64u', payload({ conv: 'not base64!' })],
-        ['conv 15 bytes', payload({ conv: P.b64u(new Uint8Array(15)) })],
-        ['from 17 bytes', payload({ from: P.b64u(new Uint8Array(17)) })],
-        ['from number', payload({ from: 1 as unknown as string })],
-        ['e negative', payload({ e: -1 })],
-        ['e fractional', payload({ e: 0.5 })],
-        ['e > u32', payload({ e: 2 ** 32 })],
-        ['n negative', payload({ n: -1 })],
-        ['n > u32', payload({ n: 2 ** 32 })],
-        ['n string', payload({ n: '0' as unknown as number })],
-        ['ts negative', payload({ ts: -1 })],
-        ['ts fractional', payload({ ts: 1.5 })],
-        ['head missing', payload({ head: undefined as unknown as P.Payload['head'] })],
-        ['head.seq negative', payload({ head: { seq: -1, h: H32 } })],
-        ['head.seq fractional', payload({ head: { seq: 1.5, h: H32 } })],
-        ['head.h number', payload({ head: { seq: 1, h: 5 as unknown as string } })],
-        ['head.h 16 bytes', payload({ head: { seq: 1, h: P.b64u(new Uint8Array(16)) } })],
-        ['head.h hex', payload({ head: { seq: 1, h: '00'.repeat(32) } })],
-        ['text empty', payload({ text: '' })],
-        ['text missing', payload({ text: undefined })],
-        ['text number', payload({ text: 5 as unknown as string })],
-        ['image without img', payload({ t: 'image', text: undefined })],
-        ['img.id path traversal', payload({ t: 'image', img: img({ id: '../../api/users/alice' }) })],
-        ['img.id 31 bytes', payload({ t: 'image', img: img({ id: P.b64u(new Uint8Array(31)) }) })],
-        ['img.id with query', payload({ t: 'image', img: img({ id: P.b64u(fill(32, 1)) + '?x=1' }) })],
-        ['img.k 16 bytes', payload({ t: 'image', img: img({ k: P.b64u(new Uint8Array(16)) }) })],
-        ['img.k empty', payload({ t: 'image', img: img({ k: '' }) })],
-        ['img.mime svg', payload({ t: 'image', img: img({ mime: 'image/svg+xml' }) })],
-        ['img.mime html', payload({ t: 'image', img: img({ mime: 'text/html' }) })],
-        ['img.mime params', payload({ t: 'image', img: img({ mime: 'image/webp; charset=x' }) })],
-        ['img.mime upper', payload({ t: 'image', img: img({ mime: 'IMAGE/WEBP' }) })],
-        ['img.w 0', payload({ t: 'image', img: img({ w: 0 }) })],
-        ['img.w 8193', payload({ t: 'image', img: img({ w: 8193 }) })],
-        ['img.h negative', payload({ t: 'image', img: img({ h: -1 }) })],
-        ['img.h fractional', payload({ t: 'image', img: img({ h: 1.5 }) })],
-        ['img.w string', payload({ t: 'image', img: img({ w: '1' as unknown as number }) })],
-      ];
-      for (const [name, x] of bad) expect(P.validPayload(x as P.Payload), name).toBe(false);
-    });
-  });
-});
-
-// ───────────────────────── blobs ─────────────────────────
-
-describe('blobs (§3.6)', () => {
-  it('round trip for several sizes; id = b64u(H(blob)); length = 24 + Padmé(n+1) + 16', () => {
-    for (const n of [0, 1, 2, 100, 5000, 65537, 300_000]) {
-      const data = new Uint8Array(randomBytes(n));
-      const { blob, id, key } = P.encryptBlob(data);
-      expect(key.length).toBe(32);
-      expect(id).toBe(P.b64u(sha(blob)));
-      expect(id).toBe(Buffer.from(sha(blob)).toString('base64url'));
-      expect(blob.length).toBe(24 + refPadmeLength(n + 1) + 16);
-      expect(toHex(P.decryptBlob(blob, id, key))).toBe(toHex(data));
-      // independent decryption
-      const pt = xchacha20poly1305(key, blob.subarray(0, 24), s2b('segv.sh/v1/blob')).decrypt(blob.subarray(24));
-      expect(toHex(P.unpad(pt))).toBe(toHex(data));
-    }
-  });
-
-  it('fresh key per blob; wrong id / key / AAD fail', () => {
-    const data = s2b('image bytes');
-    const a = P.encryptBlob(data);
-    const b = P.encryptBlob(data);
-    expect(toHex(a.key)).not.toBe(toHex(b.key));
-    expect(a.id).not.toBe(b.id);
-    expect(() => P.decryptBlob(a.blob, b.id, a.key)).toThrow(/hash mismatch/);
-    expect(() => P.decryptBlob(a.blob, a.id, b.key)).toThrow();
-    expect(() => P.decryptBlob(a.blob, a.id, new Uint8Array(31))).toThrow();
-    expect(() => P.decryptBlob(a.blob.subarray(0, 39), P.b64u(sha(a.blob.subarray(0, 39))), a.key)).toThrow();
-    // a blob encrypted under a different AAD with the same key
-    const foreign = P.aeadSeal(a.key, P.padme(data), s2b('segv.sh/v1/other'));
-    expect(() => P.decryptBlob(foreign, P.b64u(sha(foreign)), a.key)).toThrow();
-  });
-
-  it('a bit flip in nonce / ciphertext / tag is rejected even if the id is recomputed', () => {
-    const { blob, id, key } = P.encryptBlob(seqBytes(200));
-    const L = blob.length;
-    const regions = [
-      { name: 'nonce', start: 0, end: 24, every: true },
-      { name: 'ct', start: 24, end: L - 16 },
-      { name: 'tag', start: L - 16, end: L, every: true },
-    ];
-    expect(survivors(blob, regions, (b) => P.decryptBlob(b, id, key), 7)).toEqual([]);
-    expect(survivors(blob, regions, (b) => P.decryptBlob(b, P.b64u(sha(b)), key), 8)).toEqual([]);
-  });
-});
-
-// ───────────────────────── log & PoW ─────────────────────────
-
-describe('log rows (§4.1)', () => {
-  const tag = seqBytes(16, 0x10);
-  const body = seqBytes(40, 0x20);
-
-  it('rowHash matches a hand-built hash-chain entry', () => {
-    const h1 = P.rowHash(P.ZERO32, 1, 4, tag, body, TS);
-    const manual = sha(
-      cat(
-        fromHex('0000000e'),
-        s2b('segv.sh/v1/log'),
-        fromHex('00000020'),
-        new Uint8Array(32),
-        fromHex('00000008' + '0000000000000001'),
-        fromHex('00000001' + '04'),
-        fromHex('00000010'),
-        tag,
-        fromHex('00000028'),
-        body,
-        fromHex('00000008'),
-        be64(TS),
-      ),
-    );
-    expect(toHex(h1)).toBe(toHex(manual));
-    expect(toHex(P.rowHash(P.ZERO32, 1, 4, tag, body, TS))).toBe(toHex(h1));
-    expect(P.ZERO32.length).toBe(32);
-    expect(P.ZERO32.every((x) => x === 0)).toBe(true);
-  });
-
-  it('every field changes the hash; the chain links', () => {
-    const base = toHex(P.rowHash(P.ZERO32, 1, 4, tag, body, TS));
-    const variants = [
-      P.rowHash(fill(32, 1), 1, 4, tag, body, TS),
-      P.rowHash(P.ZERO32, 2, 4, tag, body, TS),
-      P.rowHash(P.ZERO32, 1, 3, tag, body, TS),
-      P.rowHash(P.ZERO32, 1, 4, flip(tag, 0), body, TS),
-      P.rowHash(P.ZERO32, 1, 4, tag, flip(body, 39), TS),
-      P.rowHash(P.ZERO32, 1, 4, tag, body, TS + 1000),
-      // moving a byte from tag to body must change the hash (length-prefixed fields)
-      P.rowHash(P.ZERO32, 1, 4, tag.subarray(0, 15), cat(tag.subarray(15), body), TS),
-    ];
-    const all = new Set([base, ...variants.map(toHex)]);
-    expect(all.size).toBe(variants.length + 1);
-    // chain of 5 rows recomputed independently
     let h: B = P.ZERO32;
     let ref: B = new Uint8Array(32);
-    for (let seq = 1; seq <= 5; seq++) {
-      h = P.rowHash(h, seq, 3, tag, body, TS + seq * 1000);
-      ref = sha(refEnc('segv.sh/v1/log', ref, be64(seq), Uint8Array.of(3), tag, body, be64(TS + seq * 1000)));
+    entries.forEach(([kind, got, want], i) => {
+      expect(toHex(got)).toBe(toHex(want));
+      const seq = i + 1;
+      h = P.dirlogH(h, seq, kind, got);
+      ref = sha(refEnc("segv.sh/v2/dirlog", ref, be64(seq), be8(kind), want));
       expect(toHex(h)).toBe(toHex(ref));
-    }
-    expect(() => P.rowHash(P.ZERO32, 1, 256, tag, body, TS)).toThrow(); // kind must fit u8, not wrap to 0
-    expect(() => P.rowHash(P.ZERO32, -1, 4, tag, body, TS)).toThrow();
-  });
-
-  it('userTag / wrapTag follow §4.1', () => {
-    expect(toHex(P.userTag(alice.uid))).toBe(toHex(sha(refEnc('segv.sh/v1/tag/user', alice.uid)).subarray(0, 16)));
-    expect(toHex(P.wrapTag('{"a":1}'))).toBe(toHex(sha(refEnc('segv.sh/v1/tag/wrap', '{"a":1}')).subarray(0, 16)));
-    expect(toHex(P.userTag(alice.uid))).not.toBe(toHex(P.userTag(bob.uid)));
-    expect(toHex(P.wrapTag('{"a":1}'))).not.toBe(toHex(P.wrapTag('{"a":2}')));
+    });
+    // the user and wrap refs are domain-separated
+    expect(toHex(P.dirlogRefUser(w1.record, P.fromB64u(w1.sig)))).not.toBe(toHex(entries[1][1]));
+    // u64 sequence numbers above 2^32
+    const big = 2 ** 40 + 3;
+    expect(toHex(P.dirlogH(h, big, 1, entries[0][1]))).toBe(toHex(sha(refEnc("segv.sh/v2/dirlog", h, be64(big), be8(1), entries[0][1]))));
+    expect(() => P.dirlogH(h, 2 ** 53, 1, entries[0][1])).toThrow();
+    expect(() => P.dirlogH(h, 1, 256, entries[0][1])).toThrow();
   });
 });
 
-describe('proof of work (§4.3)', () => {
-  it('leadingZeroBits table', () => {
-    const table: [number[], number][] = [
-      [[], 0],
-      [[0x80], 0],
-      [[0xff], 0],
-      [[0x7f], 1],
-      [[0x40], 1],
-      [[0x3f], 2],
-      [[0x20], 2],
-      [[0x10], 3],
-      [[0x08], 4],
-      [[0x04], 5],
-      [[0x02], 6],
-      [[0x01], 7],
-      [[0x00], 8],
-      [[0x00, 0xff], 8],
-      [[0x00, 0x01], 15],
-      [[0x00, 0x00, 0x80], 16],
-      [[0, 0, 0, 1], 31],
-      [[0, 0, 0, 0], 32],
-      [[1, 0, 0, 0], 7],
-    ];
-    for (const [bytes, n] of table) expect(P.leadingZeroBits(Uint8Array.from(bytes)), JSON.stringify(bytes)).toBe(n);
-    expect(P.leadingZeroBits(new Uint8Array(32))).toBe(256);
-  });
+// ───────────────────────── proof of work (§10.2) ─────────────────────────
 
-  it('powPre follows §4.3', () => {
-    const body = s2b('{"rows":[]}');
-    const pre = P.powPre('append', 2833333, P.H(body));
-    expect(toHex(pre)).toBe(toHex(sha(refEnc('segv.sh/v1/pow', 'append', be32(2833333), sha(body)))));
-    const scopes: P.PowScope[] = ['register', 'wrap', 'append', 'blob'];
-    expect(new Set(scopes.map((s) => toHex(P.powPre(s, 1, P.H(body))))).size).toBe(4);
-    expect(toHex(P.powPre('append', 2, P.H(body)))).not.toBe(toHex(P.powPre('append', 1, P.H(body))));
-    expect(() => P.powPre('append', -1, P.H(body))).toThrow();
+describe("proof of work (§10.2)", () => {
+  it("constants", () => {
+    expect([...P.POW_SCOPES]).toEqual(["register", "wrap", "put", "inbox", "blob"]);
     expect(P.POW_WINDOW_MS).toBe(600_000);
+    expect(P.POW_MAX_BASE).toBe(26);
   });
 
-  it('powDifficulty table: +1 bit per doubling above 4 KiB (append) / 1 MiB (blob); register & wrap flat', () => {
-    const KiB = 1024;
-    const MiB = 1024 * 1024;
-    // default bases from §4.3: register 20, wrap 18, append 16, blob 18
+  it("powPre = H(enc('segv.sh/v2/pow', scope, u32 window, digest)), distinct per scope and window", () => {
+    const body = s2b("body");
+    for (const scope of P.POW_SCOPES) {
+      expect(toHex(P.powPre(scope, 2833333, sha(body)))).toBe(toHex(sha(refEnc("segv.sh/v2/pow", scope, be32(2833333), sha(body)))));
+    }
+    expect(new Set(P.POW_SCOPES.map((s) => toHex(P.powPre(s, 1, sha(body))))).size).toBe(5);
+    expect(toHex(P.powPre("put", 2, sha(body)))).not.toBe(toHex(P.powPre("put", 1, sha(body))));
+    expect(toHex(P.powPre("put", 1, sha(body)))).not.toBe(toHex(sha(refEnc("segv.sh/v1/pow", "put", be32(1), sha(body)))));
+    expect(() => P.powPre("put", -1, sha(body))).toThrow();
+    expect(() => P.powPre("put", 2 ** 32, sha(body))).toThrow();
+  });
+
+  it("powDifficulty table for every scope (put / inbox unit 4096, blob 1 MiB, register / wrap always base)", () => {
+    const MiB = 1 << 20;
     const table: [P.PowScope, number, number, number][] = [
-      ['append', 16, 0, 16],
-      ['append', 16, 1, 16],
-      ['append', 16, 4096, 16],
-      ['append', 16, 4097, 17],
-      ['append', 16, 8192, 17],
-      ['append', 16, 8193, 18],
-      ['append', 16, 16384, 18],
-      ['append', 16, 16385, 19],
-      ['append', 16, 40 * 3240, 21], // 40 invites (the batch maximum)
-      ['append', 16, 40 * 16424, 24], // 40 messages of the 16384 class
-      ['append', 16, MiB, 24],
-      ['append', 16, MiB + 1, 25],
-      ['append', 0, 4097, 1],
-      ['blob', 18, 0, 18],
-      ['blob', 18, 4097, 18],
-      ['blob', 18, 512 * KiB, 18],
-      ['blob', 18, MiB, 18],
-      ['blob', 18, MiB + 1, 19],
-      ['blob', 18, 2 * MiB, 19],
-      ['blob', 18, 2 * MiB + 1, 20],
-      ['blob', 18, 4 * MiB, 20],
-      ['blob', 18, 4 * MiB + 1, 21],
-      ['blob', 18, 8 * MiB, 21],
-      ['blob', 18, 8 * MiB + 1, 22],
-      ['blob', 18, P.BLOB_MAX, 22], // 12 MiB
-      ['register', 20, 0, 20],
-      ['register', 20, 4097, 20],
-      ['register', 20, MiB + 1, 20],
-      ['register', 20, 100 * MiB, 20],
-      ['wrap', 18, 0, 18],
-      ['wrap', 18, 8193, 18],
-      ['wrap', 18, MiB + 1, 18],
-      ['wrap', 18, 100 * MiB, 18],
+      ["put", 16, 0, 16],
+      ["put", 16, 1, 16],
+      ["put", 16, 4096, 16],
+      ["put", 16, 4097, 17],
+      ["put", 16, 8192, 17],
+      ["put", 16, 8193, 18],
+      ["put", 16, 1 + 296 + 35, 16], // one class-0 row
+      ["put", 16, 1 + 16424 + 35, 19], // one class-3 row
+      ["put", 16, 263345, 23], // PUT_MAX_BYTES: 64.3 units
+      ["put", 0, 4097, 1],
+      ["inbox", 18, 0, 18],
+      ["inbox", 18, 7 + 1432, 18], // one invite
+      ["inbox", 18, 7 + 2 * 1432, 18],
+      ["inbox", 18, 7 + 3 * 1432, 19],
+      ["inbox", 18, 4096, 18],
+      ["inbox", 18, 4097, 19],
+      ["inbox", 18, 45831, 22], // INBOX_MAX_BYTES: 11.2 units
+      ["blob", 18, 0, 18],
+      ["blob", 18, 41, 18],
+      ["blob", 18, 4097, 18],
+      ["blob", 18, MiB, 18],
+      ["blob", 18, MiB + 1, 19],
+      ["blob", 18, 2 * MiB, 19],
+      ["blob", 18, 2 * MiB + 1, 20],
+      ["blob", 18, 8 * MiB, 21],
+      ["blob", 18, 8 * MiB + 1, 22],
+      ["blob", 18, 12 * MiB, 22],
+      ["register", 20, 0, 20],
+      ["register", 20, 4097, 20],
+      ["register", 20, 64 * 1024, 20],
+      ["register", 20, 100 * MiB, 20],
+      ["wrap", 18, 0, 18],
+      ["wrap", 18, 16 * 1024, 18],
+      ["wrap", 18, 100 * MiB, 18],
     ];
     for (const [scope, base, bytes, want] of table) {
       expect(P.powDifficulty(scope, base, bytes), `${scope} base ${base}, ${bytes} B`).toBe(want);
@@ -2146,108 +1768,183 @@ describe('proof of work (§4.3)', () => {
     }
   });
 
-  it('powDifficulty matches the integer formula around every power of two and prices bytes linearly', () => {
-    for (const scope of ['append', 'blob', 'register', 'wrap'] as const) {
-      const unit = scope === 'append' ? 4096 : 1024 * 1024;
+  it("powDifficulty matches the integer formula around every power of two, monotone in size", () => {
+    for (const scope of P.POW_SCOPES) {
       let prev = 0;
-      for (let k = 0; k <= 34; k++) {
+      for (let k = 0; k <= 40; k++) {
         for (const d of [-1, 0, 1]) {
           const bytes = 2 ** k + d;
           if (bytes < 0) continue;
           const got = P.powDifficulty(scope, 10, bytes);
-          expect(got, `${scope} 2^${k}${d < 0 ? '' : '+'}${d}`).toBe(refPowDifficulty(scope, 10, bytes));
-          expect(got).toBeGreaterThanOrEqual(prev); // monotone in size
+          expect(got, `${scope} 2^${k}${d < 0 ? "" : "+"}${d}`).toBe(refPowDifficulty(scope, 10, bytes));
+          expect(got).toBeGreaterThanOrEqual(prev);
           prev = got;
-          if ((scope === 'append' || scope === 'blob') && bytes > unit) {
-            // work 2^(d - base) is at least bytes / unit and less than twice that
-            const work = 2 ** (got - 10);
-            expect(work).toBeGreaterThanOrEqual(bytes / unit);
-            expect(work).toBeLessThan((2 * bytes) / unit);
-          }
         }
       }
     }
+    for (const bad of [-1, 1.5, NaN, 2 ** 53]) expect(() => P.powDifficulty("put", 16, bad), String(bad)).toThrow(/size/);
+    expect(() => P.powDifficulty("append" as P.PowScope, 16, 1)).toThrow(/scope/);
   });
 
-  it('powSolve finds the first valid nonce; powCheck verifies it', async () => {
-    const pre = P.powPre('append', 1, P.H(s2b('x')));
-    const nonce = await P.powSolve(pre, 12);
-    expect(P.powCheck(pre, nonce, 12)).toBe(true);
-    expect(P.leadingZeroBits(sha(cat(pre, be64(nonce))))).toBeGreaterThanOrEqual(12);
-    for (let k = 0; k < nonce; k++) expect(P.powCheck(pre, k, 12)).toBe(false); // solver returns the first
-    expect(P.powCheck(pre, nonce, 256)).toBe(false);
-    expect(P.powCheck(P.powPre('append', 2, P.H(s2b('x'))), nonce, 12) && P.powCheck(pre, nonce + 1, 12)).toBe(false);
-    expect(await P.powSolve(pre, 0)).toBe(0);
-    expect(P.powCheck(pre, 0, 0)).toBe(true);
-    const n1 = await P.powSolve(pre, 6, 1); // chunk = 1 yields after every hash
-    expect(P.powCheck(pre, n1, 6)).toBe(true);
-    expect(() => P.powCheck(pre, -1, 0)).toThrow();
+  it("powSolve / powCheck work on a v2 challenge", async () => {
+    const pre = P.powPre("put", 1, sha(s2b("x")));
+    const nonce = await P.powSolve(pre, 8);
+    expect(P.powCheck(pre, nonce, 8)).toBe(true);
+    expect(P.leadingZeroBits(sha(cat(pre, be64(nonce))))).toBeGreaterThanOrEqual(8);
+  });
+});
+
+// ───────────────────────── directory prefixes (§9.6, §10.6) ─────────────────────────
+
+describe("directory prefix ranges and p (§9.6, §10.6)", () => {
+  const refRange = (p: number, x: number) => {
+    const span = 1n << BigInt(32 - p);
+    const lo = BigInt(x) * span;
+    return { lo: Number(lo), hi: Number(lo + span - 1n) };
+  };
+
+  it("prefixRange for p = 0, 1, 31, 32 with x at both ends (no 32-bit shift bugs)", () => {
+    const cases: [number, number, number, number][] = [
+      [0, 0, 0, 0xffffffff],
+      [1, 0, 0, 0x7fffffff],
+      [1, 1, 0x80000000, 0xffffffff],
+      [31, 0, 0, 1],
+      [31, 0x7fffffff, 0xfffffffe, 0xffffffff],
+      [32, 0, 0, 0],
+      [32, 0xffffffff, 0xffffffff, 0xffffffff],
+      [16, 0x1234, 0x12340000, 0x1234ffff],
+    ];
+    for (const [p, x, lo, hi] of cases) {
+      expect(P.prefixRange(p, x), `p=${p} x=${x}`).toEqual({ lo, hi });
+      expect(refRange(p, x)).toEqual({ lo, hi });
+    }
+    for (let p = 0; p <= 32; p++) {
+      const top = 2 ** p - 1;
+      for (const x of [0, top, Math.floor(top / 3)]) expect(P.prefixRange(p, x), `p=${p} x=${x}`).toEqual(refRange(p, x));
+    }
+    for (const p of [-1, 33, 1.5, NaN]) expect(() => P.prefixRange(p, 0), `p=${p}`).toThrow(/prefix bits/);
+    for (const [p, x] of [
+      [0, 1],
+      [1, 2],
+      [31, 2 ** 31],
+      [32, 2 ** 32],
+      [8, -1],
+      [8, 1.5],
+    ])
+      expect(() => P.prefixRange(p, x), `p=${p} x=${x}`).toThrow(/prefix value/);
+  });
+
+  it("topBits(pre, p) selects the range that contains pre", () => {
+    const r = prng(0x70b);
+    for (let i = 0; i < 200; i++) {
+      const pre = i === 0 ? 0xffffffff : i === 1 ? 0 : r.u32();
+      for (let p = 0; p <= 32; p++) {
+        const x = P.topBits(pre, p);
+        expect(x).toBe(p === 0 ? 0 : Number(BigInt(pre) >> BigInt(32 - p)));
+        const { lo, hi } = P.prefixRange(p, x);
+        expect(lo <= pre && pre <= hi, `pre=${pre} p=${p}`).toBe(true);
+      }
+    }
+    expect(P.topBits(P.hpre("alice"), 32)).toBe(P.hpre("alice"));
+  });
+
+  it("serverP = max(0, ⌊log2(users / 32)⌋)", () => {
+    const ref = (users: number): number => (users < 32 ? 0 : bitLength(users) - 1 - 5);
+    const table: [number, number][] = [
+      [0, 0],
+      [1, 0],
+      [31, 0],
+      [32, 0],
+      [63, 0],
+      [64, 1],
+      [127, 1],
+      [128, 2],
+      [1000, 4],
+      [2 ** 20, 15],
+      [2 ** 40 - 1, 34],
+    ];
+    for (const [users, want] of table) {
+      expect(P.serverP(users), `users=${users}`).toBe(want);
+      expect(ref(users)).toBe(want);
+    }
+    for (let k = 0; k <= 45; k++) for (const d of [-1, 0, 1]) if (2 ** k + d >= 0) expect(P.serverP(2 ** k + d)).toBe(ref(2 ** k + d));
+  });
+
+  it("clientP = max(0, min(P − 1, ⌊log2(dirSeq / 64)⌋, 16)): bounded by dirSeq, at most 16", () => {
+    const ref = (Pv: number, dirSeq: number): number =>
+      Math.max(0, Math.min(Pv - 1, dirSeq < 64 ? -1 : bitLength(dirSeq) - 1 - 6, 16));
+    const table: [number, number, number][] = [
+      [0, 0, 0],
+      [0, 2 ** 30, 0],
+      [1, 2 ** 30, 0],
+      [5, 0, 0],
+      [5, 63, 0],
+      [5, 64, 0],
+      [5, 128, 1],
+      [5, 1000, 3],
+      [5, 2 ** 20, 4], // P − 1
+      [20, 1000, 3], // an inflated P does not help without an inflated dirlog
+      [30, 2 ** 30, 16], // capped at 16
+      [40, 2 ** 50, 16],
+      [10, 2 ** 40, 9],
+    ];
+    for (const [Pv, dirSeq, want] of table) {
+      expect(P.clientP(Pv, dirSeq), `P=${Pv} dirSeq=${dirSeq}`).toBe(want);
+      expect(ref(Pv, dirSeq)).toBe(want);
+    }
+    const r = prng(0xc11);
+    for (let i = 0; i < 500; i++) {
+      const Pv = r.int(40);
+      const dirSeq = r.int(2) ? r.int(5000) : r.u32() * 64;
+      const got = P.clientP(Pv, dirSeq);
+      expect(got).toBe(ref(Pv, dirSeq));
+      expect(got).toBeLessThanOrEqual(16);
+      expect(got).toBeLessThanOrEqual(Math.max(0, Pv - 1));
+      // the server accepts p ∈ [0, min(32, P + 1)]
+      expect(got).toBeLessThanOrEqual(Math.min(32, Pv + 1));
+    }
+  });
+});
+
+// ───────────────────────── blobs (§8.1) ─────────────────────────
+
+describe("blobs (§8.1)", () => {
+  it("encryptBlob: aeadSeal(key, padme(bytes), utf8('segv.sh/v2/blob')), id = b64u(H(blob))", () => {
+    expect(P.BLOB_AAD).toBe("segv.sh/v2/blob");
+    expect(P.BLOB_MIN).toBe(41);
+    for (const n of [0, 1, 100, 5000]) {
+      const data = seqBytes(n, 7);
+      const { blob, id, key } = P.encryptBlob(data);
+      expect(blob.length).toBe(24 + P.padmeLength(n + 1) + 16);
+      expect(blob.length).toBeGreaterThanOrEqual(P.BLOB_MIN);
+      expect(id).toBe(b64uN(sha(blob)));
+      const pt = xchacha20poly1305(key, blob.subarray(0, 24), s2b("segv.sh/v2/blob")).decrypt(blob.subarray(24));
+      expect(toHex(P.unpad(pt))).toBe(toHex(data));
+      expect(toHex(P.decryptBlob(blob, id, key))).toBe(toHex(data));
+      expect(() => P.decryptBlob(blob, b64uN(sha(flip(blob, 0))), key)).toThrow(/hash mismatch/);
+      expect(() => P.decryptBlob(blob, id, flip(key, 0))).toThrow();
+      expect(() => P.decryptBlob(blob, id, key, "segv.sh/v2/snapshot")).toThrow();
+    }
+    const snap = P.encryptBlob(s2b("state"), "segv.sh/v2/snapshot");
+    expect(P.fromUtf8(P.decryptBlob(snap.blob, snap.id, snap.key, "segv.sh/v2/snapshot"))).toBe("state");
+    expect(() => P.decryptBlob(snap.blob, snap.id, snap.key)).toThrow();
   });
 });
 
 // ═════════════════════════ 4. fuzz ═════════════════════════
 
-describe('fuzz', () => {
-  it('dec: 2000 random byte strings either decode exactly or throw Error', () => {
-    const r = prng(0xdec);
-    for (let t = 0; t < 2000; t++) {
-      // half pure noise, half valid encodings with a random mutation
-      let b: B;
-      if (t % 2 === 0) b = r.bytes(r.int(80));
-      else {
-        b = P.enc(...Array.from({ length: r.int(4) }, () => r.bytes(r.int(20))));
-        if (b.length > 0) b = flip(b, r.int(b.length), r.int(8));
-        if (r.int(4) === 0) b = b.subarray(0, r.int(b.length + 1));
-      }
-      const count = r.int(5);
-      try {
-        const parts = P.dec(b, count);
-        expect(parts.length).toBe(count);
-        expect(toHex(P.enc(...parts))).toBe(toHex(b));
-      } catch (e) {
-        expect(e).toBeInstanceOf(Error);
-      }
-    }
-  });
-
-  it('fromB64u: 2000 random strings either round-trip canonically or throw Error', () => {
-    const r = prng(0xb64);
-    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_+/= .é';
-    for (let t = 0; t < 2000; t++) {
-      const n = r.int(30);
-      let s = '';
-      const pool = t % 3 === 0 ? alphabet.length : 64;
-      for (let i = 0; i < n; i++) s += alphabet[r.int(pool)];
-      try {
-        expect(P.b64u(P.fromB64u(s))).toBe(s);
-      } catch (e) {
-        expect(e).toBeInstanceOf(Error);
-      }
-    }
-  });
-
-  it('unpad: random input either throws or strips exactly one marker', () => {
-    const r = prng(0x9ad);
-    for (let t = 0; t < 2000; t++) {
-      const b = r.bytes(r.int(16));
-      if (r.int(2)) b.fill(0, r.int(b.length + 1));
-      try {
-        const x = P.unpad(b);
-        expect(b[x.length]).toBe(0x80);
-        expect(b.subarray(x.length + 1).every((v) => v === 0)).toBe(true);
-      } catch (e) {
-        expect(e).toBeInstanceOf(Error);
-      }
-    }
-  });
-
-  it('parseDescriptor: mutated descriptors either throw Error or satisfy every invariant', () => {
-    const r = prng(0xd35c);
-    const base = dText({ e: 3, prev: H32, members: [alice.uidS, bob.uidS, carol.uidS], by: bob.uidS, name: 'grp' });
-    const chars = '{}[]":,0123456789-.eAZaz_ \\nul';
+describe("fuzz", () => {
+  it("parseBundle / parseWrap / parseLink on random and mutated input throw Error, never anything else", () => {
+    const r = prng(0xf022);
+    const chars = '{}[]":,0123456789-.eAZaz_ \\nulvs';
+    const bases = [
+      alice.bundle,
+      P.makeWrap(alice.uid, "recovery", seqBytes(16), P.recoveryKem(seqBytes(20)), alice.AK, alice.id, TS).record,
+      P.encodeLink("segv.sh", seqBytes(16), alice.uid),
+    ];
     let accepted = 0;
     for (let t = 0; t < 1500; t++) {
-      const a = base.split('');
+      const a = bases[t % 3].split("");
       for (let m = 0; m <= r.int(3); m++) {
         const i = r.int(a.length);
         const op = r.int(3);
@@ -2255,273 +1952,316 @@ describe('fuzz', () => {
         else if (op === 1) a.splice(i, 0, chars[r.int(chars.length)]);
         else a[i] = chars[r.int(chars.length)];
       }
-      const text = a.join('');
-      let d: P.Descriptor;
-      try {
-        d = P.parseDescriptor(text);
-      } catch (e) {
-        expect(e).toBeInstanceOf(Error);
-        continue;
+      const text = a.join("");
+      for (const f of [() => P.parseBundle(text, alice.sig), () => P.parseWrap(text, alice.sig), () => P.parseLink(text)]) {
+        try {
+          f();
+          accepted++;
+        } catch (e) {
+          expect(e).toBeInstanceOf(Error);
+        }
       }
-      accepted++;
-      expect(d.v).toBe(1);
-      expect(P.fromB64u(d.conv).length).toBe(16);
-      expect(Number.isInteger(d.e) && d.e >= 0 && d.e <= 0xffffffff).toBe(true);
-      expect(d.members.length >= 1 && d.members.length <= 32).toBe(true);
-      for (const m of d.members) expect(P.fromB64u(m).length).toBe(16);
-      expect(new Set(d.members).size).toBe(d.members.length);
-      expect(d.members).toContain(d.by);
-      expect(d.e === 0 ? d.prev === null : typeof d.prev === 'string' && P.fromB64u(d.prev).length === 32).toBe(true);
-      expect(Number.isSafeInteger(d.ts) && d.ts >= 0).toBe(true);
-      if (d.name !== undefined) expect(typeof d.name === 'string' && [...d.name].length <= 64).toBe(true);
     }
     expect(accepted).toBeGreaterThan(0);
-  });
+  }, 30_000);
 
-  it('openMessage / openClaim / openInvite / parsers on random input throw Error, never anything else', () => {
-    const r = prng(0x0be);
-    const { mk } = P.epochKeys(EK0, CONV_A, 0);
-    for (let t = 0; t < 300; t++) {
-      const body = r.bytes(t % 2 ? P.MSG_BODY_LENS[r.int(2)] : r.int(400));
-      const tag = r.bytes(16);
-      expect(throwsError(() => P.openMessage(mk, { tag, body }))).toBe(true);
-      expect(throwsError(() => P.openClaim(mk, { tag, body }))).toBe(true);
-      const s = P.fromUtf8(Uint8Array.from(r.bytes(r.int(60)), (x) => 0x20 + (x % 0x5f)));
-      expect(throwsError(() => P.parseBundle(s, alice.sig))).toBe(true);
-      expect(throwsError(() => P.parseWrap(s, alice.sig))).toBe(true);
-      expect(throwsError(() => P.parseRecoveryCode(s))).toBe(true);
+  it("open / tryOpen / openWrap on random boxes: Error or null, never anything else", () => {
+    const r = prng(0x0be2);
+    const kp = P.kemKeygen(fill(32, 3));
+    for (let t = 0; t < 60; t++) {
+      const box = r.bytes(t % 2 ? 1160 + r.int(64) : r.int(1300));
+      expect(P.tryOpen(kp.sk, LBL, CONV, box)).toBeNull();
+      expect(throwsError(() => P.open(kp.sk, LBL, CONV, box))).toBe(true);
+      expect(throwsError(() => P.openWrap({ uid: alice.uidS, id: CONV, wrap: box }, { sk: kp.sk, auth: EK }))).toBe(true);
     }
-    for (let t = 0; t < 10; t++) {
-      const row = { tag: r.bytes(16), body: r.bytes(P.INV_BODY_LENS[0]) };
-      expect(throwsError(() => P.openInvite(bob.id.kemSk, r.bytes(32), row))).toBe(true);
-    }
-  });
-});
-
-// ═════════════════════════ 3b. signature strictness ═════════════════════════
-
-describe('signature strictness', () => {
-  const L = 2n ** 252n + 27742317777372353535851937790883648493n;
-  const le = (n: bigint): B => Uint8Array.from({ length: 32 }, (_, i) => Number((n >> BigInt(8 * i)) & 0xffn));
-  const fromLe = (b: B): bigint => b.reduceRight((acc, x) => (acc << 8n) | BigInt(x), 0n);
-
-  it('rejects the universal forgery under a small-order public key', () => {
-    // A = identity point, R = identity, S = 0: passes the cofactored ZIP-215 equation for EVERY message.
-    const A = cat(Uint8Array.of(1), new Uint8Array(31));
-    const sig = cat(cat(Uint8Array.of(1), new Uint8Array(31)), new Uint8Array(32));
-    for (const m of ['bundle', 'other message', '']) expect(P.verify(sig, s2b(m), A), m).toBe(false);
-    // Consequences if accepted: a member with this "sigPk" could have one dsig/psig verify for any
-    // descriptor/EK/payload, and anyone holding mk could forge their messages.
-    expect(P.verifyDescriptorSig(dText(), P.epochKeys(EK0, CONV_A, 0).kc, sig, A)).toBe(false);
-    expect(P.verifyMessageSig(fill(16, 1), '{"v":1}', sig, A)).toBe(false);
-    // Other small-order encodings (order 2: y = -1).
-    const minusOne = le(2n ** 255n - 19n - 1n);
-    expect(P.verify(cat(minusOne, new Uint8Array(32)), s2b('x'), minusOne)).toBe(false);
-  });
-
-  it('rejects malleated signatures (S + L)', () => {
-    const msg = s2b('payload');
-    const sig = P.sign(msg, alice.id.sigSk);
-    const S = fromLe(sig.subarray(32));
-    const mall = cat(sig.subarray(0, 32), le(S + L));
-    expect(P.verify(sig, msg, alice.id.sigPk)).toBe(true);
-    expect(P.verify(mall, msg, alice.id.sigPk)).toBe(false);
-  });
-
-  it('a bundle with a small-order signing key cannot be registered', () => {
-    const A = P.b64u(cat(Uint8Array.of(1), new Uint8Array(31)));
-    const raw = { ...(JSON.parse(alice.bundle) as Record<string, unknown>), sig: A };
-    const text = JSON.stringify(raw);
-    const sig = P.b64u(cat(cat(Uint8Array.of(1), new Uint8Array(31)), new Uint8Array(32)));
-    expect(() => P.parseBundle(text, sig)).not.toThrow();
-    expect(() => P.verifyBundle(text, sig)).toThrow(/signature/);
   });
 });
 
 // ═════════════════════════ 5. known-answer vectors ═════════════════════════
-// Generated once from the implementation after the tests above passed. enc / b64u / rowHash /
-// powPre / tags / fingerprint / recovery codes are additionally cross-checked above by independent
-// computation. If one of these fails, the wire format changed: that breaks every existing account,
-// log row and conversation. Do not "fix" the vector — fix the code (or bump the protocol version).
+// Generated once from the implementation after the independent cross-checks above passed. If one of these fails, the
+// v2 wire format changed: that breaks every account, row and conversation. Do not "fix" the vector — fix the code.
 
+const KAT_AK = seqBytes(32); // 00 01 .. 1f
+const KAT_UID = seqBytes(16, 0x40);
+const KAT_TS = 1_780_000_000_000;
+
+/** Every pinned value, computed from proto (deterministic randomness where a construction is randomised). */
+function katValues() {
+  const id = P.deriveIdentity(KAT_AK);
+  const { bundle, sig } = P.makeBundle(KAT_UID, "kat_user", id, KAT_TS);
+  const sigRaw = P.fromB64u(sig);
+  const credId = seqBytes(20, 0x80);
+  const cred = P.credKem(fill(32, 0x11), credId);
+  const rec = P.recoveryKem(seqBytes(20));
+  const wrapCalls: Record<string, B[]> = { passkey: [], recovery: [] };
+  const pw = withRandom(recording(detRandom("kat wrap passkey"), wrapCalls.passkey), () =>
+    P.makeWrap(KAT_UID, "passkey", credId, cred, KAT_AK, id, KAT_TS),
+  );
+  const rw = withRandom(recording(detRandom("kat wrap recovery"), wrapCalls.recovery), () =>
+    P.makeWrap(KAT_UID, "recovery", rec.id, rec, KAT_AK, id, KAT_TS + 1),
+  );
+  const sealBox = withRandom(detRandom("kat seal"), () => P.seal(id.kemPk, LBL, seqBytes(5), seqBytes(40)));
+  const dummy = withRandom(detRandom("kat dummy"), () => P.dummySeal(LBL, seqBytes(5), 40));
+  const ep = P.epochKeys(seqBytes(32, 0x20), seqBytes(16, 0x60), 7);
+  const lk = P.linkKeys(seqBytes(16, 0x90));
+  const kr = P.kroute(seqBytes(32, 0xa0), 41);
+  const label = seqBytes(16, 0x30);
+  const body = seqBytes(1064, 3);
+  const eid = seqBytes(16, 0x50);
+  const ibody = seqBytes(1416, 2);
+  const blobId = seqBytes(32, 0x70);
+  const leaves = [P.leafShard(41, label, 1234, 1, body), P.leafInbox(41, 0, 99, eid, ibody), P.leafBlob(blobId, 11640, 600)];
+  const root = P.mth(leaves);
+  const head1 = P.nextHead(P.shardCid(41, 0), P.ZERO32, 1234, 3, root);
+  const heads = [
+    { cid: P.shardCid(41, 0), head: head1 },
+    { cid: P.inboxCid(41, 0), head: fill(32, 0x11) },
+    { cid: P.BLOBREG_CID, head: fill(32, 0x22) },
+    { cid: P.DIRLOG_CID, head: fill(32, 0x33) },
+  ];
+  const hd = P.ckptHd(heads);
+  const C1 = P.ckptC(P.ZERO32, 1, 60, hd);
+  const C2 = P.ckptC(C1, 2, 120, P.ckptHd(heads.slice(1)));
+  const srvSk = seqBytes(32, 0x5a);
+  const receipt = P.receiptMsg(41, label, body, 1234);
+  const refUser = P.dirlogRefUser(bundle, sigRaw);
+  const refWrap = P.dirlogRefWrap(pw.record, P.fromB64u(pw.sig));
+  const h1 = P.dirlogH(P.ZERO32, 1, P.DIRLOG_USER, refUser);
+  const h2 = P.dirlogH(h1, 2, P.DIRLOG_WRAP, refWrap);
+  return {
+    identity: {
+      sigSk: toHex(id.sigSk),
+      sigPk: toHex(id.sigPk),
+      kemSk: toHex(id.kemSk),
+      kemPkSha256: toHex(sha(id.kemPk)),
+      kS: toHex(id.kS),
+      rS: toHex(id.rS),
+      nS: toHex(id.nS),
+    },
+    bundle: { sha256: toHex(sha(s2b(bundle))), sig, fingerprint: P.fingerprint(KAT_UID, id.sigPk, id.kemPk), pin: toHex(P.pin(bundle, sigRaw)) },
+    dir: { hpre: P.hpre("kat_user"), upre: P.upre(KAT_UID) },
+    credKem: { pkSha256: toHex(sha(cred.pk)), sk: toHex(cred.sk), auth: toHex(cred.auth) },
+    recoveryKem: { pkSha256: toHex(sha(rec.pk)), sk: toHex(rec.sk), id: toHex(rec.id), auth: toHex(rec.auth) },
+    wrap: {
+      passkey: { recordSha256: toHex(sha(s2b(pw.record))), sig: pw.sig, wrapSha256: toHex(sha(P.parseWrap(pw.record, pw.sig).wrap)) },
+      recovery: { recordSha256: toHex(sha(s2b(rw.record))), sig: rw.sig, wrapSha256: toHex(sha(P.parseWrap(rw.record, rw.sig).wrap)) },
+    },
+    seal: { sha256: toHex(sha(sealBox)), dummySha256: toHex(sha(dummy)) },
+    epoch: {
+      rk: toHex(ep.rk),
+      mk: toHex(ep.mk),
+      kc: toHex(ep.kc),
+      nk: toHex(ep.nk),
+      dk: toHex(ep.dk),
+      ekc: toHex(P.ekc(seqBytes(16, 0x60), 7, seqBytes(32, 0x20))),
+    },
+    labels: {
+      Lmsg_3_41_5: toHex(P.Lmsg(ep.rk, 3, 41, 5)),
+      Lmsg_0_0_0: toHex(P.Lmsg(ep.rk, 0, 0, 0)),
+      Lctl_41_2: toHex(P.Lctl(ep.rk, 41, 2)),
+      topicConv: toHex(P.topicConv(ep.nk)),
+      Lself_41_9: toHex(P.Lself(id.rS, 41, 9)),
+      Lsnap_41_1: toHex(P.Lsnap(id.rS, 41, 1)),
+      topicSelf: toHex(P.topicSelf(id.nS)),
+      kL: toHex(lk.kL),
+      mL: toHex(lk.mL),
+      nL: toHex(lk.nL),
+      Lhello_41_0: toHex(P.Lhello(lk.kL, 41, 0)),
+      topicLink: toHex(P.topicLink(lk.nL)),
+      link: P.encodeLink("segv.sh", seqBytes(16, 0x90), KAT_UID),
+    },
+    routing: { kroute: toHex(kr), kcommit: toHex(P.kcommit(kr)), v: toHex(P.routeV(kr, label)) },
+    commitments: {
+      leafShard: toHex(leaves[0]),
+      leafInbox: toHex(leaves[1]),
+      leafBlob: toHex(leaves[2]),
+      mth: toHex(root),
+      head: toHex(head1),
+      hd: toHex(hd),
+      C1: toHex(C1),
+      C2: toHex(C2),
+      ckptSig: toHex(P.sign(P.ckptSigMsg(2, C2), srvSk)),
+      receiptMsg: toHex(receipt),
+      receiptSig: toHex(P.sign(receipt, srvSk)),
+      prevh: toHex(P.prevh(label, body)),
+      dirlogRefUser: toHex(refUser),
+      dirlogRefWrap: toHex(refWrap),
+      dirlogH1: toHex(h1),
+      dirlogH2: toHex(h2),
+    },
+    powPre: toHex(P.powPre("put", 2833333, P.H(body))),
+    _calls: wrapCalls,
+    _boxes: { pw, rw, cred, rec, credId, id },
+  };
+}
+
+// Generated from katValues() once the cross-checks above passed.
 const KAT = {
-  AK: seqBytes(32), // 00 01 .. 1f
-  UID: seqBytes(16, 0x40),
   identity: {
-    sigSk: 'b13f5ad2995838464ac6ba731e22484268883bd2e350a978c10324911923d3b8',
-    sigPk: '9e59ea48b6f064125961b179f2429aa774b325957276a6103c2417f895140887',
-    kemSk: '805f57afd15ff17b2ae916161c5765286b57134172542fc0d2f7fe0e08e261b9',
-    kemPkSha256: '42d50997338787800f0173db0527d5710c9c5bfe87c5c6c0e8b6c598543579da',
-    scanSk: 'a0436518afc97e60bea9c0d80375d498ea932374e39162c0e0fbeee8b4cee74d',
-    scanPk: '128e90cd4fcec9c80887843a99f63dbb8b50a6155db848ea079b4ab0289e8504',
+    sigSk: "1bed77794e28cd19fc4ac82eaef9b350c0f9b3e59cd5404121484abf06679abb",
+    sigPk: "50c9efc73d5fcb1da0836f651a4750046d5d486e0907def9fc51115a01bc7675",
+    kemSk: "c93efe194e4d35b7c7d5f23098a7b6e5eef43134b97f599698ba9bf4e247064e",
+    kemPkSha256: "f611b9c73cceb676e7be65bf2c9dc7465dbf913bb6b8ec947b74e630bea245e9",
+    kS: "10a81df1fee104128932dd1e41874a52b062e96bba0ede4a69cbb8f7fc33be73",
+    rS: "d00dc6049a2c40f9d9b8b8fa680818f7b605d2d76bb2d0141f931ca60c8d662b",
+    nS: "8e954248c5634e2a4e2a6cafb43b08fb067107df8008e3d520f91d17e20845cf",
   },
-  bundlePrefix: '{"v":1,"uid":"QEFCQ0RFRkdISUpLTE1OTw","handle":"kat_user","sig":"nlnqSLbwZBJZYbF58kKap3SzJZVydqYQPCQX-JUUCIc","kem":"bUMty7WMFqxhh-iTPya0',
-  bundleSuffix: '","scan":"Eo6QzU_OycgIh4Q6mfY9u4tQphVduEjqB5tKsCiehQQ","ts":1700000000000}',
-  bundleSha256: 'dfb041c8134c078a0bd60889844738f43d98cc33267e106c12130839d330fb95',
-  bundleSig: 'WV9F-t4eZ00yPukMGPhO_o5hzizFMSFTWno1YmiKGlScJueyfHeWjskq_rsdecHBBzhBO9y5LT7npNIB0jnMCQ',
-  fingerprint: '34615 42488 34039 22546 24887 17801',
+  bundle: {
+    sha256: "fc493f9b8dc4ecd7dde206316e7a09c591d5c5f424705d8a1807d9a8313d3127",
+    sig: "XkMNPn5lpiPaYFtdkoBahE5kHlH3-qkQ4qF9LusW2__cNuhRMPKxfNLlNai6dFQKuQuMpldQ2ENocLsj9YLWBw",
+    fingerprint: "70863 35163 00494 48310 14909 91457",
+    pin: "9601b447843b82f53a0a340c06f2fd9657f88c825442154f5c4792e9b2cf39af",
+  },
+  dir: { hpre: 1518820017, upre: 509507751 },
   credKem: {
-    pkSha256: 'db45c744a520bf010e42c7c24d55ccedfee4be247d28418e1fc9f00655bc4fb1',
-    sk: 'f60f4aeaa5afedd908b998e4b2b74fc7218a60ad2357d59fa3f473adf4c72cbb',
-    // HKDF(prf = 11*32, salt = credId 80..93, "segv.sh/v1/cred/auth"); cross-checked with Python hmac/hashlib
-    auth: '0c81fb308fd1be864e101d404d2c79168afa0ef6b247f001f47f1d401e52f1b7',
+    pkSha256: "c4c832e8f21089a6580f7bc59927c266c167221ae7a53338afe88d85e7bdbf89",
+    sk: "20f3bb8221099db1c8705135e89b585ef7815a6226c77110de58313383631a95",
+    auth: "22c9865ae198beed41a6d95144597aa0146d4d18f10782c3d0bb676bdaca60d1",
   },
   recoveryKem: {
-    pkSha256: 'd13d8d60ffc00853e5eab27893b54a863eb3e0f62c23b84eda56a686402925f0',
-    sk: 'a4810e9f844f2d70d3223ace1379a954f35d1228c1153358a944314e2eb1f74b',
-    id: '7deeaa931ddf1a1f948ca8a27bac2d87',
-    // HKDF(code = 00..13, "", "segv.sh/v1/recovery/auth"); cross-checked with Python hmac/hashlib
-    auth: 'd65bcb69d941fece84a91a4c5822d6edef1793f27fdd3eda1914da9c452a9132',
+    pkSha256: "6e76c8638779ad31988633c1f55b0da266c2b62dccb92390bf0b67feaf88cb9a",
+    sk: "031c23810cdd738fa6524c364f59491e8701e753404e55bf7b9a2704bb05305c",
+    id: "975ff740785ed14f6ee9e6766cdbf473",
+    auth: "bb97f8551ddd27623aefd55d922348cc0ed06c7366502d7226e268e47b91b3e9",
   },
-  // ak-wraps of AK = 00..1f for UID = 40..4f with fixed X-Wing randomness and nonce:
-  // ctx = enc(uid, id, auth), key = HKDF(ss, H(kct), enc("segv.sh/v1/seal", "ak-wrap", ctx)).
-  // ctx and key were recomputed with Python hmac/hashlib from ss and H(kct).
   wrap: {
     passkey: {
-      ctxSha256: 'fc2cec7c8929f4f29370c9011b32a86e222fc0a332c650c3fb592400db4e469f',
-      ss: 'fc0b871bddc13f086a2fe1cccc5eeebdd197748e2aba13ec628e0283d0b49282',
-      key: '778d82e4d488d40c6c47f366f50800942cd5032f566cca5aea258d6ddb35d0a3',
-      boxSha256: 'a92bbf47a4307759a893f338a9760c6c74ab6b4a07993fbf79e3f5a69bec5494',
+      recordSha256: "8b13d9cb2e06084307c32c915b5467e53d570839c72aae98307fd2e2bf041c82",
+      sig: "hdri0fyue50kTEn7JvPXsJH_4jBNxJzkCUJPk-OA56eVIsM-RlX2cOWpvJCYV1biXAwkDfCWYyXDCN079NxcDA",
+      wrapSha256: "9403eb5016b94f7333d61ff761ecc20be4f84662b1039c3b88094b3d95494ce8",
     },
     recovery: {
-      ctxSha256: '87283e99b60491cdf81da9b7b579173c26af77c2e0d8dcd4a24dbb03e4846d88',
-      ss: '2a3aace9ed6bf3bacffdef08ff9b838d8fc95987fec63fd69edb7d25a8706f49',
-      key: '3d52aa6345c5ab8cb12f59c2b84acd626045aa776239ba67a5461d5ea6e38639',
-      boxSha256: '183d85d1c142c1170da31ee5f3c3bb078fa706fa5408b12714f073c5f1519d2d',
+      recordSha256: "938dade6133bac613734e45b6a65b91ad554b4de6f7e731c2b81315db4b861ce",
+      sig: "tVjgP43c2HJF7GFuxQkTb_3hCvZXapDK4wZQVF1KKuDNf6EbAZlXssvJZBgQCQjtmo5IU-lN85dWhZ2Y7i8WBQ",
+      wrapSha256: "acd87cbc081776bce6a5af91ab03255f6c8af7027116b9c5c6f784b26e6987c4",
     },
   },
-  // hand check of the first group: 00 01 02 03 04 -> 00000 00000 00000 10000 00100 00000 11000 00100 -> "000G40R4"
-  recoveryCode: '000G-40R4-0M30-E209-185G-R38E-1W81-24GK',
-  epoch: {
-    rk: '547cee08d23fa9fbc7542f0928ff2353dcae3d057a83d38443aec735d674bfe0',
-    mk: '3dd9f23197f347f5b76c95926ee03eb4987be216aa65f1f07b314dbb9b50a300',
-    kc: 'adff7843caf10456305c8ce00d83006c6ebf9dded86b6f09308fb7d8dd2556cb',
-    msgTag_3_5: '0fdd065cf745c99cd3452d84959d093a',
-    msgTag_0_0: '64d3b2625af473c6ef11c5f08afcf33f',
-    claimTag: 'e3bcec83fcaf577f99f3c64f006ea721',
+  seal: {
+    sha256: "954d244ad48d0523f7dd5f542b125b90dc8b65f8237180d7ba48ae7b1877fe87",
+    dummySha256: "c7e3ca6b829585372a680eabff0faa0d2fc511203cb7c8613a06c42939249eb7",
   },
-  descriptor:
-    '{"v":1,"conv":"YGFiY2RlZmdoaWprbG1ubw","e":7,"members":["QEFCQ0RFRkdISUpLTE1OTw"],"prev":"qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo","by":"QEFCQ0RFRkdISUpLTE1OTw","ts":1700000000000,"name":"kat"}',
-  dsig: 'cfce1c194a62fd7f2ea851e0ea23a53651505ac0886d657a882bc9529b5c6272502f2f0cb50d349c87266a69a183f2339b2e7f85ef4e4dac5e9573d51c889f0f',
-  psig: '84953d8ffb7f286154c01b440862bcf96de4b8587c3f7e3d6719c5e70ebfc2757885b3b83e9351a72425427a81fd3ea7c30b4bc28be7700ff23a5ce715a60008',
-  csig: '6fc71279301ea6f4fd492f0870757400e21d245984c3daade712a421ad42dd63616c423459744cbcbeb5df2b00cddcb0697547c3375115e3776d11c6eddd2608',
-  // 32 + 1120 + 24 + 2048 + 16 (one invite class); 24 + {1024, 4096, 16384} + 16
-  invBodyLens: [3240],
-  msgBodyLens: [1064, 4136, 16424],
-  rowHash: '0f4121678809b76207bafb3e974106b8ee846892a987628325e60ffe8c6c397c',
-  rowHash2: '18cf78bb7536553506db9e876dd677e9e5dd4016579a32b31e1e529bea6b890a',
-  userTag: 'd1e08b1104bf46f7c894554b89e65eda',
-  wrapTag: 'abdb566cf3f608261ac664d449fcae65',
-  powPre: 'b84354d84df8db5df0d20329747726ce97e2007fd8511c15cc8306f0557a2e86',
-  powNonce16: 12109,
-  // hand check: lp("segv.sh/v1/kat") || lp(00..04) || lp("") || lp(ff)
-  enc: '0000000e' + '736567762e73682f76312f6b6174' + '00000005' + '0001020304' + '00000000' + '00000001' + 'ff',
-  b64u: 'wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t_g4eLj5OXm5-jp6uvs7e7v8PHy8_T19vf4-fr7_P3-_w',
+  epoch: {
+    rk: "cce9c0a8668adb80b8d86c7c7af77a43f31202e23c75e49d358255d4ecbff5b9",
+    mk: "5903167ad3ca32a5b415e5661cc5ece4c3f3ae4e0af83ba921765e6baee3c035",
+    kc: "e0a7fe7d5fca837c3f3923277c27a0125f26da3efbc4c8bd4b88571d21ea559c",
+    nk: "c100d8f1f22f383a42c44e4582bc217918167c8c0e6cc2413a3716310834597b",
+    dk: "fab405f9f3d19ad2a2713aeb615a47331c082ea5503b0d6701f13050bb9dcbbd",
+    ekc: "f580ab441f45fa99d6c10f3b4bdaa4e98f40c995ac0b1cf13117039fb1b66414",
+  },
+  labels: {
+    Lmsg_3_41_5: "d78a1b710277204a5a17132028da99b7",
+    Lmsg_0_0_0: "2462839006269ee01cd1a5658a7050c4",
+    Lctl_41_2: "73dba5791ca3f86898291ac281bedbb2",
+    topicConv: "928ae44345ec3808cac855805b094605",
+    Lself_41_9: "b07192105cc332cbe7b2367a60e0ec72",
+    Lsnap_41_1: "bb0874d1089f25ef58fdeb3a082c0d98",
+    topicSelf: "af47a5aeffd264e8bd140d6450c528fc",
+    kL: "0d778f29bdfb5cad22b87306f3ac5af1de922f2d636a3bf0d5ecf3fef21952e3",
+    mL: "777bf865cfc09e68ec63437e25b8ba51b6d66f1026502df7c76d8971728b6b0e",
+    nL: "a0258951ea20bcddc7256454976b202499a871dd1add62b123d1afcca003f4cc",
+    Lhello_41_0: "85ef899c12b5daca23fdc05aedb61462",
+    topicLink: "cf193f95fe8d944c9a5c773c7f691e3f",
+    link: "https://segv.sh/i#ApCRkpOUlZaXmJmam5ydnp9AQUJDREVGR0hJSktMTU5P",
+  },
+  routing: {
+    kroute: "95657ac9402060984afda72b8ff195e36959eea5778452fc2827fc216bd29bdc",
+    kcommit: "6f90cee6b5f540f864579fd43f4307fdc468f4d8271046b747ead3325d6e9588",
+    v: "7330dc8201a8a97d",
+  },
+  commitments: {
+    leafShard: "e268911fc61d2fca15e1b642ee0061e8e72fb15eaaaa8d2ce7bf47dbbd81f557",
+    leafInbox: "dacbc6b9949ac45d59196cb3323805b323c1109e5b273be8ed23a3ad6ee44326",
+    leafBlob: "de1459bfc63f6d6dd8293cecf286e57c27e63e2ddc7d068ab0ee036101bcc101",
+    mth: "75d163c357df66064fa7f2e61157279a505dd2ace3073228cba96d63e6f17567",
+    head: "11b0ba1d0078c5823f230ee129b9069c391e37b4035d24d76b33b394699f91ab",
+    hd: "83cfaf396f32982b1b8dd77d97ab6867fdad5847c6d3f0d648f735b93fc9bdbc",
+    C1: "4df19b0dd9e4eb893b1a02a8ee6dc03fa3cc409261dc6432187a48aa62e13378",
+    C2: "3e8f06f31a5058461dbe8b849cccca3b29a8142cccedb5870c430255224782fa",
+    ckptSig:
+      "e1303b9801495c9941b546171cc0dd9603bbc90c90db0228a85da968347c4c885041be6e8ae90cf7b75294b704e559088a1bbcf428f68b780e5bff974ac41c0a",
+    // hand check: lp("segv.sh/v2/receipt") ‖ lp(u16 41) ‖ lp(label 30..3f) ‖ lp(H(body)) ‖ lp(u32 1234)
+    receiptMsg:
+      "00000012" +
+      "736567762e73682f76322f72656365697074" +
+      "00000002" +
+      "0029" +
+      "00000010" +
+      "303132333435363738393a3b3c3d3e3f" +
+      "00000020" +
+      "9a02bff68a7fd32edc8544e8311a4fcf7504f288f90ccfc9efa338db79d7c988" +
+      "00000004" +
+      "000004d2",
+    receiptSig:
+      "fe66f9f7041b0b8d7ea42210f77878adfd9ca762c910754959e5cd3461b1d639856aa2a0d6190fd2a30fb92f8d1f2b3a495b3928f8b5bf40ebceab4c4ef41704",
+    prevh: "5d0530b64da7e981b71970dee78cfc6e",
+    dirlogRefUser: "062e89ff65baca10e3b083f8942333a117dc044f1a33b01e46028c02d40538fa",
+    dirlogRefWrap: "b078c88973046ce09db3b347536a16f33ace964b01988c99b0e265b1b5b9db38",
+    dirlogH1: "4c864621c5eba2089cf133a0321b1f9a3e50fce1796f5861c7e8bf66899c2458",
+    dirlogH2: "6012a887d792e6c49a2a0955aa339f6c891f6788718bd696a6c88430a12b6f1c",
+  },
+  powPre: "1fa2a1a5fdfadb477b348438bb9fe6337cd5f9f4688e02f44afb9ca5b1d6cc99",
 };
 
-describe('known-answer vectors', () => {
-  const id = P.deriveIdentity(KAT.AK);
+describe("known-answer vectors", () => {
+  const V = katValues();
 
-  it('enc / b64u', () => {
-    expect(toHex(P.enc('segv.sh/v1/kat', seqBytes(5), '', Uint8Array.of(0xff)))).toBe(KAT.enc);
-    expect(P.b64u(seqBytes(64, 0xc0))).toBe(KAT.b64u);
-    expect(Buffer.from(seqBytes(64, 0xc0)).toString('base64url')).toBe(KAT.b64u); // independent
+  it("deriveIdentity from AK = 00..1f", () => {
+    expect(V.identity).toEqual(KAT.identity);
   });
 
-  it('deriveIdentity from AK = 00..1f', () => {
-    expect(toHex(id.sigSk)).toBe(KAT.identity.sigSk);
-    expect(toHex(id.sigPk)).toBe(KAT.identity.sigPk);
-    expect(toHex(id.kemSk)).toBe(KAT.identity.kemSk);
-    expect(toHex(sha(id.kemPk))).toBe(KAT.identity.kemPkSha256);
-    expect(toHex(id.scanSk)).toBe(KAT.identity.scanSk);
-    expect(toHex(id.scanPk)).toBe(KAT.identity.scanPk);
+  it("bundle, bundle signature, fingerprint, pin, hpre / upre", () => {
+    expect(V.bundle).toEqual(KAT.bundle);
+    expect(V.dir).toEqual(KAT.dir);
+    const { bundle } = P.makeBundle(KAT_UID, "kat_user", V._boxes.id, KAT_TS);
+    expect(bundle.startsWith('{"v":2,"uid":"QEFCQ0RFRkdISUpLTE1OTw","handle":"kat_user","sig":"UMnvxz1fyx2gg29lGkdQBG1dSG4JB975_FERWgG8dnU","kem":"')).toBe(true);
+    expect(bundle.endsWith(`","ts":${KAT_TS}}`)).toBe(true);
+    expect(P.b64u(fromHex(KAT.identity.sigPk))).toBe("UMnvxz1fyx2gg29lGkdQBG1dSG4JB975_FERWgG8dnU");
   });
 
-  it('bundle, bundle signature and fingerprint', () => {
-    const { bundle, sig } = P.makeBundle(KAT.UID, 'kat_user', id, TS);
-    expect(bundle.startsWith(KAT.bundlePrefix)).toBe(true);
-    expect(bundle.endsWith(KAT.bundleSuffix)).toBe(true);
-    expect(toHex(sha(s2b(bundle)))).toBe(KAT.bundleSha256);
-    expect(sig).toBe(KAT.bundleSig); // Ed25519 is deterministic
-    expect(P.fingerprint(P.verifyBundle(bundle, sig))).toBe(KAT.fingerprint);
+  it("credential / recovery KEM keys and auth values", () => {
+    expect(V.credKem).toEqual(KAT.credKem);
+    expect(V.recoveryKem).toEqual(KAT.recoveryKem);
   });
 
-  it('credential / recovery KEM keys, auth values and recovery code', () => {
-    const c = P.credKem(fill(32, 0x11), seqBytes(20, 0x80));
-    expect(toHex(sha(c.pk))).toBe(KAT.credKem.pkSha256);
-    expect(toHex(c.sk)).toBe(KAT.credKem.sk);
-    expect(toHex(c.auth)).toBe(KAT.credKem.auth);
-    const r = P.recoveryKem(seqBytes(20));
-    expect(toHex(sha(r.pk))).toBe(KAT.recoveryKem.pkSha256);
-    expect(toHex(r.sk)).toBe(KAT.recoveryKem.sk);
-    expect(toHex(r.id)).toBe(KAT.recoveryKem.id);
-    expect(toHex(r.auth)).toBe(KAT.recoveryKem.auth);
-    expect(P.formatRecoveryCode(seqBytes(20))).toBe(KAT.recoveryCode);
-  });
-
-  it('ak-wraps with fixed randomness (ctx = enc(uid, id, auth))', () => {
-    const c = P.credKem(fill(32, 0x11), seqBytes(20, 0x80));
-    const r = P.recoveryKem(seqBytes(20));
-    const cases = [
-      ['passkey', c, seqBytes(20, 0x80), seqBytes(64, 0x90), seqBytes(24, 0xd0)],
-      ['recovery', r, r.id, seqBytes(64, 0xa0), seqBytes(24, 0xe0)],
-    ] as const;
-    for (const [kind, key, wid, rnd, nonce] of cases) {
-      const want = KAT.wrap[kind];
-      const ctx = refEnc(KAT.UID, wid, key.auth);
-      expect(toHex(sha(ctx)), kind).toBe(want.ctxSha256);
-      const { cipherText: kct, sharedSecret: ss } = xwing.encapsulate(key.pk, rnd);
-      expect(toHex(ss), kind).toBe(want.ss);
-      const k = hkdfN(ss, sha(kct), refEnc('segv.sh/v1/seal', 'ak-wrap', ctx));
-      expect(toHex(k), kind).toBe(want.key);
-      const box = cat(kct, nonce, xchacha20poly1305(k, nonce, refEnc('ak-wrap', ctx)).encrypt(KAT.AK));
-      expect(box.length).toBe(P.WRAP_LEN);
-      expect(toHex(sha(box)), kind).toBe(want.boxSha256);
-      // proto.ts opens the independently built box, and the owner-signed record passes the key check
-      expect(toHex(P.openWrap({ uid: P.b64u(KAT.UID), id: wid, wrap: box }, key))).toBe(toHex(KAT.AK));
-      const record = JSON.stringify({ v: 1, uid: P.b64u(KAT.UID), kind, id: P.b64u(wid), kem: P.b64u(key.pk), wrap: P.b64u(box), ts: TS });
-      const sig = P.b64u(P.sign(P.wrapSigMsg(record), id.sigSk));
-      expect(toHex(P.unwrapAK(P.verifyWrap(record, sig, id.sigPk), key, id.sigPk))).toBe(toHex(KAT.AK));
+  it("ak-wraps with fixed randomness, rebuilt independently from the recorded randomness", () => {
+    expect(V.wrap).toEqual(KAT.wrap);
+    const { pw, rw, cred, rec, credId } = V._boxes;
+    for (const [kind, w, key, wid] of [
+      ["passkey", pw, cred, credId],
+      ["recovery", rw, rec, rec.id],
+    ] as const) {
+      const calls = V._calls[kind];
+      expect(calls.map((c) => c.length), kind).toEqual([64, 24]);
+      const box = refSeal(key.pk, "segv.sh/v2/ak-wrap", refEnc(KAT_UID, wid, key.auth), KAT_AK, calls[0], calls[1]);
+      expect(toHex(sha(box)), kind).toBe(KAT.wrap[kind].wrapSha256);
+      expect(toHex(P.parseWrap(w.record, w.sig).wrap)).toBe(toHex(box));
     }
   });
 
-  it('size classes', () => {
-    expect(P.INV_BODY_LENS).toEqual(KAT.invBodyLens);
-    expect(P.MSG_BODY_LENS).toEqual(KAT.msgBodyLens);
+  it("seal and dummySeal with fixed randomness", () => {
+    expect(V.seal).toEqual(KAT.seal);
+    const calls: B[] = [];
+    const box = withRandom(recording(detRandom("kat seal"), calls), () => P.seal(V._boxes.id.kemPk, LBL, seqBytes(5), seqBytes(40)));
+    expect(toHex(sha(refSeal(V._boxes.id.kemPk, LBL, seqBytes(5), seqBytes(40), calls[0], calls[1])))).toBe(KAT.seal.sha256);
+    expect(toHex(sha(box))).toBe(KAT.seal.sha256);
   });
 
-  it('epoch keys, tags, descriptor and signatures', () => {
-    const k = P.epochKeys(seqBytes(32, 0x20), seqBytes(16, 0x60), 7);
-    expect(toHex(k.rk)).toBe(KAT.epoch.rk);
-    expect(toHex(k.mk)).toBe(KAT.epoch.mk);
-    expect(toHex(k.kc)).toBe(KAT.epoch.kc);
-    expect(toHex(P.msgTag(k.rk, 3, 5))).toBe(KAT.epoch.msgTag_3_5);
-    expect(toHex(P.msgTag(k.rk, 0, 0))).toBe(KAT.epoch.msgTag_0_0);
-    expect(toHex(P.claimTag(k.rk))).toBe(KAT.epoch.claimTag);
-    const uid = P.b64u(KAT.UID);
-    const d = P.makeDescriptor({ conv: P.b64u(seqBytes(16, 0x60)), e: 7, members: [uid], prev: P.b64u(fill(32, 0xaa)), by: uid, ts: TS, name: 'kat' });
-    expect(d).toBe(KAT.descriptor);
-    expect(toHex(P.signDescriptor(d, k.kc, id.sigSk))).toBe(KAT.dsig);
-    const p: P.Payload = { v: 1, t: 'text', conv: P.b64u(seqBytes(16, 0x60)), e: 7, from: uid, n: 5, ts: TS, text: 'kat', head: { seq: 9, h: P.b64u(fill(32, 0xbb)) } };
-    const row = P.makeMessage(k.mk, P.msgTag(k.rk, 0, 5), p, id.sigSk);
-    expect(toHex(P.openMessage(k.mk, row).psig)).toBe(KAT.psig);
-    const claim = P.openClaim(k.mk, P.makeClaim(k.mk, k.rk, d, fromHex(KAT.dsig), id.sigSk));
-    expect(toHex(claim.csig)).toBe(KAT.csig);
-    expect(nodeEdVerify(claim.csig, refEnc('segv.sh/v1/claim-sig', P.claimTag(k.rk), d, fromHex(KAT.dsig)), id.sigPk)).toBe(true);
+  it("epoch keys, ekc, every label and topic, link keys and the link", () => {
+    expect(V.epoch).toEqual(KAT.epoch);
+    expect(V.labels).toEqual(KAT.labels);
   });
 
-  it('log hashes, tags and PoW', () => {
-    const h1 = P.rowHash(P.ZERO32, 1, 4, seqBytes(16, 0x10), seqBytes(40, 0x20), TS);
-    expect(toHex(h1)).toBe(KAT.rowHash);
-    expect(toHex(P.rowHash(h1, 2, 1, seqBytes(16), new Uint8Array(0), TS + 1000))).toBe(KAT.rowHash2);
-    expect(toHex(P.userTag(KAT.UID))).toBe(KAT.userTag);
-    expect(toHex(P.wrapTag('{"v":1}'))).toBe(KAT.wrapTag);
-    const pre = P.powPre('register', 2833333, P.H(s2b('{"bundle":"x"}')));
-    expect(toHex(pre)).toBe(KAT.powPre);
+  it("routing", () => {
+    expect(V.routing).toEqual(KAT.routing);
   });
 
-  it('PoW nonce for a fixed challenge', async () => {
-    const pre = P.powPre('register', 2833333, P.H(s2b('{"bundle":"x"}')));
-    expect(await P.powSolve(pre, 16)).toBe(KAT.powNonce16);
+  it("commitments: leaves, MTH, head, checkpoints, receipts, prevh, dirlog chain", () => {
+    expect(V.commitments).toEqual(KAT.commitments);
+    expect(edVerify(fromHex(KAT.commitments.receiptSig), fromHex(KAT.commitments.receiptMsg), edPubRaw(seqBytes(32, 0x5a)))).toBe(true);
+    expect(edVerify(fromHex(KAT.commitments.ckptSig), refEnc("segv.sh/v2/ckpt-sig", be32(2), fromHex(KAT.commitments.C2)), edPubRaw(seqBytes(32, 0x5a)))).toBe(true);
+  });
+
+  it("PoW prefix", () => {
+    expect(V.powPre).toBe(KAT.powPre);
   });
 });
