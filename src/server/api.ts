@@ -23,6 +23,7 @@ import {
   sha256,
 } from "./http";
 import type { LogDO } from "./log-do";
+import { blobGetOptions } from "./v2/api";
 import { BATCH_MAX, LOG_PAGE_MAX, type AppendResult, type AppendRow, type Conflict, type LogPage, type PageCheck } from "./types";
 import {
   checkAppendRows,
@@ -351,9 +352,8 @@ async function recordBlob(env: Env, id: string, size: number): Promise<void> {
 
 async function getBlob(c: Ctx, id: string): Promise<Response> {
   await rateLimit(rl(c.env, "RL_READ"), "read", c.request);
-  // Only If-None-Match is honoured (304); other conditionals are ignored rather than mis-answered.
-  const inm = c.request.headers.get("if-none-match");
-  const obj = await c.env.BLOBS.get(`b/${id}`, inm === null ? undefined : { onlyIf: new Headers({ "if-none-match": inm }) });
+  // Only a well-formed If-None-Match is honoured (304); other conditionals are ignored rather than mis-answered.
+  const obj = await c.env.BLOBS.get(`b/${id}`, blobGetOptions(c.request.headers.get("if-none-match")));
   if (!obj) throw new HttpError(404, "no such blob");
   const headers = new Headers({
     ...SECURITY_HEADERS,

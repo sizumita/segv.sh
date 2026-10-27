@@ -1,13 +1,21 @@
-/** Abuse control: proof of work (docs/PROTOCOL.md §4.3) and per-IP rate limiting. Nothing here is persisted. */
+/**
+ * Abuse control: proof of work (v1: docs/PROTOCOL.md §4.3, v2: docs/PROTOCOL-v2.md §10.2) and per-IP rate
+ * limiting. Nothing here is persisted.
+ */
 import { HMAC, POW_WINDOW_MS, hex, powCheck, powDifficulty, powPre, utf8, type PowScope } from "../lib/proto";
+import * as P2 from "../lib/proto2";
 import { HttpError, logErr } from "./http";
 
-const POW_DEFAULTS: Readonly<Record<PowScope, number>> = { register: 20, wrap: 18, append: 16, blob: 18 };
-const POW_VARS: Readonly<Record<PowScope, string>> = {
+type AnyScope = PowScope | P2.PowScope;
+
+const POW_DEFAULTS: Readonly<Record<AnyScope, number>> = { register: 20, wrap: 18, append: 16, blob: 18, put: 16, inbox: 18 };
+const POW_VARS: Readonly<Record<AnyScope, string>> = {
   register: "POW_REGISTER",
   wrap: "POW_WRAP",
   append: "POW_APPEND",
   blob: "POW_BLOB",
+  put: "POW_PUT",
+  inbox: "POW_INBOX",
 };
 
 /**
@@ -15,7 +23,7 @@ const POW_VARS: Readonly<Record<PowScope, string>> = {
  * defaults. This is what GET /api/params reports; the required difficulty grows with the request size
  * (proto.powDifficulty).
  */
-export function powBase(env: Env, scope: PowScope): number {
+export function powBase(env: Env, scope: AnyScope): number {
   const raw = (env as unknown as Record<string, unknown>)[POW_VARS[scope]];
   const s = typeof raw === "number" ? String(raw) : raw;
   if (typeof s === "string" && /^\d{1,2}$/.test(s)) {
@@ -32,7 +40,42 @@ export const powParams = (env: Env): Record<PowScope, number> => ({
   blob: powBase(env, "blob"),
 });
 
+/** v2 params "pow" object (§10.9). */
+export const powParamsV2 = (env: Env): Record<P2.PowScope, number> => ({
+  register: powBase(env, "register"),
+  wrap: powBase(env, "wrap"),
+  put: powBase(env, "put"),
+  inbox: powBase(env, "inbox"),
+  blob: powBase(env, "blob"),
+});
+
 export const powWindow = (now = Date.now()): number => Math.floor(now / POW_WINDOW_MS);
+
+/** Parses `x-segv-pow: <window>.<nonce>` and checks the window is current or previous. Throws HttpError(403). */
+function powHeader(request: Request, now: number): { window: number; nonce: number } {
+  const header = request.headers.get("x-segv-pow");
+  if (header === null) throw new HttpError(403, "missing proof of work");
+  const m = /^(\d{1,12})\.(\d{1,16})$/.exec(header);
+  if (!m) throw new HttpError(403, "malformed proof of work");
+  const window = Number(m[1]);
+  const nonce = Number(m[2]);
+  if (!Number.isSafeInteger(nonce)) throw new HttpError(403, "malformed proof of work");
+  const current = powWindow(now);
+  if (window !== current && window !== current - 1) throw new HttpError(403, "stale proof of work");
+  return { window, nonce };
+}
+
+/**
+ * v2 proof of work (docs/PROTOCOL-v2.md §10.2): pre = H(enc("segv.sh/v2/pow", scope, u32 window, digest)),
+ * difficulty = P2.powDifficulty(scope, base, bytes). `digest` = H(body), or the raw blob id for blobs.
+ */
+export function checkPowV2(request: Request, env: Env, scope: P2.PowScope, digest: Uint8Array, bytes: number, now = Date.now()): void {
+  const { window, nonce } = powHeader(request, now);
+  const need = P2.powDifficulty(scope, powBase(env, scope), bytes);
+  if (!P2.powCheck(P2.powPre(scope, window, digest), nonce, need)) {
+    throw new HttpError(403, `insufficient proof of work (${need} bits required)`);
+  }
+}
 
 /**
  * Checks `x-segv-pow: <window>.<nonce>` against `digest` (SHA-256 of the raw request body, or the raw
@@ -41,15 +84,7 @@ export const powWindow = (now = Date.now()): number => Math.floor(now / POW_WIND
  * Accepts the current and the previous window. Throws HttpError(403).
  */
 export function checkPow(request: Request, env: Env, scope: PowScope, digest: Uint8Array, bytes: number): void {
-  const header = request.headers.get("x-segv-pow");
-  if (header === null) throw new HttpError(403, "missing proof of work");
-  const m = /^(\d{1,12})\.(\d{1,16})$/.exec(header);
-  if (!m) throw new HttpError(403, "malformed proof of work");
-  const window = Number(m[1]);
-  const nonce = Number(m[2]);
-  if (!Number.isSafeInteger(nonce)) throw new HttpError(403, "malformed proof of work");
-  const current = powWindow();
-  if (window !== current && window !== current - 1) throw new HttpError(403, "stale proof of work");
+  const { window, nonce } = powHeader(request, Date.now());
   const need = powDifficulty(scope, powBase(env, scope), bytes);
   if (!powCheck(powPre(scope, window, digest), nonce, need)) {
     throw new HttpError(403, `insufficient proof of work (${need} bits required)`);

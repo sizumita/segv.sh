@@ -7,13 +7,27 @@ interface __BaseEnv_Env {
 	RL_WRITE: RateLimit;
 	RL_BLOB: RateLimit;
 	RL_READ: RateLimit;
+	RL_INBOX: RateLimit;
 	ASSETS: Fetcher;
 	POW_REGISTER: "20";
 	POW_WRAP: "18";
 	POW_APPEND: "16";
 	POW_BLOB: "18";
+	POW_PUT: "16";
+	POW_INBOX: "18";
+	DELTA_S: "10";
+	SKEW_S: "2";
+	INBOX_SLOT_S: "10";
+	E_FIRST: "42";
 	APP_HOSTS: "segv.sh,localhost";
+	ROUTE_KEY: string;
+	SRV_KEY: string;
 	LOG: DurableObjectNamespace /* LogDO */;
+	SHARD: DurableObjectNamespace /* ShardDO */;
+	BLOBREG: DurableObjectNamespace /* BlobRegDO */;
+	INBOX: DurableObjectNamespace /* InboxDO */;
+	RT: DurableObjectNamespace /* RealtimeDO */;
+	CKPT: DurableObjectNamespace /* CheckpointDO */;
 }
 declare namespace Cloudflare {
 	interface Env extends __BaseEnv_Env {}
@@ -23,7 +37,7 @@ type StringifyValues<EnvType extends Record<string, unknown>> = {
 	[Binding in keyof EnvType]: EnvType[Binding] extends string ? EnvType[Binding] : string;
 };
 declare namespace NodeJS {
-	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "POW_REGISTER" | "POW_WRAP" | "POW_APPEND" | "POW_BLOB" | "APP_HOSTS">> {}
+	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "POW_REGISTER" | "POW_WRAP" | "POW_APPEND" | "POW_BLOB" | "POW_PUT" | "POW_INBOX" | "DELTA_S" | "SKEW_S" | "INBOX_SLOT_S" | "E_FIRST" | "APP_HOSTS" | "ROUTE_KEY" | "SRV_KEY">> {}
 }
 declare module "*.txt" {
 	const value: string;

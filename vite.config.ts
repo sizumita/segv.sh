@@ -48,7 +48,9 @@ export default defineConfig(({ command, mode }) => {
         "qwik/scope-use-task": "error",
       },
     },
-    fmt: { ignorePatterns: ["worker-configuration.d.ts", "dist/**", "server/**"] },
+    // docs/PROTOCOL-v2.md and docs/STAGE1-PLAN.md are verbatim copies owned by the spec author (overwritten
+    // with cp on every revision), so they are never reformatted here.
+    fmt: { ignorePatterns: ["worker-configuration.d.ts", "dist/**", "server/**", "docs/PROTOCOL-v2.md", "docs/STAGE1-PLAN.md"] },
     // lazyPlugins: factories are skipped by `vp lint` / `vp fmt` / `vp check`.
     // `vp test`: unit tests (pure TS, Node) + Workers-runtime tests (test/worker/vitest.config.ts).
     test: {
@@ -59,6 +61,12 @@ export default defineConfig(({ command, mode }) => {
         {
           resolve: { alias: { "~": `${import.meta.dirname}/src` } },
           test: { name: "engine", include: ["test/engine/**/*.spec.ts"], environment: "node", testTimeout: 120_000, hookTimeout: 60_000 },
+        },
+        // Protocol v2 engine (src/client/v2/) against the FakeWorld harness (test/engine2/harness.ts).
+        // Renamed to "engine" at the cut-over (docs/STAGE1-PLAN.md M9).
+        {
+          resolve: { alias: { "~": `${import.meta.dirname}/src` } },
+          test: { name: "engine2", include: ["test/engine2/**/*.spec.ts"], environment: "node", testTimeout: 120_000, hookTimeout: 60_000 },
         },
       ],
     },
