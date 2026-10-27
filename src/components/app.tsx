@@ -63,6 +63,7 @@ export const App = component$(() => {
         if (snap.phase !== lastPhase) {
           if (snap.phase === "signed-out" || snap.phase === "boot") {
             ui.active = "";
+            ui.list = "chats";
             ui.members = false;
             ui.viewer = undefined;
             ui.notice = "";

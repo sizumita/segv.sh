@@ -1,7 +1,7 @@
 import { $, component$, useContext, useSignal } from "@qwik.dev/core";
 import type { ConversationView } from "~/client/types";
 import { StateCtx, UiCtx } from "./state";
-import { act, parseHandles } from "./util";
+import { act, isGone, parseHandles } from "./util";
 
 export const Members = component$<{ conv: ConversationView }>((props) => {
   const state = useContext(StateCtx);
@@ -14,9 +14,12 @@ export const Members = component$<{ conv: ConversationView }>((props) => {
 
   const conv = props.conv;
   const meUid = state.me?.uid ?? "";
-  /** add and remove need a sendable, unfrozen conversation; a frozen member can still leave (§6.6 step 6) */
-  const canChange = conv.canSend && !conv.frozen;
-  const canLeave = conv.blocked !== "removed" && conv.blocked !== "left";
+  /**
+   * add and remove need a sendable, unfrozen conversation; a frozen member can still leave (§6.6 step 6). A request
+   * is read-only until accepted: changing or leaving it would post in it, which accepts it (§11.5).
+   */
+  const canChange = !conv.request && conv.canSend && !conv.frozen;
+  const canLeave = !conv.request && !isGone(conv);
 
   const addMembers = $(async () => {
     if (busy.value) return;

@@ -78,7 +78,7 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
                     </p>
                   )}
                   {m.kind === "image" && m.image ? (
-                    <MsgImage img={m.image} />
+                    <MsgImage img={m.image} hold={props.conv.request} />
                   ) : (
                     <p class="body">{m.text ?? ""}</p>
                   )}

@@ -6,6 +6,8 @@ import {
   MAX_NAME,
   dayKey,
   fitBox,
+  inviterOf,
+  listOf,
   parseHandles,
   relTime,
   textTooLong,
@@ -66,5 +68,28 @@ describe("formatting", () => {
     expect(textTooLong("a".repeat(14_000))).toBe(false);
     expect(textTooLong("あ".repeat(5_000))).toBe(true); // 15 000 bytes + quotes
     expect(textTooLong('"'.repeat(7_500))).toBe(true); // escaping doubles it
+  });
+});
+
+describe("lists", () => {
+  it("archives what this user left or was removed from, a removed request too; requests apart", () => {
+    expect(listOf({ blocked: "", request: false })).toBe("chats");
+    expect(listOf({ blocked: "pending", request: false })).toBe("chats");
+    expect(listOf({ blocked: "frozen", request: false })).toBe("chats");
+    expect(listOf({ blocked: "", request: true })).toBe("requests");
+    expect(listOf({ blocked: "pending", request: true })).toBe("requests");
+    expect(listOf({ blocked: "left", request: false })).toBe("archives");
+    expect(listOf({ blocked: "removed", request: false })).toBe("archives");
+    expect(listOf({ blocked: "removed", request: true })).toBe("archives");
+  });
+  it("names a request's inviter: its one resolved member other than self", () => {
+    const m = (uid: string, handle: string) => ({ uid, handle, fingerprint: "", left: false });
+    const me = m("u-me", "me");
+    const alice = m("u-a", "alice");
+    const unknown = m("u-x", "?Xk3f9QaZ");
+    expect(inviterOf({ request: true, members: [alice, me] }, "u-me")).toBe("alice");
+    expect(inviterOf({ request: true, members: [alice, me, unknown] }, "u-me")).toBe("alice");
+    expect(inviterOf({ request: true, members: [unknown, me] }, "u-me")).toBeUndefined();
+    expect(inviterOf({ request: false, members: [alice, me] }, "u-me")).toBeUndefined();
   });
 });

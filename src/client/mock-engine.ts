@@ -370,7 +370,56 @@ class MockEngine implements Engine {
         }),
       ],
     };
-    const list = [dm, group, removed, old, pending, frozen, request].sort(
+    // A group request: only its inviter is resolved, the other members stay `?…` until accepted (§11.5).
+    const groupRequest: ConversationView = {
+      id: randomId(),
+      name: "# deals",
+      members: [member("quinn"), member(handle), member("?Xk3f9QaZ")],
+      epoch: 0,
+      canSend: true,
+      blocked: "",
+      frozen: false,
+      request: true,
+      lastTs: now - 4 * HOUR,
+      unread: 2,
+      messages: [
+        m({ kind: "system", text: "@quinn started the conversation", ts: now - 4 * HOUR - MIN }),
+        m({
+          kind: "text",
+          fromHandle: "quinn",
+          text: "limited offer, see below",
+          ts: now - 4 * HOUR,
+        }),
+        m({
+          kind: "image",
+          fromHandle: "quinn",
+          image: { id: "seed-request", k: "k", mime: "image/png", w: 800, h: 600 },
+          ts: now - 4 * HOUR,
+        }),
+      ],
+    };
+    const left: ConversationView = {
+      id: randomId(),
+      name: "# book club",
+      members: [member(handle, true), member("erin"), member("grace")],
+      epoch: 2,
+      canSend: false,
+      blocked: "left",
+      frozen: false,
+      request: false,
+      lastTs: now - 9 * DAY,
+      unread: 0,
+      messages: [
+        m({
+          kind: "text",
+          fromHandle: "grace",
+          text: "next month: dune",
+          ts: now - 9 * DAY - HOUR,
+        }),
+        m({ kind: "leave", fromHandle: handle, mine: true, ts: now - 9 * DAY }),
+      ],
+    };
+    const list = [dm, group, removed, old, pending, frozen, request, groupRequest, left].sort(
       (a, b) => b.lastTs - a.lastTs,
     );
     this.set({ conversations: list });

@@ -6,17 +6,22 @@ import { errMsg, fitBox } from "./util";
 
 const MAX_SIDE = 320;
 
-/** Encrypted image: fetched + decrypted by the engine when scrolled into view. */
-export const MsgImage = component$<{ img: ImageRef }>((props) => {
+/**
+ * Encrypted image: fetched + decrypted by the engine when scrolled into view. With `hold` (a request not yet
+ * accepted) it waits until the user asks for it.
+ */
+export const MsgImage = component$<{ img: ImageRef; hold?: boolean }>((props) => {
   const ui = useContext(UiCtx);
   const url = useSignal("");
   const err = useSignal("");
   const attempt = useSignal(0);
+  const asked = useSignal(false);
 
   // Default strategy (intersection-observer): only images that scroll into view are downloaded.
   useVisibleTask$(async ({ track }) => {
     track(() => props.img.id);
     track(() => attempt.value);
+    if (track(() => !!props.hold && !asked.value)) return;
     const img = props.img;
     url.value = "";
     err.value = "";
@@ -57,7 +62,11 @@ export const MsgImage = component$<{ img: ImageRef }>((props) => {
     <div class="img">
       <canvas class="ph" width={box.w} height={box.h} aria-hidden="true" />
       <p class="phmsg small">
-        {err.value ? (
+        {props.hold && !asked.value ? (
+          <button type="button" class="link" onClick$={() => (asked.value = true)}>
+            show image
+          </button>
+        ) : err.value ? (
           <>
             <span>image unavailable: {err.value}</span>{" "}
             <button type="button" class="link" onClick$={() => attempt.value++}>

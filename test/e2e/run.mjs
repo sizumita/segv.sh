@@ -250,13 +250,42 @@ async function newConversation(d, handles, name) {
   await d.page.getByLabel("message").waitFor({ timeout: T });
 }
 
+/** Switches the left pane to a list (chats, requests, archives); the switcher shows once there is more than chats. */
+async function showList(d, list, wait = false) {
+  const lists = d.page.locator("nav.lists");
+  if (!wait && !(await lists.isVisible())) return;
+  await lists.getByRole("button", { name: list }).click({ timeout: T });
+}
+
+function listItem(d, convName) {
+  return d.page.locator(".conv", { has: d.page.locator(".name", { hasText: convName }) }).first();
+}
+
 async function open(d, convName) {
-  const item = d.page
-    .locator(".conv", { has: d.page.locator(".name", { hasText: convName }) })
-    .first();
+  await showList(d, "chats");
+  const item = listItem(d, convName);
   await item.waitFor({ timeout: T });
   await item.click();
   await d.page.locator(".convhead .title", { hasText: convName }).waitFor({ timeout: T });
+}
+
+/** Opens a request: its preview shows `text` without accepting it (no composer), then "accept" accepts it. */
+async function acceptRequest(d, convName, text) {
+  await showList(d, "requests", true);
+  await listItem(d, convName).click({ timeout: T });
+  await d.page.locator(".convhead .title", { hasText: convName }).waitFor({ timeout: T });
+  await seen(d, text);
+  await d.page.waitForTimeout(1000); // reading it must not accept it
+  const bar = d.page.getByRole("region", { name: "request" });
+  check(await bar.isVisible(), `${d.name}: the request was accepted by opening it`);
+  check(!(await d.page.getByLabel("message").isVisible()), `${d.name}: a request shows a composer`);
+  await bar.getByRole("button", { name: "accept", exact: true }).click();
+  await d.page.getByLabel("message").waitFor({ timeout: T });
+}
+
+async function inList(d, list, convName) {
+  await showList(d, list, true);
+  await listItem(d, convName).waitFor({ timeout: T });
 }
 
 async function send(d, text) {
@@ -409,12 +438,11 @@ try {
   });
 
   await step(
-    "1:1 conversation, text both ways (bob opens alice's request, which accepts it)",
+    "1:1 conversation, text both ways (bob reads alice's request, then accepts it)",
     async () => {
       await newConversation(A, H.bob);
       await send(A, t1);
-      await open(B, `@${H.alice}`);
-      await seen(B, t1);
+      await acceptRequest(B, `@${H.alice}`, t1);
       await send(B, t2);
       await seen(A, t2);
       await shot(B, "02-bob-1to1");
@@ -446,16 +474,15 @@ try {
   await step("group conversation with three members, named at creation", async () => {
     await newConversation(A, `${H.bob}, ${H.carol}`, team);
     await send(A, t3);
-    await open(B, team);
-    await open(C, team);
+    await open(B, team); // alice is bob's contact now: not a request
+    await acceptRequest(C, team, t3);
     await seen(B, t3);
-    await seen(C, t3);
     await send(C, t4);
     await seen(A, t4);
     await seen(B, t4);
   });
 
-  await step("removing a member cuts them off from new messages", async () => {
+  await step("removing a member cuts them off; it moves to their archives", async () => {
     await open(A, team);
     await open(B, team);
     await open(C, team);
@@ -466,17 +493,19 @@ try {
     await seen(A, `removed @${H.carol}`);
     await seen(C, "removed you");
     await C.page.getByText("you are no longer a member").waitFor({ timeout: T });
+    await inList(C, "archives", team);
     await send(A, t5);
     await seen(B, t5);
     await notSeen(C, t5);
     await shot(C, "04-carol-removed");
   });
 
-  await step("leaving rotates keys on the next send", async () => {
+  await step("leaving rotates keys on the next send; it moves to archives", async () => {
     const panel = await openMembers(B);
     await panel.getByRole("button", { name: "leave conversation" }).click();
     await panel.locator(".confirm").getByRole("button", { name: "leave" }).click();
     await B.page.getByText("you are no longer a member").waitFor({ timeout: T });
+    await inList(B, "archives", team);
     await seen(A, `@${H.bob} left`);
     await send(A, t6);
     await seen(A, `keys rotated after @${H.bob} left`);

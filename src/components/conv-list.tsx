@@ -1,6 +1,12 @@
 import { $, component$, useContext, useSignal } from "@qwik.dev/core";
-import { StateCtx, UiCtx } from "./state";
-import { act, MAX_NAME, parseHandles, relTime } from "./util";
+import { type ListView, StateCtx, UiCtx } from "./state";
+import { act, listOf, MAX_NAME, parseHandles, relTime } from "./util";
+
+const LISTS: { id: ListView; empty: string }[] = [
+  { id: "chats", empty: "no conversations yet." },
+  { id: "requests", empty: "no requests." },
+  { id: "archives", empty: "nothing archived." },
+];
 
 export const ConvList = component$(() => {
   const state = useContext(StateCtx);
@@ -15,6 +21,11 @@ export const ConvList = component$(() => {
 
   const me = state.me;
   const formOpen = showNew.value || state.conversations.length === 0;
+  const counts: Record<ListView, number> = { chats: 0, requests: 0, archives: 0 };
+  for (const c of state.conversations) counts[listOf(c)]++;
+  const shown = state.conversations.filter((c) => listOf(c) === ui.list);
+  // The switcher appears once there is something besides chats (or while another list is open).
+  const lists = LISTS.filter((l) => l.id === "chats" || l.id === ui.list || counts[l.id] > 0);
 
   const create = $(async () => {
     if (creating.value) return;
@@ -37,6 +48,7 @@ export const ConvList = component$(() => {
       name.value = "";
       showNew.value = false;
       ui.active = id;
+      ui.list = "chats";
       ui.members = false;
     }
   });
@@ -117,17 +129,31 @@ export const ConvList = component$(() => {
         )}
       </div>
 
-      <nav class="list" aria-label="conversation list">
-        {state.conversations.map((c) => (
+      {lists.length > 1 && (
+        <nav class="lists" aria-label="lists">
+          {lists.map((l) => (
+            <button
+              key={l.id}
+              type="button"
+              class="link"
+              aria-pressed={ui.list === l.id}
+              onClick$={() => (ui.list = l.id)}
+            >
+              {l.id}
+              {l.id !== "chats" && counts[l.id] > 0 && (
+                <span class={l.id === "requests" ? "strong" : "dim"}> {counts[l.id]}</span>
+              )}
+            </button>
+          ))}
+        </nav>
+      )}
+
+      <nav class="list" aria-label={ui.list === "chats" ? "conversation list" : ui.list}>
+        {shown.map((c) => (
           <button
             key={c.id}
             type="button"
-            class={[
-              "conv",
-              c.id === ui.active && "on",
-              c.unread > 0 && "unread",
-              (c.blocked === "removed" || c.blocked === "left") && "gone",
-            ]}
+            class={["conv", c.id === ui.active && "on", c.unread > 0 && "unread"]}
             aria-current={c.id === ui.active ? "true" : undefined}
             onClick$={() => {
               ui.active = c.id;
@@ -135,7 +161,7 @@ export const ConvList = component$(() => {
             }}
           >
             <span class="name">{c.name || "(no name)"}</span>
-            {c.request && <span class="dim small">request</span>}
+            {ui.list === "archives" && <span class="dim small">{c.blocked}</span>}
             {c.unread > 0 && (
               <span class="badge" aria-label={`${c.unread} unread`}>
                 {c.unread > 99 ? "99+" : c.unread}
@@ -144,7 +170,9 @@ export const ConvList = component$(() => {
             <span class="when">{relTime(c.lastTs, ui.now)}</span>
           </button>
         ))}
-        {state.conversations.length === 0 && <p class="dim small pad">no conversations yet.</p>}
+        {shown.length === 0 && (
+          <p class="dim small pad">{LISTS.find((l) => l.id === ui.list)?.empty}</p>
+        )}
       </nav>
 
       <footer class="foot">

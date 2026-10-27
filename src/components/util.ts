@@ -1,7 +1,7 @@
 // Plain helpers shared by the UI components (no Qwik APIs, no secrets).
-import type { Engine } from "~/client/types";
+import type { ConversationView, Engine } from "~/client/types";
 import { loadEngine } from "./engine-loader";
-import type { UiState } from "./state";
+import type { ListView, UiState } from "./state";
 
 // Mirrors of src/lib/proto.ts (HANDLE_RE, MAX_MEMBERS, MAX_NAME), kept in sync by
 // util.test.ts. Not imported from proto on purpose: UI modules are also part of the SSR
@@ -84,6 +84,31 @@ export function parseHandles(raw: string, self?: string, existing: string[] = []
     return { ok: false, error: `at most ${MAX_MEMBERS} members per conversation` };
   }
   return { ok: true, handles };
+}
+
+// ---- lists ----
+
+/** This user left or was removed: the history stays readable, nothing can be sent. */
+export const isGone = (c: Pick<ConversationView, "blocked">): boolean =>
+  c.blocked === "removed" || c.blocked === "left";
+
+/** The list a conversation belongs in: archives once gone (a removed request too), else requests or chats. */
+export function listOf(c: Pick<ConversationView, "blocked" | "request">): ListView {
+  if (isGone(c)) return "archives";
+  return c.request ? "requests" : "chats";
+}
+
+/**
+ * The handle of a request's inviter, if it is known. A request resolves only self and its inviter (`D.by`); the other
+ * members stay `?…` until it is accepted (§11.5), and a handle never starts with `?`.
+ */
+export function inviterOf(
+  c: Pick<ConversationView, "members" | "request">,
+  meUid: string,
+): string | undefined {
+  if (!c.request) return undefined;
+  const known = c.members.filter((m) => m.uid !== meUid && !m.handle.startsWith("?"));
+  return known.length === 1 ? known[0].handle : undefined;
 }
 
 export function textTooLong(text: string): boolean {
