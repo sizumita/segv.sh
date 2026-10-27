@@ -4,7 +4,8 @@
 **サーバーの中身はすべて公開**：保存されるのは公開データだけで、誰でも読める。クライアントは自分宛ての行のラベルを計算し、その行だけを取得して復号する。
 
 > **現在の状態:** プロトコル v2（stage 1）を v1 の置き換えとして実装中。登録・サインイン、1:1 とグループの作成、
-> テキストの送受信、リロードや別端末での復元が動く（M6b）。画像、メンバーの追加・削除、退出はまだ（M6c・M7）。
+> テキストと画像の送受信、リロードや別端末での復元、メンバーの追加・削除と退出（鍵の更新）が動く（M7）。
+> スナップショット、整合性チェック（チェックポイント・受領証）、リンクはまだ（M6c 残り・M8・M10）。
 
 - バイト単位のプロトコル仕様（v2）: [docs/PROTOCOL-v2.md](docs/PROTOCOL-v2.md)、実装計画: [docs/STAGE1-PLAN.md](docs/STAGE1-PLAN.md)
 - 設計の理由・保証すること/しないこと: [docs/DESIGN.md](docs/DESIGN.md)（v1 時点の内容。v2 向けの書き直しは M9）
@@ -22,7 +23,7 @@
 | `migrations/`                     | D1 スキーマ（ディレクトリ: user / wrap / dirlog）                                                                 |
 | `src/lib/*.test.ts`               | 暗号コアとバイナリ形式の単体テスト（独立実装との突き合わせ・改ざん・既知解ベクトル・ファジング）                  |
 | `test/worker/`                    | Workers ランタイム上の API / Durable Object / ディレクトリのテスト                                                |
-| `test/engine/`                    | インメモリの偽サーバー `FakeWorld` と、その上でエンジンを動かすテスト（アカウント、1:1・グループ、復元）          |
+| `test/engine/`                    | インメモリの偽サーバー `FakeWorld` と、その上でエンジンを動かすテスト（アカウント、会話、復元、メンバー変更）     |
 | `test/e2e/`                       | Playwright + 仮想認証器（PRF 対応）による v2 の E2E テスト（登録、会話、復元、別端末、公開データの監査）          |
 
 技術スタック: Vite+ (`vite-plus`) / Qwik v2 RC / Cloudflare Workers + D1 + Durable Objects + R2 / `@noble/curves`, `@noble/post-quantum` (X-Wing), `@noble/ciphers`, `@noble/hashes`。
@@ -44,8 +45,8 @@ npx vp test run            # 単体（暗号コア・バイナリ形式）+ Work
 npm run build              # 型チェック・lint 込みの本番ビルド
 ```
 
-`npm run test:e2e` は本番ビルドと `wrangler dev` を立ち上げ、ヘッドレス Chromium で主要なフローと公開データの監査を流す
-（画像とメンバー操作の手順は M6c・M7 で加わる）。
+`npm run test:e2e` は本番ビルドと `wrangler dev` を立ち上げ、ヘッドレス Chromium で主要なフロー（画像、メンバーの削除と
+退出を含む）と公開データの監査を流す。
 
 ## デプロイ（Cloudflare）
 

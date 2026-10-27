@@ -273,6 +273,20 @@ async function seen(d, text, timeout = T) {
   await d.page.locator(".thread").getByText(text, { exact: false }).first().waitFor({ timeout });
 }
 
+async function notSeen(d, text, waitMs = 4000) {
+  await d.page.waitForTimeout(waitMs);
+  const n = await d.page.locator(".thread").getByText(text, { exact: false }).count();
+  check(n === 0, `${d.name} should not see "${text}"`);
+}
+
+async function openMembers(d) {
+  const panel = d.page.locator("aside.members");
+  if (!(await panel.isVisible()))
+    await d.page.locator(".convhead").getByRole("button", { name: "members" }).click();
+  await panel.waitFor({ timeout: T });
+  return panel;
+}
+
 async function pngBytes(page, label) {
   return page.evaluate(async (label) => {
     const c = document.createElement("canvas");
@@ -363,8 +377,10 @@ const t2 = `返信です secret-2 ${sfx}`;
 const t3 = `group hello secret-3 ${sfx}`;
 const t4 = `carol here secret-4 ${sfx}`;
 const t7 = `from alice's second device secret-7 ${sfx}`;
+const t5 = `after removal secret-5 ${sfx}`;
+const t6 = `after bob left secret-6 ${sfx}`;
 const bulk = (i) => `bulk ${i} secret-8 ${sfx}`;
-const secrets = [t1, t2, t3, t4, t7, bulk(0), bulk(99)];
+const secrets = [t1, t2, t3, t4, t5, t6, t7, bulk(0), bulk(99)];
 let codeAlice = "";
 
 try {
@@ -483,6 +499,35 @@ try {
       await A2.ctx.close();
     },
   );
+
+  await step("removing a member cuts them off from new messages", async () => {
+    await open(A, team);
+    await open(B, team);
+    await open(C, team);
+    const panel = await openMembers(A);
+    const row = panel.locator("li", { hasText: H.carol });
+    await row.getByRole("button", { name: "remove" }).click();
+    await row.locator(".confirm").getByRole("button", { name: "remove" }).click();
+    await seen(A, `removed @${H.carol}`);
+    await seen(C, "removed you");
+    await C.page.getByText("you are no longer a member").waitFor({ timeout: T });
+    await send(A, t5);
+    await seen(B, t5);
+    await notSeen(C, t5);
+    await shot(C, "04-carol-removed");
+  });
+
+  await step("leaving rotates keys on the next send", async () => {
+    const panel = await openMembers(B);
+    await panel.getByRole("button", { name: "leave conversation" }).click();
+    await panel.locator(".confirm").getByRole("button", { name: "leave" }).click();
+    await B.page.getByText("you are no longer a member").waitFor({ timeout: T });
+    await seen(A, `@${H.bob} left`);
+    await send(A, t6);
+    await seen(A, `keys rotated after @${H.bob} left`);
+    await notSeen(B, t6);
+    await shot(A, "05-alice-after-leave");
+  });
 
   await step('"remember this device" survives a reload', async () => {
     const D = await device(browser, "dave");

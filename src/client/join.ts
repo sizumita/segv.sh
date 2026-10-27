@@ -1,6 +1,6 @@
 // Accepting a join (docs/PROTOCOL-v2.md §6.7) from an inbox invite or a WELCOME: the bundle checks in their order
-// (size, meta, then the blob), duplicates, and the fits of a conversation without claims: a first contact, or a
-// separate copy. The fits that need a processed claim ("Claimed", "Skip") land with M7.
+// (size, meta, then the blob), duplicates, settling the held copies (a pending claim parks the join), the fits
+// ("Claimed" is ignored, "Skip" re-adds a removed copy), and otherwise a first contact or a separate copy.
 import * as P from "~/lib/proto";
 import { ApiError, type Api } from "./api";
 import { copyKeyOf, newEpoch, type Copy, type Epoch, type KnownUser } from "./conv";
@@ -34,8 +34,18 @@ export interface NewCopy {
   dby: KnownUser;
 }
 
+/** A skip re-add of a held copy (§6.7 step 5): the epoch it continues at and its EPOCH record. */
+export interface SkipJoin {
+  copy: Copy;
+  epoch: Epoch;
+  record: P.EpochRec;
+  member: P.MemberRec | null;
+  dby: KnownUser;
+}
+
 export type JoinOutcome =
   | { kind: "new"; copy: NewCopy }
+  | { kind: "skip"; skip: SkipJoin }
   | { kind: "duplicate" }
   | { kind: "dropped" }
   | { kind: "parked"; why: string };
@@ -50,6 +60,11 @@ export interface JoinCtx {
   /** the CONTACT record of a uid, or null */
   contact(uidB: string): P.ContactRec | null;
   warn(text: string, critical?: boolean): void;
+  /**
+   * §6.7 step 4: catches up the control lane of a held copy's current epoch; true once its winner is final and
+   * processed, or every slot is decided not e-valid (throws on a transient failure).
+   */
+  settle(c: Copy): Promise<boolean>;
 }
 
 const park = (why: string): JoinOutcome => ({ kind: "parked", why });
@@ -119,7 +134,56 @@ export async function acceptJoin(ctx: JoinCtx, J: P.Join, src: JoinSource): Prom
     held.some((c) => c.epochs.get(J.e)?.D.hash && P.equalBytes(c.epochs.get(J.e)!.D.hash, D.hash))
   )
     return { kind: "duplicate" };
-  // Steps 4–5 (settling held copies, "Claimed", "Skip") need processed claims: M7. Step 6, no fit.
+  // Step 4: settle the held copies. A copy accepted earlier in this poll is not held yet: park until it is.
+  for (const c of held) {
+    if (!c.key) return park("an earlier join of this conversation is being recorded");
+    try {
+      if (!(await ctx.settle(c))) return park("a membership change is pending");
+    } catch (e) {
+      return park(e instanceof Error ? e.message : String(e));
+    }
+  }
+  // Step 5: the fits.
+  for (const c of held) {
+    const ep = c.epochs.get(c.current);
+    const w = ep?.ctl.winner;
+    if (!ep || !w?.processed) continue;
+    if (J.e === ep.e + 1 && P.equalBytes(w.claim.hD, D.hash)) return { kind: "duplicate" }; // Claimed
+    if (J.e > ep.e + 1 && ep.myIndex >= 0 && P.rmHas(w.claim.rm, ep.myIndex)) {
+      let by: Awaited<ReturnType<typeof dbyCheck>>;
+      try {
+        by = await dbyCheck(ctx, D);
+      } catch (e) {
+        return park(e instanceof Error ? e.message : String(e));
+      }
+      if (!by) return drop(INVALID_SIG_KEY);
+      const epoch = newEpoch({
+        e: J.e,
+        EK: J.EK,
+        D,
+        dsig: chk.dsig,
+        bundleId: J.bundleId,
+        bundleSize: J.bundleSize,
+        tReg: meta.t,
+        pks: chk.pks,
+        self: ctx.self.uid,
+      });
+      epoch.viaSkip = true;
+      const record: P.EpochRec = {
+        rtype: P.RT.EPOCH,
+        conv: J.conv,
+        root: c.root,
+        e: J.e,
+        EK: J.EK,
+        bundleId: J.bundleId,
+        bundleSize: J.bundleSize,
+        claim: { E: w.E, n: w.n },
+        flags: P.EPOCH_SKIP,
+      };
+      return { kind: "skip", skip: { copy: c, epoch, record, member: by.member, dby: by.user } };
+    }
+  }
+  // Step 6, no fit.
   if (held.some((c) => c.confirmed)) return drop(CONFIRMED_COPY_WARNING, true);
   let by: Awaited<ReturnType<typeof dbyCheck>>;
   try {

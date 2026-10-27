@@ -132,6 +132,8 @@ export interface FakeRequest {
   getStatuses?: GetStatus[];
   /** served from the response cache (`cache(true)`), before the rate limiter */
   cached?: boolean;
+  /** the response was thrown away after the server handled the request (`hooks.afterPut` "lose") */
+  lost?: boolean;
 }
 
 export type FailMode = "before" | "after" | null | undefined;
@@ -139,6 +141,8 @@ export type FailMode = "before" | "after" | null | undefined;
 export interface FakeHooks {
   /** Runs after a put request parsed, before any row is stored. May await (hold the request) or commit other rows first. */
   beforePut?: (rows: PutRow[], who: string | null) => void | Promise<void>;
+  /** After a put was handled: "lose" throws its response away (the rows stay stored), as `fail` "after" does. */
+  afterPut?: (rows: PutRow[], results: PutResult[], who: string | null) => "lose" | void;
   /** Network failure: 'before' = never reached the server; 'after' = handled, response lost. */
   fail?: (method: string, path: string, who: string | null) => FailMode;
   /** Runs before any HTTP request is handled (may await to hold it). */
@@ -585,7 +589,7 @@ export class FakeWorld implements WorldCtx, RtHost {
       return this.respond(res, entry, url.protocol === "https:", startNow);
     })();
     const response = signal ? await raceAbort(run, signal) : await run;
-    if (fail === "after")
+    if (fail === "after" || entry.lost)
       throw new TypeError("Failed to fetch (response lost after the server handled the request)");
     return response;
   }
@@ -851,6 +855,7 @@ export class FakeWorld implements WorldCtx, RtHost {
     });
     this.rt.publish(pub);
     log.putResults = results;
+    if (this.hooks.afterPut?.(rows, results, req.who) === "lose") log.lost = true;
     return bin(encodePutResponse(results));
   }
 

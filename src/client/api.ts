@@ -558,6 +558,24 @@ export class Api {
   }
 
   /**
+   * `GET /api/v2/blob/{id}/meta` with the MISS answer's BlobReg clock (§6.4(g)): `{t, size}`, or `{now}` (seconds
+   * since T0) when unregistered.
+   */
+  async blobMetaOrNow(id: Bytes): Promise<{ t: number; size: number } | { now: number }> {
+    const res = await this.request(`/api/v2/blob/${P.b64u(id)}/meta`, { cache: "no-store" });
+    if (res.status === 404) {
+      const j = await this.json<{ now?: unknown }>(res);
+      if (!isInt(j.now, 0, 0xffffffff)) throw new ApiError(0, "malformed blob meta");
+      return { now: j.now };
+    }
+    if (!res.ok) throw await readError(res);
+    const j = await this.json<{ t?: unknown; size?: unknown }>(res);
+    if (!isInt(j.t, 0, 0xffffffff) || !isInt(j.size, 0, P.BLOB_MAX))
+      throw new ApiError(0, "malformed blob meta");
+    return { t: j.t, size: j.size };
+  }
+
+  /**
    * `GET /api/v2/blob/{id}`, reading at most `max + 1` bytes: null for 404. A `content-length` other than `max`, or a
    * body longer than `max`, is a size mismatch (the caller decides; §6.7 step 1).
    */

@@ -537,7 +537,7 @@ export function buildMessage(
     n: slot.n,
     prev: prev ? { E: prev.E, n: prev.n } : P.NONE,
     prevh: prev ? P.prevh(prev.label, prev.body) : P.ZERO16,
-    ts: Date.now(),
+    ts: current.now(),
     ckq: 0,
     ck16: P.ZERO16,
     ...partial,
@@ -554,4 +554,243 @@ export function buildMessage(
 export function postRow(ep: Epoch, row: BuiltRow): void {
   const r = current.shard.commit(row.E, row.label, row.cls, row.body, { topic: ep.topic });
   if (!r) throw new Error("slot taken");
+}
+
+// ═════════════════════════ builders (plan §2.3; M7) ═════════════════════════
+
+/** An inbox invite of J to `to`, stored in era `era` (default: now) without proof of work (plan §2.3 `forgeJoin`). */
+export function forgeJoin(to: TestUser, J: P.Join, opts: { era?: number } = {}): void {
+  const E = opts.era ?? current.era;
+  const r = P.makeInvite(to.id.kemPk, E, 0, J);
+  const res = current.inbox.accept(E, [{ eid: r.eid, body: r.body }]);
+  if (res.s !== "ok" || !("rel" in res.results[0])) throw new Error("forgeJoin: refused");
+}
+
+/** The dense-prefix length of lane label `label(E, n)` in era E, as the shard holds it. */
+function prefixLen(E: number, label: (E: number, n: number) => Uint8Array): number {
+  let n = 0;
+  while (current.shard.hasLabel(E, label(E, n))) n++;
+  return n;
+}
+
+/** The cuts of §6.2 for epoch `ep` as the shard holds its lanes now (the head era's dense prefix, or (E_start, 0)). */
+export function realCuts(ep: Epoch): P.Cut[] {
+  const Es = ep.Estart ?? current.era;
+  return ep.D.members.map((_, j) => {
+    for (let E = current.era; E >= Es; E--) {
+      const cnt = prefixLen(E, (x, n) => P.Lmsg(ep.keys.rk, j, x, n));
+      if (cnt > 0) return { E, cnt };
+    }
+    return { E: Es, cnt: 0 };
+  });
+}
+
+/** The first empty control slot of era E of epoch `ep`. */
+export const firstCtlSlot = (ep: Epoch, E = current.era): number =>
+  prefixLen(E, (x, n) => P.Lctl(ep.keys.rk, x, n));
+
+/**
+ * A raw claim row of `by` in epoch `ep` at `Lctl(E, k)` (plan §2.3 `buildClaim`), with every claim field given or
+ * defaulted from `ep` (cuts default to the real ones).
+ */
+export function buildClaim(
+  by: TestUser,
+  ep: Epoch,
+  x: Partial<P.Claim> & {
+    hD: Uint8Array;
+    ekc: Uint8Array;
+    bundleId: Uint8Array;
+    bundleSize: number;
+  },
+  at: { E?: number; k?: number; from?: number; ts?: number } = {},
+): BuiltRow & { n: number } {
+  const E = at.E ?? current.era;
+  const k = at.k ?? firstCtlSlot(ep, E);
+  const from = at.from ?? P.memberIndex(ep.D, by.uid);
+  const msg = {
+    type: P.MT.CLAIM,
+    from,
+    lane: P.CTL_LANE,
+    n: k,
+    prev: P.NONE,
+    prevh: P.ZERO16,
+    ts: at.ts ?? current.now(),
+    ckq: 0,
+    ck16: P.ZERO16,
+    claim: {
+      prevD: x.prevD ?? ep.D.hash,
+      hD: x.hD,
+      ekc: x.ekc,
+      bundleId: x.bundleId,
+      bundleSize: x.bundleSize,
+      rm: x.rm ?? 0,
+      cuts: x.cuts ?? realCuts(ep),
+    },
+  } as P.Msg;
+  const row = P.buildRow({ keys: ep.keys, conv: ep.D.conv, e: ep.e, sigSk: by.id.sigSk }, E, msg);
+  return { E, n: k, label: row.label, cls: row.cls, body: row.body };
+}
+
+/** Replaces entry i of an SGB2 blob (the withholding cases). */
+export function replaceEntry(blob: Uint8Array, i: number, entry: Uint8Array): Uint8Array {
+  const B = P.sgb2BOfSize(blob.length)!;
+  const out = blob.slice();
+  out.set(entry, P.sgb2EntriesAt(B) + i * P.SGB2_ENTRY_LEN);
+  return out;
+}
+
+/** An SGB2 blob whose descCt is garbage (D′ does not open). */
+export function garbleDesc(blob: Uint8Array): Uint8Array {
+  const out = blob.slice();
+  out.set(P.random(P.SGB2_DESC_LEN), P.SGB2_HEADER_LEN);
+  return out;
+}
+
+/** A dummy entry for slot i of epoch e (the key withheld). */
+export const dummyEntry = (conv: Uint8Array, e: number, i: number): Uint8Array =>
+  P.dummySeal(P.REKEY_LABEL, P.rekeyCtx(conv, e, i), 32);
+
+export interface Committed {
+  e: number;
+  EK: Uint8Array;
+  D: P.Descriptor;
+  dsig: Uint8Array;
+  blob: Uint8Array;
+  bundleId: Uint8Array;
+  bundleSize: number;
+  tReg: number;
+  J: P.Join;
+  claim: BuiltRow & { n: number };
+}
+
+/**
+ * Exactly what an engine's commit does (plan §2.3 `commitChange`): D′ (continuing members keep their keys), the
+ * bundle registered, a wait of Δ + SKEW (`world.tick`), the claim at the first empty control slot of the era with real
+ * cuts, published on T_e, and J by inbox to the members it adds. `opts` forge it: another descriptor, a patched blob,
+ * no J, a claim slot.
+ */
+export async function commitChange(
+  by: TestUser,
+  ep: Epoch,
+  members: readonly TestUser[],
+  name?: string | null,
+  opts: {
+    D?: (f: P.DescriptorFields) => P.DescriptorFields;
+    patchBlob?: (blob: Uint8Array, EK: Uint8Array) => Uint8Array;
+    pks?: (u: TestUser) => Uint8Array;
+    rm?: number;
+    noJoin?: boolean;
+    noWait?: boolean;
+    at?: { E?: number; k?: number };
+    /** the registration is made (forge it here, e.g. `blobreg.forceT`) */
+    afterRegister?: (x: { id: string; t: number }) => void;
+    /** neither upload nor register the blob (register it later with `world.putBlob(c.blob)`) */
+    noRegister?: boolean;
+    /** other cuts than the real ones */
+    cuts?: (real: P.Cut[]) => P.Cut[];
+    /** the claim row is hidden from these clients (`world.shard.hide`) */
+    hideFrom?: string[];
+    /** build the claim row without storing it (post it with `postRow`) */
+    noPost?: boolean;
+  } = {},
+): Promise<Committed> {
+  const w = current;
+  const conv = ep.D.conv;
+  const e1 = ep.e + 1;
+  const EK = P.random(32);
+  const keys = P.epochKeys(EK, conv, e1);
+  let fields: P.DescriptorFields = {
+    conv,
+    e: e1,
+    prev: ep.D.hash,
+    by: by.uid,
+    ts: w.now(),
+    members: members.map(
+      (u) =>
+        ep.D.members.find((m) => P.equalBytes(m.uid, u.uid)) ?? {
+          uid: u.uid,
+          sigPk: u.id.sigPk,
+          kh: P.kemHash(u.id.kemPk),
+        },
+    ),
+    name: name === undefined ? ep.D.name : name,
+  };
+  if (opts.D) fields = opts.D(fields);
+  const Dbytes = P.encodeD(fields);
+  const D = P.parseD(Dbytes);
+  const dsig = P.signD(Dbytes, keys.kc, by.id.sigSk);
+  const rm = opts.rm ?? P.rmBits(ep.D, D);
+  const built = P.buildBundle({
+    conv,
+    e: e1,
+    D: Dbytes,
+    dsig,
+    EK,
+    pks: members.map((u) => opts.pks?.(u) ?? u.id.kemPk),
+    prevMembers: ep.D.members.map((m) => m.uid),
+    rm: P.rmBits(ep.D, D),
+  });
+  const blob = opts.patchBlob ? opts.patchBlob(built.blob, EK) : built.blob;
+  const reg = opts.noRegister ? { id: P.b64u(P.H(blob)), t: 0 } : w.putBlob(blob);
+  opts.afterRegister?.(reg);
+  if (!opts.noWait && !opts.noRegister) {
+    // §6.3 step 5: server time ≥ t_reg + Δ + SKEW, so the claim lands in a later batch than the registration.
+    const due = P.T0_MS + (reg.t + w.params.delta + w.params.skew) * 1000;
+    w.tick(Math.max(0, due - w.now()) + 1);
+  }
+  const claim = buildClaim(
+    by,
+    ep,
+    {
+      hD: D.hash,
+      ekc: P.ekc(conv, e1, EK),
+      bundleId: P.fromB64u(reg.id),
+      bundleSize: blob.length,
+      rm,
+      cuts: opts.cuts ? opts.cuts(realCuts(ep)) : undefined,
+    },
+    opts.at ?? {},
+  );
+  for (const who of opts.hideFrom ?? []) w.shard.hide(claim.E, claim.label, who);
+  if (!opts.noPost) postRow(ep, claim);
+  const J: P.Join = { conv, e: e1, EK, bundleId: P.fromB64u(reg.id), bundleSize: blob.length };
+  if (!opts.noJoin) for (const u of members) if (P.memberIndex(ep.D, u.uid) < 0) forgeJoin(u, J);
+  return {
+    e: e1,
+    EK,
+    D,
+    dsig,
+    blob,
+    bundleId: P.fromB64u(reg.id),
+    bundleSize: blob.length,
+    tReg: reg.t,
+    J,
+    claim,
+  };
+}
+
+/** Every fake shard row that opens under `mk`, parsed (plan §2.3 `readableWith`). */
+export function readableWith(mk: Uint8Array): P.Msg[] {
+  const out: P.Msg[] = [];
+  for (const r of current.shard.rows()) {
+    try {
+      out.push(P.openRow(mk, r.E, r.label, r.body).msg);
+    } catch {
+      /* not this key */
+    }
+  }
+  return out;
+}
+
+/** Whether entry i of `blob` (epoch e of `conv`) opens for `user` (plan §2.3 `entryOutcome`). */
+export function entryOutcome(
+  blob: Uint8Array,
+  conv: Uint8Array,
+  e: number,
+  user: TestUser,
+): "EK" | "none" {
+  const B = P.sgb2BOfSize(blob.length);
+  if (!B) return "none";
+  for (let i = 0; i < B; i++) if (P.openEntry(user.id.kemSk, conv, e, i, blob)) return "EK";
+  return "none";
 }

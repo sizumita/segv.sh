@@ -52,15 +52,83 @@ export interface Lane {
   seen: boolean;
   /** the oldest valid row loaded, with its prev pointer (scrollback continues below it, §11.10) */
   oldest: { E: number; n: number; prev: Slot } | null;
+  /** the dense-prefix end in the latest era with rows, as observed: a commit's cut for this lane (§6.2, §6.3 step 6) */
+  head: P.EraCount | null;
+  /**
+   * For a lane of an epoch below the current one: walked to its head after it stopped being followed (§11.2
+   * "Sweeping"). A lane that is not swept is a followed lane, or one still to sweep once more.
+   */
+  swept: boolean;
 }
 
-/** The control lane of an epoch, before claims are processed (claims land with M7). */
+/** A stored row: its slot, label, stored time (seconds since T0) and body. */
+export interface StoredRow extends Slot {
+  label: Bytes;
+  t: number;
+  body: Bytes;
+}
+
+/** The first e-valid row of a control lane (§6.5), with what its evaluation fetched. */
+export interface Winner extends StoredRow {
+  claim: P.Claim;
+  from: number;
+  /** the claim row's sender time (ms), for its system lines */
+  ts: number;
+  /** t_reg of the claim's bundle: E_start of epoch e+1 */
+  tReg: number;
+  blob: Bytes;
+  final: boolean;
+  processed: boolean;
+}
+
+/** The control lane of an epoch (§6.4–§6.6). */
 export interface ControlLane {
+  /** the first slot not yet decided: every row before it in the dense prefix is not e-valid */
   next: Slot;
-  /** a row that opens as a claim of this epoch was found: membership is changing (undecided until M7 evaluates it) */
-  claimSeen: boolean;
-  /** monotonic time when `claimSeen` became true (the 30 s processing wait of §11.3 step 2) */
-  claimSince: number | null;
+  /** rows found at or after `next`, in lane order, waiting to be decided */
+  queue: StoredRow[];
+  /** eras whose dense-prefix end was observed MISS(sealed = 1) (finality, §6.5) */
+  sealed: Set<number>;
+  /** the dense-prefix length observed per era (where finality probes an unsealed era's end) */
+  counts: Map<number, number>;
+  winner: Winner | null;
+  /** monotonic time since an undecided slot, or a winner not yet final or processed, has stood (§11.3 step 2) */
+  pendingSince: number | null;
+  /** an undecided row is evaluated again no sooner than this (monotonic; back-off 1 s doubling to 60 s) */
+  retryAt: number;
+  attempt: number;
+}
+
+/** The claim that ended an epoch (its processed final winner): what the §6.8 walk reads. */
+export interface Ended {
+  t: number;
+  rm: number;
+  cuts: readonly P.Cut[];
+  at: Slot;
+}
+
+/**
+ * The kept source of a member's leave in an epoch (§6.9 "Several sources"): its LEAVE row's stored time and, in that
+ * row's own epoch, the row's position (NONE for a leave carried into the epoch, or one taken from a LEFT record that
+ * says so). `key` and `order` locate the row's "@x left" line when this device applied the row itself.
+ */
+export interface LeaveSource {
+  t: number;
+  row: P.Pos;
+  key: string | null;
+  order: number[] | null;
+}
+
+/** An applied lane row, kept so that §6.8 can be decided again when a new final winner is learned. */
+export interface AppliedRow {
+  j: number;
+  E: number;
+  n: number;
+  t: number;
+  /** the row counted toward `unread` */
+  unread: boolean;
+  /** the row is in the view (false: §6.8 dropped it) */
+  shown: boolean;
 }
 
 export interface Epoch {
@@ -82,6 +150,16 @@ export interface Epoch {
   myIndex: number;
   lanes: Lane[];
   ctl: ControlLane;
+  /** the claim that ended this epoch, once processed */
+  ended: Ended | null;
+  /** the kept leave source of each member recorded as left here, by b64u uid (self's own leave is `Copy.left`) */
+  left: Map<string, LeaveSource>;
+  /** the copy reached this epoch by a skip re-add (§6.7 step 5): it does not continue the epoch below it */
+  viaSkip: boolean;
+  /** its lanes are processed (false only below the HEADS epoch of a restore, §11.4 step 5) */
+  lanesOn: boolean;
+  /** applied TEXT and IMAGE rows by message key (§6.8 retraction) */
+  rows: Map<string, AppliedRow>;
 }
 
 export interface Copy {
@@ -113,6 +191,10 @@ export interface Copy {
   leaves: Set<string>;
   /** scrollback ran in this session (once per copy, §11.10) */
   scrolled: boolean;
+  /** system lines whose text is rendered again when handles resolve or the leave state changes, by message key */
+  lines: Map<string, () => string>;
+  /** the HEADS entry a restore starts from, until the copy reaches its epoch (§11.4 step 5) */
+  heads: P.HeadsEntry | null;
 }
 
 /** The fold key of a copy: (conv, root). */
@@ -123,7 +205,15 @@ export const copyKeyOf = (c: { conv: Bytes; root: Bytes }): string =>
 export const rowKey = (E: number, label: Bytes): string => `${E}:${P.hex(label)}`;
 
 export function newLane(start: Slot): Lane {
-  return { next: { ...start }, tail: null, last: null, seen: false, oldest: null };
+  return {
+    next: { ...start },
+    tail: null,
+    last: null,
+    seen: false,
+    oldest: null,
+    head: null,
+    swept: false,
+  };
 }
 
 /** An epoch's state from its key material and its verified descriptor. */
@@ -155,12 +245,30 @@ export function newEpoch(x: {
     topic: P.topicConv(keys.nk),
     myIndex: P.memberIndex(x.D, x.self),
     lanes: x.D.members.map(() => newLane(start)),
-    ctl: { next: { ...start }, claimSeen: false, claimSince: null },
+    ctl: newControl(start),
+    ended: null,
+    left: new Map(),
+    viaSkip: false,
+    lanesOn: true,
+    rows: new Map(),
   };
 }
 
 /** The era of a stored time in seconds since T0. */
 export const eraOfSec = (t: number): number => Math.floor(t / (P.ERA_MS / 1000));
+
+export function newControl(start: Slot): ControlLane {
+  return {
+    next: { ...start },
+    queue: [],
+    sealed: new Set(),
+    counts: new Map(),
+    winner: null,
+    pendingSince: null,
+    retryAt: 0,
+    attempt: 0,
+  };
+}
 
 /** The kemPk of member j from the epoch's bundle (§5.4), or null when this device did not open the bundle. */
 export function pkOf(ep: Epoch, j: number): Bytes | null {
@@ -293,14 +401,66 @@ export interface ViewCtx {
   processingWait: number;
 }
 
+// ───────────────────────── leaves and the §6.8 walk ─────────────────────────
+
+/** The consecutive held epochs from e on, as §6.8 walks them: it stops before an epoch reached by a skip re-add. */
+export function walkEpochs(c: Copy, e: number): P.WalkEpoch[] {
+  const out: P.WalkEpoch[] = [];
+  for (let k = e; ; k++) {
+    const ep = c.epochs.get(k);
+    if (!ep || (k > e && ep.viaSkip)) break;
+    out.push({
+      members: ep.D.members.map((m) => m.uid),
+      claim: ep.ended ? { t: ep.ended.t, rm: ep.ended.rm, cuts: ep.ended.cuts } : null,
+    });
+  }
+  return out;
+}
+
+/**
+ * §6.8 for a valid row of member i of epoch e at `pos` (NONE for a carried leave) stored at `t`. A claim the walk
+ * needs and this device does not hold never makes it accept.
+ */
+export function acceptedOld(c: Copy, e: number, i: number, pos: P.Pos, t: number): boolean {
+  try {
+    return P.acceptOldRow({ i, E: pos.E, n: pos.n, t }, walkEpochs(c, e));
+  } catch {
+    return false;
+  }
+}
+
+/** The member (b64u uid) is recorded as left in epoch ep (§6.9): it has a kept source there that §6.8 accepts. */
+export function leftIn(c: Copy, ep: Epoch, uidB: string): boolean {
+  const s = ep.left.get(uidB);
+  if (!s) return false;
+  const i = ep.D.members.findIndex((m) => P.b64u(m.uid) === uidB);
+  return i >= 0 && acceptedOld(c, ep.e, i, s.row, s.t);
+}
+
+/** The order of leave sources (§6.9): by t, then position, NONE after every real position. */
+export function sourceCmp(a: { t: number; row: P.Pos }, b: { t: number; row: P.Pos }): number {
+  if (a.t !== b.t) return a.t - b.t;
+  const an = P.isNone(a.row);
+  const bn = P.isNone(b.row);
+  if (an || bn) return an === bn ? 0 : an ? 1 : -1;
+  return P.posCmp(a.row, b.row);
+}
+
+/**
+ * The frozen-with-removal gate (§6.6 step 6, §11.3 step 2): the claim that froze the epoch has an rm bit for a member
+ * who had not left, by the current leave state.
+ */
+export function frozenWithRemoval(c: Copy, ep: Epoch): boolean {
+  const w = ep.ctl.winner;
+  if (c.frozen === null || !w) return false;
+  return ep.D.members.some((m, j) => P.rmHas(w.claim.rm, j) && !leftIn(c, ep, P.b64u(m.uid)));
+}
+
 function blockedOf(c: Copy, ep: Epoch, x: ViewCtx): Blocked {
   if (c.removed) return "removed";
   if (c.left) return "left";
-  if (
-    ep.ctl.claimSeen &&
-    ep.ctl.claimSince !== null &&
-    x.mono - ep.ctl.claimSince >= x.processingWait
-  )
+  if (frozenWithRemoval(c, ep)) return "frozen";
+  if (ep.ctl.pendingSince !== null && x.mono - ep.ctl.pendingSince >= x.processingWait)
     return "pending";
   return "";
 }
@@ -311,8 +471,8 @@ export function viewOf(c: Copy, x: ViewCtx): ConversationView | null {
   const members: MemberView[] = ep.D.members.map((m, j) => {
     const uidB = P.b64u(m.uid);
     const self = P.equalBytes(m.uid, x.selfUid);
-    // a request's members other than D.by are unknown until it is opened (§11.5)
-    const known = c.request && !self && !P.equalBytes(m.uid, ep.D.by) ? undefined : x.user(uidB);
+    // a request's members other than its D.by (rootBy) are unknown until it is opened (§11.5)
+    const known = c.request && !self && !P.equalBytes(m.uid, c.rootBy) ? undefined : x.user(uidB);
     const handle = self ? x.selfHandle : memberHandle(m, known).handle;
     const kemPk = pkOf(ep, j) ?? known?.kemPk ?? null;
     return {
@@ -320,7 +480,7 @@ export function viewOf(c: Copy, x: ViewCtx): ConversationView | null {
       handle,
       fingerprint:
         kemPk && (self || !handle.startsWith("?")) ? P.fingerprint(m.uid, m.sigPk, kemPk) : "",
-      left: false,
+      left: self ? c.left : leftIn(c, ep, uidB),
     };
   });
   const others = members.filter((m) => m.uid !== P.b64u(x.selfUid)).map((m) => "@" + m.handle);

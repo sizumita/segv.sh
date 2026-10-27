@@ -39,7 +39,6 @@ const MAX_NOISE = 5;
 export const ACCOUNT_MISSING = "your account was not found in the directory of this server";
 export const ACCOUNT_KEYS_MISMATCH =
   "the public keys registered for your account do not match your passkey's keys";
-const NOT_YET = "this is not available in this build yet";
 
 interface Account {
   uid: Uint8Array;
@@ -216,16 +215,19 @@ export class SegvEngine implements Engine {
     }
   }
 
-  async addMembers(_convId: string, _handles: string[]): Promise<void> {
-    await this.notYet();
+  async addMembers(convId: string, handles: string[]): Promise<void> {
+    this.requireAccount();
+    await this.action(() => this.messaging().addMembers(convId, handles));
   }
 
-  async removeMember(_convId: string, _uid: string): Promise<void> {
-    await this.notYet();
+  async removeMember(convId: string, uid: string): Promise<void> {
+    this.requireAccount();
+    await this.action(() => this.messaging().removeMember(convId, uid));
   }
 
-  async leave(_convId: string): Promise<void> {
-    await this.notYet();
+  async leave(convId: string): Promise<void> {
+    this.requireAccount();
+    await this.action(() => this.messaging().leave(convId));
   }
 
   loadImage(img: ImageRef): Promise<string> {
@@ -239,13 +241,6 @@ export class SegvEngine implements Engine {
 
   clearError(): void {
     this.patch({ error: "" });
-  }
-
-  private async notYet(): Promise<void> {
-    this.requireAccount();
-    await this.action(async () => {
-      throw new UserError(NOT_YET);
-    });
   }
 
   private messaging(): Messaging {

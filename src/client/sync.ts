@@ -7,6 +7,7 @@ import type { Api } from "./api";
 import {
   P0,
   W_SLOTS,
+  acceptedOld,
   clampTs,
   insertMessage,
   removeMessage,
@@ -42,6 +43,13 @@ export interface SyncCtx {
   onValidRow(c: Copy, ep: Epoch, j: number): void;
   /** the local echo waiting for this row (rowKey), if any */
   takeEcho(key: string): { c: Copy; echoKey: string } | undefined;
+  /** a valid LEAVE row of member j at `row`, stored at `t` (§6.9) */
+  onLeave(
+    c: Copy,
+    ep: Epoch,
+    j: number,
+    src: { t: number; row: Slot; key: string; order: number[] },
+  ): void;
 }
 
 export const UNDECRYPTABLE = "ignored an undecryptable message";
@@ -65,6 +73,8 @@ class LaneWalk {
   cur: Slot;
   tail: Slot | null;
   done = false;
+  /** eras whose dense-prefix end this walk observed MISS(sealed = 1), with that end */
+  readonly sealedAt = new Map<number, number>();
   private first = true;
   private eras: number[] = [];
   private tailKey = false;
@@ -120,6 +130,7 @@ class LaneWalk {
       } else {
         ended = true;
         sealedEnd = s.s === "miss" && s.sealed;
+        if (sealedEnd) this.sealedAt.set(this.cur.E, this.cur.n);
       }
     }
     if (!ended) return rows; // every slot hit: gallop by W next round
@@ -137,6 +148,7 @@ class LaneWalk {
         this.cur = { E, n: 1 };
         return rows; // probe the rest of E (and later eras) next round
       }
+      if (s.s === "miss" && s.sealed) this.sealedAt.set(E, 0);
       if (movable && s.s === "miss" && s.sealed && E < this.Enow) this.cur = { E: E + 1, n: 0 };
       else movable = false;
     }
@@ -154,16 +166,34 @@ export interface LaneTarget {
   lane: number | "ctl";
 }
 
-/** Every lane of the current epoch of each copy, and its control lane. */
+/**
+ * The lanes to walk for each copy (§11.2): every lane of its current epoch (not once removed: the removal swept them),
+ * its control lane until a winner is found (finality and processing are claims.ts's), and the lanes of epoch c−1
+ * not yet swept: the followed lanes (each member of both epochs, other than self, silent in c), and lanes to sweep
+ * once more before they leave.
+ */
 export function targetsOf(copies: Iterable<Copy>): LaneTarget[] {
   const out: LaneTarget[] = [];
   for (const c of copies) {
     const ep = c.epochs.get(c.current);
     if (!ep || ep.Estart === null) continue;
-    ep.lanes.forEach((_, j) => out.push({ c, ep, lane: j }));
-    out.push({ c, ep, lane: "ctl" });
+    if (ep.lanesOn && !c.removed) ep.lanes.forEach((_, j) => out.push({ c, ep, lane: j }));
+    if (!ep.ctl.winner && !c.removed) out.push({ c, ep, lane: "ctl" });
+    const prev = ep.viaSkip ? undefined : c.epochs.get(c.current - 1);
+    if (prev && prev.Estart !== null)
+      prev.lanes.forEach((l, j) => {
+        if (!l.swept) out.push({ c, ep: prev, lane: j });
+      });
   }
   return out;
+}
+
+/** Lane j of an older epoch is followed: its member is in the next epoch, is not self, and is silent there (§11.2). */
+export function followed(c: Copy, prev: Epoch, j: number): boolean {
+  const next = prev.viaSkip ? undefined : c.epochs.get(prev.e + 1);
+  if (!next || next.viaSkip || c.current !== next.e) return false;
+  const k = P.memberIndex(next.D, prev.D.members[j].uid);
+  return k >= 0 && k !== next.myIndex && !next.lanes[k].seen;
 }
 
 /**
@@ -197,43 +227,40 @@ export async function syncLanes(
       const x = targets[b.k];
       const rows = w.feed(st.slice(o, o + b.keys.length), b.keys);
       o += b.keys.length;
-      if (x.lane === "ctl") applyControl(ctx, x.ep, w, rows);
-      else {
-        for (const r of rows) applyLaneRow(ctx, x.c, x.ep, x.lane, r, quiet);
+      if (x.lane === "ctl") {
+        // Control rows wait in lane order to be decided (claims.ts); the eras seen sealed serve finality (§6.5).
+        const ctl = x.ep.ctl;
+        for (const r of rows) {
+          ctl.counts.set(r.E, Math.max(ctl.counts.get(r.E) ?? 0, r.n + 1));
+          if (P.posCmp(r, ctl.next) >= 0 && !ctl.queue.some((q) => q.E === r.E && q.n === r.n))
+            ctl.queue.push(r);
+        }
+        ctl.queue.sort((a, b) => P.posCmp(a, b));
+        for (const [E, n] of w.sealedAt) {
+          ctl.sealed.add(E);
+          ctl.counts.set(E, n);
+        }
+      } else {
         const lane = x.ep.lanes[x.lane];
+        for (const r of rows) {
+          if (
+            !lane.head ||
+            P.posCmp({ E: r.E, n: r.n + 1 }, { E: lane.head.E, n: lane.head.cnt }) > 0
+          )
+            lane.head = { E: r.E, cnt: r.n + 1 };
+          applyLaneRow(ctx, x.c, x.ep, x.lane, r, quiet);
+        }
         lane.next = { ...w.cur };
         lane.tail = w.tail;
       }
     }
   }
-}
-
-/**
- * The control lane before claims are processed (M7): a row that opens as a claim of this epoch makes membership
- * pending (a send waits, §11.3 step 2) and stays the control position; a row that does not is not e-valid and the
- * position moves past it (§6.4, §6.5).
- */
-function applyControl(ctx: SyncCtx, ep: Epoch, w: LaneWalk, rows: FoundRow[]): void {
-  for (const r of rows) {
-    const v = P.acceptRow(
-      { keys: ep.keys, conv: ep.D.conv, e: ep.e, members: ep.D.members },
-      r.E,
-      r.label,
-      r.body,
-    );
-    if (v.ok && v.msg.type === P.MT.CLAIM) {
-      if (!ep.ctl.claimSeen) {
-        ep.ctl.claimSeen = true;
-        ep.ctl.claimSince = ctx.mono();
-        ctx.changed();
-      }
-      ep.ctl.next = { E: r.E, n: r.n };
-      w.done = true;
-      return;
-    }
-    ep.ctl.next = { E: r.E, n: r.n + 1 };
-  }
-  if (!ep.ctl.claimSeen) ep.ctl.next = { ...w.cur };
+  // A lane of an older epoch walked to its head that is no longer followed leaves (§11.2 "Sweeping").
+  targets.forEach((x, k) => {
+    if (x.lane === "ctl" || x.ep.e === x.c.current || !walks[k].done) return;
+    const lane = x.ep.lanes[x.lane];
+    if (!lane.tail && !followed(x.c, x.ep, x.lane)) lane.swept = true;
+  });
 }
 
 // ───────────────────────── applying a lane row ─────────────────────────
@@ -289,11 +316,19 @@ export function applyLaneRow(
     return;
   }
   if (m.type === P.MT.LEAVE) {
-    c.leaves.add(P.b64u(ep.D.members[j].uid)); // the leave itself (lines, rotation) lands with M7
     c.order.set(key, order);
+    ctx.onLeave(c, ep, j, { t: r.t, row: { E: r.E, n: r.n }, key, order });
     return;
   }
   if (m.type !== P.MT.TEXT && m.type !== P.MT.IMAGE) return;
+  // A leaver processes its lanes for WELCOMEs only (§6.9); a row §6.8 drops is not shown, and an echo of it fails.
+  const accepted = !c.left && acceptedOld(c, ep.e, j, { E: r.E, n: r.n }, r.t);
+  if (!accepted) {
+    c.order.set(key, order);
+    ep.rows.set(key, { j, E: r.E, n: r.n, t: r.t, unread: false, shown: false });
+    ctx.takeEcho(key); // the echo stays as it is; the send reports the failure (§11.3 step 7)
+    return;
+  }
   const view: MessageView = {
     key,
     seq: ctx.seq(),
@@ -318,7 +353,9 @@ export function applyLaneRow(
   const echo = ctx.takeEcho(key);
   if (echo) removeMessage(echo.c, echo.echoKey);
   if (!insertMessage(c, view, order)) return;
-  if (!mine && !quiet && ctx.live()) c.unread++;
+  const unread = !mine && !quiet && ctx.live();
+  if (unread) c.unread++;
+  ep.rows.set(key, { j, E: r.E, n: r.n, t: r.t, unread, shown: true });
   ctx.changed();
 }
 

@@ -1,15 +1,18 @@
 // Sending a row on one's own lane (docs/PROTOCOL-v2.md §11.3): the control probe before every send, the processing
-// wait, the slot (never below the lane head's era), the fresh-probe check after the proof of work, and the handling
-// of OK, CONFLICT, WRONG_ERA and lost answers, with the late-row rule. M6b sends TEXT and IMAGE; LEAVE and WELCOME
-// use the same path with M7 and M6c.
+// wait, the refusals (removed, left, frozen with a removal, a WELCOME that no longer qualifies), the rotation after a
+// leave, the slot (never below the lane head's era), the fresh-probe check after the proof of work, and the handling
+// of OK, CONFLICT, WRONG_ERA and lost answers, with the late-row rule. TEXT, IMAGE, LEAVE and WELCOME use this path.
 import * as P from "~/lib/proto";
 import * as W from "~/lib/wire";
 import { ApiError, type Api, type Params } from "./api";
+import { controlSettled } from "./claims";
 import {
   CHANGING,
   NOT_DELIVERED,
   NOT_MEMBER,
   SEND_ATTEMPTS,
+  frozenWithRemoval,
+  leftIn,
   rowKey,
   type Copy,
   type Epoch,
@@ -36,6 +39,12 @@ export interface SendCtx {
   check(): void;
   /** step 1: probe and process the control lane of the copy's current epoch (throws when the get fails) */
   probeControl(c: Copy): Promise<void>;
+  /** step 2's wait: decides the control lane's rows again (no new probe of the lane) */
+  settle(c: Copy): Promise<void>;
+  /** step 3: commits a rotation that drops the members who left (§6.9) */
+  rotate?: (c: Copy) => Promise<void>;
+  /** a LEAVE repeated by §6.9: step 2's "you left" refusal does not apply */
+  repeatLeave?: boolean;
   /** waits on a protocol timer */
   wait(ms: number): Promise<void>;
   /** applies a row of this device's own lane (or a sibling's) found by the send */
@@ -80,14 +89,24 @@ function elapsed(ctx: SendCtx, s: Stamp): number {
   return Math.max(now.mono - s.mono, Math.max(0, now.wall - s.wall), now.server - s.server);
 }
 
+export const YOU_LEFT_REFUSAL = "you left this conversation";
+export const FROZEN_REMOVAL =
+  "a removed member could still read this conversation; start a new conversation";
+
+/** The epoch lists a member other than self who has left, and a rotation may drop it (§6.9, §11.3 step 3). */
+export function needsRotation(c: Copy, ep: Epoch): boolean {
+  if (c.frozen !== null || ep.e >= P.E_MAX - 1) return false;
+  return ep.D.members.some((m, j) => j !== ep.myIndex && leftIn(c, ep, P.b64u(m.uid)));
+}
+
 /**
- * Steps 1–2: probe the control lane, then wait (at most the processing wait) while a claim is undecided, and apply
- * the refusals. Returns the send's epoch and when the probe was sent and answered.
+ * Step 1 and step 2's wait: probe the control lane (again for each epoch a claim moves the copy to), then wait, at
+ * most the processing wait, while it has an undecided slot or a winner not yet final or processed.
  */
-async function steps12(
+async function probeAndWait(
   ctx: SendCtx,
   c: Copy,
-): Promise<{ ep: Epoch; sent: Stamp; answered: Stamp }> {
+): Promise<{ ep: Epoch; sent: Stamp; answered: Stamp; timedOut: boolean }> {
   for (;;) {
     ctx.check();
     const e = c.current;
@@ -101,20 +120,53 @@ async function steps12(
     ctx.check();
     if (c.current !== e) continue; // a claim switched the copy: probe its new epoch (§11.3 step 1)
     const ep = c.epochs.get(e)!;
-    if (ep.ctl.claimSeen) {
-      // Claims are processed with M7; until then a claim only ever waits out the processing wait.
-      const until = (ep.ctl.claimSince ?? ctx.clock.mono()) + ctx.processingWait;
-      const left = until - ctx.clock.mono();
-      if (left > 0) await ctx.wait(left);
-      ctx.check();
-      if (ep.ctl.claimSeen) throw new UserError(CHANGING);
+    let timedOut = false;
+    if (!controlSettled(ep)) {
+      const deadline = (ep.ctl.pendingSince ?? ctx.clock.mono()) + ctx.processingWait;
+      while (!controlSettled(ep) && c.current === e) {
+        const left = deadline - ctx.clock.mono();
+        if (left <= 0) {
+          timedOut = true;
+          break;
+        }
+        const due = ep.ctl.retryAt - ctx.clock.mono();
+        await ctx.wait(Math.min(left, due > 0 ? due : 1000));
+        ctx.check();
+        await ctx.settle(c);
+        ctx.check();
+      }
+      if (c.current !== e) continue;
     }
+    return { ep, sent, answered, timedOut };
+  }
+}
+
+/**
+ * Steps 1–3: probe, wait, apply the refusals of step 2 and the rotation of step 3. Returns the send's epoch and when
+ * the latest probe was sent and answered.
+ */
+async function steps12(
+  ctx: SendCtx,
+  c: Copy,
+  type: number,
+): Promise<{ ep: Epoch; sent: Stamp; answered: Stamp }> {
+  for (let rotations = 0; ;) {
+    const { ep, sent, answered, timedOut } = await probeAndWait(ctx, c);
+    const visible = type === P.MT.TEXT || type === P.MT.IMAGE;
     if (ctx.welcomeTo) {
+      if (timedOut) throw new UserError(CHANGING);
       if (!ctx.qualifies?.(c, ep, ctx.welcomeTo)) throw new WelcomeRefused();
       return { ep, sent, answered };
     }
     if (c.removed) throw new UserError(NOT_MEMBER);
-    if (c.left) throw new UserError("you left this conversation");
+    if (c.left && !ctx.repeatLeave) throw new UserError(YOU_LEFT_REFUSAL);
+    if (timedOut) throw new UserError(CHANGING);
+    if (visible && frozenWithRemoval(c, ep)) throw new UserError(FROZEN_REMOVAL);
+    if (visible && ctx.rotate && needsRotation(c, ep) && rotations < 4) {
+      rotations++;
+      await ctx.rotate(c); // then step 1 again: step 2 decides whether e still takes the send
+      continue;
+    }
     return { ep, sent, answered };
   }
 }
@@ -130,7 +182,7 @@ export interface SentRow extends FoundRow {
  */
 export async function sendRow(ctx: SendCtx, c: Copy, content: P.MBody): Promise<SentRow> {
   await c.ready; // a creation's own sends wait for its decoy (§6.1)
-  let { ep, sent, answered } = await steps12(ctx, c);
+  let { ep, sent, answered } = await steps12(ctx, c, content.type);
   const triedEras = new Set<number>();
   let EnowOverride: number | null = null;
   for (let attempt = 0; attempt < SEND_ATTEMPTS;) {
@@ -167,7 +219,7 @@ export async function sendRow(ctx: SendCtx, c: Copy, content: P.MBody): Promise<
     // Step 6, fresh probe: after the proof of work, before the put.
     const params = ctx.params();
     if (elapsed(ctx, answered) > ((params.delta + params.skew) / 2) * 1000 || c.current !== ep.e) {
-      const again = await steps12(ctx, c);
+      const again = await steps12(ctx, c, content.type);
       sent = again.sent;
       answered = again.answered;
       if (again.ep.e !== ep.e) {
@@ -190,11 +242,19 @@ export async function sendRow(ctx: SendCtx, c: Copy, content: P.MBody): Promise<
     if (res.s === "ok" || (res.s === "conflict" && P.equalBytes(res.body, row.body))) {
       found.t = res.t;
       ctx.applyOwn(c, ep, found);
-      // Step 8: a late row counts as delivered only while the copy is still in its epoch (or in e+1 with no own row
-      // there, which needs M7's switches).
+      // Step 8: a late row counts as delivered only while the copy is still in its epoch, or in e+1 with no own row
+      // there (the others still follow self's lane of e).
       if (elapsed(ctx, sent) >= (params.delta + params.skew) * 1000) {
-        await steps12(ctx, c).catch(() => null);
-        if (c.current !== ep.e) throw new UserError(NOT_DELIVERED);
+        const r = await probeAndWait(ctx, c).catch(() => null);
+        const next = c.epochs.get(ep.e + 1);
+        const stillFollowed =
+          c.current === ep.e ||
+          (c.current === ep.e + 1 &&
+            next !== undefined &&
+            !next.viaSkip &&
+            next.myIndex >= 0 &&
+            !next.lanes[next.myIndex].seen);
+        if (!r || r.timedOut || !stillFollowed) throw new UserError(NOT_DELIVERED);
       }
       return { ...found, e: ep.e };
     }
