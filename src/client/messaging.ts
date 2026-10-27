@@ -22,15 +22,18 @@ import {
   type Epoch,
   type KnownUser,
 } from "./conv";
-import {
-  buildCreation,
-  deliverInvites,
-  parseHandleList,
-  resolveHandles,
-  type Recipient,
-} from "./create";
+import { buildCreation, parseHandleList, resolveHandles, type Recipient } from "./create";
+import { Deliveries, jobKey, type DeliveryJob, type WelcomeOutcome } from "./deliver";
 import { SessionEnded, UserError, message } from "./errors";
-import { cursorAt, minCursor, scanInbox, type InboxCursor } from "./inbox";
+import {
+  cursorAt,
+  minCursor,
+  sameThread,
+  scanInbox,
+  workerDecrypt,
+  type Decrypt,
+  type InboxCursor,
+} from "./inbox";
 import { acceptJoin, secondCopyWarning, type JoinCtx, type NewCopy } from "./join";
 import type {
   EngineClock,
@@ -41,7 +44,8 @@ import type {
 } from "./options";
 import { Realtime } from "./realtime";
 import { keysChangedWarning, type SelfLane } from "./selflane";
-import { sendRow, type SendCtx } from "./send";
+import { prepareImage } from "./image";
+import { WelcomeRefused, sendRow, type SendCtx } from "./send";
 import {
   applyLaneRow,
   refreshHandles,
@@ -54,6 +58,9 @@ import {
 import type { ConversationView, MessageView } from "./types";
 
 type Bytes = Uint8Array;
+
+/** Topics per realtime socket (§10.8). */
+const RT_TOPICS = 256;
 
 /** A self row holds at most this many bytes of records (cls 3 minus the S header and a margin, §7.1, §7.3). */
 const ROW_BUDGET = 16_384 - 32 - 64;
@@ -108,7 +115,9 @@ export class Messaging {
   private readonly sendChains = new Map<string, Promise<unknown>>();
   /** T_e of every held epoch, by b64u topic */
   private readonly topics = new Map<string, { c: Copy; ep: Epoch }>();
-  private rt: Realtime | null = null;
+  /** at most 2 realtime sockets of at most 256 topics each (§10.8) */
+  private readonly rts: Realtime[] = [];
+  private WS: WebSocketCtor | null = null;
   private seqCounter = 0;
   private localCounter = 0;
   /** the inbox cursor of this session (never past a parked join) */
@@ -119,8 +128,34 @@ export class Messaging {
   private readonly timers: EngineTimer[] = [];
   private stopped = false;
   live = false;
+  /** the J delivery queue (§6.11, §6.12) */
+  private readonly deliveries: Deliveries;
+  /** EPOCH_PENDING records this session wrote (resumed at once, §6.11) */
+  private readonly ownPending = new Set<string>();
+  /** decrypted images by `id.k` (never by id alone, §8.1) */
+  readonly imageCache = new Map<string, Promise<string>>();
 
-  constructor(private readonly h: MessagingHost) {}
+  constructor(private readonly h: MessagingHost) {
+    this.deliveries = new Deliveries({
+      api: h.api,
+      params: () => this.params(),
+      check: () => h.check(),
+      wait: (ms) => h.wait(ms),
+      track: (p) => h.track(p),
+      warn: (t) => h.warn(t),
+      pks: (job) => this.pksOf(job),
+      handleOf: (uidB) => this.handleOfUid(uidB),
+      welcomeChannel: async (uid) => this.welcomeChannel(uid),
+      sendWelcome: (c, uid, J) => this.sendWelcome(c as Copy, uid, J),
+      delivered: (job, uids) =>
+        h.enqueue(async () => {
+          const bundleId = job.J.bundleId;
+          await h.self.write([
+            { rtype: P.RT.DELIVERED, conv: job.conv, root: job.root, e: job.e, bundleId, uids },
+          ]);
+        }),
+    });
+  }
 
   // ───────────────────────── lifecycle ─────────────────────────
 
@@ -139,6 +174,7 @@ export class Messaging {
     await this.initialHistory();
     await this.resolveMembers([...this.copies.values()].filter((c) => !c.request));
     await this.pollInbox();
+    this.resumeDeliveries();
   }
 
   /** Starts realtime and the periodic inbox poll and catch-up (§11.5, §11.6). */
@@ -147,32 +183,39 @@ export class Messaging {
     const WS =
       this.h.opts.WebSocket ??
       (typeof WebSocket === "undefined" ? null : (WebSocket as unknown as WebSocketCtor));
-    if (WS) {
-      this.rt = new Realtime(WS, this.h.clock, {
-        onRows: (rows) => this.onRows(rows),
-        onMissed: () => void this.catchUpSoon(),
-        onSubscribed: () => void this.catchUpSoon(),
-        onHello: (s, sent, recv) => this.h.api.time.add(s, sent, recv),
-        onState: (on) => this.h.setConnected(on),
-      });
-      this.rt.start();
-      this.subscribe();
-    }
+    this.WS = WS;
+    this.subscribe();
     this.every(
       () => Math.max(this.params().inboxSlot, 2) * 1000,
       () => this.h.enqueue(() => this.pollInbox()),
     );
     this.every(
-      () => (this.rt?.connected ? 300_000 : this.h.delays.catchUpInterval),
+      () => (this.rts[0]?.connected ? 300_000 : this.h.delays.catchUpInterval),
       () => this.catchUp(),
     );
   }
 
   stop(): void {
     this.stopped = true;
-    this.rt?.stop();
-    this.rt = null;
+    for (const rt of this.rts) rt.stop();
+    this.rts.length = 0;
     for (const t of this.timers) t.cancel();
+    void this.worker?.then((w) => w?.terminate());
+  }
+
+  private worker: Promise<Worker | null> | null = null;
+
+  /**
+   * Trial decryption in the inbox Web Worker when one can be made (§11.5 step 2; EngineOptions.inboxWorker: absent
+   * is the default factory, null is none), else on this thread.
+   */
+  private async decrypter(): Promise<Decrypt> {
+    const opt = this.h.opts.inboxWorker;
+    if (opt === null) return sameThread;
+    const make = opt ?? (() => import("./inbox-worker-url").then((m) => m.createInboxWorker()));
+    this.worker ??= make().catch(() => null);
+    const w = await this.worker;
+    return w ? workerDecrypt(w) : sameThread;
   }
 
   private every(ms: () => number, fn: () => Promise<unknown>): void {
@@ -206,6 +249,7 @@ export class Messaging {
       await this.pollInbox();
       await this.resolveMembers([...this.copies.values()].filter((c) => !c.request));
     });
+    this.resumeDeliveries();
     await this.flushHeads();
   }
 
@@ -281,6 +325,7 @@ export class Messaging {
       lastTs: 0,
       ready: Promise.resolve(),
       history: false,
+      leaves: new Set(),
     };
   }
 
@@ -356,7 +401,13 @@ export class Messaging {
     if (!D || !dsig) return;
     const Dv: P.Descriptor = D;
     let tReg: number | null = request ? (rec as P.RequestRec).tReg : null;
-    if (tReg === null) tReg = f.pending.find((x) => copyKeyOf(x) === k && x.e === e)?.tReg ?? null;
+    // E_start from an EPOCH_PENDING only when it names this epoch's own bundle (sent-2b, round 14)
+    if (tReg === null)
+      tReg =
+        f.pending.find(
+          (x) =>
+            copyKeyOf(x.rec) === k && x.rec.e === e && P.equalBytes(x.rec.bundleId, rec.bundleId),
+        )?.rec.tReg ?? null;
     if (tReg === null) tReg = (await this.h.api.blobMeta(rec.bundleId))?.t ?? null;
     if (tReg === null) return;
     const ep = newEpoch({
@@ -554,7 +605,10 @@ export class Messaging {
         this.h.changed();
       },
       handleOf: (c, ep, j) => this.handleOf(c, ep, j),
-      onWelcome: (c, ep, _j, J) => void this.welcome(c, ep, J),
+      onWelcome: (c, ep, j, J) => {
+        // Own WELCOMEs (this device's or a sibling's) carry J of copies the account already holds.
+        if (!P.equalBytes(ep.D.members[j].uid, this.h.acc.uid)) void this.welcome(c, ep, J);
+      },
       onValidRow: (c, ep, j) => this.corroborate(c, ep, j),
       takeEcho: (key) => {
         const x = this.echoes.get(key);
@@ -650,8 +704,24 @@ export class Messaging {
         .catch(() => {});
   }
 
+  private newSocket(WS: WebSocketCtor): Realtime {
+    const rt = new Realtime(WS, this.h.clock, {
+      onRows: (rows) => this.onRows(rows),
+      onMissed: () => void this.catchUpSoon(),
+      onSubscribed: () => void this.catchUpSoon(),
+      onHello: (s, sent, recv) => this.h.api.time.add(s, sent, recv),
+      onState: () => this.h.setConnected(this.rts.some((x) => x.connected)),
+    });
+    rt.start();
+    return rt;
+  }
+
+  /**
+   * The topics, in priority order (§10.8): Tself, then the current epochs of accepted copies by recent activity.
+   * Requests are never subscribed. At most 256 per socket and 2 sockets; the rest are covered by catch-up.
+   */
   private subscribe(): void {
-    if (!this.rt) return;
+    if (!this.live || !this.WS) return;
     const topics: Bytes[] = [P.topicSelf(this.h.acc.id.nS)];
     const accepted = [...this.copies.values()]
       .filter((c) => !c.request)
@@ -660,7 +730,16 @@ export class Messaging {
       const ep = c.epochs.get(c.current);
       if (ep) topics.push(ep.topic);
     }
-    this.rt.setTopics(topics);
+    const parts = [topics.slice(0, RT_TOPICS), topics.slice(RT_TOPICS, 2 * RT_TOPICS)];
+    parts.forEach((part, i) => {
+      if (part.length === 0) return;
+      this.rts[i] ??= this.newSocket(this.WS!);
+      this.rts[i].setTopics(part);
+    });
+    if (parts[1].length === 0 && this.rts[1]) {
+      this.rts[1].stop();
+      this.rts.length = 1;
+    }
   }
 
   // ───────────────────────── inbox and joins (§6.7, §11.5) ─────────────────────────
@@ -675,6 +754,7 @@ export class Messaging {
       p,
       this.h.acc.regEra,
       (t) => this.h.warn(t),
+      await this.decrypter(),
     );
     this.h.check();
     await this.processJoins(
@@ -876,6 +956,7 @@ export class Messaging {
       ]),
     );
     this.h.check();
+    this.ownPending.add(jobKey(copyKeyOf({ conv: cr.conv, root: cr.D.hash }), 0, cr.bundleId));
     for (const u of others) this.learnUser(u, true);
     const k = copyKeyOf({ conv: cr.conv, root: cr.D.hash });
     const key = this.h.self.fold.viewKeys.get(k)!;
@@ -923,6 +1004,7 @@ export class Messaging {
     } finally {
       release();
     }
+    // §6.1 steps 8–9: the first attempt for every recipient, then one DELIVERED row (also when nobody got J).
     const J: P.Join = {
       conv: c.conv,
       e: ep.e,
@@ -930,32 +1012,16 @@ export class Messaging {
       bundleId: ep.bundleId,
       bundleSize: ep.bundleSize,
     };
-    const delivered = await deliverInvites(
-      {
-        api: this.h.api,
-        params: () => this.params(),
-        wait: (ms) => this.h.wait(ms),
-        check: () => this.h.check(),
-        progress: () => {},
-      },
+    const job = this.deliveries.enqueue({
+      key: jobKey(copyKeyOf(c), ep.e, ep.bundleId),
+      conv: c.conv,
+      root: c.root,
+      e: ep.e,
       J,
-      recipients,
-    );
-    this.h.check();
-    await this.retry(async () => {
-      await this.h.enqueue(() =>
-        this.h.self.write([
-          {
-            rtype: P.RT.DELIVERED,
-            conv: c.conv,
-            root: c.root,
-            e: ep.e,
-            bundleId: ep.bundleId,
-            uids: delivered,
-          },
-        ]),
-      );
+      uids: new Set(recipients.map((r) => P.b64u(r.uid))),
+      writeEmpty: true,
     });
+    await this.deliveries.first(job);
   }
 
   /** §6.1 step 7: a class-1 row of random bytes at a random label of the current era, without a topic. */
@@ -983,6 +1049,186 @@ export class Messaging {
         await this.h.wait(Math.min(this.h.delays.retryMax, this.h.delays.retryBase * 2 ** attempt));
       }
     }
+  }
+
+  // ───────────────────────── deliveries (§6.11, §6.12) ─────────────────────────
+
+  /**
+   * Resumes unfinished deliveries (§6.11): every EPOCH_PENDING of the account with uids not covered by DELIVERED
+   * records, once established (e = 0: the account holds its CONV_JOIN; later epochs land with M7), and written by
+   * this device in this session or stored more than RESUME_AFTER ago.
+   */
+  private resumeDeliveries(): void {
+    if (this.stopped) return;
+    const f = this.h.self.fold;
+    const nowSec = Math.floor((this.h.api.serverNow() - P.T0_MS) / 1000);
+    for (const { rec, t } of f.pending) {
+      const k = copyKeyOf(rec);
+      const key = jobKey(k, rec.e, rec.bundleId);
+      if (rec.e !== 0 || !f.joins.has(k)) continue;
+      const covered = f.delivered.get(key) ?? new Set<string>();
+      const uids = rec.uids.map((u) => P.b64u(u)).filter((u) => !covered.has(u));
+      if (uids.length === 0) continue;
+      // This session's own creations deliver through their own attempts (§6.1 steps 8–9, then the job's loop);
+      // another device's (or an earlier session's) once RESUME_AFTER has passed.
+      if (this.ownPending.has(key) || nowSec - t < this.h.delays.resumeAfter / 1000) continue;
+      const J: P.Join = {
+        conv: rec.conv,
+        e: rec.e,
+        EK: rec.EK,
+        bundleId: rec.bundleId,
+        bundleSize: rec.bundleSize,
+      };
+      const job = this.deliveries.enqueue({
+        key,
+        conv: rec.conv,
+        root: rec.root,
+        e: rec.e,
+        J,
+        uids: new Set(uids),
+        writeEmpty: false,
+      });
+      this.deliveries.start(job);
+    }
+  }
+
+  /** The recipients' kemPk from the epoch's bundle (held, or fetched once), by b64u uid. */
+  private async pksOf(job: DeliveryJob): Promise<Map<string, Bytes>> {
+    const c = this.byKey(copyKeyOf(job));
+    let ep = c?.epochs.get(job.e);
+    let D: P.Descriptor | null = ep?.D ?? null;
+    let pks = ep && P.equalBytes(ep.bundleId, job.J.bundleId) ? ep.pks : null;
+    if (!pks || !D) {
+      const got = await this.h.api.getBlob(job.J.bundleId, job.J.bundleSize);
+      if (!got || !got.sizeOk || !P.equalBytes(P.H(got.bytes), job.J.bundleId))
+        throw new Error("bundle not available");
+      const keys = P.epochKeys(job.J.EK, job.conv, job.e);
+      D = P.parseD(P.openDesc(keys.dk, job.conv, job.e, got.bytes).D);
+      pks = P.openPks(keys.dk, job.conv, job.e, got.bytes);
+      if (ep && P.equalBytes(ep.bundleId, job.J.bundleId)) ep.pks = pks;
+    }
+    const out = new Map<string, Bytes>();
+    D.members.forEach((m, j) => out.set(P.b64u(m.uid), pks!.slice(j * 1216, (j + 1) * 1216)));
+    ep = undefined;
+    return out;
+  }
+
+  private handleOfUid(uidB: string): string {
+    return this.knownUser(uidB)?.handle ?? unknownHandle(uidB);
+  }
+
+  /**
+   * §6.12 step 1: an accepted 1:1 copy whose current epoch lists exactly self and R, self not frozen, not left, not
+   * removed, with a valid row of R seen in that epoch, and R not left.
+   */
+  private qualifies(c: Copy, ep: Epoch, uid: Bytes): boolean {
+    if (c.request || c.frozen !== null || c.left || c.removed || ep.D.members.length !== 2)
+      return false;
+    const j = P.memberIndex(ep.D, uid);
+    if (j < 0 || j === ep.myIndex || ep.myIndex < 0) return false;
+    return ep.lanes[j].seen && !c.leaves.has(P.b64u(uid));
+  }
+
+  private welcomeChannel(uid: Bytes): Copy | null {
+    let best: Copy | null = null;
+    for (const c of this.copies.values()) {
+      const ep = c.epochs.get(c.current);
+      if (ep && this.qualifies(c, ep, uid) && (!best || c.lastTs > best.lastTs)) best = c;
+    }
+    return best;
+  }
+
+  /** Puts J as a WELCOME on self's lane of the 1:1 (§11.3 with the step-2 WELCOME check; no echo). */
+  private async sendWelcome(c: Copy, uid: Bytes, J: P.Join): Promise<WelcomeOutcome> {
+    const run = async (): Promise<WelcomeOutcome> => {
+      try {
+        await sendRow(
+          {
+            ...this.sendCtx(c, null),
+            welcomeTo: uid,
+            qualifies: (cc, ep, u) => this.qualifies(cc, ep, u),
+          },
+          c,
+          {
+            type: P.MT.WELCOME,
+            join: J,
+          },
+        );
+        return "ok";
+      } catch (e) {
+        if (e instanceof WelcomeRefused) return "invite";
+        if (e instanceof SessionEnded) throw e;
+        return "pending";
+      }
+    };
+    const prev = this.sendChains.get(c.key) ?? Promise.resolve();
+    const next = prev.then(run, run);
+    this.sendChains.set(c.key, next);
+    return next;
+  }
+
+  // ───────────────────────── images (§8.1) ─────────────────────────
+
+  /** Re-encodes, encrypts and uploads an image, then sends its IMAGE row (§8.1, §11.3). */
+  sendImage(convId: string, file: File): Promise<void> {
+    const c = this.copy(convId);
+    const echo = this.addEcho(c, "image", "[image]");
+    const run = async () => {
+      try {
+        this.h.progress("preparing image…");
+        const img = await prepareImage(file);
+        this.h.check();
+        const { blob, id, key } = P.encryptBlob(img.bytes);
+        if (blob.length > P.BLOB_MAX) throw new UserError("image is too large");
+        await this.h.api.putBlob(P.fromB64u(id), blob, (m) => this.h.progress(m));
+        this.h.check();
+        const k = P.b64u(key);
+        this.imageCache.set(
+          `${id}.${k}`,
+          Promise.resolve(
+            URL.createObjectURL(new Blob([img.bytes as BlobPart], { type: img.mime })),
+          ),
+        );
+        if (c.request) await this.accept(c);
+        const mime = img.mime === "image/webp" ? 1 : 2;
+        await sendRow(this.sendCtx(c, echo.key), c, {
+          type: P.MT.IMAGE,
+          image: { id: P.fromB64u(id), k: key, mime, w: img.w, h: img.h },
+        });
+        if (c.messages.some((m) => m.key === echo.key)) this.markEcho(c, echo.key, "sent");
+      } catch (e) {
+        for (const [kk, x] of this.echoes) if (x.echoKey === echo.key) this.echoes.delete(kk);
+        this.markEcho(c, echo.key, "failed");
+        if (!(e instanceof SessionEnded)) this.h.error(message(e));
+      } finally {
+        this.h.progress("");
+      }
+    };
+    const prev = this.sendChains.get(convId) ?? Promise.resolve();
+    const next = prev.then(run, run);
+    this.sendChains.set(convId, next);
+    return this.h.track(next);
+  }
+
+  /** Downloads, checks and decrypts an image; cached by `id.k` (§8.1). Resolves with an object URL. */
+  loadImage(img: { id: string; k: string; mime: string }): Promise<string> {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(img.id) || !/^[A-Za-z0-9_-]{43}$/.test(img.k))
+      return Promise.reject(new Error("bad image reference"));
+    if (img.mime !== "image/webp" && img.mime !== "image/jpeg")
+      return Promise.reject(new Error("bad image type"));
+    const cacheKey = `${img.id}.${img.k}`;
+    let p = this.imageCache.get(cacheKey);
+    if (!p) {
+      p = (async () => {
+        const got = await this.h.api.getBlobUpTo(P.fromB64u(img.id), P.BLOB_MAX);
+        if (!got) throw new Error("image not found");
+        const data = P.decryptBlob(got, img.id, P.fromB64u(img.k));
+        return URL.createObjectURL(new Blob([data as BlobPart], { type: img.mime }));
+      })();
+      this.imageCache.set(cacheKey, p);
+      p.catch(() => this.imageCache.delete(cacheKey));
+    }
+    return p;
   }
 
   // ───────────────────────── sending (§11.3) ─────────────────────────

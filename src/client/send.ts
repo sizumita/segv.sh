@@ -44,6 +44,21 @@ export interface SendCtx {
   expectEcho(key: string): void;
   beforePutAttempt?: () => void | Promise<void>;
   progress(text: string): void;
+  /**
+   * A WELCOME to this uid: step 2 checks the §6.12 step 1 conditions for the epoch the row would be built in
+   * (`qualifies`), and a failure is `WelcomeRefused` (the recipient gets an inbox invite instead), never the
+   * "removed" or "you left" refusal.
+   */
+  welcomeTo?: Bytes;
+  qualifies?: (c: Copy, ep: Epoch, uid: Bytes) => boolean;
+}
+
+/** §11.3 step 2 refused a WELCOME: the epoch no longer qualifies (§6.12 step 1); send an inbox invite instead. */
+export class WelcomeRefused extends Error {
+  constructor() {
+    super("the conversation no longer qualifies for a WELCOME");
+    this.name = "WelcomeRefused";
+  }
 }
 
 /** Times of the latest step-1 probe on the three clocks (§11.3 steps 6 and 8). */
@@ -93,6 +108,10 @@ async function steps12(
       if (left > 0) await ctx.wait(left);
       ctx.check();
       if (ep.ctl.claimSeen) throw new UserError(CHANGING);
+    }
+    if (ctx.welcomeTo) {
+      if (!ctx.qualifies?.(c, ep, ctx.welcomeTo)) throw new WelcomeRefused();
+      return { ep, sent, answered };
     }
     if (c.removed) throw new UserError(NOT_MEMBER);
     if (c.left) throw new UserError("you left this conversation");

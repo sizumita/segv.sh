@@ -591,6 +591,21 @@ export class Api {
     return { bytes: P.concat(...chunks), sizeOk: n === max };
   }
 
+  /** `GET /api/v2/blob/{id}` of unknown size, at most `cap` bytes: null for 404; a longer body is refused. */
+  async getBlobUpTo(id: Bytes, cap: number): Promise<Bytes | null> {
+    const res = await this.request(`/api/v2/blob/${P.b64u(id)}`);
+    if (res.status === 404) return null;
+    if (!res.ok) throw await readError(res);
+    const cl = Number(res.headers.get("content-length") ?? "0");
+    if (cl > cap) {
+      await res.body?.cancel().catch(() => {});
+      throw new ApiError(0, "blob too large");
+    }
+    const b = new Uint8Array(await res.arrayBuffer());
+    if (b.length > cap) throw new ApiError(0, "blob too large");
+    return b;
+  }
+
   // ── inbox (§10.5) ──
 
   /**

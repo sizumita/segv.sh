@@ -61,8 +61,8 @@ export class SelfFold {
   private readonly copiesOfConv = new Map<string, number>();
   /** EPOCH per (copy, e): the first wins, flags OR-ed */
   readonly epochs = new Map<string, P.EpochRec>();
-  /** every EPOCH_PENDING record */
-  readonly pending: P.EpochPendingRec[] = [];
+  /** every EPOCH_PENDING record, with the stored time of its row (the resume rule of §6.11 reads it) */
+  readonly pending: { rec: P.EpochPendingRec; t: number }[] = [];
   /** DELIVERED uids per (copy, e, bundleId), united */
   readonly delivered = new Map<string, Set<string>>();
   /** DESC per (copy, e): the first wins */
@@ -160,7 +160,7 @@ export class SelfFold {
         return;
       }
       case P.RT.EPOCH_PENDING:
-        this.pending.push(r);
+        this.pending.push({ rec: r, t });
         return;
       case P.RT.DELIVERED: {
         const k = `${copyKey(r)}:${r.e}:${P.b64u(r.bundleId)}`;

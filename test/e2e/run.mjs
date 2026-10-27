@@ -273,6 +273,22 @@ async function seen(d, text, timeout = T) {
   await d.page.locator(".thread").getByText(text, { exact: false }).first().waitFor({ timeout });
 }
 
+async function pngBytes(page, label) {
+  return page.evaluate(async (label) => {
+    const c = document.createElement("canvas");
+    c.width = 1600;
+    c.height = 900;
+    const g = c.getContext("2d");
+    g.fillStyle = "#123";
+    g.fillRect(0, 0, 1600, 900);
+    g.fillStyle = "#fc3";
+    g.font = "120px monospace";
+    g.fillText(label, 80, 480);
+    const b = await new Promise((r) => c.toBlob(r, "image/png"));
+    return Array.from(new Uint8Array(await b.arrayBuffer()));
+  }, label);
+}
+
 async function shot(d, name) {
   await d.page.screenshot({ path: join(SHOTS, `${name}.png`) });
 }
@@ -389,6 +405,28 @@ try {
     },
   );
 
+  await step("encrypted image arrives and decrypts", async () => {
+    const bytes = await pngBytes(A.page, `img ${sfx}`);
+    await A.page
+      .locator("input[type=file]")
+      .setInputFiles({ name: "pic.png", mimeType: "image/png", buffer: Buffer.from(bytes) });
+    await A.page.getByRole("button", { name: "send", exact: true }).click();
+    await A.page.locator('.thread img[src^="blob:"]').first().waitFor({ timeout: T });
+    const img = B.page.locator('.thread img[src^="blob:"]').first();
+    await img.waitFor({ timeout: T });
+    await B.page.waitForFunction(
+      () => {
+        const i = document.querySelector('.thread img[src^="blob:"]');
+        return i && i.complete && i.naturalWidth > 0;
+      },
+      null,
+      { timeout: T },
+    );
+    const w = await img.evaluate((i) => i.naturalWidth);
+    check(w === 1600, `decoded image width ${w}`);
+    await shot(B, "02b-bob-image");
+  });
+
   await step("group conversation with three members, named at creation", async () => {
     await newConversation(A, `${H.bob}, ${H.carol}`, team);
     await send(A, t3);
@@ -411,6 +449,7 @@ try {
       await open(A, `@${H.bob}`);
       await seen(A, t1);
       await seen(A, t2);
+      await A.page.locator('.thread img[src^="blob:"]').first().waitFor({ timeout: T });
     },
   );
 
@@ -504,7 +543,8 @@ try {
         check(r.body.length === P.INBOX_BODY_LEN, `invite size ${r.body.length}`);
         clean(`an invite of era ${E}`, r.body);
       }
-    check(invites >= 3, `expected at least 3 invites, got ${invites}`);
+    // bob's 1:1 invite and carol's group invite; bob's group J is a WELCOME in his 1:1 with alice (§6.12 step 1)
+    check(invites === 2, `expected 2 invites, got ${invites}`);
     // The directory's public log: four registrations.
     const log = await getJson(`/api/v2/dirlog?after=0&limit=1000`);
     const users = log.entries.filter((x) => x.kind === 1).length;

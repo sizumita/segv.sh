@@ -238,9 +238,14 @@ describe("engine-12: registration", () => {
 });
 
 describe("v2: the registration's self row and the account check (§7.3, §11.1)", () => {
-  it("the first self row is a HEADS record with the inbox cursor at the current slot, and a restore reads it", async () => {
+  it("the first self row is a HEADS record with the inbox cursor at the registration's slot, and a restore reads it", async () => {
+    let regAt = 0;
+    server().hooks.beforeRequest = (m, p) => {
+      if (m === "POST" && p === "/api/v2/register") regAt = server().now();
+    };
     const R = newEngine("first");
     const { recoveryCode } = await R.register("first");
+    server().hooks.beforeRequest = undefined;
     await settle(R);
     // the first row, at Lself(E, 0) with prev NONE, holds only the HEADS record with the registration's cursor
     const id = P.deriveIdentity(I(R).account!.AK);
@@ -251,7 +256,8 @@ describe("v2: the registration's self row and the account check (§7.3, §11.1)"
     expect(row.records).toHaveLength(1);
     const first = row.records[0] as P.HeadsRec;
     expect(first).toMatchObject({ rtype: P.RT.HEADS, entries: [] });
-    const slot = Math.floor((server().now() - P.T0_MS) / (server().params.inboxSlot * 1000));
+    // at the registration's slot (minus SKEW and a margin, R9-1), however long the test then takes
+    const slot = Math.floor((regAt - P.T0_MS) / (server().params.inboxSlot * 1000));
     expect(first.Ein).toBe(server().era);
     expect(first.relIn).toBeLessThanOrEqual(slot);
     expect(first.relIn).toBeGreaterThanOrEqual(slot - 5);

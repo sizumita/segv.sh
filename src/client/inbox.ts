@@ -50,6 +50,52 @@ export const MALFORMED_INVITE = "ignored a malformed conversation key";
 /** Rows trial-decrypted between two yields to the event loop (§11.5 step 2, same thread). */
 const DECRYPT_CHUNK = 8;
 
+/** Trial decryption of one page's rows (§5.3): the J, "malformed", or null (not for this key), in row order. */
+export type Decrypt = (
+  kemSk: Uint8Array,
+  E: number,
+  rows: readonly { eid: Uint8Array; body: Uint8Array }[],
+) => Promise<(P.JoinOpen | null)[]>;
+
+/** Trial decryption on the page's thread, yielding to the event loop every few rows (the engine tests' path). */
+export const sameThread: Decrypt = async (kemSk, E, rows) => {
+  const out: (P.JoinOpen | null)[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    out.push(P.tryOpenInvite(kemSk, E, 0, rows[i].eid, rows[i].body));
+    if ((i + 1) % DECRYPT_CHUNK === 0) await new Promise((res) => setTimeout(res, 0));
+  }
+  return out;
+};
+
+/** Trial decryption in the inbox Web Worker (src/client/inbox-worker.ts). */
+export function workerDecrypt(worker: Worker): Decrypt {
+  let seq = 0;
+  const waiting = new Map<number, (out: (Uint8Array | 0 | null)[]) => void>();
+  worker.onmessage = (ev: MessageEvent<{ id: number; out: (Uint8Array | 0 | null)[] }>) => {
+    waiting.get(ev.data.id)?.(ev.data.out);
+    waiting.delete(ev.data.id);
+  };
+  return (kemSk, E, rows) =>
+    new Promise((resolve, reject) => {
+      const id = ++seq;
+      waiting.set(id, (out) =>
+        resolve(
+          out.map((x) => {
+            if (x === null) return null;
+            if (x === 0) return { kind: "malformed" as const };
+            try {
+              return { kind: "join" as const, join: P.parseJ(x) };
+            } catch {
+              return { kind: "malformed" as const };
+            }
+          }),
+        ),
+      );
+      worker.onerror = (e) => reject(new Error(`inbox worker failed: ${e.message}`));
+      worker.postMessage({ id, kemSk, E, rows: rows.map((r) => ({ eid: r.eid, body: r.body })) });
+    });
+}
+
 /**
  * Reads the inbox from `cursor` (or, without one, from the registration rule with `t_r = start(regEra)`, R9-1) up
  * to the current era and trial-decrypts every row (§11.5 steps 1–2, §5.3). Rows with `rel ≤ after` or above the
@@ -72,6 +118,7 @@ export async function scanInbox(
   p: { skew: number; inboxSlot: number; efirst: number },
   regEra: number,
   warn: (text: string) => void,
+  decrypt: Decrypt = sameThread,
 ): Promise<InboxScan> {
   const Enow = P.era(api.serverNow());
   const start = cursor ?? cursorAt(P.eraStart(regEra), p, Enow);
@@ -79,7 +126,6 @@ export async function scanInbox(
   const from = start.E < lo ? { E: lo, rel: 0 } : start;
   const joins: FoundJoin[] = [];
   let next: InboxCursor | null = null;
-  let decrypted = 0;
   for (let E = from.E; E <= Enow; E++) {
     let after = E === from.E ? from.rel : 0;
     const issued = api.serverNow();
@@ -88,14 +134,15 @@ export async function scanInbox(
     try {
       for (;;) {
         page = await api.readInbox(E, after);
-        for (const r of page.rows) {
-          if (r.rel <= after || r.rel > page.closed) continue;
-          const opened = P.tryOpenInvite(kemSk, E, 0, r.eid, r.body);
-          if (++decrypted % DECRYPT_CHUNK === 0) await new Promise((res) => setTimeout(res, 0));
-          if (!opened) continue;
-          if (opened.kind === "malformed") warn(MALFORMED_INVITE);
-          else joins.push({ E, rel: r.rel, J: opened.join });
-        }
+        const closedNow = page.closed;
+        const rows = page.rows.filter((r) => r.rel > after && r.rel <= closedNow);
+        const opened = await decrypt(kemSk, E, rows);
+        rows.forEach((r, i) => {
+          const o = opened[i];
+          if (!o) return;
+          if (o.kind === "malformed") warn(MALFORMED_INVITE);
+          else joins.push({ E, rel: r.rel, J: o.join });
+        });
         closed = Math.max(closed, page.closed);
         if (!page.more) break;
         after = page.rows[page.rows.length - 1].rel;

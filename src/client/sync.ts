@@ -287,7 +287,8 @@ export function applyLaneRow(
     return;
   }
   if (m.type === P.MT.LEAVE) {
-    c.order.set(key, order); // leaves land with M7
+    c.leaves.add(P.b64u(ep.D.members[j].uid)); // the leave itself (lines, rotation) lands with M7
+    c.order.set(key, order);
     return;
   }
   if (m.type !== P.MT.TEXT && m.type !== P.MT.IMAGE) return;

@@ -506,3 +506,52 @@ export async function settle(...es: Engine[]): Promise<void> {
     await sleep(round < 2 ? 2 : 10);
   }
 }
+
+// ═════════════════════════ builders (plan §2.3; M6c) ═════════════════════════
+
+/** A row as stored: era, label, class and body. */
+export interface BuiltRow {
+  E: number;
+  label: Uint8Array;
+  cls: number;
+  body: Uint8Array;
+}
+
+/**
+ * A signed lane row of `from` in epoch `ep` at `(E, n)` (plan §2.3 `buildMessage`): TEXT, IMAGE, WELCOME or LEAVE,
+ * with optional header overrides (a forged `ck`, another `ts`). `prev` is the sender's previous row on the lane, if
+ * any (its stored label and body, for prevh).
+ */
+export function buildMessage(
+  from: TestUser,
+  ep: Epoch,
+  slot: { E: number; n: number; prev?: BuiltRow & { n: number } },
+  partial: P.MBody & Partial<P.MHeader>,
+): BuiltRow {
+  const i = P.memberIndex(ep.D, from.uid);
+  if (i < 0) throw new Error(`${from.handle} is not a member of this epoch`);
+  const prev = slot.prev;
+  const msg = {
+    from: i,
+    lane: i,
+    n: slot.n,
+    prev: prev ? { E: prev.E, n: prev.n } : P.NONE,
+    prevh: prev ? P.prevh(prev.label, prev.body) : P.ZERO16,
+    ts: Date.now(),
+    ckq: 0,
+    ck16: P.ZERO16,
+    ...partial,
+  } as P.Msg;
+  const row = P.buildRow(
+    { keys: ep.keys, conv: ep.D.conv, e: ep.e, sigSk: from.id.sigSk },
+    slot.E,
+    msg,
+  );
+  return { E: slot.E, label: row.label, cls: row.cls, body: row.body };
+}
+
+/** Stores a built row without validation, published on the epoch's topic (an attacker's or another client's put). */
+export function postRow(ep: Epoch, row: BuiltRow): void {
+  const r = current.shard.commit(row.E, row.label, row.cls, row.body, { topic: ep.topic });
+  if (!r) throw new Error("slot taken");
+}

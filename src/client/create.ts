@@ -116,18 +116,25 @@ export interface DeliverCtx {
   progress(text: string): void;
 }
 
+/** The outcome of one round of invites: who got one, and the longest `retry-after` a refusal asked for (s). */
+export interface InviteResult {
+  delivered: Bytes[];
+  retryAfter: number;
+}
+
 /**
  * §6.12 steps 2 and 4 for one J: inbox invites sealed to each recipient's kemPk, posted in random order in batches
  * of up to 32. A 409 `wrong era` rebuilds the batch for the returned era (fresh eid, AAD with the new E) and posts
- * again at once, or, when that era was already tried, after `end(min(E, E')) + SKEW`. Resolves with the uids that
- * were delivered (an OK row result); the rest stay pending.
+ * again at once, or, when that era was already tried, after `end(min(E, E')) + SKEW`. Only an OK row result counts
+ * as delivered; a 429, a per-row FULL, a network error or a 5xx leaves the uids pending (the caller retries).
  */
 export async function deliverInvites(
   ctx: DeliverCtx,
   J: P.Join,
   recipients: readonly Recipient[],
-): Promise<Bytes[]> {
+): Promise<InviteResult> {
   const delivered: Bytes[] = [];
+  let retryAfter = 0;
   const order = shuffle(recipients);
   for (let i = 0; i < order.length; i += 32) {
     const batch = order.slice(i, i + 32);
@@ -145,7 +152,9 @@ export async function deliverInvites(
       } catch (e) {
         const era = e instanceof ApiError && e.status === 409 ? e.body?.era : undefined;
         if (typeof era !== "number" || !Number.isInteger(era)) {
-          if (isTransient(e)) break; // pending: retried by M6c's delivery queue
+          if (e instanceof ApiError && e.retryAfter !== null)
+            retryAfter = Math.max(retryAfter, e.retryAfter);
+          if (isTransient(e)) break; // pending: the delivery queue retries
           throw e;
         }
         tried.add(E);
@@ -157,5 +166,5 @@ export async function deliverInvites(
       }
     }
   }
-  return delivered;
+  return { delivered, retryAfter };
 }

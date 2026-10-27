@@ -86,7 +86,6 @@ export class SegvEngine implements Engine {
   /** the session's conversations, once restored */
   private msg: Messaging | null = null;
   queue: Promise<unknown> = Promise.resolve();
-  readonly imageCache = new Map<string, Promise<string>>();
   readonly pending = new Map<string, string>();
   fatal = false;
   /** bumped on logout, so stale async work stops */
@@ -97,6 +96,8 @@ export class SegvEngine implements Engine {
   private inflight = 0;
   /** of those, the ones now waiting on a protocol timer */
   private waiting = 0;
+  /** tracked background work per session generation (work of an ended session no longer counts) */
+  private readonly tracked = new Map<number, number>();
   /** scheduled protocol timers (retries) with their monotonic due time; periodic timers are not here */
   private readonly protocolTimers = new Map<EngineTimer, { due: number; release: () => void }>();
   private live = false;
@@ -206,8 +207,13 @@ export class SegvEngine implements Engine {
     }
   }
 
-  async sendImage(_convId: string, _file: File): Promise<void> {
-    await this.notYet();
+  async sendImage(convId: string, file: File): Promise<void> {
+    this.requireAccount();
+    try {
+      await this.messaging().sendImage(convId, file);
+    } catch (e) {
+      this.patch({ error: message(e) });
+    }
   }
 
   async addMembers(_convId: string, _handles: string[]): Promise<void> {
@@ -222,8 +228,9 @@ export class SegvEngine implements Engine {
     await this.notYet();
   }
 
-  loadImage(_img: ImageRef): Promise<string> {
-    return Promise.reject(new UserError(NOT_YET));
+  loadImage(img: ImageRef): Promise<string> {
+    if (!this.msg) return Promise.reject(new UserError("not signed in"));
+    return this.msg.loadImage(img);
   }
 
   markRead(convId: string): void {
@@ -253,6 +260,11 @@ export class SegvEngine implements Engine {
     return this.msg?.copies ?? new Map();
   }
 
+  /** decrypted images of the session, by `id.k` */
+  get imageCache(): Map<string, Promise<string>> {
+    return this.msg?.imageCache ?? new Map();
+  }
+
   /** the per-conversation send chains */
   get sendChains(): Map<string, Promise<unknown>> {
     return this.msg?.chains ?? new Map();
@@ -260,12 +272,12 @@ export class SegvEngine implements Engine {
 
   /** Busy work: in-flight actions plus scheduled protocol timers (the harness's settle waits for 0). */
   get busy(): number {
-    return this.inflight + this.protocolTimers.size;
+    return this.inflight + (this.tracked.get(this.generation) ?? 0) + this.protocolTimers.size;
   }
 
   /** In-flight work that is not just waiting on a protocol timer (settle ticks the clocks when this is 0). */
   get busyActions(): number {
-    return Math.max(0, this.inflight - this.waiting);
+    return Math.max(0, this.inflight + (this.tracked.get(this.generation) ?? 0) - this.waiting);
   }
 
   /** The monotonic due time of the earliest protocol timer, or null. */
@@ -392,8 +404,9 @@ export class SegvEngine implements Engine {
 
   /** Counts background work as in flight until it settles (the harness's settle waits for it). */
   private track<T>(p: Promise<T>): Promise<T> {
-    this.inflight++;
-    return p.finally(() => this.inflight--);
+    const gen = this.generation;
+    this.tracked.set(gen, (this.tracked.get(gen) ?? 0) + 1);
+    return p.finally(() => this.tracked.set(gen, (this.tracked.get(gen) ?? 1) - 1));
   }
 
   /** §11.1 step 2: the account must be registered with exactly the keys the unlocked AK derives. */
@@ -477,7 +490,6 @@ export class SegvEngine implements Engine {
     this.msg?.stop();
     this.msg = null;
     this.pending.clear();
-    this.imageCache.clear();
     this.critical = [];
     this.noise.clear();
     this.live = false;

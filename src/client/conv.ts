@@ -107,6 +107,8 @@ export interface Copy {
   ready: Promise<void>;
   /** the initial history was loaded (§11.4 step 6) */
   history: boolean;
+  /** members (b64u uid) whose LEAVE row was seen in this copy (a WELCOME never goes to them, §6.12 step 1) */
+  leaves: Set<string>;
 }
 
 /** The fold key of a copy: (conv, root). */
