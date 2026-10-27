@@ -1,4 +1,4 @@
-// Scrollback (docs/PROTOCOL-v2.md §11.10): when a conversation is opened, older rows of each lane are loaded until
+// Scrollback (docs/PROTOCOL.md §11.10): when a conversation is opened, older rows of each lane are loaded until
 // the view holds VIEW_MESSAGES messages or the history is exhausted, once per copy and session; below the first row
 // of an epoch the walk continues in the copy's previous held epoch, whose lane heads are found first (never from the
 // cuts of the claim that ended it). The initial history of a restore (§11.4 step 6) takes its rows the same way.

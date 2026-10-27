@@ -1,5 +1,5 @@
 /**
- * RPC contracts of the v2 Durable Objects (docs/PROTOCOL-v2.md §9) and the stubs the Worker uses to reach
+ * RPC contracts of the v2 Durable Objects (docs/PROTOCOL.md §9) and the stubs the Worker uses to reach
  * them. Everything crosses the RPC boundary by structured clone (Uint8Array included).
  *
  * Object names (the DO derives (E, i) from ctx.id.name, §9):

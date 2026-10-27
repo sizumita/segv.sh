@@ -1,4 +1,4 @@
-// Integrity (docs/PROTOCOL-v2.md §12): the checkpoint pinned per browser and verified on every catch-up (rewrite and
+// Integrity (docs/PROTOCOL.md §12): the checkpoint pinned per browser and verified on every catch-up (rewrite and
 // rollback, persisted in localStorage), the session map of verified checkpoints that the `ck` split-view check reads,
 // the immutability of every row this session saw, and receipts. Lane omission (`prev` / `prevh`) is checked where
 // rows are applied (messaging.ts) with the texts defined here. Every finding is a sticky critical warning; nothing is

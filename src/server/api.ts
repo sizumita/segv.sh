@@ -1,5 +1,5 @@
 /**
- * HTTP + WebSocket API (docs/PROTOCOL-v2.md §10). Plain fetch, no Qwik; the Worker entry routes every /api/*
+ * HTTP + WebSocket API (docs/PROTOCOL.md §10). Plain fetch, no Qwik; the Worker entry routes every /api/*
  * path here. Every endpoint is under /api/v2/; any other /api/* path is a 404.
  *
  * Everything the server stores is public and writes are anonymous: abuse control is proof of work plus

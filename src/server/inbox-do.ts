@@ -1,5 +1,5 @@
 /**
- * InboxDO — one era of the global inbox of sealed invites (docs/PROTOCOL-v2.md §9.3, §10.5).
+ * InboxDO — one era of the global inbox of sealed invites (docs/PROTOCOL.md §9.3, §10.5).
  * Name "inbox/v2/{E}/{g}" (stage 1: g = 0, bucket 0); (E, g) come from ctx.id.name. SQLite-backed.
  *
  *  - Slot clock: D = Δin·1000 and ms = now − T0. Readers see `closed = max(⌊ms/D⌋, closed_hw)`; a new row gets

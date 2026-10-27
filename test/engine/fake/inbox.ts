@@ -1,5 +1,5 @@
 /**
- * InboxDO fake (docs/PROTOCOL-v2.md §9.3), one per era, bucket 0 only (β = 0). It reads the world's *inbox* clock
+ * InboxDO fake (docs/PROTOCOL.md §9.3), one per era, bucket 0 only (β = 0). It reads the world's *inbox* clock
  * (`now − inboxLagMs`); the Worker's checks in front of it (era bounds, 410) read the world clock.
  *
  * With `D = Δin · 1000`, `ms = now − T0` and a per-row jitter j ∈ [0, D) (0 unless `inboxJitter` sets it):

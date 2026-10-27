@@ -1,5 +1,5 @@
 /**
- * Server-side shape checks of the signed directory JSON (docs/PROTOCOL-v2.md §1.2, §2.2, §2.4, §10.6).
+ * Server-side shape checks of the signed directory JSON (docs/PROTOCOL.md §1.2, §2.2, §2.4, §10.6).
  * Signatures are checked separately with WebCrypto.
  */
 import {

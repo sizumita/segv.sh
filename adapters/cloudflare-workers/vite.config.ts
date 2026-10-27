@@ -20,7 +20,8 @@ export default extendConfig(baseConfig, () => {
         // workerd treats every export of the main module as a handler or Durable Object class, and
         // Qwik's optimizer forces preserveEntrySignatures "allow-extension" on SSR builds, which can
         // re-export shared chunks' symbols from the entry ("Incorrect type for map entry ..."). Keep
-        // the entry's exports exactly what the source declares: `default` and `LogDO`.
+        // the entry's exports exactly what the source declares: `default` and the Durable Object classes
+        // (ShardDO, BlobRegDO, InboxDO, RealtimeDO, CheckpointDO).
         name: "segv:strict-worker-entry",
         enforce: "post",
         options(opts: Record<string, unknown>) {

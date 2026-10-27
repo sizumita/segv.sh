@@ -1,4 +1,4 @@
-// The J delivery queue (docs/PROTOCOL-v2.md §6.11, §6.12): every recipient of a creation or a commit gets J by a
+// The J delivery queue (docs/PROTOCOL.md §6.11, §6.12): every recipient of a creation or a commit gets J by a
 // WELCOME in a qualifying 1:1 or by an inbox invite; a creation's (or commit's) first attempt ends with one padded
 // DELIVERED row, later successes add further rows; pending recipients are retried with back-off (10 s doubling to
 // 10 min, honouring `retry-after`) with one noise warning each; and unfinished deliveries of the account, found in

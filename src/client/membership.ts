@@ -1,4 +1,4 @@
-// Processing a copy's membership (docs/PROTOCOL-v2.md §6.6, §6.8, §6.9, §11.2, §11.9): the final winning claim of an
+// Processing a copy's membership (docs/PROTOCOL.md §6.6, §6.8, §6.9, §11.2, §11.9): the final winning claim of an
 // epoch (removed, frozen, or the switch to e+1 with its sweep and carried leaves), the leave sources of others, the
 // §6.8 decisions taken again whenever a claim is learned, and the system lines, of which the removal, rotation and
 // "@x left" lines follow the current leave state.

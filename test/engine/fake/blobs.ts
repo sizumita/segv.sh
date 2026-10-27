@@ -1,5 +1,5 @@
 /**
- * BlobRegDO fake (docs/PROTOCOL-v2.md §8.2, §9.2) and the R2 blob store (§10.7).
+ * BlobRegDO fake (docs/PROTOCOL.md §8.2, §9.2) and the R2 blob store (§10.7).
  *
  * BlobReg: create-only `id → {t, size}` with `t = max(tpub(now), last_t, tpub(hw), closed_t + Δ)`, the high-water
  * mark `hw` raised by every MISS, and the batch head chain (leaves ordered by H(id)). It reads the world clock

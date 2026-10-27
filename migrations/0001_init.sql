@@ -1,4 +1,4 @@
--- segv.sh D1 schema: the directory (docs/PROTOCOL-v2.md §9.6). Authoritative: there is no outbox and no log fallback.
+-- segv.sh D1 schema: the directory (docs/PROTOCOL.md §9.6). Authoritative: there is no outbox and no log fallback.
 -- Binary values are stored as base64url TEXT; dirseq = the dirlog seq of the row.
 
 -- One row per registered account (the exact signed bundle text and its signature).

@@ -1,4 +1,4 @@
-/** RealtimeDO (docs/PROTOCOL-v2.md §9.4, §10.8): HELLO, SUB / UNSUB / RESUME, publish, limits, caps, max age, hibernation. */
+/** RealtimeDO (docs/PROTOCOL.md §9.4, §10.8): HELLO, SUB / UNSUB / RESUME, publish, limits, caps, max age, hibernation. */
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";

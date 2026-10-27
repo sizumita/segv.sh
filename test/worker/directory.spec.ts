@@ -1,5 +1,5 @@
 /**
- * The v2 D1 directory (docs/PROTOCOL-v2.md §2.4–§2.5, §9.6, §10.6; docs/STAGE1-PLAN.md M3), calling
+ * The v2 D1 directory (docs/PROTOCOL.md §2.4–§2.5, §9.6, §10.6; docs/STAGE1-PLAN.md M3), calling
  * src/server/directory.ts directly inside workerd (the HTTP layer is tested separately).
  */
 import { env } from "cloudflare:workers";

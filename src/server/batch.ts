@@ -1,5 +1,5 @@
 /**
- * Batch commitments and alarm discipline shared by the ShardDO and the BlobRegDO (docs/PROTOCOL-v2.md §9 intro,
+ * Batch commitments and alarm discipline shared by the ShardDO and the BlobRegDO (docs/PROTOCOL.md §9 intro,
  * §9.1 "Batches", §9.2).
  *
  * Both objects keep the same meta keys: 'last_t' (largest t ever assigned), 'open_t' (t of the open batch; absent =

@@ -1,5 +1,5 @@
 /**
- * ShardDO fake (docs/PROTOCOL-v2.md §9.1): one in-memory shard per era, keyed by (E, label).
+ * ShardDO fake (docs/PROTOCOL.md §9.1): one in-memory shard per era, keyed by (E, label).
  *
  * Mirrors the DO's rules: create-only rows, the accept window `start(E) − SKEW ≤ now < end(E)`, sealing at
  * `end(E) + SKEW` (plus the test knob `sealDelayMs`, or `sealPrevious()`), `t = max(tpub(now), last_t,

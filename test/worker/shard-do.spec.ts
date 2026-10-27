@@ -1,5 +1,5 @@
 /**
- * ShardDO (docs/PROTOCOL-v2.md §9.1, plan M2): CAS, BAD, WRONG_ERA, sealing, batches and the head chain, feed
+ * ShardDO (docs/PROTOCOL.md §9.1, plan M2): CAS, BAD, WRONG_ERA, sealing, batches and the head chain, feed
  * paging (feedBatches / feedRows, which never close a due batch), monotonic t (IMP-7), early acceptance at the SKEW
  * boundary, identity and alarm discipline (an ended era arms nothing), the pinned Δ, and batches of thousands of
  * rows (closeBatch never reads a body; feed results stay within budget).

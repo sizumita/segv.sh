@@ -1,4 +1,4 @@
-// Accounts (docs/PROTOCOL-v2.md §2.4–§2.5): register, passkey and recovery login, adding a passkey, and unwrapFrom.
+// Accounts (docs/PROTOCOL.md §2.4–§2.5): register, passkey and recovery login, adding a passkey, and unwrapFrom.
 // Ported from v1's engine (3de5f5e:src/client/engine.ts) with the v2 directory lookups.
 import * as P from "~/lib/proto";
 import { ApiError, isTransient, type Api, type DirWrapJson, type Progress } from "./api";

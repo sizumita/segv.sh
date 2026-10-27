@@ -48,9 +48,9 @@ export default defineConfig(({ command, mode }) => {
         "qwik/scope-use-task": "error",
       },
     },
-    // docs/PROTOCOL-v2.md and docs/STAGE1-PLAN.md are verbatim copies owned by the spec author (overwritten
+    // docs/PROTOCOL.md and docs/STAGE1-PLAN.md are verbatim copies owned by the spec author (overwritten
     // with cp on every revision), so they are never reformatted here.
-    fmt: { ignorePatterns: ["worker-configuration.d.ts", "dist/**", "server/**", "docs/PROTOCOL-v2.md", "docs/STAGE1-PLAN.md"] },
+    fmt: { ignorePatterns: ["worker-configuration.d.ts", "dist/**", "server/**", "docs/PROTOCOL.md", "docs/STAGE1-PLAN.md"] },
     // lazyPlugins: factories are skipped by `vp lint` / `vp fmt` / `vp check`.
     // `vp test`: unit tests (pure TS, Node) + Workers-runtime tests (test/worker/vitest.config.ts).
     test: {

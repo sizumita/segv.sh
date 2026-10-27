@@ -1,4 +1,4 @@
-// Test suite for the core of src/lib/proto.ts (protocol v2, stage 1, docs/PROTOCOL-v2.md): everything above the
+// Test suite for the core of src/lib/proto.ts (protocol v2, stage 1, docs/PROTOCOL.md): everything above the
 // "conversation codecs" banner. The codecs below the banner are tested in proto-conv.test.ts.
 //
 // Layout (as in proto.test.ts):

@@ -1,5 +1,5 @@
 /**
- * ShardDO — one era's create-only row store (docs/PROTOCOL-v2.md §9.1). Name "shard/v2/{E}/{i}" (stage 1: i = 0).
+ * ShardDO — one era's create-only row store (docs/PROTOCOL.md §9.1). Name "shard/v2/{E}/{i}" (stage 1: i = 0).
  *
  *  - put: H(body) of every well-formed row is computed natively (crypto.subtle) first; then one synchronous
  *    transactionSync per call (no await inside): prepare(), the accept window start(E) − SKEW ≤ now < end(E), FULL

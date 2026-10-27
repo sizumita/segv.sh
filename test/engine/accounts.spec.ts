@@ -1,4 +1,4 @@
-// Accounts (docs/PROTOCOL-v2.md §2.4–§2.5, §11.1; docs/STAGE1-PLAN.md §3 rows 1–10): wraps filed under someone
+// Accounts (docs/PROTOCOL.md §2.4–§2.5, §11.1; docs/STAGE1-PLAN.md §3 rows 1–10): wraps filed under someone
 // else's public id, the registration's lost response, passkeys without PRF, a second passkey, and "remember this
 // device" without IndexedDB, ported from v1 (3de5f5e:test/engine/accounts.spec.ts); plus the v2 account check and
 // the registration's first self row. WebAuthn is replaced by an in-memory authenticator (credential id → uid + PRF).

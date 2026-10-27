@@ -1,4 +1,4 @@
-// Links (docs/PROTOCOL-v2.md §4.3, §5.5, §7.2): the owner's LINK records, the `Tlink` subscriptions and the hello
+// Links (docs/PROTOCOL.md §4.3, §5.5, §7.2): the owner's LINK records, the `Tlink` subscriptions and the hello
 // probing (every era of a link's lifetime up to the first MISS), one-shot and expiry; and the opener's hello, put at
 // the first empty slot of the era. The engine implements links internally: there is no link UI and no Engine method
 // in stage 1 (§11.11, §14).

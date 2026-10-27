@@ -1,4 +1,4 @@
-// Creating a conversation (docs/PROTOCOL-v2.md §6.1) and delivering J by inbox invites (§6.12 steps 2–4). M6b posts
+// Creating a conversation (docs/PROTOCOL.md §6.1) and delivering J by inbox invites (§6.12 steps 2–4). M6b posts
 // every J as a batched inbox invite with the 409 rebuild and writes the DELIVERED row after the first attempts;
 // WELCOMEs, retries with back-off and resume land with M6c.
 import * as P from "~/lib/proto";

@@ -1,4 +1,4 @@
-// The registration's inbox cursor and the self lane's era floor (docs/PROTOCOL-v2.md §7.3, §11.1, §11.5 step 1; the
+// The registration's inbox cursor and the self lane's era floor (docs/PROTOCOL.md §7.3, §11.1, §11.5 step 1; the
 // spec session's answer R9-1): the cursor comes from the register response's server time, minus SKEW, once; and no
 // self row is written below the registration era.
 import { describe, expect, it, vi } from "vite-plus/test";

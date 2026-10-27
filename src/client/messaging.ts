@@ -1,4 +1,4 @@
-// One session's conversations (docs/PROTOCOL-v2.md §6.1, §6.7, §6.12, §7.3, §11.2–§11.8): the copies restored from
+// One session's conversations (docs/PROTOCOL.md §6.1, §6.7, §6.12, §7.3, §11.2–§11.8): the copies restored from
 // the self lane, catch-up, the inbox and its joins, creation, sending, requests and their acceptance, realtime
 // routing, HEADS writes and the views. The engine (engine.ts) owns accounts and the session lifecycle and creates one
 // Messaging per unlocked session.

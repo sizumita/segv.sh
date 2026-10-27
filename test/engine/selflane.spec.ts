@@ -1,4 +1,4 @@
-// The self-lane fold (docs/PROTOCOL-v2.md §7.3): every record type's rule, copy view keys in lane order, the
+// The self-lane fold (docs/PROTOCOL.md §7.3): every record type's rule, copy view keys in lane order, the
 // CONFIRMED rule, the REQUEST bounds, LEFT's least key, and pin mismatches.
 import { describe, expect, it } from "vite-plus/test";
 import { CONFIRMED_COPY_WARNING, SelfFold, copyKey, leftKeyCmp } from "../../src/client/selflane";

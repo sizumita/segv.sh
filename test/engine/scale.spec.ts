@@ -52,13 +52,26 @@ function noiseHits(w: FakeWorld, n: Noise): number {
   return hits;
 }
 
-/** Requests of one client since index `from`, without inbox and checkpoint requests. */
-function measured(w: FakeWorld, who: string, from: number) {
-  const rs = w.requests
-    .slice(from)
+/**
+ * Requests of one client since index `from`, without inbox and checkpoint requests, and, when `self` is given,
+ * without the probes of that account's own self lane (its length depends on how many HEADS rows the account wrote
+ * while settling, which timing decides, not the noise).
+ */
+function measured(w: FakeWorld, who: string, from: number, self?: TestUser, untilLive = false) {
+  const selfLabels = new Set<string>();
+  if (self)
+    for (let E = w.era - 1; E <= w.era; E++)
+      for (let n = 0; n < 512; n++) selfLabels.add(P.b64u(P.Lself(self.id.rS, E, n)));
+  const all = w.requests.slice(from).filter((r) => r.who === who);
+  // The restore ends where the session goes live: its realtime socket opens (§11.4 step 9).
+  const live = untilLive ? all.findIndex((r) => r.path === "/api/v2/rt") : -1;
+  const rs = (live >= 0 ? all.slice(0, live) : all)
     .filter(
       (r: FakeRequest) =>
-        r.who === who && !r.path.startsWith("/api/v2/inbox") && !r.path.startsWith("/api/v2/ckpt"),
+        r.who === who &&
+        !r.path.startsWith("/api/v2/inbox") &&
+        !r.path.startsWith("/api/v2/ckpt") &&
+        !(r.getKeys && r.getKeys.length > 0 && r.getKeys.every((k) => selfLabels.has(P.b64u(k.label)))),
     );
   return { count: rs.length, bytes: rs.reduce((n, r) => n + r.resBytes, 0), rs };
 }
@@ -94,7 +107,7 @@ describe("T1: the client never downloads the log", () => {
       await A.logout();
       const from = w.requests.length;
       const A2 = await restoreOnly(alice);
-      const restore = measured(w, "alice", from);
+      const restore = measured(w, "alice", from, alice, true);
       for (let i = 0; i < 20; i++) await A2.sendText(id, `more ${i}`);
       await settle(A2, B);
       return {
@@ -106,11 +119,9 @@ describe("T1: the client never downloads the log", () => {
     const clean = await run(false);
     const noisy = await run(true);
     expect(noisy.hits).toBe(0);
-    // The self lane's own length (HEADS rows written while settling) depends on timing, not on the noise: it may
-    // cost one more gallop round (W = 8 slots) of the self-lane probe in either world.
-    expect(Math.abs(noisy.restore.count - clean.restore.count)).toBeLessThanOrEqual(1);
+    expect(noisy.restore.count).toBe(clean.restore.count);
     expect(Math.abs(noisy.restore.bytes - clean.restore.bytes)).toBeLessThanOrEqual(
-      clean.restore.bytes * 0.05,
+      clean.restore.bytes * 0.02,
     );
     // bob's MEMBER record is in the self lane: no prefix lookup, no dirlog read, only the own uid lookup
     expect(noisy.dir.every((p) => p.startsWith("/api/v2/dir/uid/"))).toBe(true);

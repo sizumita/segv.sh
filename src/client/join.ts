@@ -1,4 +1,4 @@
-// Accepting a join (docs/PROTOCOL-v2.md §6.7) from an inbox invite or a WELCOME: the bundle checks in their order
+// Accepting a join (docs/PROTOCOL.md §6.7) from an inbox invite or a WELCOME: the bundle checks in their order
 // (size, meta, then the blob), duplicates, settling the held copies (a pending claim parks the join), the fits
 // ("Claimed" is ignored, "Skip" re-adds a removed copy), and otherwise a first contact or a separate copy.
 import * as P from "~/lib/proto";

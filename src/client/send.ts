@@ -1,4 +1,4 @@
-// Sending a row on one's own lane (docs/PROTOCOL-v2.md §11.3): the control probe before every send, the processing
+// Sending a row on one's own lane (docs/PROTOCOL.md §11.3): the control probe before every send, the processing
 // wait, the refusals (removed, left, frozen with a removal, a WELCOME that no longer qualifies), the rotation after a
 // leave, the slot (never below the lane head's era), the fresh-probe check after the proof of work, and the handling
 // of OK, CONFLICT, WRONG_ERA and lost answers, with the late-row rule. TEXT, IMAGE, LEAVE and WELCOME use this path.

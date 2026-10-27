@@ -1,4 +1,4 @@
-// Conversation copies as this device holds them (docs/PROTOCOL-v2.md §11.2): epochs, lanes and positions, the
+// Conversation copies as this device holds them (docs/PROTOCOL.md §11.2): epochs, lanes and positions, the
 // message list in the order of §11.8, names (§5.1) and the view the UI renders. Pure state: the probing, sending and
 // joining modules change it, and the engine builds views from it.
 import * as P from "~/lib/proto";

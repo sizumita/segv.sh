@@ -1,4 +1,4 @@
-// The self lane (docs/PROTOCOL-v2.md §7): the fold of the account's device-state records (§7.3), the dense probe
+// The self lane (docs/PROTOCOL.md §7): the fold of the account's device-state records (§7.3), the dense probe
 // that reads the lane at restore and catch-up (§11.4 step 4), and CAS writes at the first empty slot (§7.3).
 import * as P from "~/lib/proto";
 import type * as W from "~/lib/wire";

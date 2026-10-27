@@ -1,5 +1,5 @@
 // End-to-end test: production build + `wrangler dev` + headless Chromium with virtual passkeys (PRF), on protocol v2
-// (docs/PROTOCOL-v2.md; docs/STAGE1-PLAN.md §5). The steps are those of milestone M6b; M6c adds images and
+// (docs/PROTOCOL.md; docs/STAGE1-PLAN.md §5). The steps are those of milestone M6b; M6c adds images and
 // scrollback, M7 removing and leaving.
 //
 //   npm run test:e2e              # build, then test

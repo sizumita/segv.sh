@@ -1,7 +1,7 @@
 /**
- * HTTP + WebSocket API v2 tests (docs/PROTOCOL-v2.md §9.7, §10, §12.5) against ../entry.ts inside workerd,
- * ported section by section from ../api.spec.ts (docs/STAGE1-PLAN.md M4). Tests that need to observe or
- * replace a binding call handleApi directly (helpers.direct) with a spied or fake namespace.
+ * HTTP + WebSocket API v2 tests (docs/PROTOCOL.md §9.7, §10, §12.5) against ../entry.ts inside workerd
+ * (docs/STAGE1-PLAN.md M4). Tests that need to observe or replace a binding call handleApi directly
+ * (helpers.direct) with a spied or fake namespace.
  */
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";

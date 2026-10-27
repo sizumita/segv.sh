@@ -1,4 +1,4 @@
-// The control lane (docs/PROTOCOL-v2.md §6.4–§6.6): three-valued e-validity in the order of requests of §6.4, the
+// The control lane (docs/PROTOCOL.md §6.4–§6.6): three-valued e-validity in the order of requests of §6.4, the
 // winner (the first e-valid row with every earlier slot decided), its finality across eras (§6.5), and the state
 // machine that drives a copy's control lane to a processed final winner. Processing the winner (removed, frozen, or
 // the switch to e+1) is the caller's (messaging.ts), which needs the sweep, the lines and the topics.

@@ -1,5 +1,5 @@
 /**
- * CheckpointDO — the signed checkpoint chain over the heads of the public data (docs/PROTOCOL-v2.md §9.5, §10.9,
+ * CheckpointDO — the signed checkpoint chain over the heads of the public data (docs/PROTOCOL.md §9.5, §10.9,
  * §12.3). One instance, "ckpt/v2".
  *
  *  - An alarm runs tick() every 60 s and is re-armed in the same synchronous block as the tick's commit. The

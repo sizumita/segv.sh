@@ -1,4 +1,4 @@
-/** Abuse control: proof of work (docs/PROTOCOL-v2.md §10.2) and per-IP rate limiting. Nothing here is persisted. */
+/** Abuse control: proof of work (docs/PROTOCOL.md §10.2) and per-IP rate limiting. Nothing here is persisted. */
 import { HMAC, POW_WINDOW_MS, hex, powCheck, powDifficulty, powPre, utf8, type PowScope } from "../lib/proto";
 import { HttpError, logErr } from "./http";
 

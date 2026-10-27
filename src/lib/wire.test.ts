@@ -1,4 +1,4 @@
-// Test suite for src/lib/wire.ts: the binary layouts of the v2 API (docs/PROTOCOL-v2.md §10.3–§10.5, §10.8, §10.9).
+// Test suite for src/lib/wire.ts: the binary layouts of the v2 API (docs/PROTOCOL.md §10.3–§10.5, §10.8, §10.9).
 //
 //   1. layouts — every codec against bytes built by hand from the spec's layout (independent of the encoders).
 //   2. round trips — every request, response, result kind, status and frame.

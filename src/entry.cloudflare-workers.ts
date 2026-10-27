@@ -14,7 +14,7 @@ import render from "./entry.ssr";
 import { handleApi, stampResponse } from "./server/api";
 import { pinHost } from "./server/hosts";
 
-// Durable Object classes must be exported from the Worker's main module (docs/PROTOCOL-v2.md §9): per-era
+// Durable Object classes must be exported from the Worker's main module (docs/PROTOCOL.md §9): per-era
 // shards and inboxes, the blob registry, realtime WebSockets and checkpoints.
 export { ShardDO } from "./server/shard-do";
 export { BlobRegDO } from "./server/blobreg-do";

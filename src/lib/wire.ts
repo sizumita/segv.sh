@@ -1,4 +1,4 @@
-// Binary request / response layouts of the v2 API (docs/PROTOCOL-v2.md §10.3–§10.5, §10.8, §10.9).
+// Binary request / response layouts of the v2 API (docs/PROTOCOL.md §10.3–§10.5, §10.8, §10.9).
 // Shared by the Worker, the client and the engine test fake, so none of them can drift from the spec.
 // Every decoder is strict: exact lengths, known enums, counts within limits, no trailing bytes.
 // Keep this file free of DOM / Workers APIs.

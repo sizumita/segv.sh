@@ -1,4 +1,4 @@
-// HTTP client for the v2 API (docs/PROTOCOL-v2.md §10): params with their §3.1 bounds, the server-time estimate
+// HTTP client for the v2 API (docs/PROTOCOL.md §10): params with their §3.1 bounds, the server-time estimate
 // from clock samples (§10.1), proof of work (§10.2), the binary put and get (§10.3, §10.4), and the directory (§10.6).
 // One instance per engine: the transport and the clock come from the engine's options.
 import * as P from "~/lib/proto";

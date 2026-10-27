@@ -1,5 +1,5 @@
 /**
- * CheckpointDO fake (docs/PROTOCOL-v2.md §9.5, §12.3). There is no alarm: `tick()` stands for the DO's 60 s alarm
+ * CheckpointDO fake (docs/PROTOCOL.md §9.5, §12.3). There is no alarm: `tick()` stands for the DO's 60 s alarm
  * (tests and `settle` call it). It does nothing until at least CKPT_PERIOD_MS of world clock have passed since the
  * last checkpoint, so q grows at most once per 60 s as in production (§12.3 step 4 relies on it); then it collects
  * the heads and signs a new checkpoint when `hd` changed, with sec = max(secOf(now), previous sec).

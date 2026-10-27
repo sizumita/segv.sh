@@ -1,5 +1,5 @@
 /**
- * The D1 directory fake (docs/PROTOCOL-v2.md §2.4, §9.6, §10.6): users, wrap records and the dirlog chain, with
+ * The D1 directory fake (docs/PROTOCOL.md §2.4, §9.6, §10.6): users, wrap records and the dirlog chain, with
  * the server's validation (canonical signed JSON, signatures, checkUserKeys, 409 on a taken handle / uid / wrap,
  * 64 wraps per uid) and the prefix lookups (`p ≤ min(32, P + 1)`, ordered by uid, 256 per page).
  *

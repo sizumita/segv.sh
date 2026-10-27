@@ -1,5 +1,5 @@
 /**
- * Deployment parameters and server secrets for the v2 API (docs/PROTOCOL-v2.md §3.1, §4.4, §9.5, §9.7).
+ * Deployment parameters and server secrets for the v2 API (docs/PROTOCOL.md §3.1, §4.4, §9.5, §9.7).
  *
  * Vars (wrangler.jsonc "vars", strings): DELTA_S (Δ), SKEW_S (SKEW), INBOX_SLOT_S (Δin), E_FIRST. A var that is
  * present but invalid (not decimal, out of range, or a Δ that does not divide 604 800) makes the Worker answer

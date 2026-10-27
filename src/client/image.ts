@@ -1,5 +1,5 @@
 // Re-encodes an image through a canvas before encryption. This strips EXIF/GPS and other metadata,
-// normalises orientation, and bounds the size (docs/PROTOCOL-v2.md §8.1). Browser only.
+// normalises orientation, and bounds the size (docs/PROTOCOL.md §8.1). Browser only.
 const MAX_SIDE = 2048;
 const MAX_BYTES = 8 * 1024 * 1024;
 

@@ -1,5 +1,5 @@
 /**
- * FakeWorld: an in-memory stand-in for the segv.sh v2 Worker and its components (docs/PROTOCOL-v2.md §9–§10,
+ * FakeWorld: an in-memory stand-in for the segv.sh v2 Worker and its components (docs/PROTOCOL.md §9–§10,
  * docs/STAGE1-PLAN.md §2.1), served through `fetch` and `FakeWebSocket`. Binary bodies are decoded and encoded
  * with the same `src/lib/wire.ts` codecs as the Worker, and commitments come from `src/lib/proto.ts`, so the fake
  * cannot drift from the wire format.

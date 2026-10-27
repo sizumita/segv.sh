@@ -1,5 +1,5 @@
 /**
- * RealtimeDO — topic-filtered delivery of published rows over hibernatable WebSockets (docs/PROTOCOL-v2.md §9.4,
+ * RealtimeDO — topic-filtered delivery of published rows over hibernatable WebSockets (docs/PROTOCOL.md §9.4,
  * §10.8). One instance, "rt/v2/0". Storage holds only `meta` ('ws-tag-key'); nothing about topics, subscriptions
  * or rows is ever persisted (§13.1).
  *

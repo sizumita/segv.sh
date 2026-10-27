@@ -1,4 +1,4 @@
-// The inbox (docs/PROTOCOL-v2.md §10.5, §11.5): the cursor rules. The poll and trial decryption land with M6b.
+// The inbox (docs/PROTOCOL.md §10.5, §11.5): the cursor rules. The poll and trial decryption land with M6b.
 import * as P from "~/lib/proto";
 
 /** An inbox cursor (Ein, relIn): every row of era E with rel ≤ relIn has been processed (§7.2 HEADS, §11.5). */

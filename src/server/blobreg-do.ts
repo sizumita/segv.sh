@@ -1,5 +1,5 @@
 /**
- * BlobRegDO — the create-only blob registry (docs/PROTOCOL-v2.md §8.2, §9.2). One instance, "blobreg/v2".
+ * BlobRegDO — the create-only blob registry (docs/PROTOCOL.md §8.2, §9.2). One instance, "blobreg/v2".
  *
  *  - register(id, size): the first registration wins forever. A new one gets
  *    t = max(tpub(now), last_t, tpub(hw), closed_t + Δ) and joins the open Δ batch (batch.ts, like the shard).

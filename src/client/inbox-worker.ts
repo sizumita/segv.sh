@@ -1,4 +1,4 @@
-// The inbox trial-decryption Web Worker (docs/PROTOCOL-v2.md §11.5 step 2): one X-Wing decapsulation per invite, off
+// The inbox trial-decryption Web Worker (docs/PROTOCOL.md §11.5 step 2): one X-Wing decapsulation per invite, off
 // the page's thread. Messages: {id, kemSk, E, rows: [{eid, body}]} → {id, out: (J bytes | 0 malformed | null)[]}.
 import * as P from "~/lib/proto";
 

@@ -1,4 +1,4 @@
-// Committing epoch e+1 (docs/PROTOCOL-v2.md §6.3): an add, a removal, a rotation after a leave, or a rename. The
+// Committing epoch e+1 (docs/PROTOCOL.md §6.3): an add, a removal, a rotation after a leave, or a rename. The
 // blob first (continuing members' kemPk from the previous bundle, never from the directory), EPOCH_PENDING, the wait
 // for the commit time, the re-check and cuts, the CAS loop with every outcome, the decide step, the switch, and the
 // first delivery of J to the added members.

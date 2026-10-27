@@ -1,6 +1,6 @@
 /**
  * Shared types of the FakeWorld components (test/engine/fake/*). Each component models one server part of
- * docs/PROTOCOL-v2.md §9 and talks to the rest of the world only through `WorldCtx`.
+ * docs/PROTOCOL.md §9 and talks to the rest of the world only through `WorldCtx`.
  */
 import type { Bytes } from "../../../src/lib/proto";
 

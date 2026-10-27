@@ -1,4 +1,4 @@
-// The segv.sh client engine (docs/PROTOCOL-v2.md §11): unlocks the account key with a passkey (PRF) or the recovery
+// The segv.sh client engine (docs/PROTOCOL.md §11): unlocks the account key with a passkey (PRF) or the recovery
 // code, checks the account against the directory, restores the account's state from its self lane, and turns it into
 // the view the UI renders. Browser only: the UI imports it dynamically (src/components/engine-loader.ts).
 //

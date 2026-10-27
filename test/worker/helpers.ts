@@ -1,5 +1,5 @@
 /**
- * Shared helpers for the v2 Workers-runtime tests (docs/PROTOCOL-v2.md §10). Binary bodies are built and
+ * Shared helpers for the v2 Workers-runtime tests (docs/PROTOCOL.md §10). Binary bodies are built and
  * parsed with the production codecs of src/lib/wire.ts, so the tests cannot drift from the Worker.
  */
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";

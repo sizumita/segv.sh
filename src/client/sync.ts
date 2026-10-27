@@ -1,4 +1,4 @@
-// Probing and processing conversation lanes (docs/PROTOCOL-v2.md §4.2, §6.5, §11.2, §11.4 step 5, §11.6): one batched
+// Probing and processing conversation lanes (docs/PROTOCOL.md §4.2, §6.5, §11.2, §11.4 step 5, §11.6): one batched
 // `get` per round over every lane asked for, dense prefixes from each lane's processed position, galloping by W on
 // full hits, one key per idle era, and the slot after an earlier era's prefix kept until it is observed sealed.
 import * as P from "~/lib/proto";

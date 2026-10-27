@@ -1,5 +1,5 @@
 // segv.sh protocol v2 (stage 1) — shared by the browser client, the Worker, the Durable Objects and the
-// tests. Byte-exact implementation of docs/PROTOCOL-v2.md. Keep this file free of DOM / Workers APIs.
+// tests. Byte-exact implementation of docs/PROTOCOL.md. Keep this file free of DOM / Workers APIs.
 //
 // Section map (spec §):
 //   encoding .............. §1.2    primitives ......... §1.1    padding ........... §1.3

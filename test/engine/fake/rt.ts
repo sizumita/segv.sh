@@ -1,5 +1,5 @@
 /**
- * RealtimeDO fake (docs/PROTOCOL-v2.md §9.4, §10.8) and the browser-side `FakeWebSocket` bound to a world.
+ * RealtimeDO fake (docs/PROTOCOL.md §9.4, §10.8) and the browser-side `FakeWebSocket` bound to a world.
  *
  * - On open the server sends HELLO {boot, now, seq = last assigned}.
  * - SUB / UNSUB / RESUME (by seq; only as the first binary frame; installs its topic set even on GAP). RESUME gets

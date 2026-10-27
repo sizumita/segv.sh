@@ -1,4 +1,4 @@
-/** InboxDO (docs/PROTOCOL-v2.md §9.3): slot clock, Δin pin, closed_hw, era end, posts, paging, slot commitments. */
+/** InboxDO (docs/PROTOCOL.md §9.3): slot clock, Δin pin, closed_hw, era end, posts, paging, slot commitments. */
 import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";

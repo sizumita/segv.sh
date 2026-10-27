@@ -1,5 +1,5 @@
 /**
- * The v2 directory in D1 (docs/PROTOCOL-v2.md §2.4–§2.5, §9.6, §10.6).
+ * The v2 directory in D1 (docs/PROTOCOL.md §2.4–§2.5, §9.6, §10.6).
  *
  * Contract used by the HTTP layer (src/server/api.ts). Every function throws HttpError with the status
  * of §10.1 (400 malformed, 404 unknown, 409 conflict / prefix bits out of range, 503 D1 unavailable).

@@ -1,4 +1,4 @@
-// The realtime socket (docs/PROTOCOL-v2.md §10.8, §11.6): SUB / UNSUB / RESUME by seq, HELLO (a clock sample),
+// The realtime socket (docs/PROTOCOL.md §10.8, §11.6): SUB / UNSUB / RESUME by seq, HELLO (a clock sample),
 // ROWS, GAP and RESUMED; ping every 30 s; reconnect with back-off and jitter, at least 60 s after a 1008 or 1013.
 // One socket of up to 256 topics (the second socket of §10.8 is for more than 256 topics, M6c).
 import * as P from "~/lib/proto";

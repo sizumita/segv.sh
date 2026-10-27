@@ -19,7 +19,7 @@
     // API + websocket paths always hit the Worker (never the asset server).
     "run_worker_first": ["/api/*"],
   },
-  // The directory (accounts, key wraps, the dirlog hash chain; docs/PROTOCOL-v2.md §9.6). See migrations/.
+  // The directory (accounts, key wraps, the dirlog hash chain; docs/PROTOCOL.md §9.6). See migrations/.
   "d1_databases": [
     {
       "binding": "DB",
@@ -30,7 +30,7 @@
   ],
   // Client-side-encrypted, content-addressed blobs: key "b/<b64u(sha256(blob))>".
   "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "segv-blobs" }],
-  // docs/PROTOCOL-v2.md §9: SHARD "shard/v2/{E}/{i}" and INBOX "inbox/v2/{E}/{g}" per era, BLOBREG
+  // docs/PROTOCOL.md §9: SHARD "shard/v2/{E}/{i}" and INBOX "inbox/v2/{E}/{g}" per era, BLOBREG
   // "blobreg/v2", RT "rt/v2/0" (realtime WebSockets), CKPT "ckpt/v2" (signed checkpoints every 60 s).
   "durable_objects": {
     "bindings": [
@@ -57,14 +57,14 @@
     { "name": "RL_INBOX", "namespace_id": "1004", "simple": { "limit": 10, "period": 60 } },
   ],
   "vars": {
-    // Proof-of-work base difficulty (leading zero bits) per scope, docs/PROTOCOL-v2.md §10.2. Puts, inbox
+    // Proof-of-work base difficulty (leading zero bits) per scope, docs/PROTOCOL.md §10.2. Puts, inbox
     // posts and blobs need more for larger bodies (proto.powDifficulty).
     "POW_REGISTER": "20",
     "POW_WRAP": "18",
     "POW_PUT": "16",
     "POW_INBOX": "18",
     "POW_BLOB": "18",
-    // Deployment parameters (docs/PROTOCOL-v2.md §3.1, §9.3, §9.7). Treat them as constants of the
+    // Deployment parameters (docs/PROTOCOL.md §3.1, §9.3, §9.7). Treat them as constants of the
     // deployment (the Durable Objects pin Δ and Δin at their first write).
     // DELTA_S = Δ (row time granularity; must divide 604800, else the API answers 503), SKEW_S = bound on
     // clock differences between server components, INBOX_SLOT_S = Δin, E_FIRST = the era of the first deploy

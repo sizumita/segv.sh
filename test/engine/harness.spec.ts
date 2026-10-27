@@ -1,6 +1,6 @@
 /**
  * Self-tests of the FakeWorld (test/engine/fake/) through `fetch` / `WebSocket` with the src/lib/wire.ts codecs,
- * against the semantics of docs/PROTOCOL-v2.md §9–§10 (docs/STAGE1-PLAN.md M5).
+ * against the semantics of docs/PROTOCOL.md §9–§10 (docs/STAGE1-PLAN.md M5).
  */
 import { describe, expect, it } from "vite-plus/test";
 import {
