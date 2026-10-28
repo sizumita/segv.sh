@@ -545,8 +545,10 @@ export class Messaging {
     }
     if (!D || !dsig) return;
     const Dv: P.Descriptor = D;
-    let tReg: number | null = request ? (rec as P.RequestRec).tReg : null;
-    // E_start from an EPOCH_PENDING only when it names this epoch's own bundle
+    // t_reg (E_start, the join line): the bundle's TREG, else the REQUEST or an EPOCH_PENDING naming this bundle, else
+    // one blob/meta (a copy joined before TREG existed; §7.2).
+    let tReg: number | null = f.tregs.get(P.b64u(rec.bundleId)) ?? null;
+    if (tReg === null && request) tReg = (rec as P.RequestRec).tReg;
     if (tReg === null)
       tReg =
         f.pending.find(
@@ -693,8 +695,11 @@ export class Messaging {
     }
     if (!P.equalBytes(D.conv, c.conv) || D.e !== rec.e || !P.verifyD(D, keys.kc, pair.dsig))
       return null;
-    const meta = await this.h.api.blobMeta(rec.bundleId);
-    if (!meta) return null;
+    const tReg =
+      this.h.self.fold.tregs.get(P.b64u(rec.bundleId)) ??
+      (await this.h.api.blobMeta(rec.bundleId))?.t ??
+      null;
+    if (tReg === null) return null;
     const ep = newEpoch({
       e: rec.e,
       EK: rec.EK,
@@ -702,7 +707,7 @@ export class Messaging {
       dsig: pair.dsig,
       bundleId: rec.bundleId,
       bundleSize: rec.bundleSize,
-      tReg: meta.t,
+      tReg,
       pks,
       self: this.h.acc.uid,
     });
@@ -1323,11 +1328,12 @@ export class Messaging {
       }
       return kinds;
     }
-    const records = [...created.flatMap((x) => x.records), ...skips.map((x) => x.record)];
+    // Each join's records (a CONV_JOIN and its TREG, a REQUEST and its MEMBER) stay in one row.
+    const groups = [...created.map((x) => x.records), ...skips.map((x) => [x.record])];
     const heads: P.HeadsRec | null = cursor
       ? { rtype: P.RT.HEADS, Ein: cursor.E, relIn: cursor.rel, entries: [] }
       : null;
-    await this.writeRows(records, heads);
+    await this.writeRows(groups, heads);
     if (cursor) this.cursor = cursor;
     for (const x of created) this.adopt(x);
     for (const x of skips) this.adoptSkip(x);
@@ -1361,20 +1367,22 @@ export class Messaging {
   }
 
   /** Writes records in as few self rows as fit cls 3, `last` in the final row, each after the previous is CAS OK. */
-  private async writeRows(records: P.SelfRecord[], last: P.SelfRecord | null): Promise<void> {
+  /**
+   * Writes groups of records in as few self rows as fit cls 3, never splitting a group, `last` in the final row,
+   * each row after the previous is CAS OK.
+   */
+  private async writeRows(groups: P.SelfRecord[][], last: P.SelfRecord | null): Promise<void> {
     const rows: P.SelfRecord[][] = [[]];
     let size = 0;
-    const all = last ? [...records, last] : records;
-    for (const r of all) {
-      const len = P.encodeRecord(r).length;
-      if (
-        rows[rows.length - 1].length > 0 &&
-        (size + len > ROW_BUDGET || rows[rows.length - 1].length >= 255)
-      ) {
+    const all = last ? [...groups, [last]] : groups;
+    for (const g of all) {
+      const len = g.reduce((n, r) => n + P.encodeRecord(r).length, 0);
+      const cur = rows[rows.length - 1];
+      if (cur.length > 0 && (size + len > ROW_BUDGET || cur.length + g.length > 255)) {
         rows.push([]);
         size = 0;
       }
-      rows[rows.length - 1].push(r);
+      rows[rows.length - 1].push(...g);
       size += len;
     }
     for (const row of rows) if (row.length) await this.h.self.write(row);

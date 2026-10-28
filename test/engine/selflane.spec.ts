@@ -93,6 +93,14 @@ describe("the self-lane fold (§7.3)", () => {
     expect(leftKeyCmp(left(9, P.NONE), left(10, { E: 0, n: 0 }))).toBeLessThan(0);
   });
 
+  it("keeps the first TREG per bundleId", () => {
+    const f = new SelfFold({ warn: () => {} });
+    const bundleId = fill(32, 5);
+    f.apply([{ rtype: P.RT.TREG, bundleId, tReg: 100 }], 1);
+    f.apply([{ rtype: P.RT.TREG, bundleId, tReg: 200 }], 2);
+    expect(f.tregs.get(P.b64u(bundleId))).toBe(100);
+  });
+
   it("raises the critical warning for a MEMBER or CONTACT whose pin differs from the one held", () => {
     const { f, warnings } = fold();
     const member = (pin: number): P.MemberRec => ({

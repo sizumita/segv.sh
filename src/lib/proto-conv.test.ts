@@ -1772,6 +1772,7 @@ const records: [string, P.SelfRecord, B, number][] = [
     cat(refCopy, be32(5), bob.uid, be32(1_780_000_123), be16(0xffff), be32(0xffffffff)),
     78,
   ],
+  ["TREG", { rtype: 0x0f, bundleId: fill(32, 0x34), tReg: 25_465_628 }, cat(fill(32, 0x34), be32(25_465_628)), 36],
   [
     "SNAP",
     { rtype: 0x20, blobId: fill(32, 0x73), key: fill(32, 0x74), size: 4096, pos: { E: 7, n: 12 } },
@@ -1925,8 +1926,35 @@ describe("self records (§7.2)", () => {
   });
 
   it("returns null (skip) for unknown rtypes", () => {
-    for (const rtype of [0x00, 0x0f, 0x10, 0x1f, 0x21, 0x30, 0x80, 0xff])
+    for (const rtype of [0x00, 0x10, 0x11, 0x1f, 0x21, 0x30, 0x80, 0xff])
       expect(P.parseRecord(rtype, fill(5, 0xff))).toBeNull();
+  });
+});
+
+describe("TREG (§7.2): a bundle's t_reg beside the CONV_JOIN or EPOCH that names it", () => {
+  const join = records.find(([n]) => n === "CONV_JOIN")!;
+  const treg = records.find(([n]) => n === "TREG")!;
+
+  it("a TREG of 35 or 37 B makes its row malformed", () => {
+    for (const c of [treg[2].slice(0, 35), cat(treg[2], be8(0))]) {
+      expect(() => P.parseRecord(0x0f, c)).toThrow(P.CodecError);
+      expect(() => P.parseS(refS(6, 4, fill(16, 1), TS, [refRecord(1, join[2]), refRecord(0x0f, c)]))).toThrow(
+        P.CodecError,
+      );
+    }
+  });
+
+  it("a join row with CONV_JOIN and TREG keeps the CONV_JOIN for a reader that does not know TREG", () => {
+    const row = refS(6, 4, fill(16, 1), TS, [refRecord(1, join[2]), refRecord(0x0f, treg[2])]);
+    expect(P.parseS(row).records).toEqual([join[1], treg[1]]);
+    // A reader without TREG skips an unknown rtype by its len and keeps parsing (§7.1); 0x11 is unknown to every
+    // reader, so the same row with it in TREG's place is what such a reader sees.
+    const older = refS(6, 4, fill(16, 1), TS, [refRecord(1, join[2]), refRecord(0x11, treg[2])]);
+    expect(P.parseS(older)).toMatchObject({ records: [join[1]], skipped: 1 });
+    // a single join row stays class 0: 32 + 3 + 137 + 3 + 36 = 211 B of S
+    expect(P.encodeS({ prev: { E: 6, n: 4 }, prevh: fill(16, 1), ts: TS, records: [join[1], treg[1]] }).length).toBe(
+      211,
+    );
   });
 });
 
@@ -2267,11 +2295,13 @@ function computeKat() {
       ts: TS,
       records: [records[3][1], records[0][1]],
     });
-    // LEFT (0x0E) came after this vector was pinned: it has a vector of its own (left, below)
+    // LEFT (0x0E) and TREG (0x0F) came after this vector was pinned: they have vectors of their own (below)
     const snap = P.encryptSnapshot({
       pos: { E: 7, n: 30 },
       ts: TS,
-      records: records.filter(([, r]) => r.rtype !== 0x20 && r.rtype !== 0x0e).map(([, r]) => r),
+      records: records
+        .filter(([, r]) => r.rtype !== 0x20 && r.rtype !== 0x0e && r.rtype !== 0x0f)
+        .map(([, r]) => r),
     });
     return {
       D0: toHex(D0.bytes),
@@ -2300,6 +2330,7 @@ function computeKat() {
     heads: toHex(P.encodeRecord(record("HEADS with an entry"))),
     member: toHex(P.encodeRecord(record("MEMBER"))),
     left: toHex(P.encodeRecord(record("LEFT"))),
+    treg: toHex(P.encodeRecord(record("TREG"))),
   };
 }
 
@@ -2349,6 +2380,8 @@ const KAT = {
     "5ae3c82486104f11f0d04833bcfb216e55c768727272727272727272727272727272727272727272727272727272727272727205626f625f31",
   // a LEFT record (78 bytes): conv | root | e = 4 | bob | t | (E, n) = (7, 12)
   left: "0e004e606162636465666768696a6b6c6d6e6f525252525252525252525252525252525252525252525252525252525252525200000004a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a16a18a57b00070000000c",
+  // a TREG record (36 bytes): bundleId | t_reg
+  treg: "0f002434343434343434343434343434343434343434343434343434343434343434340184931c",
 };
 
 describe("known-answer vectors", () => {

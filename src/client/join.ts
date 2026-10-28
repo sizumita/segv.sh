@@ -221,7 +221,11 @@ export async function acceptJoin(ctx: JoinCtx, J: P.Join, src: JoinSource): Prom
         },
         ...(by.member ? [by.member] : []),
       ]
-    : [{ rtype: P.RT.CONV_JOIN, conv: J.conv, root, ...material, rootBy: D.by, via: src.via }];
+    : [
+        { rtype: P.RT.CONV_JOIN, conv: J.conv, root, ...material, rootBy: D.by, via: src.via },
+        // the bundle's t_reg in the same row, so a restore needs no blob/meta for E_start (§7.2)
+        { rtype: P.RT.TREG, bundleId: J.bundleId, tReg: meta.t },
+      ];
   return {
     kind: "new",
     copy: {

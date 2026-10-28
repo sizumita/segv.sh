@@ -2276,6 +2276,7 @@ export const RT = {
   DESC: 0x0c,
   MEMBER: 0x0d,
   LEFT: 0x0e,
+  TREG: 0x0f,
   SNAP: 0x20,
 } as const;
 export type RType = (typeof RT)[keyof typeof RT];
@@ -2414,6 +2415,15 @@ export interface LeftRec extends CopyRef {
   /** R's position when e is R's own epoch, or NONE when the leave was carried into e from an earlier epoch */
   row: Pos;
 }
+/**
+ * The registration time `t_reg` of a bundle (§7.2): written in the same row as the CONV_JOIN of an accepted join (and
+ * kept by snapshots), so a restore reads E_start = era(t_reg) without `blob/meta`. Folded by bundleId; the first wins.
+ */
+export interface TregRec {
+  rtype: typeof RT.TREG;
+  bundleId: Bytes;
+  tReg: number;
+}
 export interface SnapRec {
   rtype: typeof RT.SNAP;
   blobId: Bytes;
@@ -2438,6 +2448,7 @@ export type SelfRecord =
   | DescRec
   | MemberRec
   | LeftRec
+  | TregRec
   | SnapRec;
 
 const wrCopy = (x: CopyRef): Bytes => concat(fixed(x.conv, 16, "record conv"), fixed(x.root, 32, "record root"));
@@ -2506,6 +2517,8 @@ function recordContent(x: SelfRecord): Bytes {
     }
     case RT.LEFT:
       return concat(wrCopy(x), u32(x.e), fixed(x.uid, 16, "LEFT uid"), u32(x.t), wrPos(x.row, "LEFT"));
+    case RT.TREG:
+      return concat(fixed(x.bundleId, 32, "TREG bundleId"), u32(x.tReg));
     case RT.SNAP:
       return concat(
         fixed(x.blobId, 32, "SNAP blobId"),
@@ -2636,6 +2649,9 @@ export function parseRecord(rtype: number, c: Bytes): SelfRecord | null {
     }
     case RT.LEFT:
       x = { rtype, ...rdCopy(r), e: r.u32(), uid: r.bytes(16), t: r.u32(), row: rdPos(r, what) };
+      break;
+    case RT.TREG:
+      x = { rtype, bundleId: r.bytes(32), tReg: r.u32() };
       break;
     case RT.SNAP:
       x = { rtype, blobId: r.bytes(32), key: r.bytes(32), size: r.u32(), pos: rdPos(r, what) };
