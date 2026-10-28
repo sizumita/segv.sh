@@ -30,7 +30,8 @@ export const onRequest: RequestHandler = ({ headers, sharedMap, url }) => {
     "style-src 'self'",
     "img-src 'self' blob: data:",
     "font-src 'self'",
-    `connect-src 'self' ${ws}`,
+    // blob: lets the image viewer read back the decrypted image it shows, to hand it to the share sheet.
+    `connect-src 'self' ${ws} blob:`,
     "worker-src 'self'",
     "manifest-src 'self'",
     "media-src 'self' blob:",
