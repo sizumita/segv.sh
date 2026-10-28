@@ -273,6 +273,13 @@ export function contest(
 export const copyKeyOf = (c: { conv: Bytes; root: Bytes }): string =>
   `${P.b64u(c.conv)}.${P.b64u(c.root)}`;
 
+/** The key of copy refs (`ConversationView.ref`): local to the UI, so its label is outside the protocol's. */
+export const refKeyOf = (AK: Bytes): Bytes => P.HKDF(AK, "", "segv.sh/ui/ref");
+
+/** A copy's ref: b64u of the first 9 bytes of HMAC(refKey, utf8(copy key)). */
+export const refOf = (refKey: Bytes, key: string): string =>
+  P.b64u(P.HMAC(refKey, P.utf8(key)).slice(0, 9));
+
 /** A row's message key: era and label hex (§0.3 `MessageView.key`). */
 export const rowKey = (E: number, label: Bytes): string => `${E}:${P.hex(label)}`;
 
@@ -477,6 +484,8 @@ export interface ViewCtx {
   /** monotonic now (for the 30 s processing wait) */
   mono: number;
   processingWait: number;
+  /** the copy's ref (`ConversationView.ref`) by copy key */
+  ref(key: string): string;
 }
 
 // ───────────────────────── leaves and the §6.8 walk ─────────────────────────
@@ -569,6 +578,7 @@ export function viewOf(c: Copy, x: ViewCtx): ConversationView | null {
   const blocked = blockedOf(c, ep, x);
   return {
     id: c.key,
+    ref: x.ref(c.key),
     name:
       (!c.confirmed && x.contested(c) ? "⚠ " : "") +
       (name ? `# ${name}` : others.join(", ") || "just you"),

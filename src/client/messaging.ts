@@ -18,6 +18,7 @@ import {
   leftIn,
   memberHandle,
   newEpoch,
+  refOf,
   rowKey,
   systemLine,
   unknownHandle,
@@ -127,6 +128,8 @@ export interface SessionAccount {
   id: P.Identity;
   handle: string;
   regEra: number;
+  /** the key of copy refs (`refKeyOf(AK)`) */
+  refKey: Bytes;
 }
 
 /** What Messaging needs from the engine. */
@@ -162,6 +165,8 @@ export interface MessagingHost {
 export class Messaging {
   /** copies by view key */
   readonly copies = new Map<string, Copy>();
+  /** copy refs by view key (`ConversationView.ref`) */
+  private readonly refs = new Map<string, string>();
   private readonly byConv = new Map<string, Copy[]>();
   /** users verified in the directory this session, by b64u uid */
   private readonly users = new Map<string, KnownUser>();
@@ -3413,6 +3418,11 @@ export class Messaging {
       byContact: (c: Copy) => this.byContact(c),
       mono: this.h.clock.mono(),
       processingWait: this.h.delays.processingWait,
+      ref: (key: string) => {
+        let r = this.refs.get(key);
+        if (r === undefined) this.refs.set(key, (r = refOf(this.h.acc.refKey, key)));
+        return r;
+      },
     };
     const out: ConversationView[] = [];
     for (const c of this.copies.values()) {

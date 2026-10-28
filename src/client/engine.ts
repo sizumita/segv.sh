@@ -22,6 +22,7 @@ import {
   type EngineOptions,
   type EngineTimer,
 } from "./options";
+import { refKeyOf } from "./conv";
 import { cursorAt, type InboxCursor } from "./inbox";
 import { Messaging, type MessagingHost } from "./messaging";
 import { PushClient, browserPushPlatform, localPushStore } from "./push";
@@ -469,6 +470,7 @@ export class SegvEngine implements Engine {
           return acc.handle;
         },
         regEra: acc.regEra!,
+        refKey: refKeyOf(acc.AK),
       },
       self: this.self!,
       check: () => this.assertSession(acc, gen),
