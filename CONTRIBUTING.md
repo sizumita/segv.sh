@@ -12,9 +12,10 @@ Thank you for helping. Bug reports, fixes, tests and documentation are all welco
 [docs/PROTOCOL.md](docs/PROTOCOL.md) is normative, and the implementation follows it byte for byte. A change to
 anything the specification defines needs a change to the specification first: the bytes that are written, served or
 accepted, the labels, the verdicts, the texts of warnings and system lines, the requests a client makes, and the
-server's status codes, headers and bodies. Open an issue that describes the change and its effect on the guarantees
-(§0.3 and §0.4) and on the leakage table (§13). Pull requests do not edit `docs/PROTOCOL.md` directly: the maintainer
-applies accepted changes to the specification, and the implementation follows it.
+server's status codes, headers and bodies. Open an issue with the "Protocol change" template that describes the change
+and its effect on the guarantees (§0.3 and §0.4) and on the leakage table (§13). Pull requests do not edit
+`docs/PROTOCOL.md` directly: the maintainer applies accepted changes to the specification, and the implementation
+follows it.
 
 What the specification leaves to the implementation, such as the names of functions and types, failure codes, log
 lines, and the order of checks that it does not fix, can change freely (see the preamble of `docs/PROTOCOL.md`).
