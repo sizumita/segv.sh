@@ -449,6 +449,17 @@ try {
     },
   );
 
+  await step("bob reacts to alice's message, and alice sees the emoji with count 1", async () => {
+    const mine = B.page.locator(".thread .m", { hasText: t1 }).first();
+    await mine.hover();
+    await mine.getByRole("button", { name: "add a reaction" }).click({ timeout: T });
+    await mine.getByRole("button", { name: "👍", exact: true }).click({ timeout: T });
+    await mine.locator(".react.mine", { hasText: "👍 1" }).waitFor({ timeout: T });
+    const theirs = A.page.locator(".thread .m", { hasText: t1 }).first();
+    await theirs.locator(".react", { hasText: "👍 1" }).waitFor({ timeout: T });
+    await shot(A, "02a-alice-reaction");
+  });
+
   await step("encrypted image arrives and decrypts", async () => {
     const bytes = await pngBytes(A.page, `img ${sfx}`);
     await A.page

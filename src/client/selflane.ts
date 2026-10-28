@@ -258,9 +258,12 @@ export class SelfFold {
     switch (r.rtype) {
       case P.RT.CONV_JOIN: {
         const k = copyKey(r);
-        // A first-release tab's acceptance of a copy it continued by a skip (§7.2): it accepts that skip's copy.
+        // A first-release tab's acceptance of a copy it continued by a skip, in a row without HEADS (§7.2): it accepts
+        // that skip's copy. New code writes every via-5 CONV_JOIN with a HEADS record (§7.3).
         const skip =
-          r.via === P.VIA.REQUEST_ACCEPTED && !this.inSnapshot ? this.latestSkipOf(k) : null;
+          r.via === P.VIA.REQUEST_ACCEPTED && !withHeads && !this.inSnapshot
+            ? this.latestSkipOf(k)
+            : null;
         if (skip) {
           if (!this.skipAccepted.has(skip.id)) this.skipAccepted.set(skip.id, r);
           return;

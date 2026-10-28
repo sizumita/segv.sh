@@ -107,7 +107,7 @@ describe("T1: the client never downloads the log", () => {
       const B = await engineFor(bob);
       const id = await A.createConversation(["bob"]);
       await settle(A, B);
-      B.markRead(id);
+      await B.accept(id);
       for (let i = 0; i < 25; i++) await A.sendText(id, `a${i}`);
       for (let i = 0; i < 25; i++) await B.sendText(id, `b${i}`);
       await settle(A, B);
@@ -172,7 +172,7 @@ describe("T3: no global feed of rows", () => {
     const D = await engineFor(dave);
     const id = await C.createConversation(["dave"]);
     await settle(A, C, D);
-    D.markRead(id);
+    await D.accept(id);
     await settle(A, C, D);
     const mine = () => [...server().rt.sockets].filter((s) => s.who === "alice");
     const rx = () => mine().reduce((n, s) => n + s.rx.rows, 0);
@@ -201,7 +201,7 @@ describe("T5: catch-up after being offline", () => {
       const B = await engineFor(bob);
       const id = await A.createConversation(["bob"]);
       await settle(A, B);
-      B.markRead(id);
+      await B.accept(id);
       await settle(A, B);
       await A.logout();
       if (noisy)
@@ -251,7 +251,7 @@ describe("T4: no replay of the whole history on a new device", () => {
       const B = await engineFor(bob);
       const id = await A.createConversation(["bob"]);
       await settle(A, B);
-      B.markRead(id);
+      await B.accept(id);
       await settle(A, B);
       const ep = epoch(A, id);
       postTexts(ep, bob, messages);
@@ -320,7 +320,7 @@ describe("T7: spam requests", () => {
       const B = await engineFor(bob);
       const id = await A.createConversation(["bob"]);
       await settle(A, B);
-      B.markRead(id);
+      await B.accept(id);
       postTexts(epoch(A, id), bob, 40);
       await settle(A, B);
       for (let i = 0; i < spam; i++) {

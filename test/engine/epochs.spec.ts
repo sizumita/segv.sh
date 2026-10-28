@@ -30,7 +30,7 @@ async function group(names: string[], name = "g") {
   for (const u of users) engines.push(await engineFor(u));
   const id = await engines[0].createConversation(names.slice(1), name);
   await settle(...engines);
-  for (const E of engines.slice(1)) E.markRead(id);
+  for (const E of engines.slice(1)) await E.accept(id);
   await settle(...engines);
   return { users, engines, id };
 }
@@ -149,7 +149,7 @@ describe("forged member slots", () => {
     forgeJoin(alice, { conv: conv0, e: 0, EK, bundleId: P.fromB64u(reg.id), bundleSize: b.size });
     await settle(A);
     const id = P.b64u(conv0);
-    A.markRead(id);
+    await A.accept(id);
     await settle(A);
     const handles = mustView(A, id).members.map((m) => m.handle);
     expect(handles).toContain("mallory");

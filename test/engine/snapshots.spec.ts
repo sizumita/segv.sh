@@ -32,7 +32,7 @@ async function group(names: string[], name = "g") {
   for (const u of users) engines.push(await engineFor(u));
   const id = await engines[0].createConversation(names.slice(1), name);
   await settle(...engines);
-  for (const E of engines.slice(1)) E.markRead(id);
+  for (const E of engines.slice(1)) await E.accept(id);
   await settle(...engines);
   return { users, engines, id };
 }
@@ -236,7 +236,7 @@ describe("control positions at restore (§7.3, §11.4 step 5)", () => {
     const B = await engineFor(bob);
     const id = await A.createConversation(["bob"]);
     await settle(A, B);
-    B.markRead(id);
+    await B.accept(id);
     await settle(A, B);
     const junk: Uint8Array[] = [];
     // three signed junk claims that pass the local rules (their bundles are not registered: rule (g) decides them)

@@ -268,8 +268,8 @@ export async function scrollback(ctx: SyncCtx, c: Copy): Promise<void> {
 export async function olderInitialHistory(ctx: SyncCtx, c: Copy): Promise<void> {
   const cur = c.epochs.get(c.current);
   if (!cur) return;
-  const loaded = [...cur.rows.values()].filter((r) => r.shown).length;
-  const prev = loaded < HISTORY_INITIAL ? await previousHeld(ctx, c, cur) : undefined;
+  // every row of the epoch that was loaded counts, REACTION rows included, so the cost never depends on content
+  const prev = cur.loaded < HISTORY_INITIAL ? await previousHeld(ctx, c, cur) : undefined;
   if (!prev || prev.Estart === null) return;
   const heads = await olderHeads(ctx, prev);
   await walkBack(ctx, c, prev, heads, () => false, 1);

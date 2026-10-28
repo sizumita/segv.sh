@@ -12,14 +12,14 @@ export const ConversationPane = component$<{ conv: ConversationView }>((props) =
   const conv = props.conv;
   const active = conv.members.filter((m) => !m.left).length;
 
-  // Opening the pane is the engine's "conversation opened" hint (§11.10–§11.11): it starts scrollback once, even
-  // when nothing is unread (after a reload every conversation has unread = 0). It also accepts a request copy, so a
-  // request is shown as a preview instead and the hint waits for the accept button (or another acceptance, §11.5).
+  // Opening the pane is the engine's "pane is open" hint (§11.10–§11.11): it starts scrollback once, even when nothing
+  // is unread (after a reload every conversation has unread = 0). It accepts nothing; still, no read-only preview
+  // calls it: a copy whose inviter is not a contact waits for the accept button (§11.11).
   useVisibleTask$(async ({ track }) => {
     const id = track(() => props.conv.id);
-    const request = track(() => props.conv.request);
+    const byContact = track(() => props.conv.byContact);
     const visible = track(() => ui.visible);
-    if (!request && visible && document.visibilityState === "visible") {
+    if (byContact && visible && document.visibilityState === "visible") {
       try {
         (await loadEngine()).markRead(id);
       } catch {
@@ -32,10 +32,10 @@ export const ConversationPane = component$<{ conv: ConversationView }>((props) =
   // tab becomes visible again.
   useVisibleTask$(async ({ track }) => {
     const unread = track(() => props.conv.unread);
-    const request = track(() => props.conv.request);
+    const byContact = track(() => props.conv.byContact);
     const visible = track(() => ui.visible);
     const id = props.conv.id;
-    if (unread > 0 && !request && visible && document.visibilityState === "visible") {
+    if (unread > 0 && byContact && visible && document.visibilityState === "visible") {
       try {
         (await loadEngine()).markRead(id);
       } catch {
@@ -44,10 +44,10 @@ export const ConversationPane = component$<{ conv: ConversationView }>((props) =
     }
   });
 
-  // An accepted request moves to chats: follow it there.
+  // An accepted copy moves to chats: follow it there.
   useVisibleTask$(({ track }) => {
-    const request = track(() => props.conv.request);
-    if (!request && ui.list === "requests") ui.list = "chats";
+    const byContact = track(() => props.conv.byContact);
+    if (byContact && ui.list === "requests") ui.list = "chats";
   });
 
   return (
@@ -81,7 +81,7 @@ export const ConversationPane = component$<{ conv: ConversationView }>((props) =
       <div class={["convbody", ui.members && "with-members"]}>
         <div class="thread">
           <Messages conv={conv} />
-          {conv.request && !isGone(conv) ? (
+          {!conv.byContact && !isGone(conv) ? (
             <RequestBar conv={conv} />
           ) : (
             <Composer convId={conv.id} blocked={conv.blocked} />
@@ -93,7 +93,10 @@ export const ConversationPane = component$<{ conv: ConversationView }>((props) =
   );
 });
 
-/** In place of the composer while a conversation is a request: what accepting does, and the button. */
+/**
+ * In place of the composer while the conversation's inviter is neither self nor a contact (a request, or a copy that
+ * only another member's message accepted): what accepting does, and the button, which calls `accept` (§11.11).
+ */
 const RequestBar = component$<{ conv: ConversationView }>((props) => {
   const state = useContext(StateCtx);
   const ui = useContext(UiCtx);
@@ -112,11 +115,12 @@ const RequestBar = component$<{ conv: ConversationView }>((props) => {
     try {
       const engine = await loadEngine();
       engine.clearError(); // so that a failure shows as a new error, even with the same text
-      // markRead accepts a request copy (§11.5, §11.11); the pane leaves preview once `request` turns false.
-      engine.markRead(props.conv.id);
+      // The user's acceptance: the pane leaves the preview once `byContact` turns true.
+      await engine.accept(props.conv.id);
     } catch (e) {
-      accepting.value = false;
       ui.localError = errMsg(e);
+    } finally {
+      accepting.value = false;
     }
   });
 

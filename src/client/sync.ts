@@ -332,6 +332,7 @@ export function applyLaneRow(
   ctx.checkRow(c, ep, j, r, m, quiet);
   if (expected && !P.equalBytes(expected, ph)) ctx.prevMismatch(c, ep, j);
   ctx.onValidRow(c, ep, j);
+  ep.loaded++;
   const mine = P.equalBytes(ep.D.members[j].uid, ctx.selfUid);
   const ts = clampTs(m.ts, r.t, ctx.delta());
   const order = rowOrder(ts, ep.e, r.E, j, r.n);
@@ -345,12 +346,32 @@ export function applyLaneRow(
     ctx.onLeave(c, ep, j, { t: r.t, row: { E: r.E, n: r.n }, key, order });
     return;
   }
+  if (m.type === P.MT.REACTION) {
+    // A valid row of its member (above), but not a message: no view, no unread, no lastTs (§11.12).
+    c.order.set(key, order);
+    c.reactions.set(key, {
+      e: ep.e,
+      j,
+      E: r.E,
+      n: r.n,
+      t: r.t,
+      uid: P.b64u(ep.D.members[j].uid),
+      shown: !c.left && acceptedOld(c, ep.e, j, { E: r.E, n: r.n }, r.t),
+      reaction: m.reaction,
+    });
+    c.reactionsDirty = true;
+    ctx.changed();
+    return;
+  }
   if (m.type !== P.MT.TEXT && m.type !== P.MT.IMAGE) return;
+  // What a REACTION to this row names: its label and stored body under the epoch's route key (§3.3).
+  const th = P.reactTh(ep.keys.rk, r.label, r.body);
+  if (c.reactions.size) c.reactionsDirty = true; // a waiting reaction's target may have come
   // A leaver processes its lanes for WELCOMEs only (§6.9); a row §6.8 drops is not shown, and an echo of it fails.
   const accepted = !c.left && acceptedOld(c, ep.e, j, { E: r.E, n: r.n }, r.t);
   if (!accepted) {
     c.order.set(key, order);
-    ep.rows.set(key, { j, E: r.E, n: r.n, t: r.t, unread: false, shown: false });
+    ep.rows.set(key, { j, E: r.E, n: r.n, t: r.t, unread: false, shown: false, th });
     ctx.takeEcho(key); // the echo stays as it is; the send reports the failure (§11.3 step 7)
     return;
   }
@@ -363,6 +384,7 @@ export function applyLaneRow(
     ts,
     kind: m.type === P.MT.TEXT ? "text" : "image",
     status: "sent",
+    reactions: [],
     ...(m.type === P.MT.TEXT
       ? { text: m.text }
       : {
@@ -380,7 +402,7 @@ export function applyLaneRow(
   if (!insertMessage(c, view, order)) return;
   const unread = !mine && !quiet && ctx.live();
   if (unread) c.unread++;
-  ep.rows.set(key, { j, E: r.E, n: r.n, t: r.t, unread, shown: true });
+  ep.rows.set(key, { j, E: r.E, n: r.n, t: r.t, unread, shown: true, th });
   ctx.changed();
 }
 

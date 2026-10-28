@@ -31,7 +31,7 @@ async function group(names: string[], name = "g", opts: Record<string, EngineOpt
   for (const u of users) engines.push(await engineFor(u, opts[u.handle] ?? {}));
   const id = await engines[0].createConversation(names.slice(1), name);
   await settle(...engines);
-  for (const E of engines.slice(1)) E.markRead(id);
+  for (const E of engines.slice(1)) await E.accept(id);
   await settle(...engines);
   return { users, engines, id };
 }
@@ -250,7 +250,7 @@ describe("leave order and WELCOMEs", () => {
     const C = await engineFor(carol);
     const one = await A.createConversation(["bob"]);
     await settle(A, B);
-    B.markRead(one);
+    await B.accept(one);
     await B.sendText(one, "hi alice");
     await settle(A, B);
     const ep = epoch(A, one);
@@ -272,7 +272,7 @@ describe("leave order and WELCOMEs", () => {
     const D = await engineFor(dave);
     const one = await A.createConversation(["bob"]);
     await settle(A, B);
-    B.markRead(one);
+    await B.accept(one);
     await B.sendText(one, "hi");
     await settle(A, B);
     const ep = epoch(A, one);

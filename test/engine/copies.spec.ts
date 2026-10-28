@@ -39,7 +39,7 @@ async function group(names: string[], name = "g") {
   for (const u of users) engines.push(await engineFor(u));
   const id = await engines[0].createConversation(names.slice(1), name);
   await settle(...engines);
-  for (const E of engines.slice(1)) E.markRead(id);
+  for (const E of engines.slice(1)) await E.accept(id);
   await settle(...engines);
   return { users, engines, id };
 }
@@ -336,7 +336,7 @@ describe("requests and ended requests (§11.5)", () => {
     const D = await engineFor(dave);
     const id = await C.createConversation(["bob", "dave"], "g");
     await settle(B, C, D);
-    D.markRead(id);
+    await D.accept(id);
     await settle(B, C, D);
     expect(mustView(B, id).request).toBe(true);
     return { users: { alice, bob, carol, dave }, B, C, D, id };
@@ -355,10 +355,10 @@ describe("requests and ended requests (§11.5)", () => {
     expect(warnings(B)).toEqual([]);
     expect(mustView(B, id).name.startsWith("⚠")).toBe(false);
     expect(mustView(B, r1).name.startsWith("⚠")).toBe(false);
-    B.markRead(id); // the ended request: nothing accepts it
+    await B.accept(id); // the ended request: accept does nothing
     await settle(B, C, D);
     expect(mustView(B, id).request).toBe(true);
-    B.markRead(r1);
+    await B.accept(r1);
     await settle(B, C, D);
     expect(mustView(B, r1).request).toBe(false);
     expect(mustView(B, id).request).toBe(true);
@@ -384,7 +384,7 @@ describe("requests and ended requests (§11.5)", () => {
     expect(conv(B2, id).confirmed).toBe(true); // confirmed by dave's claim
     const r1 = `${id}~1`;
     expect(mustView(B2, r1).request).toBe(true);
-    B2.markRead(r1);
+    await B2.accept(r1);
     await settle(B2, C, D);
     expect(mustView(B2, r1).request).toBe(false);
     const recs = selfRowsOf(users.bob).flat();
@@ -408,7 +408,7 @@ describe("requests and ended requests (§11.5)", () => {
     const F = await engineFor(frank);
     await C.addMembers(id, ["frank"]); // C_0: carol's (rootBy) claim confirms nothing
     await settle(B, C, D, F);
-    F.markRead(id);
+    await F.accept(id);
     await commitChange(users.dave, epoch(D, id), [users.carol, users.bob, users.dave, frank], "r");
     await settle(B, C, D, F);
     expect(conv(B, id).confirmed).toBe(true); // by dave's rename
@@ -489,5 +489,57 @@ describe("a CONFLICT with a sibling's CONFIRMED row (§7.3)", () => {
     for (const X of [B, B2]) expect(I(X).views().map((v) => v.id)).toEqual([id]);
     const B3 = await engineFor(bob);
     expect(I(B3).views().map((v) => v.id)).toEqual([id]);
+  });
+});
+
+describe("a sibling's ENDED record (§11.7)", () => {
+  it("the device that latches it reads the claim and drops a row stored after it", async () => {
+    const {
+      users: [alice, bob, carol],
+      engines: [A, B, C],
+      id,
+    } = await group(["alice", "bob", "carol"]);
+    const B2 = newEngine("bob2");
+    await I(B2).unlock(bob.AK, bob.uid, bob.handle);
+    await waitFor(() => !B2.getState().syncing, "bob2's restore");
+    await settle(A, B, B2, C);
+    const r = await commitChange(alice, epoch(A, id), [alice, carol], undefined, { hideFrom: ["bob2"] });
+    // carol's row of epoch 0 stored after C_0: bob2, which never saw the claim, shows it
+    const ep = conv(C, id).epochs.get(0)!;
+    const j = P.memberIndex(ep.D, carol.uid);
+    postRow(ep, buildMessage(carol, ep, { E: server().era, n: ep.lanes[j].next.n }, { type: P.MT.TEXT, text: "after" } as P.MBody));
+    await settle(A, B, C);
+    expect(chat(B, id)).not.toContain("carol: after");
+    server().shard.unhide(r.claim.E, r.claim.label, "bob2");
+    await settle(A, B, B2, C);
+    expect(mustView(B2, id).blocked).toBe("removed");
+    expect(chat(B2, id)).not.toContain("carol: after");
+    expect(systemLines(B2, id)).toContain("@alice removed you");
+  });
+
+  it("⚠: a copy whose ENDED record the fold holds counts as ended there, also on a lagging device", async () => {
+    const {
+      users: [alice, bob, carol],
+      engines: [A, B, C],
+      id,
+    } = await group(["alice", "bob", "carol"]);
+    const B2 = newEngine("bob2");
+    await I(B2).unlock(bob.AK, bob.uid, bob.handle);
+    await waitFor(() => !B2.getState().syncing, "bob2's restore");
+    await settle(A, B, B2, C);
+    // bob2 stays at 0: alice's rename C_0 is hidden from it; B1 follows to 1, where C_1 removes bob
+    await commitChange(alice, epoch(A, id), [alice, bob, carol], "x", { hideFrom: ["bob2"] });
+    await settle(A, B, B2, C);
+    await A.removeMember(id, bob.uidB);
+    await settle(A, B, B2, C);
+    await A.addMembers(id, ["bob"]); // the re-add at 3
+    await settle(A, B, B2, C);
+    expect(mustView(B, id).blocked).toBe("removed");
+    expect(conv(B2, id).current).toBe(0); // still lagging, holding B1's ENDED record for 1
+    const readd = `${id}~1`;
+    expect(mustView(B2, readd).epoch).toBe(3);
+    expect(mustView(B2, readd).name.startsWith("⚠")).toBe(false);
+    expect(mustView(B2, id).name.startsWith("⚠")).toBe(false);
+    expect(B2.getState().warnings).toEqual([]);
   });
 });

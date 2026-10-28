@@ -61,6 +61,7 @@ import type {
 import { Realtime } from "./realtime";
 import { keysChangedWarning, leftKeyCmp, liveAt, type SelfLane } from "./selflane";
 import { SNAP_RECORDS, firstFreePointer, writeSnapshot } from "./snapshot";
+import { MAX_REACTIONS, reactionSets, refreshReactions } from "./reactions";
 import { lanesEnd, olderInitialHistory, scrollback } from "./history";
 import { prepareImage } from "./image";
 import {
@@ -115,6 +116,9 @@ const before = (at: { E: number; rel: number }): InboxCursor => ({
   E: at.E,
   rel: Math.max(0, at.rel - 1),
 });
+
+/** `accept`, or a post that accepts, could not verify the inviter's directory bundle (§11.11). */
+export const NOT_VERIFIED = "could not verify who started this conversation; try again";
 
 /** The account of the session, as the engine holds it. */
 export interface SessionAccount {
@@ -397,6 +401,8 @@ export class Messaging {
     const ep = c.epochs.get(c.current);
     if (!rec || !ep || rec.e !== ep.e) return;
     await endByRecord(this.membershipHost(quiet), c, ep, rec.claim);
+    // A device that holds rows of that epoch reads the claim now: rows stored after it are dropped (§6.8, §11.7).
+    if (ep.loaded > 0) await this.readEndClaim(c, quiet);
   }
 
   /** The copy ended at a claim it has not read yet (its ENDED record): its rows wait for that claim. */
@@ -756,6 +762,7 @@ export class Messaging {
       deriveLines(mh, c);
       this.h.changed();
     }
+    this.acceptByContact(); // a request whose D.by became a contact (§11.5)
   }
 
   // ───────────────────────── copies ─────────────────────────
@@ -816,6 +823,8 @@ export class Messaging {
       lines: new Map(),
       heads: null,
       probe: false,
+      reactions: new Map(),
+      reactionsDirty: false,
     };
   }
 
@@ -1626,10 +1635,14 @@ export class Messaging {
       }
       if (!controlSettled(ep) || this.endAhead(c)) continue;
       this.corroborations.delete(c);
+      // CONFIRMED and a request's via-5 CONV_JOIN, with a HEADS record (§7.3), and no CONTACT: a third member's row
+      // is not the user's acceptance (§11.5)
       const recs: P.SelfRecord[] = [];
       if (!c.confirmed) recs.push({ rtype: P.RT.CONFIRMED, conv: c.conv, root: c.root });
       c.confirmed = true;
       if (c.request) recs.push(...this.acceptRecords(c));
+      if (recs.length === 0) continue;
+      recs.push(this.cursorHeads());
       void this.h
         .track(
           this.h.enqueue(async () => {
@@ -2053,9 +2066,10 @@ export class Messaging {
   // ───────────────────────── requests (§11.5) ─────────────────────────
 
   /** The CONV_JOIN (via 5) and CONTACT that accept a request copy. */
+  /** The CONV_JOIN (via 5) that accepts a request copy, from its REQUEST's epoch key (§11.5). */
   private acceptRecords(c: Copy): P.SelfRecord[] {
-    const root = [...c.epochs.values()].sort((a, b) => a.e - b.e)[0];
-    const recs: P.SelfRecord[] = [
+    const root = c.epochs.get(c.rootE) ?? [...c.epochs.values()].sort((a, b) => a.e - b.e)[0];
+    return [
       {
         rtype: P.RT.CONV_JOIN,
         conv: c.conv,
@@ -2068,10 +2082,111 @@ export class Messaging {
         via: P.VIA.REQUEST_ACCEPTED,
       },
     ];
-    const m = this.h.self.fold.members.get(P.b64u(c.rootBy));
-    if (m && !this.h.self.fold.contacts.has(P.b64u(c.rootBy)))
-      recs.push({ rtype: P.RT.CONTACT, uid: c.rootBy, pin: m.pin });
-    return recs;
+  }
+
+  /**
+   * A HEADS record with only the inbox cursor (`c = 0`): every CONFIRMED and via-5 CONV_JOIN, and the CONTACT of the
+   * user's acceptance, ride in a row that holds one, so §7.2's place rule never moves them (§7.3).
+   */
+  private cursorHeads(): P.HeadsRec {
+    const cursor = this.cursor ??
+      this.h.self.fold.cursor ?? { E: P.era(this.h.api.serverNow()), rel: 0 };
+    return { rtype: P.RT.HEADS, Ein: cursor.E, relIn: cursor.rel, entries: [] };
+  }
+
+  /** The copy's `rootBy` is self or a contact (§11.11 `byContact`; a CONTACT waiting for its HEADS row counts). */
+  private byContact(c: Copy): boolean {
+    const uidB = P.b64u(c.rootBy);
+    return (
+      P.equalBytes(c.rootBy, this.h.acc.uid) ||
+      this.h.self.fold.contacts.has(uidB) ||
+      this.pendingRecords.some((r) => r.rtype === P.RT.CONTACT && P.b64u(r.uid) === uidB)
+    );
+  }
+
+  /**
+   * The user's acceptance of a live copy whose `rootBy` is neither self nor a contact (§11.5, §11.11), written at once
+   * in one self row with a HEADS record: a request's via-5 CONV_JOIN, and the CONTACT for `rootBy` (with its MEMBER,
+   * looked up first when the account has none). A lookup that fails writes nothing and throws. In the queue.
+   */
+  private async writeAcceptance(c: Copy): Promise<void> {
+    if (c.removed || this.endAhead(c) || this.byContact(c)) return;
+    const f = this.h.self.fold;
+    const uidB = P.b64u(c.rootBy);
+    const recs: P.SelfRecord[] = [];
+    let m: P.MemberRec | undefined =
+      f.members.get(uidB) ??
+      (this.pendingRecords.find((r) => r.rtype === P.RT.MEMBER && P.b64u(r.uid) === uidB) as
+        | P.MemberRec
+        | undefined);
+    if (!m) {
+      let u: DirUser | null = null;
+      try {
+        u = await this.h.api.userByUidPrefix(c.rootBy);
+      } catch {
+        u = null;
+      }
+      if (!u) throw new UserError(NOT_VERIFIED);
+      m = {
+        rtype: P.RT.MEMBER,
+        uid: u.uidBytes,
+        sigPk: u.sigPk,
+        kh: P.kemHash(u.kemPk),
+        pin: u.pin,
+        handle: u.handle,
+      };
+      this.users.set(uidB, { handle: u.handle, sigPk: u.sigPk, kh: m.kh, kemPk: u.kemPk });
+      recs.push(m);
+    }
+    if (c.request) recs.push(...this.acceptRecords(c));
+    recs.push({ rtype: P.RT.CONTACT, uid: c.rootBy, pin: m.pin }, this.cursorHeads());
+    await this.h.self.write(recs);
+    this.pendingRecords = this.pendingRecords.filter(
+      (r) => !((r.rtype === P.RT.MEMBER || r.rtype === P.RT.CONTACT) && P.b64u(r.uid) === uidB),
+    );
+    if (c.request) this.becomeAccepted(c);
+    this.acceptByContact();
+    this.h.changed();
+  }
+
+  /**
+   * A request whose `D.by` is now a contact is accepted (§11.5): its via-5 CONV_JOIN, in a row with a HEADS record.
+   * Not an ended request, nor one whose ENDED record names an epoch its probe has not reached.
+   */
+  private acceptByContact(): void {
+    const due = [...this.copies.values()].filter(
+      (c) =>
+        c.request &&
+        !c.probe &&
+        !c.removed &&
+        !this.endAhead(c) &&
+        !P.equalBytes(c.rootBy, this.h.acc.uid) &&
+        this.h.self.fold.contacts.has(P.b64u(c.rootBy)),
+    );
+    for (const c of due) {
+      c.request = false; // at most one acceptance per copy
+      void this.h
+        .track(
+          this.h.enqueue(async () => {
+            if (!this.h.self.fold.joins.has(copyKeyOf(c)))
+              await this.h.self.write([...this.acceptRecords(c), this.cursorHeads()]);
+            c.request = true;
+            this.becomeAccepted(c);
+          }),
+        )
+        .catch(() => {
+          c.request = true;
+        });
+    }
+  }
+
+  /**
+   * Before self's TEXT, IMAGE or REACTION: in a live copy whose `rootBy` is neither self nor a contact, the post is the
+   * user's acceptance (§11.5): it writes the same records as `accept`, before the put.
+   */
+  private async acceptForPost(c: Copy): Promise<void> {
+    if (c.removed || this.byContact(c)) return;
+    await this.h.enqueue(() => this.writeAcceptance(c));
   }
 
   /** A request copy becomes accepted: subscribed, its members looked up, every lane processed from E_start. */
@@ -2091,13 +2206,12 @@ export class Messaging {
   }
 
   /**
-   * Accepts a request copy now (the user accepted it, or self posts in it). An ended request is inert, and so is one
-   * whose ENDED record names an epoch its probe has not reached yet: nothing accepts it (§11.5).
+   * The accept control (§11.11): the user's acceptance of a live copy whose `rootBy` is neither self nor a contact.
+   * Nothing for any other copy, an ended one included. Resolves once the row is written.
    */
-  private async accept(c: Copy): Promise<void> {
-    if (!c.request || c.removed || this.endAhead(c)) return;
-    await this.h.enqueue(() => this.h.self.write(this.acceptRecords(c)));
-    this.becomeAccepted(c);
+  async accept(convId: string): Promise<void> {
+    const c = this.copy(convId);
+    await this.h.track(this.h.enqueue(() => this.writeAcceptance(c)));
   }
 
   markRead(convId: string): void {
@@ -2107,9 +2221,8 @@ export class Messaging {
       c.unread = 0;
       this.h.changed();
     }
-    if (c.request) void this.h.track(this.accept(c)).catch((e) => this.h.error(message(e)));
-    // The "conversation opened" hint: scrollback once per copy and session (§11.10), after the claim that ended a
-    // copy restored by its ENDED record is read (its "@by removed you" line, §11.9).
+    // The pane is open: scrollback once per copy and session (§11.10), after the claim that ended a copy restored by
+    // its ENDED record is read (its "@by removed you" line, §11.9). It accepts nothing (§11.11).
     if (!c.scrolled)
       void this.h
         .track(
@@ -2658,7 +2771,7 @@ export class Messaging {
             URL.createObjectURL(new Blob([img.bytes as BlobPart], { type: img.mime })),
           ),
         );
-        if (c.request) await this.accept(c);
+        await this.acceptForPost(c);
         const mime = img.mime === "image/webp" ? 1 : 2;
         await sendRow(this.sendCtx(c, echo.key), c, {
           type: P.MT.IMAGE,
@@ -2713,6 +2826,7 @@ export class Messaging {
       kind,
       text,
       status: "sending",
+      reactions: [],
     };
     c.messages.push(m);
     this.h.changed();
@@ -2757,7 +2871,7 @@ export class Messaging {
     const echo = this.addEcho(c, "text", body);
     const run = async () => {
       try {
-        if (c.request) await this.accept(c);
+        await this.acceptForPost(c);
         await sendRow(this.sendCtx(c, echo.key), c, { type: P.MT.TEXT, text: body });
         if (c.messages.some((m) => m.key === echo.key)) this.markEcho(c, echo.key, "sent");
       } catch (e) {
@@ -2926,6 +3040,50 @@ export class Messaging {
       this.pendingRecords = this.pendingRecords.filter((r) => !recs.includes(r));
       this.lastHeads = sig;
     });
+  }
+
+  // ───────────────────────── reactions (§11.12) ─────────────────────────
+
+  /**
+   * §11.12: one REACTION row for the TEXT or IMAGE message `messageKey`, sent as a text is (§11.3) but without an echo,
+   * after the user's acceptance that a post makes (§11.5). A reaction that changes nothing by the state this device
+   * holds (an add of an emoji that is on, a remove of one that is off, an add beyond 8) resolves without a row.
+   */
+  react(convId: string, messageKey: string, emoji: string, on: boolean): Promise<void> {
+    const c = this.copy(convId);
+    const size = P.utf8(emoji).length;
+    if (size < 1 || size > P.MAX_EMOJI_BYTES)
+      return Promise.reject(new UserError("pick one emoji"));
+    let target: { e: number; row: { j: number; E: number; n: number; th: Bytes } } | null = null;
+    for (const ep of c.epochs.values()) {
+      const row = ep.rows.get(messageKey);
+      if (row?.shown) target = { e: ep.e, row };
+    }
+    if (!target) return Promise.reject(new UserError("unknown message"));
+    const t = target;
+    return this.chain(convId, async () => {
+      const mine = reactionSets(c).get(messageKey)?.get(this.h.acc.uidB) ?? new Set<string>();
+      if (on ? mine.has(emoji) || mine.size >= MAX_REACTIONS : !mine.has(emoji)) return;
+      await this.acceptForPost(c);
+      await sendRow(this.sendCtx(c, null), c, {
+        type: P.MT.REACTION,
+        reaction: {
+          te: t.e,
+          tl: t.row.j,
+          tE: t.row.E,
+          tn: t.row.n,
+          th: t.row.th,
+          op: on ? 1 : 0,
+          emoji,
+        },
+      });
+    });
+  }
+
+  /** The epoch at which a copy ended, for ⚠: processed, or named by its ENDED record (§6.7 step 6); else null. */
+  private endOf(c: Copy): number | null {
+    if (c.removed) return c.current;
+    return this.h.self.fold.ended.get(copyKeyOf(c))?.e ?? null;
   }
 
   // ───────────────────────── snapshots (§7.4) ─────────────────────────
@@ -3199,12 +3357,15 @@ export class Messaging {
       selfUid: this.h.acc.uid,
       selfHandle: this.h.acc.handle,
       user: (uidB: string) => this.knownUser(uidB),
-      contested: (c: Copy) => this.copiesOf(c.convB).some((y) => y !== c && contest(c, y)),
+      contested: (c: Copy) =>
+        this.copiesOf(c.convB).some((y) => y !== c && contest(c, y, (x) => this.endOf(x))),
+      byContact: (c: Copy) => this.byContact(c),
       mono: this.h.clock.mono(),
       processingWait: this.h.delays.processingWait,
     };
     const out: ConversationView[] = [];
     for (const c of this.copies.values()) {
+      if (c.reactionsDirty) refreshReactions(c, this.h.acc.uidB);
       const v = viewOf(c, x);
       if (v) out.push(v);
     }

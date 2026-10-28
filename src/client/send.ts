@@ -1,7 +1,8 @@
 // Sending a row on one's own lane (docs/PROTOCOL.md §11.3): the control probe before every send, the processing
 // wait, the refusals (removed, left, frozen with a removal, a WELCOME that no longer qualifies), the rotation after a
 // leave, the slot (never below the lane head's era), the fresh-probe check after the proof of work, and the handling
-// of OK, CONFLICT, WRONG_ERA and lost answers, with the late-row rule. TEXT, IMAGE, LEAVE and WELCOME use this path.
+// of OK, CONFLICT, WRONG_ERA and lost answers, with the late-row rule. TEXT, IMAGE, REACTION, LEAVE and WELCOME use
+// this path.
 import * as P from "~/lib/proto";
 import * as W from "~/lib/wire";
 import { ApiError, type Api, type Params } from "./api";
@@ -154,7 +155,8 @@ async function steps12(
 ): Promise<{ ep: Epoch; sent: Stamp; answered: Stamp }> {
   for (let rotations = 0; ;) {
     const { ep, sent, answered, timedOut } = await probeAndWait(ctx, c);
-    const visible = type === P.MT.TEXT || type === P.MT.IMAGE;
+    // texts, images and reactions (§6.6 step 6, §11.3 steps 2–3, §11.12)
+    const visible = type === P.MT.TEXT || type === P.MT.IMAGE || type === P.MT.REACTION;
     if (ctx.welcomeTo) {
       if (timedOut) throw new UserError(CHANGING);
       if (!ctx.qualifies?.(c, ep, ctx.welcomeTo)) throw new WelcomeRefused();

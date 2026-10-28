@@ -73,14 +73,14 @@ describe("formatting", () => {
 
 describe("lists", () => {
   it("archives what this user left or was removed from, a removed request too; requests apart", () => {
-    expect(listOf({ blocked: "", request: false })).toBe("chats");
-    expect(listOf({ blocked: "pending", request: false })).toBe("chats");
-    expect(listOf({ blocked: "frozen", request: false })).toBe("chats");
-    expect(listOf({ blocked: "", request: true })).toBe("requests");
-    expect(listOf({ blocked: "pending", request: true })).toBe("requests");
-    expect(listOf({ blocked: "left", request: false })).toBe("archives");
-    expect(listOf({ blocked: "removed", request: false })).toBe("archives");
-    expect(listOf({ blocked: "removed", request: true })).toBe("archives");
+    expect(listOf({ blocked: "", byContact: true })).toBe("chats");
+    expect(listOf({ blocked: "pending", byContact: true })).toBe("chats");
+    expect(listOf({ blocked: "frozen", byContact: true })).toBe("chats");
+    expect(listOf({ blocked: "", byContact: false })).toBe("requests");
+    expect(listOf({ blocked: "pending", byContact: false })).toBe("requests");
+    expect(listOf({ blocked: "left", byContact: true })).toBe("archives");
+    expect(listOf({ blocked: "removed", byContact: true })).toBe("archives");
+    expect(listOf({ blocked: "removed", byContact: false })).toBe("archives");
   });
   it("names a request's inviter: its one resolved member other than self", () => {
     const m = (uid: string, handle: string) => ({ uid, handle, fingerprint: "", left: false });

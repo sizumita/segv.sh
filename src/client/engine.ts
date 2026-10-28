@@ -221,6 +221,18 @@ export class SegvEngine implements Engine {
     }
   }
 
+  /** §11.12: one emoji reaction to a TEXT or IMAGE message, without an echo; rejects with §11.3's errors. */
+  async react(convId: string, messageKey: string, emoji: string, on: boolean): Promise<void> {
+    this.requireAccount();
+    await this.action(() => this.messaging().react(convId, messageKey, emoji, on));
+  }
+
+  /** The accept control (§11.5, §11.11): the user's acceptance of a copy whose inviter is not a contact yet. */
+  async accept(convId: string): Promise<void> {
+    this.requireAccount();
+    await this.action(() => this.messaging().accept(convId));
+  }
+
   async addMembers(convId: string, handles: string[]): Promise<void> {
     this.requireAccount();
     await this.action(() => this.messaging().addMembers(convId, handles));

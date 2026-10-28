@@ -39,7 +39,7 @@ describe("links", () => {
     expect(mustView(B, ida).request).toBe(true);
     expect(mustView(B, idc).request).toBe(true);
     expect(mustView(A, ida).name).toBe("@bob");
-    B.markRead(ida);
+    await B.accept(ida);
     await B.sendText(ida, "hi alice, via my link");
     await A.sendText(ida, "hi bob");
     await settle(A, B, C);

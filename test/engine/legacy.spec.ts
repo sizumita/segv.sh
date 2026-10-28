@@ -26,7 +26,7 @@ async function group(names: string[], name = "g") {
   for (const u of users) engines.push(await engineFor(u));
   const id = await engines[0].createConversation(names.slice(1), name);
   await settle(...engines);
-  for (const E of engines.slice(1)) E.markRead(id);
+  for (const E of engines.slice(1)) await E.accept(id);
   await settle(...engines);
   return { users, engines, id };
 }

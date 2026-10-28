@@ -1,8 +1,12 @@
 import { $, component$, useContext, useSignal, useVisibleTask$ } from "@qwik.dev/core";
 import type { ConversationView, MessageView } from "~/client/types";
+import { loadEngine } from "./engine-loader";
 import { MsgImage } from "./msg-image";
 import { UiCtx } from "./state";
-import { clock, dayKey, dayLabel, fullTime } from "./util";
+import { clock, dayKey, dayLabel, errMsg, fullTime } from "./util";
+
+/** The reaction palette (one emoji each; §11.12). */
+const PALETTE = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
 
 const GROUP_MS = 5 * 60_000;
 const NEAR_BOTTOM_PX = 48;
@@ -45,6 +49,8 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
   });
 
   const msgs = props.conv.messages;
+  // A reaction is a post: not in a read-only preview (it would accept the copy) or where nothing can be sent.
+  const canReact = props.conv.canSend && props.conv.byContact;
   return (
     <div class="msgwrap">
       <div class="msgs" ref={box} onScroll$={onScroll} role="log" aria-live="polite" tabIndex={0}>
@@ -84,6 +90,9 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
                   )}
                   {m.status === "sending" && <p class="st">sending…</p>}
                   {m.status === "failed" && <p class="st failed">failed — not delivered</p>}
+                  {m.status === "sent" && (m.reactions.length > 0 || canReact) && (
+                    <Reactions convId={props.conv.id} m={m} canReact={canReact} />
+                  )}
                 </div>
               )}
             </div>
@@ -95,6 +104,71 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
           new messages — jump to latest
         </button>
       )}
+    </div>
+  );
+});
+
+/** The reactions under a message, each with its count, and the palette to add one (§11.12). */
+const Reactions = component$<{ convId: string; m: MessageView; canReact: boolean }>((props) => {
+  const ui = useContext(UiCtx);
+  const open = useSignal(false);
+  const busy = useSignal(false);
+
+  const toggle = $(async (emoji: string, on: boolean) => {
+    if (busy.value) return;
+    busy.value = true;
+    open.value = false;
+    ui.localError = "";
+    try {
+      await (await loadEngine()).react(props.convId, props.m.key, emoji, on);
+    } catch (e) {
+      ui.localError = errMsg(e);
+    } finally {
+      busy.value = false;
+    }
+  });
+
+  const mineOn = (emoji: string) => props.m.reactions.some((r) => r.emoji === emoji && r.mine);
+  return (
+    <div class="reacts">
+      {props.m.reactions.map((r) => (
+        <button
+          type="button"
+          key={r.emoji}
+          class={["react", r.mine && "mine"]}
+          disabled={!props.canReact || busy.value}
+          aria-pressed={r.mine}
+          title={r.mine ? "remove your reaction" : "react with this too"}
+          onClick$={() => toggle(r.emoji, !r.mine)}
+        >
+          {r.emoji} {r.count}
+        </button>
+      ))}
+      {props.canReact &&
+        (open.value ? (
+          <span class="palette" role="group" aria-label="react">
+            {PALETTE.map((e) => (
+              <button
+                type="button"
+                key={e}
+                class={["react", mineOn(e) && "mine"]}
+                disabled={busy.value}
+                onClick$={() => toggle(e, !mineOn(e))}
+              >
+                {e}
+              </button>
+            ))}
+          </span>
+        ) : (
+          <button
+            type="button"
+            class="react add"
+            aria-label="add a reaction"
+            onClick$={() => (open.value = true)}
+          >
+            +
+          </button>
+        ))}
     </div>
   );
 });

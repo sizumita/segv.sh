@@ -92,10 +92,13 @@ export function parseHandles(raw: string, self?: string, existing: string[] = []
 export const isGone = (c: Pick<ConversationView, "blocked">): boolean =>
   c.blocked === "removed" || c.blocked === "left";
 
-/** The list a conversation belongs in: archives once gone (a removed request too), else requests or chats. */
-export function listOf(c: Pick<ConversationView, "blocked" | "request">): ListView {
+/**
+ * The list a conversation belongs in: archives once gone (a removed request too), requests while its inviter is
+ * neither self nor a contact (the user has not accepted it, §11.11), else chats.
+ */
+export function listOf(c: Pick<ConversationView, "blocked" | "byContact">): ListView {
   if (isGone(c)) return "archives";
-  return c.request ? "requests" : "chats";
+  return c.byContact ? "chats" : "requests";
 }
 
 /**
