@@ -158,10 +158,45 @@ carry none of these. Keep it that way.
 Run staging as a separate deployment, with its own Worker name, D1 database, R2 bucket, secrets and `E_FIRST`, and its
 own host name in `routes` and `APP_HOSTS`. Passkeys registered on staging work only there.
 
+## Deploying from GitHub Actions
+
+`.github/workflows/deploy.yml` deploys every push to `main`. One job runs the checks, the tests and the build without
+any secret; a second job, in the `production` environment, deploys what the first one built with Wrangler and then
+checks that `/api/v2/params` answers. Do the first deployment by hand (the steps above); the workflow only updates a
+Worker that already exists. For your own instance, change the URL in the workflow to your domain.
+
+1. Create the Cloudflare API token. On the **Account API tokens** page of the Cloudflare dashboard, create a custom
+   token with a single permission: the **Editor** role of **Workers**, scoped to your Worker alone (`segv-sh`). Add no
+   zone permissions and no D1 or R2 permissions, and give the token an expiry date.
+
+   Such a token can deploy and roll back that one Worker and change its secrets. It cannot create or delete Workers,
+   touch other Workers, read D1 or R2 directly, or add, change or remove routes, Custom Domains or DNS records. It can
+   still deploy any code to the Worker, and that code reaches every binding, so treat it as a production credential.
+
+2. In the repository's settings, create the environment `production`. Under **Deployment branches and tags**, choose
+   **Selected branches and tags** and add the branch `main`, so that no other branch can use the environment's
+   secrets. Optionally add yourself as a required reviewer to approve each deployment.
+
+3. Add the token and your account id as secrets of that environment, not of the repository. `gh` asks for each value:
+
+   ```bash
+   gh secret set CLOUDFLARE_API_TOKEN --env production
+   gh secret set CLOUDFLARE_ACCOUNT_ID --env production
+   ```
+
+4. Under **Actions › General** in the repository's settings, require actions to be pinned to a full-length commit SHA,
+   and allow only actions created by GitHub. The workflow uses nothing else.
+
+The token cannot apply D1 migrations, and a change to `routes` in `wrangler.jsonc` makes the deployment fail at the
+Custom Domain step after the new version is live. Apply both by hand (the next section).
+
 ## Updating
 
-- Deploy new code with `npm run deploy`.
+- A push to `main` deploys it (the previous section). Without the workflow, deploy new code with `npm run deploy`.
 - When a change adds a D1 migration, apply it with `npx wrangler d1 migrations apply DB --remote` before deploying the
-  code that needs it. Changes to Durable Object classes are declared in `migrations` in `wrangler.jsonc`.
+  code that needs it, that is, before merging the pull request when `main` deploys itself. Changes to Durable Object
+  classes are declared in `migrations` in `wrangler.jsonc`.
+- To change `routes`, deploy the change with `npm run deploy` from an account that has Workers Routes Write on the
+  zone, then push it to `main`.
 - Check a change to `wrangler.jsonc` with `npm run build` followed by `npx wrangler deploy --dry-run` before you deploy
   it.
