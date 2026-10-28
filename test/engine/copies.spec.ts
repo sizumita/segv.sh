@@ -9,6 +9,7 @@ import { secondCopyWarning } from "../../src/client/join";
 import {
   I,
   P,
+  buildMessage,
   chat,
   commitChange,
   conv,
@@ -19,6 +20,7 @@ import {
   makeUser,
   mustView,
   newEngine,
+  postRow,
   selfRowsOf,
   server,
   settle,
@@ -445,5 +447,47 @@ describe("siblings (§11.7)", () => {
       (q) => q.who === "bob2" && q.path === `/api/v2/blob/${P.b64u(r.bundleId)}/meta`,
     );
     expect(meta).toEqual([]);
+  });
+});
+
+describe("a CONFLICT with a sibling's CONFIRMED row (§7.3)", () => {
+  it("runs §6.7 steps 3–6 again for the J: neither device holds the forged copy", async () => {
+    const {
+      users: [, bob, carol, mallory],
+      engines: [A, B, C, M],
+      id,
+    } = await group(["alice", "bob", "carol", "mallory"]);
+    const B2 = newEngine("bob2");
+    await I(B2).unlock(bob.AK, bob.uid, bob.handle);
+    await waitFor(() => !B2.getState().syncing, "bob2's restore");
+    await settle(A, B, B2, C, M);
+    // B1's next self rows, and carol's row that makes B1 confirm G, are hidden from bob2
+    const E = server().era;
+    let n0 = 0;
+    while (server().shard.hasLabel(E, P.Lself(bob.id.rS, E, n0))) n0++;
+    for (let n = n0; n < n0 + 64; n++) server().shard.hide(E, P.Lself(bob.id.rS, E, n), "bob2");
+    const ep = epoch(C, id);
+    const j = P.memberIndex(ep.D, carol.uid);
+    const row = buildMessage(carol, ep, { E, n: ep.lanes[j].next.n }, { type: P.MT.TEXT, text: "hi" } as P.MBody);
+    server().shard.hide(row.E, row.label, "bob2");
+    postRow(ep, row);
+    await settle(A, B, C, M);
+    expect(conv(B, id).confirmed).toBe(true);
+    expect(conv(B2, id).confirmed).toBe(false);
+    const conflicts = () =>
+      server().requests.filter(
+        (r) => r.who === "bob2" && r.path === "/api/v2/put" && r.putResults?.some((x) => x.s === "conflict"),
+      ).length;
+    const before = conflicts();
+    forgeJoin(bob, forgedJ(mallory, conv(B, id).conv, 3, [bob, mallory]));
+    await settle(A, B, C, M);
+    expect(warnings(B)).toContain(CONFIRMED_COPY_WARNING);
+    await settle(B2); // bob2's poll (live, it may have run already) meets B1's rows by CONFLICT
+    expect(conflicts()).toBeGreaterThan(before);
+    expect(warnings(B2)).toContain(CONFIRMED_COPY_WARNING);
+    expect(warnings(B2)).not.toContain(secondCopyWarning("mallory"));
+    for (const X of [B, B2]) expect(I(X).views().map((v) => v.id)).toEqual([id]);
+    const B3 = await engineFor(bob);
+    expect(I(B3).views().map((v) => v.id)).toEqual([id]);
   });
 });

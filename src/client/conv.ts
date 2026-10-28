@@ -176,6 +176,13 @@ export interface Copy {
   convB: string;
   /** H(D) of the first epoch the account accepted */
   root: Bytes;
+  /** that epoch: the copy holds every epoch from it to `current`, though a restore materializes them from its start */
+  rootE: number;
+  /**
+   * The highest epoch whose key the snapshot's CONV_JOIN or flag-0 EPOCH records give, while a restore has not reached
+   * it: the epochs below it are reached by the claims those records name, read without probing (§11.4 step 5).
+   */
+  top: number | null;
   /** D.by of that epoch */
   rootBy: Bytes;
   request: boolean;
@@ -210,7 +217,7 @@ export interface Copy {
 }
 
 /** The epoch the copy was joined at: its root epoch (every epoch above it is held, §6.6 step 3). */
-export const rootEpoch = (c: Copy): number => Math.min(...c.epochs.keys());
+export const rootEpoch = (c: Copy): number => c.rootE;
 
 /**
  * Two held copies of one conversation contest each other (§6.7 step 6): two that have not ended always do; an ended

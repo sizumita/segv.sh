@@ -120,11 +120,22 @@ export class SelfFold {
   readonly confirmed = new Set<string>();
   /** the latest HEADS entry per copy key and epoch, with its lane order (§7.2 assigns a legacy key's by epoch) */
   private readonly headsAt = new Map<string, Map<number, { entry: P.HeadsEntry; order: number }>>();
+  /**
+   * The furthest control position `(ctlE, ctlCnt)` per copy key and epoch among the HEADS entries applied, the
+   * replaced ones included: a control position stays true of its epoch (§7.3, §11.4 step 5).
+   */
+  readonly ctlAt = new Map<string, P.EraCount>();
   /** PREFS: the latest value per key */
   readonly prefs = new Map<number, Bytes>();
+  /** the lane order of each copy's first CONV_JOIN or REQUEST (a snapshot keeps that order, §7.4) */
+  readonly firstOrder = new Map<string, number>();
+  /** CONV_JOINs that a snapshot held: a restore starts such a copy at its snapshot's top (§11.4 step 5) */
+  readonly snapJoins = new Set<string>();
   /** records applied so far (rows count once each) */
   applied = 0;
   private order = 0;
+  /** applying a snapshot: every record is under its own copy's key, so no placement rule of §7.2 applies */
+  private inSnapshot = false;
 
   constructor(private readonly hooks: FoldHooks) {}
 
@@ -178,6 +189,19 @@ export class SelfFold {
     return s.viewKey;
   }
 
+  /**
+   * Applies a snapshot's records (§7.4, §11.4 step 3): every copy's records are under that copy's own key, and a
+   * REQUEST takes its age from its bundle's `t_reg`, so a request still expires as it would from its row.
+   */
+  applySnapshot(records: readonly P.SelfRecord[], ts: number): void {
+    this.inSnapshot = true;
+    try {
+      this.apply(records, Math.max(0, Math.floor((ts - P.T0_MS) / 1000)));
+    } finally {
+      this.inSnapshot = false;
+    }
+  }
+
   /** Applies the records of one row, stored at time `t` (seconds since T0). */
   apply(records: readonly P.SelfRecord[], t: number): void {
     const withHeads = records.some((r) => r.rtype === P.RT.HEADS);
@@ -200,6 +224,7 @@ export class SelfFold {
    * came first (the copy it starts is this one), else the next number of its conversation (§7.3 "Copy keys").
    */
   private assignViewKey(k: string, r: P.ConvJoinRec | P.RequestRec): void {
+    if (!this.firstOrder.has(k)) this.firstOrder.set(k, this.order);
     if (this.viewKeys.has(k)) return;
     const mk = materialKey(r);
     const had = this.byMaterial.get(mk);
@@ -234,11 +259,13 @@ export class SelfFold {
       case P.RT.CONV_JOIN: {
         const k = copyKey(r);
         // A first-release tab's acceptance of a copy it continued by a skip (§7.2): it accepts that skip's copy.
-        const skip = r.via === P.VIA.REQUEST_ACCEPTED ? this.latestSkipOf(k) : null;
+        const skip =
+          r.via === P.VIA.REQUEST_ACCEPTED && !this.inSnapshot ? this.latestSkipOf(k) : null;
         if (skip) {
           if (!this.skipAccepted.has(skip.id)) this.skipAccepted.set(skip.id, r);
           return;
         }
+        if (this.inSnapshot) this.snapJoins.add(k);
         if (this.joins.has(k)) return;
         this.joins.set(k, r);
         this.assignViewKey(k, r);
@@ -247,7 +274,7 @@ export class SelfFold {
       case P.RT.REQUEST: {
         const k = copyKey(r);
         if (this.joins.has(k) || this.requestRecs.has(k)) return;
-        this.requestRecs.set(k, { rec: r, t, order: this.order });
+        this.requestRecs.set(k, { rec: r, t: this.inSnapshot ? r.tReg : t, order: this.order });
         this.assignViewKey(k, r);
         return;
       }
@@ -335,7 +362,7 @@ export class SelfFold {
       case P.RT.CONFIRMED: {
         const k = copyKey(r);
         // A first-release tab's confirmation of a copy it continued by a skip, in a row of its own (§7.2).
-        const skip = withHeads ? null : this.latestSkipOf(k);
+        const skip = withHeads || this.inSnapshot ? null : this.latestSkipOf(k);
         if (skip) this.skipConfirmed.add(skip.id);
         else this.confirmed.add(k);
         return;
@@ -349,6 +376,10 @@ export class SelfFold {
           let m = this.headsAt.get(k);
           if (!m) this.headsAt.set(k, (m = new Map()));
           m.set(x.e, { entry: x, order: this.order });
+          const ck = `${k}:${x.e}`;
+          const had = this.ctlAt.get(ck);
+          if (!had || x.ctl.E > had.E || (x.ctl.E === had.E && x.ctl.cnt > had.cnt))
+            this.ctlAt.set(ck, { ...x.ctl });
         }
         return;
       }
@@ -383,6 +414,13 @@ export class SelfLane {
   /** writes never go below this era: the account's registration era (§7.3), set after the account check */
   floorEra = 0;
   readonly fold: SelfFold;
+  /**
+   * The latest snapshot pointer this session read or wrote (§7.4): its era, and the fold's record count once its
+   * records were applied (a device writes a new one after more than 200 more, or in an era without one).
+   */
+  snapshot: { E: number; applied: number; pos: P.Pos } | null = null;
+  /** the restore looked for a snapshot (steps 2–3 run once per session) */
+  snapshotRead = false;
 
   constructor(
     private readonly api: Api,

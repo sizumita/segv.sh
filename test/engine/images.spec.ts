@@ -92,8 +92,10 @@ describe("images", () => {
     const id = await E.createConversation(["bob"]);
     await settle(E);
     let release!: () => void;
+    // holds the image's upload only (a snapshot's blob of the next session goes through)
     server().hooks.beforeRequest = (m, p) => {
-      if (m === "PUT" && p.startsWith("/api/v2/blob/")) return new Promise<void>((r) => (release = r));
+      if (m === "PUT" && p.startsWith("/api/v2/blob/") && !release)
+        return new Promise<void>((r) => (release = r));
     };
     const p = E.sendImage(id, new File([P.utf8("alice only") as BlobPart], "a.webp", { type: "image/webp" }));
     await sleep(50);
@@ -118,8 +120,10 @@ describe("images", () => {
     const id = await E.createConversation(["bob", "dave"]); // dave is a member too
     await settle(E, B);
     let release!: () => void;
+    // holds the image's upload only (a snapshot's blob of the next session goes through)
     server().hooks.beforeRequest = (m, p) => {
-      if (m === "PUT" && p.startsWith("/api/v2/blob/")) return new Promise<void>((r) => (release = r));
+      if (m === "PUT" && p.startsWith("/api/v2/blob/") && !release)
+        return new Promise<void>((r) => (release = r));
     };
     const p = E.sendImage(id, new File([P.utf8("picked by alice") as BlobPart], "a.webp", { type: "image/webp" }));
     await sleep(50);

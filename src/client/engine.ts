@@ -25,6 +25,7 @@ import {
 import { cursorAt, type InboxCursor } from "./inbox";
 import { Messaging, type MessagingHost } from "./messaging";
 import { SelfLane } from "./selflane";
+import { readSnapshot } from "./snapshot";
 import { clearSession, loadSession, saveSession } from "./session";
 import type { ConversationView, Engine, EngineState, ImageRef } from "./types";
 import { prfCapability } from "./webauthn";
@@ -365,7 +366,21 @@ export class SegvEngine implements Engine {
       if (acc.regEra === null) await this.checkAccount(acc, gen);
       if (this.fatal) return;
       self.floorEra = acc.regEra!;
-      await this.enqueue(() => self.catchUp({ E: acc.regEra!, n: 0 }));
+      // §11.4 steps 2–4: the latest snapshot, then the self delta from its position (or the lane from regEra).
+      await this.enqueue(async () => {
+        if (!self.snapshotRead) {
+          const snap = await readSnapshot(this.api, acc.id, acc.regEra!);
+          self.snapshotRead = true;
+          if (snap) {
+            self.fold.applySnapshot(snap.records, snap.ts);
+            self.snapshot = { E: snap.E, applied: self.fold.applied, pos: snap.pos };
+          }
+        }
+        const pos = self.snapshot?.pos;
+        await self.catchUp(
+          pos && !P.isNone(pos) ? { E: pos.E, n: pos.n } : { E: acc.regEra!, n: 0 },
+        );
+      });
       this.assertSession(acc, gen);
       if (registered && !self.fold.cursor) {
         cursor ??= cursorAt(

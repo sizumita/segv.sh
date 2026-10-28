@@ -53,6 +53,11 @@ export interface MembershipHost {
   claimConfirms(c: Copy, ep: Epoch, w: Winner): void;
   /** the copy enters the epoch of its restore's HEADS entry (§11.4 step 5) */
   applyHeads(c: Copy, ep: Epoch): void;
+  /**
+   * The copy enters epoch `ep`: its control lane starts at the furthest control position that the account's HEADS
+   * entries for that epoch give, when one does (§7.3, §11.4 step 5).
+   */
+  ctlFrom(c: Copy, ep: Epoch): void;
   /** an own LEAVE row was applied in epoch e: write its LEAVE record if the account has none (§6.9) */
   ownLeave(c: Copy, e: number): void;
   /** a member's kept leave source changed in this epoch (its LEFT record rides in the next HEADS row, §7.3) */
@@ -361,6 +366,50 @@ export function claimRead(h: MembershipHost, c: Copy, ep: Epoch, w: Winner): voi
   h.changed();
 }
 
+/**
+ * Below a snapshot's top (§11.4 step 5): the epoch's winning claim, read at the position that the next held epoch's
+ * EPOCH record names, is used as a processed claim without evaluating it again: it confirms the copy when a third
+ * member made it, the lanes of e−1 still followed are swept, and the copy switches to the next epoch, whose key the
+ * record gives, with the claim's lines.
+ */
+export async function switchByRecord(
+  h: MembershipHost,
+  c: Copy,
+  ep: Epoch,
+  w: Winner,
+  next: Epoch,
+): Promise<void> {
+  ep.ctl.winner = w;
+  ep.ctl.queue = [];
+  ep.ended = { t: w.t, rm: w.claim.rm, cuts: w.claim.cuts, at: { E: w.E, n: w.n } };
+  h.claimConfirms(c, ep, w);
+  const below = unsweptBelow(c, ep);
+  if (below.length) await h.sweep(below);
+  for (const t of below) t.ep.lanes[t.lane as number].swept = true;
+  if (!ep.lanesOn) for (const l of ep.lanes) l.swept = true;
+  carryLeaves(ep, next);
+  enterEpoch(h, c, next);
+  claimLines(h, c, ep, next, w);
+  retract(h, c);
+  deriveLines(h, c);
+  h.changed();
+}
+
+/**
+ * An older epoch that history loads (§11.10, §11.4 step 6), with the claim that ended it read at a record's position:
+ * its lines show as a processed claim's would (§11.9), and §6.8 decides its rows with it.
+ */
+export function historyClaim(h: MembershipHost, c: Copy, ep: Epoch, w: Winner): void {
+  ep.ctl.winner = w;
+  ep.ctl.queue = [];
+  ep.ended = { t: w.t, rm: w.claim.rm, cuts: w.claim.cuts, at: { E: w.E, n: w.n } };
+  const next = c.epochs.get(ep.e + 1);
+  if (next) claimLines(h, c, ep, next, w);
+  retract(h, c);
+  deriveLines(h, c);
+  h.changed();
+}
+
 /** The copy continues at `next` (the switch of §6.6 step 4): held, current, its lanes, HEADS, topic. */
 export function enterEpoch(h: MembershipHost, c: Copy, next: Epoch): void {
   next.lanesOn = c.heads === null || next.e >= c.heads.e;
@@ -368,6 +417,7 @@ export function enterEpoch(h: MembershipHost, c: Copy, next: Epoch): void {
   c.epochs.set(next.e, next);
   c.current = next.e;
   if (c.heads && c.heads.e === next.e) h.applyHeads(c, next);
+  h.ctlFrom(c, next);
   h.onSwitch(c, next);
 }
 

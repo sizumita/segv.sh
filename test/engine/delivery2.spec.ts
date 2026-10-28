@@ -157,9 +157,9 @@ describe("a parked WELCOME (§6.7 step 4, §7.3)", () => {
     await D.sendText(one, "hi alice"); // the 1:1 qualifies as dave's WELCOME channel (§6.12 step 1)
     await settle(A, D);
     let failing = true;
-    const oneBundle = P.b64u(epoch(A, one).bundleId);
+    // the J's blob/meta fails transiently, so the WELCOME's J parks (§6.7 step 1)
     server().hooks.fail = (m, p, who) =>
-      failing && who === "dave" && m === "GET" && p.startsWith("/api/v2/blob/") && !p.includes(oneBundle)
+      failing && who === "dave" && m === "GET" && p.startsWith("/api/v2/blob/") && p.endsWith("/meta")
         ? "before"
         : undefined;
     const g = await A.createConversation(["carol", "dave"], "g");

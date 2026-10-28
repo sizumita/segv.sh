@@ -62,6 +62,11 @@ export interface SyncCtx {
    * 5). True when the host keeps the row, to apply it once the claim is read.
    */
   holdRow?(c: Copy, ep: Epoch, j: number, r: FoundRow): boolean;
+  /**
+   * An older held epoch that a restore did not materialize (below its start after a snapshot), loaded for history
+   * (§11.10): undefined below the copy's root, or when its records do not give it.
+   */
+  older?(c: Copy, e: number): Promise<Epoch | undefined>;
 }
 
 export const UNDECRYPTABLE = "ignored an undecryptable message";
