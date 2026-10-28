@@ -9,8 +9,10 @@ export type ListView = "chats" | "requests" | "archives";
 
 /** UI-only state. Secrets (the recovery code) and live objects are wrapped in noSerialize(). */
 export interface UiState {
-  /** id of the conversation shown on the right ('' = none). Never put it in the URL. */
+  /** id of the conversation shown on the right ('' = none). Secret: the URL names it by its `ref` instead. */
   active: string;
+  /** a ref from the URL (`#c/<ref>`) whose conversation is not loaded yet ('' = none; route.ts) */
+  wanted: string;
   /** which list the left pane shows */
   list: ListView;
   /** members panel open */
@@ -43,10 +45,12 @@ export const initialEngineState = (): EngineState => ({
   warnings: [],
   prfSupported: null,
   notifications: "unavailable",
+  preview: "unavailable",
 });
 
 export const initialUiState = (): UiState => ({
   active: "",
+  wanted: "",
   list: "chats",
   members: false,
   recovery: undefined,

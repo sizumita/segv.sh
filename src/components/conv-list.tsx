@@ -1,4 +1,5 @@
 import { $, component$, useContext, useSignal } from "@qwik.dev/core";
+import { showChat } from "./route";
 import { type ListView, StateCtx, UiCtx } from "./state";
 import { act, listOf, MAX_NAME, parseHandles, relTime } from "./util";
 
@@ -45,6 +46,7 @@ export const ConvList = component$(() => {
       handles.value = "";
       name.value = "";
       showNew.value = false;
+      ui.wanted = "";
       ui.active = id;
       ui.list = "chats";
       ui.members = false;
@@ -147,10 +149,7 @@ export const ConvList = component$(() => {
             type="button"
             class={["conv", c.id === ui.active && "on", c.unread > 0 && "unread"]}
             aria-current={c.id === ui.active ? "true" : undefined}
-            onClick$={() => {
-              ui.active = c.id;
-              ui.members = false;
-            }}
+            onClick$={() => showChat(ui, c)}
           >
             <span class="name">{c.name || "(no name)"}</span>
             {ui.list === "archives" && <span class="dim small">{c.blocked}</span>}

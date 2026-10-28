@@ -70,6 +70,12 @@ export type Blocked = "" | "removed" | "left" | "pending" | "frozen";
 export interface ConversationView {
   /** opaque copy key (`b64u(conv)`, or `b64u(conv)~i` for a later copy, §7.3); secret, only ever used locally */
   id: string;
+  /**
+   * The copy's name in the page URL (`/#c/<ref>`): 12 b64u characters, a keyed hash of `id` under a key derived from
+   * the account key. Every device of the account computes the same ref, other accounts a different one, and it tells
+   * nothing about `conv`. It sits in a URL fragment, which browsers never send to the server.
+   */
+  ref: string;
   name: string; // explicit group name ("# name"), or the other members' handles joined by ", "
   members: MemberView[]; // current epoch, in descriptor order
   epoch: number;
@@ -113,6 +119,11 @@ export interface EngineState {
    * a Home Screen web app) or the server offers none; otherwise whether they are on. Per device, never synced.
    */
   notifications: "unavailable" | "off" | "on";
+  /**
+   * What notifications show on this device (§11.13): "unavailable" while notifications are unavailable or the session
+   * is not kept on this device (the Service Worker needs the notification cache, which is kept only then).
+   */
+  preview: "unavailable" | "none" | "name" | "message";
 }
 
 export interface Engine {
@@ -170,5 +181,7 @@ export interface Engine {
    * may ask for permission.
    */
   setNotifications(on: boolean): Promise<void>;
+  /** Chooses what notifications show on this device (§11.13). */
+  setPreview(p: "none" | "name" | "message"): Promise<void>;
   clearError(): void;
 }

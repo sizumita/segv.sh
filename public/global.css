@@ -105,7 +105,8 @@ input::placeholder,
 textarea::placeholder {
   color: var(--dim);
 }
-input[type="checkbox"] {
+input[type="checkbox"],
+input[type="radio"] {
   accent-color: var(--fg);
   margin: 0 6px 0 0;
   vertical-align: -2px;
@@ -743,6 +744,17 @@ textarea:focus {
 }
 .settings h3 {
   font-weight: 700;
+}
+.settings .choice {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.settings .choice legend {
+  padding: 0;
+  margin-bottom: 4px;
 }
 
 @media (max-width: 1000px) {

@@ -4,6 +4,7 @@ import { Composer } from "./composer";
 import { loadEngine } from "./engine-loader";
 import { Members } from "./members";
 import { Messages } from "./messages";
+import { leaveChat } from "./route";
 import { StateCtx, UiCtx } from "./state";
 import { errMsg, inviterOf, isGone } from "./util";
 
@@ -53,14 +54,7 @@ export const ConversationPane = component$<{ conv: ConversationView }>((props) =
   return (
     <>
       <header class="convhead">
-        <button
-          type="button"
-          class="link back"
-          onClick$={() => {
-            ui.active = "";
-            ui.members = false;
-          }}
-        >
+        <button type="button" class="link back" onClick$={() => leaveChat(ui)}>
           back
         </button>
         <h2 class="title" title={conv.name}>

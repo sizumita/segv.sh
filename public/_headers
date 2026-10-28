@@ -11,11 +11,12 @@
   Cache-Control: no-store
   Content-Type: application/javascript
 
-# The push Service Worker (docs/PROTOCOL.md §11.13): never cached, and it loads nothing.
+# The push Service Worker (docs/PROTOCOL.md §11.13), built from src/client/sw-main.ts: never cached; it loads nothing
+# and reads rows from this origin's API only (the `message` preview).
 /sw.js
   Cache-Control: no-store
   Content-Type: application/javascript
-  Content-Security-Policy: default-src 'none'
+  Content-Security-Policy: default-src 'none'; connect-src 'self'
 
 /build/*
   Cache-Control: public, max-age=31536000, s-maxage=31536000, immutable

@@ -3,21 +3,35 @@ import {
   component$,
   useContextProvider,
   useOnDocument,
+  useOnWindow,
   useStore,
   useVisibleTask$,
 } from "@qwik.dev/core";
 import type { EngineState } from "~/client/types";
 import { Chat } from "./chat";
+import { refreshServiceWorker } from "~/client/sw-url";
 import { loadEngine } from "./engine-loader";
 import { Fatal } from "./fatal";
 import { Leaving } from "./leaving";
 import { Recovery } from "./recovery";
+import {
+  closeNotifications,
+  followUrl,
+  openFromWorker,
+  refOfHash,
+  resolveWanted,
+  writeUrl,
+} from "./route";
 import { SignedOut } from "./signed-out";
 import { initialEngineState, initialUiState, StateCtx, UiCtx } from "./state";
 import { errMsg } from "./util";
 import { Viewer } from "./viewer";
 
 const KEYS = Object.keys(initialEngineState()) as (keyof EngineState)[];
+
+/** Signed in, and the restore has put every conversation in the list. */
+const restored = (s: EngineState) =>
+  !!s.me && (s.phase === "ready" || s.phase === "working") && !s.syncing;
 
 function snapshot(s: EngineState): EngineState {
   try {
@@ -36,6 +50,14 @@ export const App = component$(() => {
 
   useVisibleTask$(
     async ({ cleanup }) => {
+      // A link, a reload or a notification may name a conversation (route.ts): show it once it is loaded.
+      ui.wanted = refOfHash(location.hash);
+      // A new /sw.js applies from this launch on, not whenever the browser gets round to checking it.
+      refreshServiceWorker();
+      // A tapped notification of a conversation, while this window is open.
+      const onWorker = (e: MessageEvent) => openFromWorker(e.data);
+      navigator.serviceWorker?.addEventListener("message", onWorker);
+      cleanup(() => navigator.serviceWorker?.removeEventListener("message", onWorker));
       ui.visible = document.visibilityState === "visible";
       ui.now = Date.now();
       const tick = window.setInterval(() => (ui.now = Date.now()), 30_000);
@@ -73,6 +95,8 @@ export const App = component$(() => {
           lastPhase = snap.phase;
         }
         if (ui.active && !snap.conversations.some((c) => c.id === ui.active)) ui.active = "";
+        if (snap.me && (snap.phase === "ready" || snap.phase === "working"))
+          resolveWanted(ui, snap.conversations, restored(snap));
         const unread = snap.conversations.reduce((n, c) => n + (c.unread > 0 ? c.unread : 0), 0);
         document.title = unread > 0 ? `(${unread}) segv.sh` : "segv.sh";
       };
@@ -89,10 +113,35 @@ export const App = component$(() => {
     { strategy: "document-ready" },
   );
 
+  // The URL follows the conversation on screen (not before the engine has booted: a link's ref waits in ui.wanted).
+  useVisibleTask$(
+    ({ track }) => {
+      const phase = track(() => state.phase);
+      const id = track(() => ui.active);
+      const wanted = track(() => ui.wanted);
+      if (phase === "boot" || wanted) return;
+      const c = id ? state.conversations.find((x) => x.id === id) : undefined;
+      writeUrl(c ? c.ref : "");
+      if (c) closeNotifications(c.ref);
+    },
+    { strategy: "document-ready" },
+  );
+  // Back, forward, or an edited fragment.
+  useOnWindow(
+    "popstate",
+    $(() => followUrl(ui, state.conversations, restored(state))),
+  );
+  useOnWindow(
+    "hashchange",
+    $(() => followUrl(ui, state.conversations, restored(state))),
+  );
+
   useOnDocument(
     "visibilitychange",
     $(() => {
       ui.visible = document.visibilityState === "visible";
+      // A web app on a phone is often resumed rather than launched again.
+      if (ui.visible) refreshServiceWorker();
     }),
   );
   useOnDocument(
