@@ -11,14 +11,11 @@ const LISTS: { id: ListView; empty: string }[] = [
 export const ConvList = component$(() => {
   const state = useContext(StateCtx);
   const ui = useContext(UiCtx);
-  const showFp = useSignal(false);
   const showNew = useSignal(false);
   const handles = useSignal("");
   const name = useSignal("");
   const formError = useSignal("");
   const creating = useSignal(false);
-  const addingKey = useSignal(false);
-  const pushBusy = useSignal(false);
 
   const me = state.me;
   const formOpen = showNew.value || state.conversations.length === 0;
@@ -58,21 +55,15 @@ export const ConvList = component$(() => {
     <aside class="left" aria-label="conversations">
       {me && (
         <div class="me">
+          <span class="handle strong">@{me.handle}</span>
           <button
             type="button"
             class="link"
-            aria-expanded={showFp.value}
-            title="show your safety number"
-            onClick$={() => (showFp.value = !showFp.value)}
+            aria-haspopup="dialog"
+            onClick$={() => (ui.settings = true)}
           >
-            @{me.handle}
+            settings
           </button>
-          {showFp.value && (
-            <div class="fp-box">
-              <p class="dim small">your safety number — compare it with your contacts in person:</p>
-              <p class="fp">{me.fingerprint}</p>
-            </div>
-          )}
         </div>
       )}
 
@@ -175,52 +166,6 @@ export const ConvList = component$(() => {
           <p class="dim small pad">{LISTS.find((l) => l.id === ui.list)?.empty}</p>
         )}
       </nav>
-
-      <footer class="foot">
-        <button
-          type="button"
-          class="link"
-          disabled={addingKey.value}
-          onClick$={async () => {
-            addingKey.value = true;
-            ui.notice = "";
-            const ok = await act(ui, async (e) => {
-              await e.addPasskey();
-              return true;
-            });
-            addingKey.value = false;
-            if (ok) {
-              ui.notice = "passkey added.";
-              setTimeout(() => {
-                if (ui.notice === "passkey added.") ui.notice = "";
-              }, 6000);
-            }
-          }}
-        >
-          {addingKey.value ? "adding passkey…" : "add passkey"}
-        </button>
-        {state.notifications !== "unavailable" && (
-          <button
-            type="button"
-            class="link"
-            disabled={pushBusy.value}
-            aria-pressed={state.notifications === "on"}
-            title="a notification that says only “new messages”, on this device only"
-            onClick$={async () => {
-              // Turning on asks for permission: it must start inside this click.
-              const on = state.notifications !== "on";
-              pushBusy.value = true;
-              await act(ui, (e) => e.setNotifications(on));
-              pushBusy.value = false;
-            }}
-          >
-            {state.notifications === "on" ? "notifications: on" : "notifications: off"}
-          </button>
-        )}
-        <button type="button" class="link" onClick$={() => act(ui, (e) => e.logout())}>
-          sign out
-        </button>
-      </footer>
     </aside>
   );
 });

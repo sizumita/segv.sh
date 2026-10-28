@@ -19,8 +19,8 @@ export interface UiState {
   recovery: NoSerialize<{ code: string }>;
   /** error from a rejected engine call (when the engine did not set state.error itself) */
   localError: string;
-  /** short-lived success notice ("passkey added") */
-  notice: string;
+  /** settings dialog open */
+  settings: boolean;
   /** document.visibilityState === 'visible' */
   visible: boolean;
   /** clock for relative times, refreshed every 30 s */
@@ -49,7 +49,7 @@ export const initialUiState = (): UiState => ({
   members: false,
   recovery: undefined,
   localError: "",
-  notice: "",
+  settings: false,
   visible: true,
   now: 0,
   viewer: undefined,

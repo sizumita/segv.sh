@@ -261,12 +261,21 @@ textarea:focus {
   padding: 8px 12px;
   border-bottom: 1px solid var(--fg);
 }
+.me {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+.me .handle {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .newconv form {
   display: grid;
   gap: 6px;
-}
-.fp-box {
-  margin-top: 6px;
 }
 .fp {
   word-spacing: 0.2em;
@@ -328,13 +337,6 @@ textarea:focus {
 .conv.on .dim {
   color: inherit;
 }
-.foot {
-  border-top: 1px solid var(--fg);
-  padding: 8px 12px;
-  display: flex;
-  gap: 16px;
-}
-
 .right {
   display: flex;
   flex-direction: column;
@@ -603,6 +605,45 @@ textarea:focus {
   cursor: default;
 }
 
+/* <dialog> opened with showModal(): centred on wide screens, the whole screen on phones (below). */
+.settings {
+  width: min(32rem, calc(100% - 32px));
+  max-width: none;
+  max-height: calc(100% - 64px);
+  padding: 0;
+  border: 1px solid var(--fg);
+  background: var(--bg);
+  color: var(--fg);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+/* ::backdrop does not inherit the custom properties in every browser: plain colours. */
+.settings::backdrop {
+  background: rgb(255 255 255 / 0.85);
+}
+@media (prefers-color-scheme: dark) {
+  .settings::backdrop {
+    background: rgb(0 0 0 / 0.85);
+  }
+}
+.settings .sheet {
+  padding: 10px 16px 20px;
+  display: grid;
+  gap: 16px;
+}
+.settings h2 {
+  font-weight: 700;
+}
+.settings section {
+  border-top: 1px solid var(--fg);
+  padding-top: 10px;
+  display: grid;
+  gap: 6px;
+}
+.settings h3 {
+  font-weight: 700;
+}
+
 @media (max-width: 1000px) {
   .members {
     position: absolute;
@@ -632,6 +673,17 @@ textarea:focus {
   }
   .back {
     display: inline;
+  }
+  .settings {
+    width: 100%;
+    height: 100%;
+    max-height: none;
+    margin: 0;
+    border: 0;
+  }
+  .settings .sheet {
+    padding: calc(10px + env(safe-area-inset-top)) max(16px, env(safe-area-inset-right))
+      calc(24px + env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
   }
   .composer .hint:not(.strong) {
     display: none;
