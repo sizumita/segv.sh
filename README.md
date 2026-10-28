@@ -27,8 +27,11 @@ The reference deployment runs at <https://segv.sh>.
 - A fingerprint for every account, to compare keys out of band.
 - Integrity warnings when the server rewrites or rolls back data, drops rows from a sender's sequence, or shows
   members different views.
-- Optional notifications (Web Push), off by default and turned on per device. Every notification says only "new
-  messages"; invites, requests and reactions never notify.
+- Optional notifications (Web Push), off by default and turned on per device. A notification says "new messages", or,
+  if the user chooses so on that device, the conversation's name or its name and newest message, which the device
+  decrypts itself; invites, requests and reactions never notify.
+- A URL for each conversation (`/#c/…`) that opens it from a link, a reload or a notification. The part after `#`
+  never reaches the server, and it is not the conversation's secret id.
 - Installable as an app (a web app manifest; on iPhone and iPad, "Add to Home Screen").
 
 ## How it works
@@ -147,8 +150,10 @@ segv.sh does not protect against:
 Notifications are off unless the deployment configures them and the user turns them on, per device. A device that
 does registers a "bell" for each conversation it accepted: a value derived from that conversation's epoch key, which
 every member can compute and no one else can. After sending a text or an image, a client asks the server to ring the
-other members' bells, and the server sends each registered device one fixed, contentless notification, at most once a
-minute.
+other members' bells, and the server sends each registered device one contentless push, at most once a minute. The
+push names, encrypted to the device, the bells that rang. By default the device shows the fixed text "new messages". A
+device that keeps its session can instead show the conversation's name, or its name and newest message: it looks the
+bell up in a cache sealed on the device and, for the message, fetches and decrypts the new rows itself.
 
 - The server stores, per device, its push endpoint and keys sealed under a server key, keyed hashes of its bells, and
   the day of its last registration: no account, conversation, topic or address, and nothing about which devices a
@@ -160,6 +165,10 @@ minute.
 - The operator sees, at each ring, which devices a message is for, including devices that are offline.
 - A member can make other members' devices show the notification, at most once a minute, or hold the registration
   places of their bells and so keep their devices from being notified.
+- A preview hands the conversation's name, and with messages their text, to the device's notification system: it can
+  show them on the lock screen and keep them in its notification history after the messages or the app are gone. With
+  message previews the device fetches the new rows after each push, also while the app is closed, so the operator
+  learns the device's address each time.
 
 [docs/PROTOCOL.md](docs/PROTOCOL.md) §9.8, §10.10, §11.13 and §13.4 are the normative statements.
 

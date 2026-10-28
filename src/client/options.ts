@@ -1,5 +1,6 @@
 // Engine options (docs/PROTOCOL.md §11): the transport, the clocks, and every protocol delay, so tests can inject
 // them. The app constructs the engine without options.
+import type { CacheStore, PreviewStore } from "./notify-cache";
 import type { PushPlatform, PushStore } from "./push";
 
 /** A scheduled callback; `cancel()` is idempotent. */
@@ -85,4 +86,6 @@ export interface EngineOptions {
    * null: no Web Push (the engine tests inject fakes).
    */
   push?: { platform: PushPlatform | null; store?: PushStore };
+  /** The notification cache and the preview setting (§11.13); defaults: IndexedDB and localStorage. */
+  notify?: { store: CacheStore | null; preview: PreviewStore };
 }

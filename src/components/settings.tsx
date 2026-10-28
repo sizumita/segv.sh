@@ -3,6 +3,19 @@ import { Errors } from "./errors";
 import { StateCtx, UiCtx } from "./state";
 import { act } from "./util";
 
+type Preview = "none" | "name" | "message";
+
+/** What notifications show on this device (docs/PROTOCOL.md §11.13). */
+const PREVIEWS: { id: Preview; label: string; hint: string }[] = [
+  { id: "none", label: "“new messages”", hint: "the same text for every notification" },
+  { id: "name", label: "the conversation's name", hint: "decrypted on this device" },
+  {
+    id: "message",
+    label: "the name and the newest message",
+    hint: "this device fetches and decrypts it after each notification, also while the app is closed",
+  },
+];
+
 /**
  * Account settings in a modal <dialog>: the browser traps focus, closes it on escape and gives focus back to the
  * button that opened it. Every way of closing goes through the dialog's `close` event, which clears `ui.settings`.
@@ -14,6 +27,7 @@ export const Settings = component$(() => {
   const addingKey = useSignal(false);
   const added = useSignal(false);
   const pushBusy = useSignal(false);
+  const previewBusy = useSignal(false);
 
   useVisibleTask$(
     ({ cleanup }) => {
@@ -87,9 +101,7 @@ export const Settings = component$(() => {
         {state.notifications !== "unavailable" && (
           <section aria-labelledby="st-push">
             <h3 id="st-push">notifications</h3>
-            <p class="dim small">
-              a notification that says only “new messages”, on this device only.
-            </p>
+            <p class="dim small">on this device only. invites and requests never notify.</p>
             <p class="row">
               <span>{state.notifications === "on" ? "on" : "off"}</span>
               <button
@@ -106,6 +118,39 @@ export const Settings = component$(() => {
                 {state.notifications === "on" ? "turn off" : "turn on"}
               </button>
             </p>
+            {state.notifications === "on" &&
+              (state.preview === "unavailable" ? (
+                <p class="dim small">
+                  to show conversation names or messages, sign in with “remember this device”: this
+                  device decrypts them itself, from what it keeps.
+                </p>
+              ) : (
+                <fieldset class="choice" disabled={previewBusy.value}>
+                  <legend>notifications show</legend>
+                  {PREVIEWS.map((p) => (
+                    <label key={p.id}>
+                      <input
+                        type="radio"
+                        name="preview"
+                        value={p.id}
+                        checked={state.preview === p.id}
+                        onChange$={async () => {
+                          previewBusy.value = true;
+                          await act(ui, (e) => e.setPreview(p.id));
+                          previewBusy.value = false;
+                        }}
+                      />
+                      {p.label} <span class="dim small">— {p.hint}</span>
+                    </label>
+                  ))}
+                  {state.preview !== "none" && (
+                    <p class="dim small">
+                      your phone or computer may show what notifications say on the lock screen and
+                      keep it in its notification history.
+                    </p>
+                  )}
+                </fieldset>
+              ))}
           </section>
         )}
 

@@ -57,6 +57,11 @@ function randomId(n = 16): string {
     .replace(/=+$/, "");
 }
 
+/** A fixed 12-character ref per seed conversation, so that a reload with `#c/<ref>` finds it again. */
+function mockRef(seed: string): string {
+  return (seed + "____________").slice(0, 12).replace(/[^A-Za-z0-9_-]/g, "_");
+}
+
 function recoveryCode(): string {
   const b = crypto.getRandomValues(new Uint8Array(32));
   const chars = Array.from(b, (x) => CROCKFORD[x & 31]).join("");
@@ -107,6 +112,7 @@ class MockEngine implements Engine {
     warnings: [],
     prfSupported: null,
     notifications: "unavailable",
+    preview: "unavailable",
   };
   private subs = new Set<(s: EngineState) => void>();
   private seq = 1000;
@@ -124,6 +130,7 @@ class MockEngine implements Engine {
     this.set({
       prfSupported: !this.opts.noprf,
       notifications: this.opts.push ? "off" : "unavailable",
+      preview: this.opts.push ? "none" : "unavailable",
     });
     if (this.opts.fatal) {
       this.set({
@@ -211,6 +218,7 @@ class MockEngine implements Engine {
     const m = (p: Partial<MessageView> & Pick<MessageView, "kind">) => this.msg(p);
     const dm: ConversationView = {
       id: randomId(),
+      ref: mockRef("dm"),
       name: "bob",
       members: [member(handle), member("bob")],
       epoch: 0,
@@ -263,6 +271,7 @@ class MockEngine implements Engine {
     };
     const group: ConversationView = {
       id: randomId(),
+      ref: mockRef("group"),
       name: "project 夜明け",
       members: [member(handle), member("bob"), member("carol"), member("dave", true)],
       epoch: 3,
@@ -305,6 +314,7 @@ class MockEngine implements Engine {
     };
     const removed: ConversationView = {
       id: randomId(),
+      ref: mockRef("removed"),
       name: "old team",
       members: [member("erin"), member("frank")],
       epoch: 5,
@@ -322,6 +332,7 @@ class MockEngine implements Engine {
     };
     const old: ConversationView = {
       id: randomId(),
+      ref: mockRef("old"),
       name: "carol",
       members: [member(handle), member("carol")],
       epoch: 0,
@@ -336,6 +347,7 @@ class MockEngine implements Engine {
     };
     const pending: ConversationView = {
       id: randomId(),
+      ref: mockRef("pending"),
       name: "# release",
       members: [member(handle), member("bob"), member("erin")],
       epoch: 2,
@@ -352,6 +364,7 @@ class MockEngine implements Engine {
     };
     const frozen: ConversationView = {
       id: randomId(),
+      ref: mockRef("frozen"),
       name: "# infra",
       members: [member(handle), member("dave"), member("mallory")],
       epoch: 4,
@@ -366,6 +379,7 @@ class MockEngine implements Engine {
     };
     const request: ConversationView = {
       id: randomId(),
+      ref: mockRef("request"),
       name: "zed",
       members: [member(handle), member("zed")],
       epoch: 0,
@@ -388,6 +402,7 @@ class MockEngine implements Engine {
     // A group request: only its inviter is resolved, the other members stay `?…` until accepted (§11.5).
     const groupRequest: ConversationView = {
       id: randomId(),
+      ref: mockRef("groupRequest"),
       name: "# deals",
       members: [member("quinn"), member(handle), member("?Xk3f9QaZ")],
       epoch: 0,
@@ -416,6 +431,7 @@ class MockEngine implements Engine {
     };
     const left: ConversationView = {
       id: randomId(),
+      ref: mockRef("left"),
       name: "# book club",
       members: [member(handle, true), member("erin"), member("grace")],
       epoch: 2,
@@ -505,6 +521,7 @@ class MockEngine implements Engine {
     const now = Date.now();
     const c: ConversationView = {
       id: randomId(),
+      ref: randomId(9),
       name: name || handles.join(", "),
       members: [member(me.handle), ...handles.map((h) => member(h))],
       epoch: 0,
@@ -664,6 +681,11 @@ class MockEngine implements Engine {
     if (this.state.notifications === "unavailable") return;
     await sleep(150);
     this.set({ notifications: on ? "on" : "off" });
+  }
+
+  async setPreview(p: "none" | "name" | "message"): Promise<void> {
+    if (this.state.preview === "unavailable") return;
+    this.set({ preview: p });
   }
 
   markRead(convId: string): void {

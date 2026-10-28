@@ -17,7 +17,7 @@ import { H, HMAC, aeadOpen, aeadSeal, concat, dec, enc, hex, t16, u16 } from "..
 import { pushConfig, pushHostAllowed, v2Params, type PushConfig } from "./env";
 import { logErr } from "./http";
 import type { PushSubResult } from "./types";
-import { VapidSigner, encryptPayload, pushPayload } from "./webpush";
+import { PUSH_BELLS, VapidSigner, encryptPayload, pushPayload } from "./webpush";
 
 type Bytes = Uint8Array;
 
@@ -254,6 +254,22 @@ interface PushState {
   tries: number;
   /** the first attempt of the current push */
   first: number;
+  /** the endpoint's bells that rang it since its last push, newest first, at most PUSH_BELLS (§9.8 `rang`) */
+  rang: Bytes[];
+}
+
+/** `fresh` in front of `rang`, without repeats, at most PUSH_BELLS (§9.8 `ring` step 2). */
+function rangWith(fresh: readonly Bytes[], rang: readonly Bytes[]): Bytes[] {
+  const out: Bytes[] = [];
+  const seen = new Set<string>();
+  for (const b of [...fresh, ...rang]) {
+    const k = hex(b);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(b);
+    if (out.length === PUSH_BELLS) break;
+  }
+  return out;
 }
 
 interface SubRow {
@@ -475,15 +491,30 @@ export class PushDO extends DurableObject<Env> {
     const seen = this.dedup.get(id);
     if (seen !== undefined && seen > now) return;
     this.dedup.set(id, now + RING_DEDUP * 1000);
-    const eps = new Map<string, Bytes>();
-    for (const b of bellsSorted) for (const ep of this.holders(tkOf(cfg.pushKey, b))) eps.set(hex(ep), ep);
+    // Each endpoint's registered bells among `tokens`, in their order there.
+    const eps = new Map<string, { ep: Bytes; bells: Bytes[] }>();
+    const order = new Set<string>();
+    for (const b of tokens) {
+      if (order.has(hex(b))) continue;
+      order.add(hex(b));
+      for (const ep of this.holders(tkOf(cfg.pushKey, b))) {
+        const k = hex(ep);
+        const e = eps.get(k) ?? { ep, bells: [] };
+        e.bells.push(b);
+        eps.set(k, e);
+      }
+    }
     const jitter = v2Params(this.env).delta * 1000;
-    for (const [k, ep] of eps) {
+    for (const [k, { ep, bells }] of eps) {
       const st = this.pushes.get(k);
-      if (st && st.due !== null) continue;
+      const rang = rangWith(bells, st?.rang ?? []);
+      if (st && st.due !== null) {
+        st.rang = rang;
+        continue;
+      }
       const last = st?.last ?? null;
       const due = (last === null ? now : Math.max(now, last + WINDOW_MS)) + Math.floor(this.rand() * (jitter + 1));
-      this.pushes.set(k, { ep, last, due, tries: 0, first: 0 });
+      this.pushes.set(k, { ep, last, due, tries: 0, first: 0, rang });
     }
   }
 
@@ -667,7 +698,7 @@ export class PushDO extends DurableObject<Env> {
     const cfg = this.config();
     if (!cfg) {
       // While push is off nothing is sent, and what is due is dropped.
-      for (const st of this.pushes.values()) st.due = null;
+      for (const st of this.pushes.values()) Object.assign(st, { due: null, rang: [] });
       return;
     }
     const tally = { sent: 0, retried: 0, dropped: 0, deleted: 0 };
@@ -733,7 +764,7 @@ export class PushDO extends DurableObject<Env> {
     const timer = setTimeout(() => abort.abort(), PUSH_TIMEOUT_MS);
     try {
       this.signer = this.signer?.cfg === cfg ? this.signer : { cfg, s: new VapidSigner(cfg.vapidSk, cfg.vapidSub) };
-      const body = await encryptPayload(pushPayload(cfg.appHost), t.p256dh, t.auth);
+      const body = await encryptPayload(pushPayload(cfg.appHost, s.rang), t.p256dh, t.auth);
       const authorization = await this.signer.s.authorization(url.origin, at);
       const res = await this.fetcher(t.endpoint, {
         method: "POST",
@@ -763,7 +794,7 @@ export class PushDO extends DurableObject<Env> {
       clearTimeout(timer);
     }
     if (typeof status === "number" && status >= 200 && status < 300) {
-      Object.assign(s, { last: at, due: null, tries: 0 });
+      Object.assign(s, { last: at, due: null, tries: 0, rang: [] });
       return "sent";
     }
     if (status === "error" || status === 429 || status >= 500) {
@@ -772,7 +803,7 @@ export class PushDO extends DurableObject<Env> {
         Object.assign(s, { tries: 1, due: this.clock() + (ra !== null && ra <= 60 ? ra * 1000 : RETRY_MS) });
         return "retried";
       }
-      Object.assign(s, { last: s.first, due: null, tries: 0 });
+      Object.assign(s, { last: s.first, due: null, tries: 0, rang: [] });
       return "dropped";
     }
     // A 3xx (never followed) or any other 4xx: no push service accepts this endpoint any more.

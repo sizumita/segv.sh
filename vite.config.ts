@@ -8,7 +8,57 @@
 import { cloudflare } from "@cloudflare/vite-plugin";
 import { qwikVite } from "@qwik.dev/core/optimizer";
 import { qwikRouter } from "@qwik.dev/router/vite";
+import type { Plugin } from "vite";
 import { defineConfig, lazyPlugins } from "vite-plus";
+
+const SRC = `${import.meta.dirname}/src`;
+/** The push Service Worker's own CSP: it loads nothing, and reads rows from this origin's API only (§11.13). */
+const SW_CSP = "default-src 'none'; connect-src 'self'";
+
+/** Bundles src/client/sw-main.ts into one classic script (a Service Worker at a fixed URL, /sw.js). */
+async function bundleSw(minify: boolean): Promise<string> {
+  const { build } = await import("vite");
+  const out = await build({
+    configFile: false,
+    logLevel: "warn",
+    resolve: { alias: { "~": SRC } },
+    build: {
+      write: false,
+      minify,
+      target: "es2022",
+      lib: { entry: `${SRC}/client/sw-main.ts`, formats: ["iife"], name: "segvSw", fileName: () => "sw.js" },
+    },
+  });
+  const outputs = (Array.isArray(out) ? out : [out]) as { output: { type: string; code?: string }[] }[];
+  const code = outputs.flatMap((o) => o.output).find((o) => o.type === "chunk")?.code;
+  if (!code) throw new Error("sw.js: the bundle has no chunk");
+  return code;
+}
+
+/** Serves /sw.js in dev and emits it at the root of the client build. */
+function swPlugin(): Plugin {
+  return {
+    name: "segv:sw",
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        if (req.url?.split("?")[0] !== "/sw.js") return next();
+        bundleSw(false).then(
+          (code) => {
+            res.setHeader("Content-Type", "application/javascript");
+            res.setHeader("Cache-Control", "no-store");
+            res.setHeader("Content-Security-Policy", SW_CSP);
+            res.end(code);
+          },
+          (e: unknown) => next(e),
+        );
+      });
+    },
+    async generateBundle() {
+      if (this.environment?.config.consumer !== "client") return;
+      this.emitFile({ type: "asset", fileName: "sw.js", source: await bundleSw(true) });
+    },
+  };
+}
 
 // In workerd dev, Qwik libs must be transformed by the Qwik optimizer instead of being
 // pre-bundled by Vite's dep optimizer, otherwise their QRL segments 404 in the browser.
@@ -65,6 +115,7 @@ export default defineConfig(({ command, mode }) => {
       ],
     },
     plugins: lazyPlugins(() => mode === "test" ? [] : [
+      swPlugin(),
       qwikRouter(dev ? { devSsrServer: false } : {}),
       qwikVite(),
       ...(dev

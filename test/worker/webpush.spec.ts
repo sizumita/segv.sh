@@ -102,15 +102,34 @@ describe("encryptPayload (RFC 8291)", () => {
 });
 
 describe("pushPayload", () => {
-  it("is the exact fixed text of §9.8", () => {
+  const zero = "A".repeat(86); // b64u of 64 zero bytes
+  it("is the text of §9.8, with the bells zero-padded to 64 bytes", () => {
     expect(P.fromUtf8(pushPayload("segv.sh"))).toBe(
-      '{"web_push":8030,"notification":{"title":"segv.sh","body":"new messages","navigate":"https://segv.sh/","tag":"segv"}}',
+      `{"web_push":8030,"mutable":true,"notification":{"title":"segv.sh","body":"new messages","navigate":"https://segv.sh/","tag":"segv","data":{"bells":"${zero}"}}}`,
     );
-    const j = JSON.parse(P.fromUtf8(pushPayload("segv.test"))) as Record<string, unknown>;
+    const b1 = P.random(16);
+    const b2 = P.random(16);
+    const j = JSON.parse(P.fromUtf8(pushPayload("segv.test", [b1, b2]))) as Record<string, unknown>;
     expect(j).toEqual({
       web_push: 8030,
-      notification: { title: "segv.sh", body: "new messages", navigate: "https://segv.test/", tag: "segv" },
+      mutable: true,
+      notification: {
+        title: "segv.sh",
+        body: "new messages",
+        navigate: "https://segv.test/",
+        tag: "segv",
+        data: { bells: P.b64u(P.concat(b1, b2, new Uint8Array(32))) },
+      },
     });
+  });
+
+  it("has the same length for 0 to 4 bells, keeps the first 4 of more, and refuses a bell that is not 16 bytes", () => {
+    const lens = [0, 1, 2, 3, 4, 6].map((n) => pushPayload("segv.sh", Array.from({ length: n }, () => P.random(16))).length);
+    expect(new Set(lens).size).toBe(1);
+    const bs = Array.from({ length: 6 }, () => P.random(16));
+    const j = JSON.parse(P.fromUtf8(pushPayload("segv.sh", bs))) as { notification: { data: { bells: string } } };
+    expect(j.notification.data.bells).toBe(P.b64u(P.concat(...bs.slice(0, 4))));
+    expect(() => pushPayload("segv.sh", [P.random(15)])).toThrow();
   });
 });
 

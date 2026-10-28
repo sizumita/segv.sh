@@ -18,6 +18,7 @@ import {
   leftIn,
   memberHandle,
   newEpoch,
+  refOf,
   rowKey,
   systemLine,
   unknownHandle,
@@ -64,6 +65,7 @@ import { SNAP_RECORDS, firstFreePointer, writeSnapshot } from "./snapshot";
 import { MAX_REACTIONS, reactionSets, refreshReactions } from "./reactions";
 import { lanesEnd, olderInitialHistory, scrollback } from "./history";
 import { prepareImage } from "./image";
+import type { CacheCopy } from "./notify-cache";
 import {
   claimRead,
   deriveLines,
@@ -127,6 +129,8 @@ export interface SessionAccount {
   id: P.Identity;
   handle: string;
   regEra: number;
+  /** the key of copy refs (`refKeyOf(AK)`) */
+  refKey: Bytes;
 }
 
 /** What Messaging needs from the engine. */
@@ -162,6 +166,8 @@ export interface MessagingHost {
 export class Messaging {
   /** copies by view key */
   readonly copies = new Map<string, Copy>();
+  /** copy refs by view key (`ConversationView.ref`) */
+  private readonly refs = new Map<string, string>();
   private readonly byConv = new Map<string, Copy[]>();
   /** users verified in the directory this session, by b64u uid */
   private readonly users = new Map<string, KnownUser>();
@@ -2904,14 +2910,48 @@ export class Messaging {
    * copies with the newest `lastTs` first.
    */
   pushBells(): Bytes[] {
-    const out: { bell: Bytes; ts: number }[] = [];
+    return this.notifiable().map((x) => x.bell);
+  }
+
+  /** The copies of the registration set (§11.13) with their bells, newest `lastTs` first. */
+  private notifiable(): { c: Copy; ep: Epoch; bell: Bytes }[] {
+    const out: { c: Copy; ep: Epoch; bell: Bytes }[] = [];
     for (const c of this.copies.values()) {
       if (c.probe || c.request || c.left || this.endOf(c) !== null || !this.byContact(c)) continue;
       const ep = c.epochs.get(c.current);
       if (!ep || ep.myIndex < 0) continue;
-      out.push({ bell: P.bell(ep.keys.nk, ep.myIndex), ts: c.lastTs });
+      out.push({ c, ep, bell: P.bell(ep.keys.nk, ep.myIndex) });
     }
-    return out.sort((a, b) => b.ts - a.ts).map((x) => x.bell);
+    return out.sort((a, b) => b.c.lastTs - a.c.lastTs);
+  }
+
+  /**
+   * The notification cache's copies (§11.13): each copy of the registration set with its bell, ref and shown name, and
+   * with `withEpoch` its current epoch's keys, members and lane positions.
+   */
+  notifyCopies(withEpoch: boolean): CacheCopy[] {
+    const views = new Map(this.views().map((v) => [v.id, v]));
+    const out: CacheCopy[] = [];
+    for (const { c, ep, bell } of this.notifiable()) {
+      const v = views.get(c.key);
+      if (!v) continue;
+      const copy: CacheCopy = { bell: P.b64u(bell), ref: v.ref, name: v.name };
+      if (withEpoch)
+        copy.epoch = {
+          e: ep.e,
+          conv: P.b64u(c.conv),
+          mk: P.b64u(ep.keys.mk),
+          rk: P.b64u(ep.keys.rk),
+          self: ep.myIndex,
+          members: ep.D.members.map((m, j) => ({
+            sigPk: P.b64u(m.sigPk),
+            handle: v.members[j]?.handle ?? "?",
+          })),
+          next: ep.lanes.map((l) => ({ E: l.next.E, n: l.next.n })),
+        };
+      out.push(copy);
+    }
+    return out;
   }
 
   sendText(convId: string, text: string): Promise<void> {
@@ -3414,6 +3454,11 @@ export class Messaging {
       byContact: (c: Copy) => this.byContact(c),
       mono: this.h.clock.mono(),
       processingWait: this.h.delays.processingWait,
+      ref: (key: string) => {
+        let r = this.refs.get(key);
+        if (r === undefined) this.refs.set(key, (r = refOf(this.h.acc.refKey, key)));
+        return r;
+      },
     };
     const out: ConversationView[] = [];
     for (const c of this.copies.values()) {
