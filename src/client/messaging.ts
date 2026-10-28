@@ -2208,31 +2208,42 @@ export class Messaging {
       ]);
       const recs = this.pendingRecords;
       if (sig === this.lastHeads && recs.length === 0) return;
-      // Split the entries over records that each fit a row with the waiting records, each entry in the same row as
-      // the LEFT records of its epoch (§7.3 "HEADS splitting").
-      const chunks: { entries: P.HeadsEntry[]; lefts: P.LeftRec[] }[] = [
-        { entries: [], lefts: [] },
-      ];
-      let size = recs.reduce((n, r) => n + P.encodeRecord(r).length, 0) + 11;
+      // Split everything over as many self rows as needed (§7.3 "HEADS splitting"): every row stays within the cls-3
+      // budget and the record cap, ends with a HEADS record (the cursor, and the entries placed in it), and holds
+      // each of its entries in the same row as the LEFT records of that entry's epoch.
+      const HEADS_FIXED = 3 + 2 + 4 + 2;
+      const rows: { recs: P.SelfRecord[]; entries: P.HeadsEntry[]; size: number }[] = [];
+      const place = (bytes: number, count: number) => {
+        let row = rows[rows.length - 1];
+        if (
+          !row ||
+          ((row.recs.length > 0 || row.entries.length > 0) &&
+            (row.size + bytes > ROW_BUDGET || row.recs.length + count + 1 > P.MAX_SELF_RECORDS))
+        )
+          rows.push((row = { recs: [], entries: [], size: HEADS_FIXED }));
+        row.size += bytes;
+        return row;
+      };
+      for (const r of recs) place(P.encodeRecord(r).length, 1).recs.push(r);
       for (const { entry: x, lefts } of all) {
-        const len = 68 + 6 * x.lanes.length + 12 * x.followed.length + 80 * lefts.length;
-        const last = chunks[chunks.length - 1];
-        if (last.entries.length > 0 && size + len > ROW_BUDGET) {
-          chunks.push({ entries: [], lefts: [] });
-          size = 11;
-        }
-        chunks[chunks.length - 1].entries.push(x);
-        chunks[chunks.length - 1].lefts.push(...lefts);
-        size += len;
+        const bytes =
+          68 +
+          6 * x.lanes.length +
+          12 * x.followed.length +
+          lefts.reduce((n, l) => n + P.encodeRecord(l).length, 0);
+        const row = place(bytes, lefts.length);
+        row.recs.push(...lefts);
+        row.entries.push(x);
       }
-      for (let i = 0; i < chunks.length; i++) {
+      if (rows.length === 0) rows.push({ recs: [], entries: [], size: HEADS_FIXED });
+      for (const row of rows) {
         const heads: P.HeadsRec = {
           rtype: P.RT.HEADS,
           Ein: cursor.E,
           relIn: cursor.rel,
-          entries: chunks[i].entries,
+          entries: row.entries,
         };
-        await this.h.self.write([...(i === 0 ? recs : []), ...chunks[i].lefts, heads]);
+        await this.h.self.write([...row.recs, heads]);
       }
       this.pendingRecords = this.pendingRecords.filter((r) => !recs.includes(r));
       this.lastHeads = sig;
