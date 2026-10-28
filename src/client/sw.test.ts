@@ -269,6 +269,19 @@ describe("the notifications of a push (§11.13)", () => {
     expect(w.moves[0][0].next[1]).toEqual({ E, n: 1 });
   });
 
+  it("a cache read that stalls past the deadline gives the fixed notification; a push without bells reads nothing", async () => {
+    const a = makeConv();
+    const w = world(null);
+    w.deps.readCache = () => new Promise(() => {});
+    w.deps.sleep = () => Promise.resolve();
+    expect(await notesFor(proposed([a.bell]), w.deps, NOW)).toEqual([FIXED_NOTE]);
+    let reads = 0;
+    const v = world(null);
+    v.deps.readCache = async () => (reads++, null);
+    expect(await notesFor(proposed([]), v.deps, later)).toEqual([FIXED_NOTE]);
+    expect(reads).toBe(0);
+  });
+
   it("past the deadline, or when the read fails: the names", async () => {
     const a = makeConv("bob");
     const c: NotifyCache = { v: 1, preview: "message", deltaS: 10, copies: [a.copy] };
@@ -377,6 +390,20 @@ describe("the worker", () => {
         opts: { body: "new messages", tag: a.ref, data: { navigate: `${ORIGIN}/#c/${a.ref}` } },
       },
     ]);
+  });
+
+  it("still shows the fixed notification when the cache's storage never answers", async () => {
+    const sw = load({ readCache: () => new Promise(() => {}), sleep: () => Promise.resolve() });
+    const bells = P.b64u(P.concat(P.random(16), new Uint8Array(48)));
+    await sw.dispatch("push", {
+      data: {
+        json: () => ({
+          web_push: 8030,
+          notification: { title: "segv.sh", navigate: "/", data: { bells } },
+        }),
+      },
+    });
+    expect(sw.shown.map((s) => [s.title, s.opts.tag])).toEqual([["segv.sh", "segv"]]);
   });
 
   it("still shows the fixed notification when reading the cache throws", async () => {

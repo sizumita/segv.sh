@@ -226,13 +226,16 @@ export function bodyOf(found: readonly Found[]): string {
 /** The notifications of one push (§11.13 steps 1–3). Never throws; the caller falls back to the fixed one anyway. */
 export async function notesFor(p: Proposed, d: SwDeps, deadline: number): Promise<Note[]> {
   const fixed = [fixedNote(p)];
+  if (p.bells.length === 0) return fixed;
+  // Everything below, the cache's storage included, races the deadline: a stalled read never keeps a push silent.
+  const timeout = d.sleep(Math.max(0, deadline - d.now())).then(() => null);
   let cache: NotifyCache | null = null;
   try {
-    cache = await d.readCache();
+    cache = await Promise.race([d.readCache(), timeout]);
   } catch {
     cache = null;
   }
-  if (!cache || p.bells.length === 0) return fixed;
+  if (!cache) return fixed;
   const byBell = new Map(cache.copies.map((c) => [c.bell, c]));
   const picked: CacheCopy[] = [];
   for (const b of p.bells) {
@@ -249,8 +252,6 @@ export async function notesFor(p: Proposed, d: SwDeps, deadline: number): Promis
   if (cache.preview !== "message") return named;
   const withEpoch = picked.flatMap((c) => (c.epoch ? [{ copy: c, ep: c.epoch }] : []));
   if (withEpoch.length === 0) return named;
-  const left = deadline - d.now();
-  const timeout = d.sleep(Math.max(0, left)).then(() => null);
   let read: Awaited<ReturnType<typeof readNewest>> | null;
   try {
     read = await Promise.race([readNewest(withEpoch, d, cache.deltaS), timeout]);
@@ -375,7 +376,9 @@ export function install(self: SwScope, deps: SwDeps = browserDeps(self.location.
       (async () => {
         let notes: Note[];
         try {
-          notes = await notesFor(p, deps, started + DEADLINE_MS - 500);
+          // notesFor keeps to its deadline; this outer one only guards against a bug there.
+          const late = deps.sleep(Math.max(0, started + DEADLINE_MS - deps.now())).then(() => []);
+          notes = await Promise.race([notesFor(p, deps, started + DEADLINE_MS - 500), late]);
         } catch {
           notes = [];
         }
