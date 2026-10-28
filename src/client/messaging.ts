@@ -898,7 +898,17 @@ export class Messaging {
       if (f.joins.has(k) || f.requestOf(k) || !pre) continue;
       const D = pre.D;
       const legacyAccepted = accepted || f.joins.has(s.from);
-      if (!legacyAccepted && !liveAt(s.t, Enow)) continue;
+      // its t_reg: a TREG for its bundle, else one blob/meta (§4.2); a request lives 4 eras from it (§7.3)
+      let tReg: number | null = f.tregs.get(P.b64u(s.rec.bundleId)) ?? null;
+      if (tReg === null) {
+        try {
+          tReg = (await this.h.api.blobMeta(s.rec.bundleId))?.t ?? null;
+        } catch {
+          this.skipsRead.delete(s.id); // read again at the next catch-up
+          continue;
+        }
+      }
+      if (tReg === null || (!legacyAccepted && !liveAt(tReg, Enow))) continue;
       const material = {
         conv: s.rec.conv,
         root: D.hash,
@@ -911,8 +921,12 @@ export class Messaging {
       };
       const rec: P.ConvJoinRec | P.RequestRec = legacyAccepted
         ? { rtype: P.RT.CONV_JOIN, ...material }
-        : { rtype: P.RT.REQUEST, ...material, tReg: 0, desc: P.concat(D.bytes, pre.dsig) };
-      await this.materialize(k, rec, !legacyAccepted, { ...pre, viewKey: f.viewKeys.get(k)! });
+        : { rtype: P.RT.REQUEST, ...material, tReg, desc: P.concat(D.bytes, pre.dsig) };
+      await this.materialize(k, rec, !legacyAccepted, {
+        ...pre,
+        viewKey: f.viewKeys.get(k)!,
+        tReg,
+      });
     }
   }
 
@@ -987,7 +1001,7 @@ export class Messaging {
     k: string,
     rec: P.ConvJoinRec | P.RequestRec,
     request: boolean,
-    pre?: { D: P.Descriptor; dsig: Bytes; pks: Bytes; viewKey: string },
+    pre?: { D: P.Descriptor; dsig: Bytes; pks: Bytes; viewKey: string; tReg: number },
   ): Promise<void> {
     const f = this.h.self.fold;
     const key = pre?.viewKey ?? f.viewKeys.get(k);
@@ -1047,7 +1061,7 @@ export class Messaging {
     // CONV_JOIN superseded) or an EPOCH_PENDING naming this bundle, else one blob/meta (a copy an earlier version
     // recorded without a TREG, a legacy skip record's included).
     const sameBundle = (x: { bundleId: Bytes }) => P.equalBytes(x.bundleId, rec.bundleId);
-    let tReg: number | null = f.tregs.get(P.b64u(rec.bundleId)) ?? null;
+    let tReg: number | null = pre?.tReg ?? f.tregs.get(P.b64u(rec.bundleId)) ?? null;
     const req = f.requestOf(k)?.rec;
     if (tReg === null && req && req.e === e && sameBundle(req)) tReg = req.tReg;
     if (tReg === null)

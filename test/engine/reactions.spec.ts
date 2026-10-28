@@ -213,7 +213,7 @@ describe("reactions (§11.12)", () => {
 
   it("8. refused where a text is: frozen with a removal, after self's leave; a rotation first after a leave", async () => {
     const {
-      users: [alice, bob, carol],
+      users: [alice, , carol],
       engines: [A, B, C],
       id,
     } = await group(["alice", "bob", "carol"]);
@@ -236,7 +236,7 @@ describe("reactions (§11.12)", () => {
 
   it("8. frozen with a removal: refused as a text is", async () => {
     const {
-      users: [alice, bob, carol, mallory],
+      users: [alice, bob, , mallory],
       engines: [A, B, C, M],
       id,
     } = await group(["alice", "bob", "carol", "mallory"]);

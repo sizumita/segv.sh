@@ -55,15 +55,16 @@ describe("the self-lane fold (§7.3)", () => {
     expect(warnings).toEqual([]);
   });
 
-  it("keeps at most 64 live REQUESTs, none stored more than 4 eras ago, none superseded by a CONV_JOIN", () => {
+  it("keeps at most 64 live REQUESTs, none registered more than 4 eras ago, none superseded by a CONV_JOIN", () => {
     const { f } = fold();
     const convs = Array.from({ length: 70 }, (_, i) => fill(16, 100 + i));
-    convs.forEach((c, i) => f.apply([request(c)], 10 * ERA_S + i));
+    // a request's age is its bundle's t_reg (§7.3), not its row's time: the rows here are stored much later
+    convs.forEach((c, i) => f.apply([{ ...request(c), tReg: 10 * ERA_S + i }], 12 * ERA_S + i));
     const live = f.requests(10);
     expect(live.size).toBe(64);
     expect(live.has(copyKey({ conv: convs[5], root: rootA }))).toBe(false); // the oldest six dropped
     expect(live.has(copyKey({ conv: convs[69], root: rootA }))).toBe(true);
-    expect(f.requests(15).size).toBe(0); // stored in era 10: more than 4 eras before era 15
+    expect(f.requests(15).size).toBe(0); // registered in era 10: more than 4 eras before era 15
     expect(f.requests(14).size).toBe(64);
     f.apply([{ ...join(rootA, convs[69]), via: P.VIA.REQUEST_ACCEPTED }], 10 * ERA_S + 100);
     expect(f.requests(10).has(copyKey({ conv: convs[69], root: rootA }))).toBe(false);

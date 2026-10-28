@@ -53,7 +53,7 @@ export interface LegacySkip {
   /** its index in `SelfFold.skips` */
   id: number;
   rec: P.EpochRec;
-  /** the stored time of its row (the age of a request it starts) and its place in lane order */
+  /** the stored time of its row, and its place in lane order (where a request it starts sits among the 64) */
   t: number;
   order: number;
   /** the fold key of the legacy copy it came from: the record's own (conv, root) */
@@ -139,7 +139,10 @@ export class SelfFold {
 
   constructor(private readonly hooks: FoldHooks) {}
 
-  /** The live REQUESTs at era `Enow`: at most 64, the newest in lane order, none stored more than 4 eras ago. */
+  /**
+   * The live REQUESTs at era `Enow`: at most 64, the newest in lane order, none whose bundle was registered more than 4
+   * eras ago (its `t_reg`, the server's time that every device and every snapshot holds alike, §7.3).
+   */
   requests(Enow: number): Map<string, P.RequestRec> {
     const live = [...this.requestRecs.entries()]
       .filter(([k, x]) => !this.joins.has(k) && liveAt(x.t, Enow))
@@ -189,10 +192,7 @@ export class SelfFold {
     return s.viewKey;
   }
 
-  /**
-   * Applies a snapshot's records (§7.4, §11.4 step 3): every copy's records are under that copy's own key, and a
-   * REQUEST takes its age from its bundle's `t_reg`, so a request still expires as it would from its row.
-   */
+  /** Applies a snapshot's records (§7.4, §11.4 step 3): every copy's records are under that copy's own key. */
   applySnapshot(records: readonly P.SelfRecord[], ts: number): void {
     this.inSnapshot = true;
     try {
@@ -277,7 +277,7 @@ export class SelfFold {
       case P.RT.REQUEST: {
         const k = copyKey(r);
         if (this.joins.has(k) || this.requestRecs.has(k)) return;
-        this.requestRecs.set(k, { rec: r, t: this.inSnapshot ? r.tReg : t, order: this.order });
+        this.requestRecs.set(k, { rec: r, t: r.tReg, order: this.order });
         this.assignViewKey(k, r);
         return;
       }
@@ -395,7 +395,7 @@ export class SelfFold {
   }
 }
 
-/** A request whose row was stored at `t` (seconds since T0) is live at era `Enow` for 4 eras (§7.3). */
+/** A request whose bundle was registered at `t` (seconds since T0) is live at era `Enow` for 4 eras (§7.3). */
 export const liveAt = (t: number, Enow: number): boolean =>
   Math.floor(t / (P.ERA_MS / 1000)) >= Enow - REQUEST_MAX_AGE_ERAS;
 
