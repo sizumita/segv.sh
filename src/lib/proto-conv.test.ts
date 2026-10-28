@@ -1773,6 +1773,7 @@ const records: [string, P.SelfRecord, B, number][] = [
     78,
   ],
   ["TREG", { rtype: 0x0f, bundleId: fill(32, 0x34), tReg: 25_465_628 }, cat(fill(32, 0x34), be32(25_465_628)), 36],
+  ["ENDED", { rtype: 0x12, ...copy, e: 6, claim: { E: 7, n: 3 } }, cat(refCopy, be32(6), be16(7), be32(3)), 58],
   [
     "SNAP",
     { rtype: 0x20, blobId: fill(32, 0x73), key: fill(32, 0x74), size: 4096, pos: { E: 7, n: 12 } },
@@ -1902,6 +1903,8 @@ describe("self records (§7.2)", () => {
       ["SNAP era 0xFFFF outside NONE", 0x20, cat(fill(32, 0x73), fill(32, 0x74), be32(4096), be16(0xffff), be32(1))],
       ["LEFT (E, n) = (0xFFFF, 0)", 0x0e, cat(refCopy, be32(4), bob.uid, be32(1), be16(0xffff), be32(0))],
       ["LEFT (E, n) = (0xFFFF, 0xFFFFFFFE)", 0x0e, cat(refCopy, be32(4), bob.uid, be32(1), be16(0xffff), be32(0xfffffffe))],
+      ["ENDED claim NONE", 0x12, cat(refCopy, be32(6), be16(0xffff), be32(0xffffffff))],
+      ["ENDED claim era 0xFFFF outside NONE", 0x12, cat(refCopy, be32(6), be16(0xffff), be32(0))],
     ];
     for (const [what, rtype, c] of bads)
       expect([what, throwsError(() => P.parseRecord(rtype, c))]).toEqual([what, true]);
@@ -1916,6 +1919,8 @@ describe("self records (§7.2)", () => {
     expect(() =>
       P.encodeRecord({ rtype: 0x0e, ...copy, e: 4, uid: bob.uid, t: 1, row: { E: 0xffff, n: 0 } }),
     ).toThrow(P.CodecError);
+    for (const claim of [P.NONE, { E: 0xffff, n: 0 }])
+      expect(() => P.encodeRecord({ rtype: 0x12, ...copy, e: 6, claim })).toThrow(P.CodecError);
     // DESC / REQUEST desc: only 224 ≤ dlen ≤ 2960 at parse time (the consumer parses D, §7.2)
     for (const n of [224, 2960]) {
       const desc = cat(refCopy, be32(0), be16(n), fill(n, 0));
@@ -1955,6 +1960,20 @@ describe("TREG (§7.2): a bundle's t_reg beside the CONV_JOIN or EPOCH that name
     expect(P.encodeS({ prev: { E: 6, n: 4 }, prevh: fill(16, 1), ts: TS, records: [join[1], treg[1]] }).length).toBe(
       211,
     );
+  });
+});
+
+describe("ENDED (§7.2): the claim that ended a copy, beside its HEADS", () => {
+  const ended = records.find(([n]) => n === "ENDED")!;
+  const heads = records.find(([n]) => n === "HEADS with an entry")!;
+
+  it("encodes as 12 00 3a and a HEADS row that carries it keeps its HEADS for a reader that does not know ENDED", () => {
+    expect(toHex(P.encodeRecord(ended[1]).subarray(0, 3))).toBe("12003a");
+    const row = refS(6, 4, fill(16, 1), TS, [refRecord(0x12, ended[2]), refRecord(8, heads[2])]);
+    expect(P.parseS(row).records).toEqual([ended[1], heads[1]]);
+    // the first release skips an unknown rtype by its len (§7.1): 0x11, unknown to every reader, stands in for it
+    const older = refS(6, 4, fill(16, 1), TS, [refRecord(0x11, ended[2]), refRecord(8, heads[2])]);
+    expect(P.parseS(older)).toMatchObject({ records: [heads[1]], skipped: 1 });
   });
 });
 
@@ -2300,7 +2319,7 @@ function computeKat() {
       pos: { E: 7, n: 30 },
       ts: TS,
       records: records
-        .filter(([, r]) => r.rtype !== 0x20 && r.rtype !== 0x0e && r.rtype !== 0x0f)
+        .filter(([, r]) => r.rtype !== 0x20 && r.rtype !== 0x0e && r.rtype !== 0x0f && r.rtype !== 0x12)
         .map(([, r]) => r),
     });
     return {
@@ -2331,6 +2350,7 @@ function computeKat() {
     member: toHex(P.encodeRecord(record("MEMBER"))),
     left: toHex(P.encodeRecord(record("LEFT"))),
     treg: toHex(P.encodeRecord(record("TREG"))),
+    ended: toHex(P.encodeRecord(record("ENDED"))),
   };
 }
 
@@ -2382,6 +2402,7 @@ const KAT = {
   left: "0e004e606162636465666768696a6b6c6d6e6f525252525252525252525252525252525252525252525252525252525252525200000004a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a16a18a57b00070000000c",
   // a TREG record (36 bytes): bundleId | t_reg
   treg: "0f002434343434343434343434343434343434343434343434343434343434343434340184931c",
+  ended: "12003a606162636465666768696a6b6c6d6e6f525252525252525252525252525252525252525252525252525252525252525200000006000700000003",
 };
 
 describe("known-answer vectors", () => {

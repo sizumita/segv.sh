@@ -1813,8 +1813,8 @@ export interface WalkEpoch {
   /** uids of D_j in index order (raw or b64u), to follow the sender across epochs. */
   members: readonly (Bytes | string)[];
   /**
-   * The claim that ended epoch j (its stored t, rm and cuts): the final winning claim C_j, or, for the last epoch
-   * before a skip re-add, the claim that removed self; null when the epoch has no final winning claim yet.
+   * The claim that ended epoch j (its stored t, rm and cuts): the final winning claim C_j; null when the epoch has no
+   * final winning claim yet.
    */
   claim: { t: number; rm: number; cuts: readonly Cut[] } | null;
 }
@@ -1842,11 +1842,11 @@ export class MissingClaimError extends Error {
 /**
  * §6.8 old-epoch acceptance. `selfRemoved`: the claim that ended the last listed epoch removed or dropped the receiver
  * itself (its own rm bit is 1), so the receiver holds no later epoch through it.
- * `epochs` are consecutive held epochs: `epochs[0]` is D_e (the row's epoch) and
- * `epochs[k]` is D_{e+k}, so the list stops before an epoch reached by a skip re-add, and a frozen receiver's at its
- * frozen epoch. The caller passes the claim that ended each listed epoch whenever one exists, read at the position
- * of the next held epoch's EPOCH record when it did not process it (for the epoch before a skip: the claim that
- * removed self). A null claim on the last listed epoch means it has no final winning claim yet: accept. A null claim
+ * `epochs` are consecutive held epochs of one copy (a list never crosses copies): `epochs[0]` is D_e (the row's epoch)
+ * and `epochs[k]` is D_{e+k}, so a frozen receiver's list stops at its frozen epoch. The caller passes the claim that
+ * ended each listed epoch whenever one exists, read at the position of the next held epoch's EPOCH record, or of the
+ * copy's ENDED record, when it did not process it. A null claim on the last listed epoch means it has no final
+ * winning claim yet: accept. A null claim
  * with a next epoch continues by membership, since the sender's bit is 0 iff D_{j+1} lists it ("The bit without
  * C_j"); when D_{j+1} does not list the sender, the bit is 1 and the claim is needed, so the call throws
  * `MissingClaimError`. A row is never accepted for lack of a claim.
@@ -2277,6 +2277,7 @@ export const RT = {
   MEMBER: 0x0d,
   LEFT: 0x0e,
   TREG: 0x0f,
+  ENDED: 0x12,
   SNAP: 0x20,
 } as const;
 export type RType = (typeof RT)[keyof typeof RT];
@@ -2286,7 +2287,10 @@ export const VIA = { CREATED: 1, INBOX: 2, WELCOME: 3, HELLO: 4, REQUEST_ACCEPTE
 export type Via = (typeof VIA)[keyof typeof VIA];
 const isVia = (v: number): v is Via => v >= 1 && v <= 5;
 
-/** EPOCH flags: bit1 = accepted by a skip join; every other bit, bit0 included, is 0 (§7.2). */
+/**
+ * EPOCH flags: bit1 marks a legacy skip record, which the first release wrote for a skip re-add and which a reader
+ * reads as the join of a separate copy (§7.2); new code never sets it. Every other bit, bit0 included, is 0.
+ */
 export const EPOCH_SKIP = 2;
 /** LINK flags. */
 export const LINK_ONE_SHOT = 1;
@@ -2313,8 +2317,8 @@ export interface ConvJoinRec extends CopyRef, EpochMaterial {
 export interface EpochRec extends CopyRef, EpochMaterial {
   rtype: typeof RT.EPOCH;
   /**
-   * the winning claim that ended the previous held epoch: on Lctl_{e−1}, or, for a skip re-add (flag bit1), the claim
-   * that removed self, on Lctl_k of the epoch k it removed self from (§7.2)
+   * the winning claim that ended the previous held epoch, on Lctl_{e−1} (§7.2); a legacy skip record (flag bit1) names
+   * the claim that removed self from its copy, which a reader ignores
    */
   claim: Pos;
   flags: number;
@@ -2424,6 +2428,16 @@ export interface TregRec {
   bundleId: Bytes;
   tReg: number;
 }
+/**
+ * The copy ended in its epoch e (§6.6 step 3): the final winning claim of e, at `claim` on Lctl_e (never NONE),
+ * removed or dropped self. Written with the next HEADS row and kept by snapshots, so a restore needs neither that
+ * control lane nor the claim's bundle (§11.4 step 5).
+ */
+export interface EndedRec extends CopyRef {
+  rtype: typeof RT.ENDED;
+  e: number;
+  claim: Pos;
+}
 export interface SnapRec {
   rtype: typeof RT.SNAP;
   blobId: Bytes;
@@ -2449,6 +2463,7 @@ export type SelfRecord =
   | MemberRec
   | LeftRec
   | TregRec
+  | EndedRec
   | SnapRec;
 
 const wrCopy = (x: CopyRef): Bytes => concat(fixed(x.conv, 16, "record conv"), fixed(x.root, 32, "record root"));
@@ -2519,6 +2534,9 @@ function recordContent(x: SelfRecord): Bytes {
       return concat(wrCopy(x), u32(x.e), fixed(x.uid, 16, "LEFT uid"), u32(x.t), wrPos(x.row, "LEFT"));
     case RT.TREG:
       return concat(fixed(x.bundleId, 32, "TREG bundleId"), u32(x.tReg));
+    case RT.ENDED:
+      if (isNone(x.claim)) bad("ENDED: the claim position is NONE");
+      return concat(wrCopy(x), u32(x.e), wrPos(x.claim, "ENDED"));
     case RT.SNAP:
       return concat(
         fixed(x.blobId, 32, "SNAP blobId"),
@@ -2652,6 +2670,10 @@ export function parseRecord(rtype: number, c: Bytes): SelfRecord | null {
       break;
     case RT.TREG:
       x = { rtype, bundleId: r.bytes(32), tReg: r.u32() };
+      break;
+    case RT.ENDED:
+      x = { rtype, ...rdCopy(r), e: r.u32(), claim: rdPos(r, what) };
+      if (isNone(x.claim)) bad(`${what}: the claim position is NONE`);
       break;
     case RT.SNAP:
       x = { rtype, blobId: r.bytes(32), key: r.bytes(32), size: r.u32(), pos: rdPos(r, what) };
