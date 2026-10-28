@@ -1,5 +1,6 @@
 // Engine options (docs/PROTOCOL.md §11): the transport, the clocks, and every protocol delay, so tests can inject
 // them. The app constructs the engine without options.
+import type { PushPlatform, PushStore } from "./push";
 
 /** A scheduled callback; `cancel()` is idempotent. */
 export interface EngineTimer {
@@ -79,4 +80,9 @@ export interface EngineOptions {
    * resolves to null: no worker, trial decryption runs on the same thread (the engine tests set it to null).
    */
   inboxWorker?: (() => Promise<Worker | null>) | null;
+  /**
+   * Web Push on this device (§11.13). Absent: the browser's (Push API, Service Worker) and localStorage; `platform`
+   * null: no Web Push (the engine tests inject fakes).
+   */
+  push?: { platform: PushPlatform | null; store?: PushStore };
 }

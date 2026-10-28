@@ -6,8 +6,10 @@ segv.sh is an end-to-end encrypted messenger for the web, for one-to-one and gro
 images. A passkey unlocks your keys in the browser through the WebAuthn PRF extension, and any device can restore all
 of your conversations and their history with that passkey or a recovery code.
 
-The server is designed to be public: anyone may read every byte it stores, so it stores nothing secret. Each client
-computes the labels of the rows meant for it and fetches only those rows.
+The server is designed to be public: anyone may read every byte of conversation data it stores, so that data holds
+nothing secret. Each client computes the labels of the rows meant for it and fetches only those rows. The one
+exception is optional: a deployment that offers notifications keeps a sealed registration for each device that turns
+them on, and never serves it (see [Notifications](#notifications)).
 
 The reference deployment runs at <https://segv.sh>.
 
@@ -25,6 +27,9 @@ The reference deployment runs at <https://segv.sh>.
 - A fingerprint for every account, to compare keys out of band.
 - Integrity warnings when the server rewrites or rolls back data, drops rows from a sender's sequence, or shows
   members different views.
+- Optional notifications (Web Push), off by default and turned on per device. Every notification says only "new
+  messages"; invites, requests and reactions never notify.
+- Installable as an app (a web app manifest; on iPhone and iPad, "Add to Home Screen").
 
 ## How it works
 
@@ -110,7 +115,9 @@ segv.sh protects:
 - **Partial detection of server misbehaviour:** changed rows, rows missing from a sender's sequence, rewritten or
   rolled-back history (through a signed checkpoint chain that each browser keeps), and split views between members.
   Signed receipts prove that a write was accepted.
-- A database leak exposes nothing new: the data is public by design.
+- A database leak exposes nothing new: the conversation data is public by design. The one store that is not public,
+  the optional notification registrations, is sealed under a server key and holds no account, conversation or
+  address.
 
 segv.sh does not protect against:
 
@@ -133,6 +140,28 @@ segv.sh does not protect against:
   and by disagreement with the keys listed in conversations.
 - Deniability among members, deletion (the archive is public), censorship resistance, and post-quantum signatures
   (signatures use Ed25519).
+- **What notifications reveal**, on the devices that turn them on: see [Notifications](#notifications).
+
+### Notifications
+
+Notifications are off unless the deployment configures them and the user turns them on, per device. A device that
+does registers a "bell" for each conversation it accepted: a value derived from that conversation's epoch key, which
+every member can compute and no one else can. After sending a text or an image, a client asks the server to ring the
+other members' bells, and the server sends each registered device one fixed, contentless notification, at most once a
+minute.
+
+- The server stores, per device, its push endpoint and keys sealed under a server key, keyed hashes of its bells, and
+  the day of its last registration: no account, conversation, topic or address, and nothing about which devices a
+  message reached. It writes registration changes only once a day, because the platform keeps a 30-day history of the
+  storage; that history can still suggest, on a quiet day, which devices changed together.
+- The browser's push service (Apple for every iPhone and iPad web app, Google, Mozilla or Microsoft) learns that the
+  device uses segv.sh and when it is notified, and can guess from the timing which of its devices share a
+  conversation.
+- The operator sees, at each ring, which devices a message is for, including devices that are offline.
+- A member can make other members' devices show the notification, at most once a minute, or hold the registration
+  places of their bells and so keep their devices from being notified.
+
+[docs/PROTOCOL.md](docs/PROTOCOL.md) §9.8, §10.10, §11.13 and §13.4 are the normative statements.
 
 Protocol v2 replaced an earlier design, v1, in which every client downloaded the whole public log. v2 makes a client's
 cost independent of everyone else's data, at the price of some guarantees that v1 had.
@@ -151,6 +180,7 @@ The app is a Qwik v2 site with a client engine that runs entirely in the browser
 | `BlobRegDO`             | Registers uploads to R2 and their times, which membership changes depend on                                                                                                                       |
 | `RealtimeDO`            | Hibernatable WebSockets that push new rows to the topics each client subscribed to                                                                                                                |
 | `CheckpointDO`          | Every 60 seconds, signs the heads of the shard, inbox, upload registry and directory into a checkpoint chain                                                                                      |
+| `PushDO` (optional)     | The sealed notification registrations of the devices that turned notifications on, and the notifications; written once a day                                                                      |
 | D1                      | The directory (handle ↔ account id ↔ public keys, key wraps) and its public, hash-chained log                                                                                                     |
 | R2                      | Encrypted images and key bundles, content-addressed and immutable                                                                                                                                 |
 

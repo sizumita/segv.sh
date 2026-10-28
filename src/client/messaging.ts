@@ -12,6 +12,7 @@ import {
   MAX_TEXT_BYTES,
   clampTs,
   cleanName,
+  contest,
   copyKeyOf,
   currentEpoch,
   leftIn,
@@ -24,6 +25,8 @@ import {
   type Copy,
   type Epoch,
   type KnownUser,
+  type Slot,
+  type Winner,
 } from "./conv";
 import { buildCreation, parseHandleList, resolveHandles, type Recipient } from "./create";
 import { Deliveries, jobKey, type DeliveryJob, type WelcomeOutcome } from "./deliver";
@@ -39,7 +42,15 @@ import {
 } from "./inbox";
 import { Checkpoints, different, hiding } from "./integrity";
 import { HelloProber, LINK_ERAS, liveLinks, putHello, type LiveLink } from "./links";
-import { acceptJoin, secondCopyWarning, type JoinCtx, type NewCopy, type SkipJoin } from "./join";
+import {
+  acceptJoin,
+  secondCopyWarning,
+  type JoinCtx,
+  type JoinOutcome,
+  type JoinSource,
+  type NewCopy,
+  type SettleOwn,
+} from "./join";
 import type {
   EngineClock,
   EngineDelays,
@@ -48,10 +59,22 @@ import type {
   WebSocketCtor,
 } from "./options";
 import { Realtime } from "./realtime";
-import { keysChangedWarning, type SelfLane } from "./selflane";
-import { olderInitialHistory, scrollback } from "./history";
+import { keysChangedWarning, leftKeyCmp, liveAt, type SelfLane } from "./selflane";
+import { SNAP_RECORDS, firstFreePointer, writeSnapshot } from "./snapshot";
+import { MAX_REACTIONS, reactionSets, refreshReactions } from "./reactions";
+import { lanesEnd, olderInitialHistory, scrollback } from "./history";
 import { prepareImage } from "./image";
-import { enterEpoch, onLeave, processWinner, relabel, type MembershipHost } from "./membership";
+import {
+  claimRead,
+  deriveLines,
+  endByRecord,
+  historyClaim,
+  onLeave,
+  processWinner,
+  relabel,
+  switchByRecord,
+  type MembershipHost,
+} from "./membership";
 import { WelcomeRefused, sendRow, type SendCtx } from "./send";
 import {
   applyLaneRow,
@@ -70,6 +93,32 @@ const RT_TOPICS = 256;
 
 /** A self row holds at most this many bytes of records (cls 3 minus the S header and a margin, §7.1, §7.3). */
 const ROW_BUDGET = 16_384 - 32 - 64;
+
+/** A WELCOME's J that parked: its carrier copy, epoch, lane and row. */
+interface ParkedWelcome {
+  c: Copy;
+  ep: Epoch;
+  j: number;
+  at: Slot;
+  J: P.Join;
+}
+
+/** A join of one poll on its way to the self lane: its outcome, where it came from, and whether it was taken out. */
+interface JoinWrite {
+  x: NewCopy;
+  src: JoinSource;
+  at: { E: number; rel: number } | null;
+  out: boolean;
+}
+
+/** The inbox cursor just before an invite at `(E, rel)` (a parked join stays after it, §11.5 step 3). */
+const before = (at: { E: number; rel: number }): InboxCursor => ({
+  E: at.E,
+  rel: Math.max(0, at.rel - 1),
+});
+
+/** `accept`, or a post that accepts, could not verify the inviter's directory bundle (§11.11). */
+export const NOT_VERIFIED = "could not verify who started this conversation; try again";
 
 /** The account of the session, as the engine holds it. */
 export interface SessionAccount {
@@ -106,6 +155,8 @@ export interface MessagingHost {
   setConnected(on: boolean): void;
   /** the latest verified checkpoint (EngineState.head, §12.3) */
   setHead(q: number, C: Bytes): void;
+  /** a TEXT or IMAGE was stored: ask the server to ring these bells (§11.13); never waits */
+  ring(E: number, label: Bytes, bells: Bytes[]): void;
 }
 
 export class Messaging {
@@ -156,6 +207,15 @@ export class Messaging {
   private prevChecks: { c: Copy; ep: Epoch; j: number; prev: P.Pos; prevh: Bytes }[] = [];
   /** omission warnings already raised, per kind and sender (§12.2) */
   private readonly omissionWarned = new Set<string>();
+  /**
+   * Copies with a valid row of a member other than rootBy and self, waiting for their control lane to settle: a row
+   * accepts or confirms a copy only once it is settled, and never once the copy has ended (§6.7 step 6, §11.5).
+   */
+  private readonly corroborations = new Set<Copy>();
+  /** rows walked in an epoch whose ending claim is not read yet (an ENDED record, §11.4 step 5), applied after it is */
+  private heldRows: { c: Copy; ep: Epoch; j: number; r: FoundRow }[] = [];
+  /** WELCOME Js that parked, with their carrier lane and row (§6.7 step 4) */
+  private parkedWelcomes: ParkedWelcome[] = [];
 
   constructor(private readonly h: MessagingHost) {
     this.ckpt = new Checkpoints({
@@ -195,20 +255,19 @@ export class Messaging {
   // ───────────────────────── lifecycle ─────────────────────────
 
   /**
-   * Restore (§11.4 steps 5–9, without snapshots): the copies of the fold, their lanes from the HEADS positions,
-   * the initial history, the inbox, the subscriptions. Rows applied here never count as unread.
+   * Restore (§11.4 steps 5–9, without snapshots): the copies of the fold (those that legacy skip records start
+   * included, §7.2), their lanes from the HEADS positions, the initial history, the inbox, the subscriptions. Rows
+   * applied here never count as unread.
    */
   async restore(): Promise<void> {
+    this.h.api.beginOperation(); // §10.6: directory answers fetched from now on are fresh for the restore
     await this.ckpt.verify().catch(() => {}); // §11.1: checkpoints first; a failure is retried at catch-up
     const f = this.h.self.fold;
     this.cursor = f.cursor;
-    const Enow = P.era(this.h.api.serverNow());
-    for (const [k, rec] of f.joins) if (!this.byKey(k)) await this.materialize(k, rec, false);
-    for (const [k, rec] of f.requests(Enow))
-      if (!this.byKey(k)) await this.materialize(k, rec, true);
+    await this.materializeAll();
     await this.syncCopies([...this.copies.values()], true);
-    // The own leave state comes from the LEAVE records (and a skip re-add above the latest one ends it, §6.9).
-    for (const c of this.copies.values()) if (!c.removed) c.left = c.left || this.leaveCurrent(c);
+    // The own leave state comes from the copy's LEAVE records (§6.9).
+    for (const c of this.copies.values()) c.left = c.left || this.leaveCurrent(c);
     // A HEADS entry whose epoch the control lanes never reached is ignored: the current epoch's lanes start at E_start.
     const late = [...this.copies.values()].filter((c) => {
       const ep = c.epochs.get(c.current);
@@ -229,6 +288,8 @@ export class Messaging {
   /** Starts realtime and the periodic inbox poll and catch-up (§11.5, §11.6). */
   start(): void {
     this.live = true;
+    // §11.4 step 10: a snapshot when the era has none or many records were applied since the latest one.
+    void this.h.track(this.maybeSnapshot()).catch(() => {});
     const WS =
       this.h.opts.WebSocket ??
       (typeof WebSocket === "undefined" ? null : (WebSocket as unknown as WebSocketCtor));
@@ -293,34 +354,267 @@ export class Messaging {
     await this.ckpt.verify().catch(() => {});
     await this.h.enqueue(async () => {
       this.h.check();
+      this.h.api.beginOperation();
       await this.h.self.catchUp({ E: this.h.acc.regEra, n: 0 });
       await this.absorbFold();
       await this.syncCopies([...this.copies.values()], false);
       await this.pollInbox();
+      await this.retryWelcomes();
       await this.probeLinks();
       await this.resolveMembers([...this.copies.values()].filter((c) => !c.request));
     });
     this.resumeDeliveries();
     this.repeatLeaves();
     await this.flushHeads();
+    await this.maybeSnapshot();
   }
 
   // ───────────────────────── lanes and claims (§6.4–§6.6, §11.2) ─────────────────────────
 
   /**
    * Walks the copies' lanes (current epoch, control lane, followed lanes and lanes to sweep) and settles their control
-   * lanes, again for every copy a final winner moved to a later epoch. Runs in the queue.
+   * lanes, again for every copy a final winner moved to a later epoch. A copy that reaches the epoch its ENDED record
+   * names ends there without that control lane (§11.4 step 5). Rows that wait for a settled control lane or for an
+   * ending claim are handled after the walk. Runs in the queue.
    */
   private async syncCopies(copies: readonly Copy[], quiet: boolean): Promise<void> {
     let todo = copies.filter((c) => c.epochs.has(c.current));
+    for (const c of todo) if (c.top !== null) await this.advanceByRecords(c, quiet);
     for (let round = 0; round < 64 && todo.length; round++) {
+      for (const c of todo) await this.endByRecordIf(c, quiet);
       await syncLanes(this.syncCtx(quiet), targetsOf(todo), quiet);
       await this.checkPrevs();
       const moved: Copy[] = [];
       for (const c of todo) if (await settleControl(this.controlHost(quiet), c)) moved.push(c);
       todo = moved;
     }
-    for (const c of copies) this.scheduleSettle(c);
+    await this.applyHeldRows(quiet);
+    this.corroborateSettled();
+    for (const c of copies) if (!c.probe) this.scheduleSettle(c);
+  }
+
+  /**
+   * A copy that holds the epoch its ENDED record names (its own or a sibling's) has ended there, latched, without
+   * processing that claim (§6.6 step 3, §7.3); a record for an epoch it does not hold is not applied yet.
+   */
+  private async endByRecordIf(c: Copy, quiet: boolean): Promise<void> {
+    if (c.removed || c.probe) return;
+    const rec = this.h.self.fold.ended.get(copyKeyOf(c));
+    const ep = c.epochs.get(c.current);
+    if (!rec || !ep || rec.e !== ep.e) return;
+    await endByRecord(this.membershipHost(quiet), c, ep, rec.claim);
+    // A device that holds rows of that epoch reads the claim now: rows stored after it are dropped (§6.8, §11.7).
+    if (ep.loaded > 0) await this.readEndClaim(c, quiet);
+  }
+
+  /** The copy ended at a claim it has not read yet (its ENDED record): its rows wait for that claim. */
+  private endPending(c: Copy): boolean {
+    return c.epochs.get(c.current)?.endedAt != null;
+  }
+
+  /** Rows held for an ending claim: the claim is read at its record's position, then they are applied in order. */
+  private async applyHeldRows(quiet: boolean): Promise<void> {
+    if (this.heldRows.length === 0) return;
+    const held = this.heldRows;
+    this.heldRows = [];
+    for (const c of new Set(held.map((x) => x.c))) await this.readEndClaim(c, quiet);
+    const ctx = this.syncCtx(quiet);
+    for (const x of held)
+      if (this.endPending(x.c)) this.heldRows.push(x); // still unread (a transient failure): held again
+      else applyLaneRow(ctx, x.c, x.ep, x.j, x.r, quiet);
+  }
+
+  /**
+   * Reads the claim that ended the copy at its ENDED record's position (one body key, opened with that epoch's mk and
+   * not evaluated again, §11.4 step 5), when a row of the copy or its history needs it: the rows are decided with it,
+   * and "@by removed you" shows unless self had left in that epoch (§11.9). A transient failure leaves it unread.
+   */
+  private async readEndClaim(c: Copy, quiet: boolean): Promise<void> {
+    const ep = c.epochs.get(c.current);
+    const at = ep?.endedAt;
+    if (!ep || !at) return;
+    const got = await this.readClaimAt(ep, at);
+    if (got.kind === "transient") return;
+    if (got.kind === "gone") {
+      ep.endedAt = null; // nothing there: no claim to show
+      return;
+    }
+    claimRead(this.membershipHost(quiet), c, ep, got.w);
+  }
+
+  /**
+   * The claim of epoch `ep` at `at` on its control lane, read without probing the slots before it and without
+   * evaluating it again (a record of the account names it, §6.8, §11.4 step 5): one body key, opened with that epoch's
+   * mk, as a processed final winner. "gone" when the slot holds no claim of the epoch.
+   */
+  private async readClaimAt(
+    ep: Epoch,
+    at: P.Pos,
+  ): Promise<{ kind: "ok"; w: Winner } | { kind: "gone" } | { kind: "transient" }> {
+    const had = ep.ctl.winner;
+    if (had && had.E === at.E && had.n === at.n)
+      return { kind: "ok", w: { ...had, final: true, processed: true } };
+    const label = P.Lctl(ep.keys.rk, at.E, at.n);
+    let st: Awaited<ReturnType<Api["get"]>>;
+    try {
+      st = await this.h.api.get([{ E: at.E, label, mode: 0 }]);
+    } catch {
+      return { kind: "transient" };
+    }
+    const s = st[0];
+    if (s.s !== "hit" || !s.body) return s.s === "miss" ? { kind: "gone" } : { kind: "transient" };
+    const v = P.acceptRow(
+      { keys: ep.keys, conv: ep.D.conv, e: ep.e, members: ep.D.members },
+      at.E,
+      label,
+      s.body,
+    );
+    if (!v.ok || v.msg.type !== P.MT.CLAIM) return { kind: "gone" };
+    return {
+      kind: "ok",
+      w: {
+        E: at.E,
+        n: at.n,
+        label,
+        t: s.t,
+        body: s.body,
+        claim: v.msg.claim,
+        from: v.msg.from,
+        ts: v.msg.ts,
+        tReg: 0,
+        blob: new Uint8Array(0),
+        final: true,
+        processed: true,
+      },
+    };
+  }
+
+  /**
+   * An epoch of a copy from its key material (an EPOCH record, or the copy's CONV_JOIN for its root epoch): D from
+   * a DESC record of the copy, or else from the bundle (checked as §7.2 says), and `t_reg` in §4.2's order. Null when
+   * the material does not check; throws on a transient failure.
+   */
+  private async epochFromRecord(
+    c: { conv: Bytes; root: Bytes },
+    rec: P.EpochMaterial,
+  ): Promise<Epoch | null> {
+    const f = this.h.self.fold;
+    const k = copyKeyOf(c);
+    const keys = P.epochKeys(rec.EK, c.conv, rec.e);
+    let D: P.Descriptor | null = null;
+    let dsig: Bytes | null = null;
+    let pks: Bytes | null = null;
+    const check = (pair: { D: Bytes; dsig: Bytes }): boolean => {
+      try {
+        const d = P.parseD(pair.D);
+        if (!P.equalBytes(d.conv, c.conv) || d.e !== rec.e || !P.verifyD(d, keys.kc, pair.dsig))
+          return false;
+        D = d;
+        dsig = pair.dsig;
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const desc = f.desc.get(`${k}:${rec.e}`);
+    let ok = false;
+    if (desc) {
+      try {
+        ok = check(P.splitDesc(desc.desc));
+      } catch {
+        ok = false;
+      }
+    }
+    if (!ok) {
+      const got = await this.h.api.getBlob(rec.bundleId, rec.bundleSize);
+      if (!got || !got.sizeOk || !P.equalBytes(P.H(got.bytes), rec.bundleId)) return null;
+      try {
+        if (!check(P.openDesc(keys.dk, c.conv, rec.e, got.bytes))) return null;
+        pks = P.openPks(keys.dk, c.conv, rec.e, got.bytes);
+      } catch {
+        return null;
+      }
+    }
+    if (!D || !dsig) return null;
+    const sameBundle = (x: { bundleId: Bytes }) => P.equalBytes(x.bundleId, rec.bundleId);
+    let tReg: number | null = f.tregs.get(P.b64u(rec.bundleId)) ?? null;
+    const req = f.requestOf(k)?.rec;
+    if (tReg === null && req && req.e === rec.e && sameBundle(req)) tReg = req.tReg;
+    if (tReg === null)
+      tReg =
+        f.pending.find((x) => copyKeyOf(x.rec) === k && x.rec.e === rec.e && sameBundle(x.rec))?.rec
+          .tReg ?? null;
+    if (tReg === null) tReg = (await this.h.api.blobMeta(rec.bundleId))?.t ?? null;
+    if (tReg === null) return null;
+    const ep = newEpoch({
+      e: rec.e,
+      EK: rec.EK,
+      D,
+      dsig,
+      bundleId: rec.bundleId,
+      bundleSize: rec.bundleSize,
+      tReg,
+      pks,
+      self: this.h.acc.uid,
+    });
+    return ep.myIndex >= 0 ? ep : null;
+  }
+
+  /**
+   * §11.4 step 5 below a snapshot's top: from the restore's start up to the top, each epoch's lanes are walked and its
+   * winning claim is read at the position the next held epoch's EPOCH record names, then the copy switches by that
+   * record, with no probe of the control lane and no evaluation. A record that does not check leaves the copy probing
+   * from where it is.
+   */
+  private async advanceByRecords(c: Copy, quiet: boolean): Promise<void> {
+    const f = this.h.self.fold;
+    const k = copyKeyOf(c);
+    while (c.top !== null && c.current < c.top && !c.removed) {
+      const ep = c.epochs.get(c.current)!;
+      const rec = f.epochs.get(`${k}:${ep.e + 1}`);
+      const next = rec ? await this.epochFromRecord(c, rec) : null;
+      const got = rec && next ? await this.readClaimAt(ep, rec.claim) : null;
+      if (got?.kind === "transient") throw new Error("claim not read yet");
+      if (!rec || !next || !got || got.kind !== "ok") break;
+      await syncLanes(
+        this.syncCtx(quiet),
+        targetsOf([c]).filter((x) => x.lane !== "ctl"),
+        quiet,
+      );
+      await switchByRecord(this.membershipHost(quiet), c, ep, got.w, next);
+    }
+    c.top = null;
+  }
+
+  /**
+   * An older held epoch of a copy that a restore did not materialize (below its start, §11.4 step 5), for its history
+   * (§11.10, step 6): its key from the fold's EPOCH record (or the CONV_JOIN for the root epoch), its D from a DESC
+   * record or its bundle, and the claim that ended it read at the position the next epoch's EPOCH record names. Its
+   * lanes are not walked forward; history reads them backward.
+   */
+  private async olderEpoch(c: Copy, e: number): Promise<Epoch | undefined> {
+    if (e < c.rootE || c.epochs.has(e)) return c.epochs.get(e);
+    const f = this.h.self.fold;
+    const k = copyKeyOf(c);
+    const material: P.EpochMaterial | undefined =
+      e === c.rootE ? (f.joins.get(k) ?? f.requestOf(k)?.rec) : f.epochs.get(`${k}:${e}`);
+    const nextRec = f.epochs.get(`${k}:${e + 1}`);
+    if (!material || !nextRec) return undefined;
+    let ep: Epoch | null;
+    try {
+      ep = await this.epochFromRecord(c, material);
+    } catch {
+      return undefined;
+    }
+    if (!ep || c.epochs.has(e)) return c.epochs.get(e) ?? undefined;
+    const got = await this.readClaimAt(ep, nextRec.claim);
+    if (got.kind !== "ok") return undefined;
+    ep.lanesOn = false;
+    for (const l of ep.lanes) l.swept = true;
+    c.epochs.set(e, ep);
+    this.topics.set(P.b64u(ep.topic), { c, ep });
+    historyClaim(this.membershipHost(true), c, ep, got.w);
+    return ep;
   }
 
   /** Settles a copy's control lane without probing it again; a switch walks the new epoch's lanes. In the queue. */
@@ -367,6 +661,10 @@ export class Messaging {
     };
   }
 
+  /**
+   * The host of a copy's membership processing. A probe copy (an overtaken J's own copy, §6.7 step 6) is not held: it
+   * gets no topic, record or warning until it is kept.
+   */
   private membershipHost(quiet: boolean): MembershipHost {
     return {
       kemSk: this.h.acc.id.kemSk,
@@ -381,39 +679,92 @@ export class Messaging {
       handleOf: (c, ep, j) => this.handleOf(c, ep, j),
       sweep: (targets) => syncLanes(this.syncCtx(quiet), targets, quiet),
       onSwitch: (c, ep) => {
+        if (c.probe) return;
         this.topics.set(P.b64u(ep.topic), { c, ep });
         this.subscribe();
         this.markHeads();
       },
-      skipAfter: (c, k) => this.skipAfter(c, k),
+      recordEnd: (c, ep, w) => {
+        if (!c.probe) this.queueEnded(c, ep.e, { E: w.E, n: w.n });
+      },
+      claimConfirms: (c, ep, w) => this.claimConfirms(c, ep, w),
       applyHeads: (c, ep) => this.applyHeads(c, ep),
-      ownLeave: (c, e) => this.writeLeave(c, e),
+      ctlFrom: (c, ep) => this.ctlFrom(c, ep),
+      ownLeave: (c, e) => {
+        if (!c.probe) this.writeLeave(c, e);
+      },
       leftChanged: () => this.markHeads(),
       failOwn: (c, key) => this.markEcho(c, key, "failed"),
-      leaveCurrent: (c) => this.leaveCurrent(c),
       leftAt: (c, k) => c.left || this.leftAt(c, k),
     };
+  }
+
+  /** Queues the copy's ENDED record for the next HEADS row unless the account holds one (§6.6 step 3, §7.3). */
+  private queueEnded(c: Copy, e: number, claim: P.Pos): void {
+    const k = copyKeyOf(c);
+    if (this.h.self.fold.ended.has(k)) return;
+    if (this.pendingRecords.some((r) => r.rtype === P.RT.ENDED && copyKeyOf(r) === k)) return;
+    this.pendingRecords.push({
+      rtype: P.RT.ENDED,
+      conv: c.conv,
+      root: c.root,
+      e,
+      claim: { ...claim },
+    });
+    this.markHeads();
+  }
+
+  /**
+   * A final winning claim (processed, or read at a record's position) whose committer is neither `rootBy` nor self
+   * confirms its copy, the claim that ended it included; recorded by a CONFIRMED with the next HEADS row, never a row of
+   * its own (§6.7 step 6, §7.3). It accepts nothing.
+   */
+  private claimConfirms(c: Copy, ep: Epoch, w: Winner): void {
+    const by = ep.D.members[w.from]?.uid;
+    if (!by || P.equalBytes(by, c.rootBy) || P.equalBytes(by, this.h.acc.uid)) return;
+    c.confirmed = true;
+    if (c.probe || P.equalBytes(c.rootBy, this.h.acc.uid)) return; // a created copy is confirmed by its creation
+    const k = copyKeyOf(c);
+    if (this.h.self.fold.confirmed.has(k)) return;
+    if (this.pendingRecords.some((r) => r.rtype === P.RT.CONFIRMED && copyKeyOf(r) === k)) return;
+    this.pendingRecords.push({ rtype: P.RT.CONFIRMED, conv: c.conv, root: c.root });
+    this.markHeads();
   }
 
   private catchUpSoon(): Promise<void> {
     return this.h.track(this.catchUp()).catch(() => {});
   }
 
-  /** New copies and acceptances written by sibling devices (§7.3, §11.7). */
+  /**
+   * What sibling devices (or a tab on the first release) wrote (§7.3, §11.7): new copies, a legacy skip record's copy
+   * included (§7.2), acceptances, confirmations, and the own leave of a copy from its LEAVE records, which derives the
+   * removal line again (§6.6 step 3). A sibling's ENDED record ends its copy at the next walk (`syncCopies`).
+   */
   private async absorbFold(): Promise<void> {
     const f = this.h.self.fold;
-    for (const [k, rec] of f.joins) {
+    await this.materializeAll();
+    for (const k of f.joins.keys()) {
       const c = this.byKey(k);
-      if (!c) await this.materialize(k, rec, false);
-      else if (c.request) this.becomeAccepted(c);
+      if (c?.request) this.becomeAccepted(c);
     }
-    const Enow = P.era(this.h.api.serverNow());
-    for (const [k, rec] of f.requests(Enow))
-      if (!this.byKey(k)) await this.materialize(k, rec, true);
+    for (const s of f.skips) {
+      const c = s.copy ? this.byKey(s.copy) : undefined;
+      if (!c) continue;
+      if (f.skipAccepted.has(s.id) && c.request) this.becomeAccepted(c);
+      if (f.skipConfirmed.has(s.id)) c.confirmed = true;
+    }
     for (const k of f.confirmed) {
       const c = this.byKey(k);
       if (c) c.confirmed = true;
     }
+    const mh = this.membershipHost(false);
+    for (const c of this.copies.values()) {
+      if (c.left || !this.leaveCurrent(c)) continue;
+      c.left = true;
+      deriveLines(mh, c);
+      this.h.changed();
+    }
+    this.acceptByContact(); // a request whose D.by became a contact (§11.5)
   }
 
   // ───────────────────────── copies ─────────────────────────
@@ -453,6 +804,8 @@ export class Messaging {
       conv: x.conv,
       convB: P.b64u(x.conv),
       root: x.root,
+      rootE: ep.e,
+      top: null,
       rootBy: x.rootBy,
       request: x.request,
       confirmed: x.confirmed,
@@ -471,19 +824,25 @@ export class Messaging {
       scrolled: false,
       lines: new Map(),
       heads: null,
+      probe: false,
+      reactions: new Map(),
+      reactionsDirty: false,
     };
   }
 
   /** The system line of the epoch a copy was joined at (§11.9). */
   private joinLine(c: Copy, ep: Epoch): void {
-    const by = this.whoOf(c, ep, ep.D.by);
-    const text = ep.e === 0 ? `${by} started the conversation` : `${by} added you`;
     // A join without a stored row of its own takes D.ts clamped to the §11.8 window around the bundle's t_reg, so a
     // far-future D.ts cannot pin the copy to the top of the list. It sorts before the epoch's rows.
     const ts = ep.tReg !== null ? clampTs(ep.D.ts, ep.tReg, this.params().delta) : ep.D.ts;
-    const key = `sys:${ep.e}:join`;
+    this.putJoinLine(c, ep.e, this.whoOf(c, ep, ep.D.by), ts);
+  }
+
+  private putJoinLine(c: Copy, e: number, by: string, ts: number): void {
+    const text = e === 0 ? `${by} started the conversation` : `${by} added you`;
+    const key = `sys:${e}:join`;
     if (c.order.has(key)) return;
-    c.order.set(key, [ts, ep.e, -1, -1, -1]);
+    c.order.set(key, [ts, e, -1, -1, -1]);
     const m = systemLine(key, ts, text);
     let i = c.messages.length;
     while (i > 0 && (c.order.get(c.messages[i - 1].key)?.[0] ?? Infinity) > ts) i--;
@@ -491,24 +850,177 @@ export class Messaging {
     c.lastTs = Math.max(c.lastTs, ts);
   }
 
+  /** Holds every copy the fold names that is not held yet: CONV_JOINs, live REQUESTs, then legacy skip records. */
+  private async materializeAll(): Promise<void> {
+    const f = this.h.self.fold;
+    for (const [k, rec] of f.joins) if (!this.byKey(k)) await this.materialize(k, rec, false);
+    const Enow = P.era(this.h.api.serverNow());
+    for (const [k, rec] of f.requests(Enow))
+      if (!this.byKey(k)) await this.materialize(k, rec, true);
+    await this.materializeSkips();
+  }
+
+  /** bit1 records already read in this session (by `LegacySkip.id`) */
+  private readonly skipsRead = new Set<number>();
+
   /**
-   * A copy from its CONV_JOIN or REQUEST record (§11.4 step 5): the root epoch's D from the REQUEST's desc, a DESC
-   * record or the bundle (checked as §7.2 says), E_start from EPOCH_PENDING, REQUEST or blob meta, and the lane
-   * positions of its HEADS entry when it fits D.
+   * Legacy skip records (§7.2): each is the join of a separate copy `(conv, H(D_{e′}))` at e′. One that matches a
+   * CONV_JOIN or REQUEST of its conv by `(e′, EK, bundleId)` is that record's copy, with no fetch; any other reads
+   * `D_{e′}` from its bundle. A copy of its key that the fold holds by its own CONV_JOIN or REQUEST is that copy (a
+   * REQUEST stays a request, unless a first-release tab accepted it after the record); otherwise the copy is held as an
+   * accepted copy when the legacy copy's own CONV_JOIN is in the fold, else as a request of the record's row. A record
+   * that fails a check is ignored without a warning; a transient failure is retried at the next catch-up.
+   */
+  private async materializeSkips(): Promise<void> {
+    const f = this.h.self.fold;
+    const Enow = P.era(this.h.api.serverNow());
+    for (const s of f.skips) {
+      if (this.skipsRead.has(s.id)) continue;
+      let pre: { D: P.Descriptor; dsig: Bytes; pks: Bytes } | null = null;
+      let k = s.copy;
+      if (!k) {
+        try {
+          pre = await this.legacyD(s.rec);
+        } catch {
+          continue;
+        }
+        this.skipsRead.add(s.id);
+        if (!pre) continue;
+        k = copyKeyOf({ conv: s.rec.conv, root: pre.D.hash });
+        f.bindSkip(s, k);
+      } else this.skipsRead.add(s.id);
+      const accepted = f.skipAccepted.has(s.id);
+      const held = this.byKey(k);
+      if (held) {
+        if (held.request && accepted) this.becomeAccepted(held);
+        if (f.skipConfirmed.has(s.id)) held.confirmed = true;
+        continue;
+      }
+      // A record of its own key decides (a REQUEST that is no longer live makes no copy).
+      if (f.joins.has(k) || f.requestOf(k) || !pre) continue;
+      const D = pre.D;
+      const legacyAccepted = accepted || f.joins.has(s.from);
+      // its t_reg: a TREG for its bundle, else one blob/meta (§4.2); a request lives 4 eras from it (§7.3)
+      let tReg: number | null = f.tregs.get(P.b64u(s.rec.bundleId)) ?? null;
+      if (tReg === null) {
+        try {
+          tReg = (await this.h.api.blobMeta(s.rec.bundleId))?.t ?? null;
+        } catch {
+          this.skipsRead.delete(s.id); // read again at the next catch-up
+          continue;
+        }
+      }
+      if (tReg === null || (!legacyAccepted && !liveAt(tReg, Enow))) continue;
+      const material = {
+        conv: s.rec.conv,
+        root: D.hash,
+        e: s.rec.e,
+        EK: s.rec.EK,
+        bundleId: s.rec.bundleId,
+        bundleSize: s.rec.bundleSize,
+        rootBy: D.by,
+        via: P.VIA.INBOX,
+      };
+      const rec: P.ConvJoinRec | P.RequestRec = legacyAccepted
+        ? { rtype: P.RT.CONV_JOIN, ...material }
+        : { rtype: P.RT.REQUEST, ...material, tReg, desc: P.concat(D.bytes, pre.dsig) };
+      await this.materialize(k, rec, !legacyAccepted, {
+        ...pre,
+        viewKey: f.viewKeys.get(k)!,
+        tReg,
+      });
+    }
+  }
+
+  /**
+   * `D_{e′}` of a legacy skip record from its bundle, checked as §11.4 step 5 checks an epoch's bundle (§7.2): its hash
+   * and size, `descCt` and `pkCt` under `dk_{e′}(EK)`, `D.conv`, `D.e`, `dsig` under `kc_{e′}` for `D.by`, and self
+   * listed with its own keys. Null when a check fails; throws on a transient failure.
+   */
+  private async legacyD(
+    rec: P.EpochRec,
+  ): Promise<{ D: P.Descriptor; dsig: Bytes; pks: Bytes } | null> {
+    if (P.sgb2BOfSize(rec.bundleSize) === null) return null;
+    let got: { bytes: Bytes; sizeOk: boolean } | null;
+    try {
+      got = await this.h.api.getBlob(rec.bundleId, rec.bundleSize);
+    } catch (e) {
+      if (isTransient(e)) throw e;
+      return null;
+    }
+    if (!got) return null;
+    if (!got.sizeOk) return null;
+    const chk = P.checkJoinBundle(
+      { conv: rec.conv, e: rec.e, EK: rec.EK, bundleId: rec.bundleId, bundleSize: rec.bundleSize },
+      got.bytes,
+      { uid: this.h.acc.uid, sigPk: this.h.acc.id.sigPk, kh: P.kemHash(this.h.acc.id.kemPk) },
+    );
+    return chk.ok ? { D: chk.D, dsig: chk.dsig, pks: chk.pks } : null;
+  }
+
+  /**
+   * Where a copy's records are (§7.2): its own key, below the lowest e′ of the bit1 records of that key (the epochs
+   * that those records' copies hold belong to them), and, for a copy that bit1 records start, the legacy key from each
+   * such record's e′ up to the next e′ of that key.
+   */
+  private sources(c: Copy | string): { key: string; lo: number; hi: number }[] {
+    const f = this.h.self.fold;
+    const own = typeof c === "string" ? c : copyKeyOf(c);
+    const mine = f.skipsOf(own);
+    const out = [{ key: own, lo: 0, hi: mine.length ? mine[0].rec.e : Infinity }];
+    for (const s of f.skips) {
+      if (s.copy !== own || s.from === own) continue;
+      const next = f.skipsOf(s.from).find((x) => x.rec.e > s.rec.e);
+      out.push({ key: s.from, lo: s.rec.e, hi: next ? next.rec.e : Infinity });
+    }
+    return out;
+  }
+
+  /** The copy's latest HEADS entry among its sources (§7.2, §7.3). */
+  private headsOfCopy(c: Copy | string): P.HeadsEntry | null {
+    let best: { entry: P.HeadsEntry; order: number } | null = null;
+    for (const s of this.sources(c)) {
+      const x = this.h.self.fold.headsIn(s.key, s.lo, s.hi);
+      if (x && (!best || x.order > best.order)) best = x;
+    }
+    return best?.entry ?? null;
+  }
+
+  /** The copy's LEAVE records, from each of its sources by epoch (§7.2). */
+  private leavesOf(c: Copy): P.LeaveRec[] {
+    const f = this.h.self.fold;
+    return this.sources(c).flatMap((s) =>
+      (f.leaves.get(s.key) ?? []).filter((r) => r.e >= s.lo && r.e < s.hi),
+    );
+  }
+
+  /**
+   * A copy from its CONV_JOIN or REQUEST record (§11.4 step 5), or from a legacy skip record read as one (`pre`: its D
+   * from the bundle and its view key): the root epoch's D from the REQUEST's desc, a DESC record or the bundle (checked
+   * as §7.2 says), `t_reg` in §4.2's order, and the lane positions of its HEADS entry when it fits D.
    */
   private async materialize(
     k: string,
     rec: P.ConvJoinRec | P.RequestRec,
     request: boolean,
+    pre?: { D: P.Descriptor; dsig: Bytes; pks: Bytes; viewKey: string; tReg: number },
   ): Promise<void> {
     const f = this.h.self.fold;
-    const key = f.viewKeys.get(k);
+    const key = pre?.viewKey ?? f.viewKeys.get(k);
     if (!key) return;
     const e = rec.e;
+    // A copy whose CONV_JOIN the snapshot held starts at its top (the highest epoch whose key the snapshot's records
+    // give), or at its HEADS epoch when that is lower; every other copy at its root (§11.4 step 5).
+    let top = e;
+    if (!request && !pre && f.snapJoins.has(k)) while (f.epochs.has(`${k}:${top + 1}`)) top++;
+    const entry = this.headsOfCopy(k);
+    const start = Math.min(top, entry && entry.e >= e ? entry.e : e);
+    if (start > e && (await this.materializeAt(k, key, rec as P.ConvJoinRec, start, top, entry)))
+      return;
     const keys = P.epochKeys(rec.EK, rec.conv, e);
-    let D: P.Descriptor | null = null;
-    let dsig: Bytes | null = null;
-    let pks: Bytes | null = null;
+    let D: P.Descriptor | null = pre?.D ?? null;
+    let dsig: Bytes | null = pre?.dsig ?? null;
+    let pks: Bytes | null = pre?.pks ?? null;
     const descOk = (desc: Bytes): boolean => {
       try {
         const s = P.splitDesc(desc);
@@ -527,7 +1039,9 @@ export class Messaging {
         return false;
       }
     };
-    if (request) {
+    if (pre) {
+      // D_{e′} of a legacy skip record, already read from its bundle (§7.2)
+    } else if (request) {
       if (!descOk((rec as P.RequestRec).desc)) return; // a REQUEST that fails is ignored (§7.2)
     } else {
       const desc = f.desc.get(`${k}:${e}`);
@@ -545,16 +1059,20 @@ export class Messaging {
     }
     if (!D || !dsig) return;
     const Dv: P.Descriptor = D;
-    let tReg: number | null = request ? (rec as P.RequestRec).tReg : null;
-    // E_start from an EPOCH_PENDING only when it names this epoch's own bundle
+    // t_reg (E_start, the join line), in §4.2's order: the bundle's TREG, else the copy's REQUEST (also one that a
+    // CONV_JOIN superseded) or an EPOCH_PENDING naming this bundle, else one blob/meta (a copy an earlier version
+    // recorded without a TREG, a legacy skip record's included).
+    const sameBundle = (x: { bundleId: Bytes }) => P.equalBytes(x.bundleId, rec.bundleId);
+    let tReg: number | null = pre?.tReg ?? f.tregs.get(P.b64u(rec.bundleId)) ?? null;
+    const req = f.requestOf(k)?.rec;
+    if (tReg === null && req && req.e === e && sameBundle(req)) tReg = req.tReg;
     if (tReg === null)
       tReg =
-        f.pending.find(
-          (x) =>
-            copyKeyOf(x.rec) === k && x.rec.e === e && P.equalBytes(x.rec.bundleId, rec.bundleId),
-        )?.rec.tReg ?? null;
+        f.pending.find((x) => copyKeyOf(x.rec) === k && x.rec.e === e && sameBundle(x.rec))?.rec
+          .tReg ?? null;
     if (tReg === null) tReg = (await this.h.api.blobMeta(rec.bundleId))?.t ?? null;
     if (tReg === null) return;
+    if (this.copies.has(key) || this.byKey(k)) return; // held meanwhile
     const ep = newEpoch({
       e,
       EK: rec.EK,
@@ -566,8 +1084,8 @@ export class Messaging {
       pks,
       self: this.h.acc.uid,
     });
-    const heads = f.heads.get(k);
     const created = rec.rtype === P.RT.CONV_JOIN && rec.via === P.VIA.CREATED;
+    const confirmedBySkip = f.skips.some((s) => s.copy === k && f.skipConfirmed.has(s.id));
     const c = this.newCopy(
       key,
       {
@@ -575,12 +1093,16 @@ export class Messaging {
         root: rec.root,
         rootBy: rec.rootBy,
         request,
-        confirmed: created || f.confirmed.has(k),
+        confirmed: created || f.confirmed.has(k) || confirmedBySkip,
       },
       ep,
     );
+    // Below the snapshot's top the epochs are reached by the claims their EPOCH records name (§11.4 step 5).
+    c.top = top > e ? top : null;
+    const heads = this.headsOfCopy(c);
     c.lastTs = heads?.lastTs ?? 0;
-    // The HEADS entry's epoch: lanes are processed from it on; the control lanes from the root (§11.4 step 5).
+    // The HEADS entry's epoch: lanes are processed from it on; the control lanes from the root (§11.4 step 5). An
+    // entry below the root counts as absent (§7.2).
     if (heads && heads.e >= e) {
       c.heads = heads;
       if (heads.e === e) this.applyHeads(c, ep);
@@ -589,8 +1111,85 @@ export class Messaging {
         for (const l of ep.lanes) l.swept = true;
       }
     }
+    this.ctlFrom(c, ep);
     this.joinLine(c, ep);
     this.register(c);
+  }
+
+  /**
+   * An accepted copy that a snapshot holds, restored from epoch `start` above its root (§11.4 step 5): that epoch from
+   * its EPOCH record (D from DESC or its bundle), the root epoch not materialized (its join line from the CONV_JOIN
+   * and its bundle's TREG), and the epochs up to `top` reached by the claims their records name. False when the
+   * record does not check (the copy then restores from its root).
+   */
+  private async materializeAt(
+    k: string,
+    key: string,
+    rec: P.ConvJoinRec,
+    start: number,
+    top: number,
+    entry: P.HeadsEntry | null,
+  ): Promise<boolean> {
+    const f = this.h.self.fold;
+    const at = f.epochs.get(`${k}:${start}`);
+    const ep = at ? await this.epochFromRecord(rec, at) : null;
+    if (!ep) return false;
+    if (this.copies.has(key) || this.byKey(k)) return true; // held meanwhile
+    const confirmedBySkip = f.skips.some((s) => s.copy === k && f.skipConfirmed.has(s.id));
+    const c = this.newCopy(
+      key,
+      {
+        conv: rec.conv,
+        root: rec.root,
+        rootBy: rec.rootBy,
+        request: false,
+        confirmed: rec.via === P.VIA.CREATED || f.confirmed.has(k) || confirmedBySkip,
+      },
+      ep,
+    );
+    c.rootE = rec.e;
+    c.top = top > start ? top : null;
+    c.lastTs = entry?.lastTs ?? 0;
+    if (entry && entry.e >= start) {
+      c.heads = entry;
+      if (entry.e === start) this.applyHeads(c, ep);
+      else {
+        ep.lanesOn = false;
+        for (const l of ep.lanes) l.swept = true;
+      }
+    }
+    // The root epoch's join line: D.ts is not held without its bundle, so the line takes t_reg's time (§11.8).
+    const tReg = f.tregs.get(P.b64u(rec.bundleId)) ?? null;
+    const uidB = P.b64u(rec.rootBy);
+    const by = P.equalBytes(rec.rootBy, this.h.acc.uid)
+      ? "you"
+      : "@" + (this.knownUser(uidB)?.handle ?? unknownHandle(uidB));
+    if (tReg !== null) this.putJoinLine(c, rec.e, by, P.T0_MS + tReg * 1000);
+    this.ctlFrom(c, ep);
+    this.register(c);
+    return true;
+  }
+
+  /**
+   * The control lane of epoch `ep` starts at the furthest control position among the HEADS entries the account wrote
+   * for that epoch (its own sources, §7.2), the replaced ones included, when it lies past the lane's position: every
+   * era before it was observed sealed and every slot before it decided not e-valid (§7.3, §11.4 step 5).
+   */
+  private ctlFrom(c: Copy, ep: Epoch): void {
+    if (c.probe || ep.Estart === null || ep.ctl.winner) return;
+    const f = this.h.self.fold;
+    let best: P.EraCount | null = null;
+    for (const s of this.sources(c)) {
+      if (ep.e < s.lo || ep.e >= s.hi) continue;
+      const x = f.ctlAt.get(`${s.key}:${ep.e}`);
+      if (x && (!best || x.E > best.E || (x.E === best.E && x.cnt > best.cnt))) best = x;
+    }
+    if (!best || best.E < ep.Estart) return;
+    const at = { E: best.E, n: best.cnt };
+    if (P.posCmp(at, ep.ctl.next) <= 0) return;
+    ep.ctl.next = at;
+    ep.ctl.queue = ep.ctl.queue.filter((r) => P.posCmp(r, at) >= 0);
+    for (let E = ep.Estart; E < at.E; E++) ep.ctl.sealed.add(E); // trusted (§6.5, §7.2)
   }
 
   /**
@@ -604,7 +1203,7 @@ export class Messaging {
     if (!hd || hd.e !== ep.e || hd.lanes.length !== ep.D.members.length || ep.Estart === null)
       return;
     const Es = ep.Estart;
-    const prev = ep.viaSkip ? undefined : c.epochs.get(ep.e - 1);
+    const prev = c.epochs.get(ep.e - 1);
     const fl = prev ? hd.followed.filter((x) => x.ef === ep.e - 1) : [];
     if (
       prev &&
@@ -634,80 +1233,17 @@ export class Messaging {
       });
     }
     const f = this.h.self.fold;
-    const prefix = `${copyKeyOf(c)}:${ep.e}:`;
-    for (const [key, rec] of f.lefts)
-      if (key.startsWith(prefix) && P.memberIndex(ep.D, rec.uid) >= 0)
-        ep.left.set(P.b64u(rec.uid), { t: rec.t, row: { ...rec.row }, key: null, order: null });
-  }
-
-  /**
-   * A restore met the claim that removed self from epoch k: the earliest EPOCH record with flag bit1 above k
-   * continues the copy there (§11.4 step 5), its D from a DESC record or its bundle, E_start from `meta`.
-   */
-  private async skipAfter(c: Copy, k: number): Promise<Epoch | null> {
-    const f = this.h.self.fold;
-    const prefix = `${copyKeyOf(c)}:`;
-    let best: P.EpochRec | null = null;
-    for (const [key, rec] of f.epochs)
-      if (
-        key.startsWith(prefix) &&
-        rec.e > k &&
-        (rec.flags & P.EPOCH_SKIP) !== 0 &&
-        (!best || rec.e < best.e)
-      )
-        best = rec;
-    if (!best) return null;
-    const ep = await this.epochOf(c, best);
-    if (ep) this.joinLine(c, ep); // as the live skip join showed it (§11.4 step 5)
-    return ep;
-  }
-
-  /** An epoch from its key material (an EPOCH record): D from DESC or the bundle (checked), E_start from meta. */
-  private async epochOf(c: Copy, rec: P.EpochMaterial): Promise<Epoch | null> {
-    const keys = P.epochKeys(rec.EK, c.conv, rec.e);
-    let pair: { D: Bytes; dsig: Bytes } | null = null;
-    let pks: Bytes | null = null;
-    const desc = this.h.self.fold.desc.get(`${copyKeyOf(c)}:${rec.e}`);
-    if (desc) {
-      try {
-        pair = P.splitDesc(desc.desc);
-      } catch {
-        pair = null;
-      }
+    for (const s of this.sources(c)) {
+      if (ep.e < s.lo || ep.e >= s.hi) continue;
+      const prefix = `${s.key}:${ep.e}:`;
+      for (const [key, rec] of f.lefts)
+        if (key.startsWith(prefix) && P.memberIndex(ep.D, rec.uid) >= 0) {
+          const uidB = P.b64u(rec.uid);
+          const had = ep.left.get(uidB);
+          if (!had || leftKeyCmp(rec, had) < 0)
+            ep.left.set(uidB, { t: rec.t, row: { ...rec.row }, key: null, order: null });
+        }
     }
-    if (!pair) {
-      const got = await this.h.api.getBlob(rec.bundleId, rec.bundleSize);
-      if (!got || !got.sizeOk || !P.equalBytes(P.H(got.bytes), rec.bundleId)) return null;
-      try {
-        pair = P.openDesc(keys.dk, c.conv, rec.e, got.bytes);
-        pks = P.openPks(keys.dk, c.conv, rec.e, got.bytes);
-      } catch {
-        return null;
-      }
-    }
-    let D: P.Descriptor;
-    try {
-      D = P.parseD(pair.D);
-    } catch {
-      return null;
-    }
-    if (!P.equalBytes(D.conv, c.conv) || D.e !== rec.e || !P.verifyD(D, keys.kc, pair.dsig))
-      return null;
-    const meta = await this.h.api.blobMeta(rec.bundleId);
-    if (!meta) return null;
-    const ep = newEpoch({
-      e: rec.e,
-      EK: rec.EK,
-      D,
-      dsig: pair.dsig,
-      bundleId: rec.bundleId,
-      bundleSize: rec.bundleSize,
-      tReg: meta.t,
-      pks,
-      self: this.h.acc.uid,
-    });
-    ep.viaSkip = true;
-    return ep.myIndex >= 0 ? ep : null;
   }
 
   /**
@@ -718,17 +1254,26 @@ export class Messaging {
     const copies = [...this.copies.values()]
       .sort((a, b) => b.lastTs - a.lastTs)
       .slice(0, HISTORY_COPIES);
+    // The history of a copy restored by its ENDED record reads the claim that ended it (§11.4 step 6).
+    for (const c of copies) await this.readEndClaim(c, true);
     const keys: { c: Copy; ep: Epoch; j: number; E: number; n: number; label: Bytes }[] = [];
+    const ctx = this.syncCtx(true);
+    // each lane's last slots: in its position's era, or in the latest earlier era with rows (an idle lane's position
+    // sits at slot 0 of a later era once the earlier one was observed sealed), found for every lane at once
+    const lanes: { c: Copy; ep: Epoch; j: number }[] = [];
     for (const c of copies) {
       c.history = true;
       const ep = c.epochs.get(c.current);
-      if (!ep) continue;
-      ep.lanes.forEach((lane, j) => {
-        for (let n = Math.max(0, lane.next.n - HISTORY_INITIAL); n < lane.next.n; n++)
-          keys.push({ c, ep, j, E: lane.next.E, n, label: P.Lmsg(ep.keys.rk, j, lane.next.E, n) });
-      });
+      if (!ep || ep.Estart === null) continue;
+      for (let j = 0; j < ep.lanes.length; j++) lanes.push({ c, ep, j });
     }
-    const ctx = this.syncCtx(true);
+    const ends = await lanesEnd(ctx, lanes).catch(() => lanes.map(() => null));
+    lanes.forEach(({ c, ep, j }, i) => {
+      const end = ends[i];
+      if (!end) return;
+      for (let n = Math.max(0, end.n - HISTORY_INITIAL); n < end.n; n++)
+        keys.push({ c, ep, j, E: end.E, n, label: P.Lmsg(ep.keys.rk, j, end.E, n) });
+    });
     const st = keys.length
       ? await this.h.api.get(keys.map((x) => ({ E: x.E, label: x.label, mode: 0 as const })))
       : [];
@@ -866,9 +1411,11 @@ export class Messaging {
         this.h.changed();
       },
       handleOf: (c, ep, j) => this.handleOf(c, ep, j),
-      onWelcome: (c, ep, j, J) => {
-        // Own WELCOMEs (this device's or a sibling's) carry J of copies the account already holds.
-        if (!P.equalBytes(ep.D.members[j].uid, this.h.acc.uid)) void this.welcome(c, ep, J);
+      onWelcome: (c, ep, j, at, J) => {
+        // Own WELCOMEs (this device's or a sibling's) carry J of copies the account already holds; a probe copy's
+        // rows carry nothing until it is held.
+        if (!c.probe && !P.equalBytes(ep.D.members[j].uid, this.h.acc.uid))
+          void this.welcome(c, ep, j, at, J);
       },
       onValidRow: (c, ep, j) => this.corroborate(c, ep, j),
       takeEcho: (key) => {
@@ -877,8 +1424,18 @@ export class Messaging {
         return x ? { c: x.c, echoKey: x.echoKey } : undefined;
       },
       onLeave: (c, ep, j, src) => onLeave(this.membershipHost(quiet), c, ep, j, src),
-      checkRow: (c, ep, j, row, msg, q) => this.checkRow(c, ep, j, row, msg, q),
-      prevMismatch: (c, ep, j) => this.omission("diff", "@" + this.handleOf(c, ep, j)),
+      checkRow: (c, ep, j, row, msg, q) => {
+        if (!c.probe) this.checkRow(c, ep, j, row, msg, q);
+      },
+      prevMismatch: (c, ep, j) => {
+        if (!c.probe) this.omission("diff", "@" + this.handleOf(c, ep, j));
+      },
+      holdRow: (c, ep, j, r) => {
+        if (!this.endPending(c)) return false;
+        this.heldRows.push({ c, ep, j, r });
+        return true;
+      },
+      older: (c, e) => this.olderEpoch(c, e),
     };
   }
 
@@ -1000,40 +1557,26 @@ export class Messaging {
 
   // ───────────────────────── own leaves (§6.9) ─────────────────────────
 
-  /** The latest LEAVE record of a copy: the one with the highest e (§7.3). */
+  /** The latest LEAVE record of a copy: the one with the highest e (§7.3), among the copy's own records (§7.2). */
   private latestLeave(c: Copy): P.LeaveRec | null {
-    const list = this.h.self.fold.leaves.get(copyKeyOf(c)) ?? [];
-    return list.reduce<P.LeaveRec | null>((a, r) => (!a || r.e > a.e ? r : a), null);
+    return this.leavesOf(c).reduce<P.LeaveRec | null>((a, r) => (!a || r.e > a.e ? r : a), null);
   }
 
-  /** The copy's own leave is current: a LEAVE record and no skip re-add above the latest one (§6.9). */
+  /** The copy's own leave is current: it holds a LEAVE record (§6.9; a re-add is a separate copy). */
   private leaveCurrent(c: Copy): boolean {
-    const latest = this.latestLeave(c);
-    if (!latest) return false;
-    const prefix = `${copyKeyOf(c)}:`;
-    for (const [key, rec] of this.h.self.fold.epochs)
-      if (key.startsWith(prefix) && rec.e > latest.e && (rec.flags & P.EPOCH_SKIP) !== 0)
-        return false;
-    return true;
+    return this.latestLeave(c) !== null;
   }
 
-  /** Self had left in epoch k by the records: a LEAVE record at or below k and no skip re-add in between (§6.6). */
+  /** Self had left in epoch k by the records: the copy holds a LEAVE record for an epoch at or below k (§6.6). */
   private leftAt(c: Copy, k: number): boolean {
-    const f = this.h.self.fold;
-    const prefix = `${copyKeyOf(c)}:`;
-    const skips: number[] = [];
-    for (const [key, rec] of f.epochs)
-      if (key.startsWith(prefix) && (rec.flags & P.EPOCH_SKIP) !== 0) skips.push(rec.e);
-    return (f.leaves.get(copyKeyOf(c)) ?? []).some(
-      (r) => r.e <= k && !skips.some((s) => s > r.e && s <= k),
-    );
+    return this.leavesOf(c).some((r) => r.e <= k);
   }
 
   /** Writes the LEAVE record of an own LEAVE row of epoch e unless the account has one (§6.9). */
   private writeLeave(c: Copy, e: number): void {
     const key = `${copyKeyOf(c)}:${e}`;
     if (this.leaveWrites.has(key)) return;
-    const has = (this.h.self.fold.leaves.get(copyKeyOf(c)) ?? []).some((r) => r.e === e);
+    const has = this.leavesOf(c).some((r) => r.e === e);
     if (has) {
       this.leaveWrites.set(key, Promise.resolve());
       return;
@@ -1086,27 +1629,85 @@ export class Messaging {
 
   /**
    * A valid row of a member other than rootBy and self confirms the copy (§6.7 step 6), and accepts a request
-   * (§11.5); both are recorded (CONFIRMED before the CONV_JOIN, §7.3).
+   * (§11.5); both are recorded (CONFIRMED before the CONV_JOIN, §7.3). It counts only once the copy's control lane is
+   * settled (the row waits until then) and never once the copy has ended. A request that a claim confirmed is still
+   * accepted by such a row, without a second CONFIRMED.
    */
   private corroborate(c: Copy, ep: Epoch, j: number): void {
+    if (c.probe) return;
     const uid = ep.D.members[j].uid;
-    if (P.equalBytes(uid, c.rootBy) || P.equalBytes(uid, this.h.acc.uid) || c.confirmed) return;
-    c.confirmed = true;
-    void this.h
-      .track(
-        this.h.enqueue(async () => {
-          const recs: P.SelfRecord[] = [{ rtype: P.RT.CONFIRMED, conv: c.conv, root: c.root }];
-          if (c.request) recs.push(...this.acceptRecords(c));
-          await this.h.self.write(recs);
-          if (c.request) this.becomeAccepted(c);
-        }),
-      )
-      .catch((e) => this.h.warn(`could not record a conversation: ${message(e)}`));
+    if (P.equalBytes(uid, c.rootBy) || P.equalBytes(uid, this.h.acc.uid)) return;
+    if (c.removed || (c.confirmed && !c.request)) return;
+    this.corroborations.add(c);
   }
 
-  /** A WELCOME's J: accepted whenever its row is processed (§5.2). */
-  private async welcome(_c: Copy, _ep: Epoch, J: P.Join): Promise<void> {
-    await this.h.track(this.h.enqueue(() => this.processJoins([{ J, at: null }])));
+  /** The rows that wait in `corroborations`, for the copies whose control lane is settled now. */
+  private corroborateSettled(): void {
+    for (const c of this.corroborations) {
+      const ep = c.epochs.get(c.current);
+      if (c.removed || (c.confirmed && !c.request) || !ep) {
+        this.corroborations.delete(c);
+        continue;
+      }
+      if (!controlSettled(ep) || this.endAhead(c)) continue;
+      this.corroborations.delete(c);
+      // CONFIRMED and a request's via-5 CONV_JOIN, with a HEADS record (§7.3), and no CONTACT: a third member's row
+      // is not the user's acceptance (§11.5)
+      const recs: P.SelfRecord[] = [];
+      if (!c.confirmed) recs.push({ rtype: P.RT.CONFIRMED, conv: c.conv, root: c.root });
+      c.confirmed = true;
+      if (c.request) recs.push(...this.acceptRecords(c));
+      if (recs.length === 0) continue;
+      recs.push(this.cursorHeads());
+      void this.h
+        .track(
+          this.h.enqueue(async () => {
+            await this.h.self.write(recs);
+            if (c.request) this.becomeAccepted(c);
+          }),
+        )
+        .catch((e) => this.h.warn(`could not record a conversation: ${message(e)}`));
+    }
+  }
+
+  /**
+   * The fold holds an ENDED record for an epoch of the copy it has not reached yet: no trigger accepts it before its
+   * probe reaches that epoch, where it ends (§11.5).
+   */
+  private endAhead(c: Copy): boolean {
+    const rec = this.h.self.fold.ended.get(copyKeyOf(c));
+    return !!rec && rec.e >= c.current;
+  }
+
+  /**
+   * A WELCOME's J: accepted whenever its row is processed (§5.2). A J that parks is kept with its carrier lane and
+   * evaluated again after each catch-up; meanwhile the carrier copy's HEADS entries hold that lane's position before
+   * the row (§6.7 step 4, §7.3 "Durability order").
+   */
+  private async welcome(c: Copy, ep: Epoch, j: number, at: Slot, J: P.Join): Promise<void> {
+    await this.h.track(
+      this.h.enqueue(async () => {
+        const [kind] = await this.processJoins([{ J, at: null }]);
+        const same = (x: ParkedWelcome) =>
+          x.c === c && x.ep === ep && x.j === j && P.posCmp(x.at, at) === 0;
+        if (kind === "parked") {
+          if (!this.parkedWelcomes.some(same)) this.parkedWelcomes.push({ c, ep, j, at, J });
+          this.markHeads();
+        } else this.parkedWelcomes = this.parkedWelcomes.filter((x) => !same(x));
+      }),
+    );
+  }
+
+  /** The parked WELCOME Js, evaluated again after a catch-up (§6.7 step 4). In the queue. */
+  private async retryWelcomes(): Promise<void> {
+    const parked = this.parkedWelcomes;
+    if (parked.length === 0) return;
+    this.parkedWelcomes = [];
+    for (const x of parked) {
+      const [kind] = await this.processJoins([{ J: x.J, at: null }]);
+      if (kind === "parked") this.parkedWelcomes.push(x);
+    }
+    if (this.parkedWelcomes.length !== parked.length) this.markHeads();
   }
 
   /** Applies a row that this device's own send stored (or a sibling's found by the send). */
@@ -1223,7 +1824,7 @@ export class Messaging {
     }
     for (const c of accepted) {
       const ep = c.epochs.get(c.current);
-      const prev = ep && !ep.viaSkip ? c.epochs.get(ep.e - 1) : undefined;
+      const prev = ep ? c.epochs.get(ep.e - 1) : undefined;
       if (prev?.lanes.some((l) => !l.swept)) topics.push(prev.topic);
     }
     this.linkTopics.clear();
@@ -1247,6 +1848,7 @@ export class Messaging {
 
   /** Reads the inbox, accepts the joins found (in order) and moves the cursor (§11.5). */
   async pollInbox(): Promise<void> {
+    this.h.api.beginOperation(); // a poll's joins share one fresh answer per prefix (§10.6)
     const p = await this.h.api.params();
     const scan = await scanInbox(
       this.h.api,
@@ -1280,9 +1882,55 @@ export class Messaging {
       settle: async (c) => {
         await this.syncCopies([c], !this.live);
         const ep = c.epochs.get(c.current);
-        return !!ep && controlSettled(ep);
+        // An ended copy needs nothing more (§6.7 step 4): its last winner was processed, or it holds the epoch its
+        // ENDED record names; one whose record names a later epoch is settled up to it and ends there.
+        return !!ep && (c.removed || controlSettled(ep));
       },
+      settleOwn: (x) => this.settleOwn(x),
     };
+  }
+
+  /**
+   * §6.7 step 6 for an overtaken J: the copy it would start is settled as step 4 settles a held copy (its control
+   * lane of e under the J's EK from `(E_start(e), 0)`, its lanes, and on through the epochs its own entries reach), not
+   * held meanwhile, and stops at r − 1 (`stopAt`), when it ends, freezes or has no winning claim, or when a held copy
+   * holds an epoch it reached with another H(D).
+   */
+  private async settleOwn(x: Parameters<JoinCtx["settleOwn"]>[0]): Promise<SettleOwn> {
+    const ep = newEpoch({
+      e: x.J.e,
+      EK: x.J.EK,
+      D: x.D,
+      dsig: x.dsig,
+      bundleId: x.J.bundleId,
+      bundleSize: x.J.bundleSize,
+      tReg: x.tReg,
+      pks: x.pks,
+      self: this.h.acc.uid,
+    });
+    const c = this.newCopy(
+      "",
+      { conv: x.J.conv, root: x.D.hash, rootBy: x.D.by, request: false, confirmed: false },
+      ep,
+    );
+    c.probe = true;
+    for (let guard = 0; guard < 4096; guard++) {
+      const cur = c.epochs.get(c.current)!;
+      if (cur.e > x.J.e) {
+        const of = x.forkOf(cur.e, cur.D.hash);
+        if (of) return { kind: "fork", of };
+      }
+      if (cur.e >= x.stopAt) return { kind: "reached" };
+      await syncLanes(this.syncCtx(true), targetsOf([c]), true);
+      const moved = await settleControl(this.controlHost(true), c);
+      if (c.removed) return { kind: "ended", copy: c };
+      if (c.frozen !== null) return { kind: "reached" };
+      if (!moved)
+        return controlSettled(cur)
+          ? { kind: "reached" } // no winning claim: it stops below r − 1 without ending
+          : { kind: "parked", why: "a membership change is pending" };
+    }
+    return { kind: "parked", why: "a membership change is pending" };
   }
 
   /**
@@ -1294,105 +1942,133 @@ export class Messaging {
     next?: InboxCursor,
   ): Promise<string[]> {
     const kinds: string[] = [];
-    const created: NewCopy[] = [];
-    const skips: SkipJoin[] = [];
+    const created: JoinWrite[] = [];
     let cursor = next ?? null;
     for (const x of found) {
-      const out = await acceptJoin(
-        this.joinCtx(created),
-        x.J,
-        x.at
-          ? { via: P.VIA.INBOX, ...x.at }
-          : x.hello
-            ? { via: P.VIA.HELLO }
-            : { via: P.VIA.WELCOME },
-      );
+      const src: JoinSource = x.at
+        ? { via: P.VIA.INBOX, ...x.at }
+        : x.hello
+          ? { via: P.VIA.HELLO }
+          : { via: P.VIA.WELCOME };
+      const out = await acceptJoin(this.joinCtx(created.map((y) => y.x)), x.J, src);
       kinds.push(out.kind);
       this.h.check();
-      if (out.kind === "parked" && x.at && cursor)
-        cursor = minCursor(cursor, { E: x.at.E, rel: Math.max(0, x.at.rel - 1) });
-      if (out.kind === "new") created.push(out.copy);
-      if (out.kind === "skip" && !skips.some((y) => y.copy === out.skip.copy)) skips.push(out.skip);
+      if (out.kind === "parked" && x.at && cursor) cursor = minCursor(cursor, before(x.at));
+      if (out.kind === "new") created.push({ x: out.copy, src, at: x.at, out: false });
     }
     const moved =
       cursor && (!this.cursor || cursor.E !== this.cursor.E || cursor.rel !== this.cursor.rel);
-    if (created.length === 0 && skips.length === 0) {
+    if (created.length === 0) {
       if (moved) {
         this.cursor = cursor;
         this.markHeads();
       }
       return kinds;
     }
-    const records = [...created.flatMap((x) => x.records), ...skips.map((x) => x.record)];
-    const heads: P.HeadsRec | null = cursor
-      ? { rtype: P.RT.HEADS, Ein: cursor.E, relIn: cursor.rel, entries: [] }
-      : null;
-    await this.writeRows(records, heads);
+    cursor = await this.writeJoins(created, cursor);
     if (cursor) this.cursor = cursor;
-    for (const x of created) this.adopt(x);
-    for (const x of skips) this.adoptSkip(x);
+    for (const y of created) if (!y.out) this.adopt(y.x);
     return kinds;
   }
 
   /**
-   * A skip re-add (§6.7 step 5): the removed copy continues at the J's epoch (its EPOCH record written), "who(by) added
-   * you", and the leave of the copy ends when the skip lies above its latest LEAVE record (§6.9).
+   * Writes a poll's joins in as few self rows as fit cls 3, never splitting a join's records (a CONV_JOIN and its
+   * TREG, a REQUEST and its MEMBER), with the HEADS record that moves the cursor in the last row, each row after the
+   * previous is CAS OK (§7.3 "Durability order"). A CONFLICT whose occupant holds a CONFIRMED for another copy of a J's
+   * conversation runs §6.7 steps 3–6 again for that J once the occupants are applied (step 4 settling every held copy,
+   * the occupants' included): a J that is now a duplicate, rejected, or parked is taken out of the row, a parked one
+   * with the cursor before it (§7.3 "When to write"). Returns the cursor written.
    */
-  private adoptSkip(x: SkipJoin): void {
-    const c = x.copy;
-    if (c.epochs.has(x.epoch.e) || !this.copies.has(c.key)) return;
-    this.users.set(P.b64u(x.epoch.D.by), x.dby);
-    if (x.member) this.pendingRecords.push(x.member);
-    enterEpoch(this.membershipHost(false), c, x.epoch);
-    c.removed = false;
-    c.left = this.leaveCurrent(c);
-    this.joinLine(c, x.epoch);
-    if (this.live) c.unread++;
-    this.markHeads();
-    this.h.changed();
-    void this.h
-      .track(
-        this.h.enqueue(async () => {
-          await this.syncCopies([c], !this.live);
-          await this.resolveMembers([c]);
-        }),
-      )
-      .catch(() => {});
-  }
-
-  /** Writes records in as few self rows as fit cls 3, `last` in the final row, each after the previous is CAS OK. */
-  private async writeRows(records: P.SelfRecord[], last: P.SelfRecord | null): Promise<void> {
-    const rows: P.SelfRecord[][] = [[]];
-    let size = 0;
-    const all = last ? [...records, last] : records;
-    for (const r of all) {
-      const len = P.encodeRecord(r).length;
+  private async writeJoins(
+    joins: JoinWrite[],
+    start: InboxCursor | null,
+  ): Promise<InboxCursor | null> {
+    let cursor = start;
+    const HEADS_LEN = 3 + 2 + 4 + 2;
+    const rows: JoinWrite[][] = [[]];
+    let size = HEADS_LEN;
+    let count = 1;
+    for (const g of joins) {
+      const len = g.x.records.reduce((n, r) => n + P.encodeRecord(r).length, 0);
+      const cur = rows[rows.length - 1];
       if (
-        rows[rows.length - 1].length > 0 &&
-        (size + len > ROW_BUDGET || rows[rows.length - 1].length >= 255)
+        cur.length > 0 &&
+        (size + len > ROW_BUDGET || count + g.x.records.length > P.MAX_SELF_RECORDS)
       ) {
         rows.push([]);
-        size = 0;
+        size = HEADS_LEN;
+        count = 1;
       }
-      rows[rows.length - 1].push(r);
+      rows[rows.length - 1].push(g);
       size += len;
+      count += g.x.records.length;
     }
-    for (const row of rows) if (row.length) await this.h.self.write(row);
+    for (let i = 0; i < rows.length; i++) {
+      const last = i === rows.length - 1;
+      const build = (): P.SelfRecord[] => [
+        ...rows[i].filter((g) => !g.out).flatMap((g) => g.x.records),
+        ...(last && cursor
+          ? [{ rtype: P.RT.HEADS, Ein: cursor.E, relIn: cursor.rel, entries: [] } as P.HeadsRec]
+          : []),
+      ];
+      const first = build();
+      if (first.length === 0) continue;
+      await this.h.self.write(first, async (occupant) => {
+        const hit = rows[i].filter(
+          (g) =>
+            !g.out &&
+            occupant.some(
+              (r) =>
+                r.rtype === P.RT.CONFIRMED &&
+                P.equalBytes(r.conv, g.x.conv) &&
+                !P.equalBytes(r.root, g.x.root),
+            ),
+        );
+        if (hit.length === 0) return build();
+        await this.absorbFold();
+        for (const g of hit) {
+          const out: JoinOutcome = await acceptJoin(this.joinCtx([]), g.x.J, g.src);
+          if (out.kind === "new") g.x = out.copy;
+          else {
+            g.out = true;
+            if (out.kind === "parked" && g.at && cursor) cursor = minCursor(cursor, before(g.at));
+          }
+        }
+        return build();
+      });
+    }
+    return cursor;
   }
 
-  /** Holds a copy accepted by a join (after its records are written). */
+  /**
+   * Holds a copy accepted by a join (after its records are written): a new copy, or an overtaken J's own copy kept as
+   * an ended copy (§6.7 step 6), whose ENDED record and claims' confirmation ride in the next HEADS row.
+   */
   private adopt(x: NewCopy): void {
     const k = copyKeyOf(x);
     const key = this.h.self.fold.viewKeys.get(k);
-    if (!key || this.copies.has(key)) return;
-    const c = this.newCopy(key, { ...x, confirmed: false }, x.epoch);
+    if (!key || this.copies.has(key) || this.byKey(k)) return;
+    const c = x.ended ?? this.newCopy(key, { ...x, confirmed: false }, x.epoch);
+    if (x.ended) {
+      c.key = key;
+      c.probe = false;
+      c.request = x.request;
+    }
     this.users.set(P.b64u(x.rootBy), x.dby);
     if (x.member) this.pendingRecords.push(x.member);
     this.joinLine(c, x.epoch);
-    if (this.live && !P.equalBytes(x.rootBy, this.h.acc.uid)) c.unread++;
+    if (this.live && !x.ended && !P.equalBytes(x.rootBy, this.h.acc.uid)) c.unread++;
     if (x.second) this.h.warn(secondCopyWarning(x.dby.handle), true);
     this.register(c);
+    if (x.ended) {
+      for (const ep of c.epochs.values())
+        if (ep.ctl.winner?.processed) this.claimConfirms(c, ep, ep.ctl.winner);
+      const last = c.epochs.get(c.current)!;
+      const w = last.ctl.winner;
+      if (w) this.queueEnded(c, last.e, { E: w.E, n: w.n });
+    }
     this.markHeads();
+    if (x.ended) return;
     void this.h
       .track(
         this.h.enqueue(async () => {
@@ -1406,9 +2082,10 @@ export class Messaging {
   // ───────────────────────── requests (§11.5) ─────────────────────────
 
   /** The CONV_JOIN (via 5) and CONTACT that accept a request copy. */
+  /** The CONV_JOIN (via 5) that accepts a request copy, from its REQUEST's epoch key (§11.5). */
   private acceptRecords(c: Copy): P.SelfRecord[] {
-    const root = [...c.epochs.values()].sort((a, b) => a.e - b.e)[0];
-    const recs: P.SelfRecord[] = [
+    const root = c.epochs.get(c.rootE) ?? [...c.epochs.values()].sort((a, b) => a.e - b.e)[0];
+    return [
       {
         rtype: P.RT.CONV_JOIN,
         conv: c.conv,
@@ -1421,10 +2098,111 @@ export class Messaging {
         via: P.VIA.REQUEST_ACCEPTED,
       },
     ];
-    const m = this.h.self.fold.members.get(P.b64u(c.rootBy));
-    if (m && !this.h.self.fold.contacts.has(P.b64u(c.rootBy)))
-      recs.push({ rtype: P.RT.CONTACT, uid: c.rootBy, pin: m.pin });
-    return recs;
+  }
+
+  /**
+   * A HEADS record with only the inbox cursor (`c = 0`): every CONFIRMED and via-5 CONV_JOIN, and the CONTACT of the
+   * user's acceptance, ride in a row that holds one, so §7.2's place rule never moves them (§7.3).
+   */
+  private cursorHeads(): P.HeadsRec {
+    const cursor = this.cursor ??
+      this.h.self.fold.cursor ?? { E: P.era(this.h.api.serverNow()), rel: 0 };
+    return { rtype: P.RT.HEADS, Ein: cursor.E, relIn: cursor.rel, entries: [] };
+  }
+
+  /** The copy's `rootBy` is self or a contact (§11.11 `byContact`; a CONTACT waiting for its HEADS row counts). */
+  private byContact(c: Copy): boolean {
+    const uidB = P.b64u(c.rootBy);
+    return (
+      P.equalBytes(c.rootBy, this.h.acc.uid) ||
+      this.h.self.fold.contacts.has(uidB) ||
+      this.pendingRecords.some((r) => r.rtype === P.RT.CONTACT && P.b64u(r.uid) === uidB)
+    );
+  }
+
+  /**
+   * The user's acceptance of a live copy whose `rootBy` is neither self nor a contact (§11.5, §11.11), written at once
+   * in one self row with a HEADS record: a request's via-5 CONV_JOIN, and the CONTACT for `rootBy` (with its MEMBER,
+   * looked up first when the account has none). A lookup that fails writes nothing and throws. In the queue.
+   */
+  private async writeAcceptance(c: Copy): Promise<void> {
+    if (c.removed || this.endAhead(c) || this.byContact(c)) return;
+    const f = this.h.self.fold;
+    const uidB = P.b64u(c.rootBy);
+    const recs: P.SelfRecord[] = [];
+    let m: P.MemberRec | undefined =
+      f.members.get(uidB) ??
+      (this.pendingRecords.find((r) => r.rtype === P.RT.MEMBER && P.b64u(r.uid) === uidB) as
+        | P.MemberRec
+        | undefined);
+    if (!m) {
+      let u: DirUser | null = null;
+      try {
+        u = await this.h.api.userByUidPrefix(c.rootBy);
+      } catch {
+        u = null;
+      }
+      if (!u) throw new UserError(NOT_VERIFIED);
+      m = {
+        rtype: P.RT.MEMBER,
+        uid: u.uidBytes,
+        sigPk: u.sigPk,
+        kh: P.kemHash(u.kemPk),
+        pin: u.pin,
+        handle: u.handle,
+      };
+      this.users.set(uidB, { handle: u.handle, sigPk: u.sigPk, kh: m.kh, kemPk: u.kemPk });
+      recs.push(m);
+    }
+    if (c.request) recs.push(...this.acceptRecords(c));
+    recs.push({ rtype: P.RT.CONTACT, uid: c.rootBy, pin: m.pin }, this.cursorHeads());
+    await this.h.self.write(recs);
+    this.pendingRecords = this.pendingRecords.filter(
+      (r) => !((r.rtype === P.RT.MEMBER || r.rtype === P.RT.CONTACT) && P.b64u(r.uid) === uidB),
+    );
+    if (c.request) this.becomeAccepted(c);
+    this.acceptByContact();
+    this.h.changed();
+  }
+
+  /**
+   * A request whose `D.by` is now a contact is accepted (§11.5): its via-5 CONV_JOIN, in a row with a HEADS record.
+   * Not an ended request, nor one whose ENDED record names an epoch its probe has not reached.
+   */
+  private acceptByContact(): void {
+    const due = [...this.copies.values()].filter(
+      (c) =>
+        c.request &&
+        !c.probe &&
+        !c.removed &&
+        !this.endAhead(c) &&
+        !P.equalBytes(c.rootBy, this.h.acc.uid) &&
+        this.h.self.fold.contacts.has(P.b64u(c.rootBy)),
+    );
+    for (const c of due) {
+      c.request = false; // at most one acceptance per copy
+      void this.h
+        .track(
+          this.h.enqueue(async () => {
+            if (!this.h.self.fold.joins.has(copyKeyOf(c)))
+              await this.h.self.write([...this.acceptRecords(c), this.cursorHeads()]);
+            c.request = true;
+            this.becomeAccepted(c);
+          }),
+        )
+        .catch(() => {
+          c.request = true;
+        });
+    }
+  }
+
+  /**
+   * Before self's TEXT, IMAGE or REACTION: in a live copy whose `rootBy` is neither self nor a contact, the post is the
+   * user's acceptance (§11.5): it writes the same records as `accept`, before the put.
+   */
+  private async acceptForPost(c: Copy): Promise<void> {
+    if (c.removed || this.byContact(c)) return;
+    await this.h.enqueue(() => this.writeAcceptance(c));
   }
 
   /** A request copy becomes accepted: subscribed, its members looked up, every lane processed from E_start. */
@@ -1443,11 +2221,13 @@ export class Messaging {
       .catch(() => {});
   }
 
-  /** Accepts a request copy now (it was opened, or self posts in it). */
-  private async accept(c: Copy): Promise<void> {
-    if (!c.request) return;
-    await this.h.enqueue(() => this.h.self.write(this.acceptRecords(c)));
-    this.becomeAccepted(c);
+  /**
+   * The accept control (§11.11): the user's acceptance of a live copy whose `rootBy` is neither self nor a contact.
+   * Nothing for any other copy, an ended one included. Resolves once the row is written.
+   */
+  async accept(convId: string): Promise<void> {
+    const c = this.copy(convId);
+    await this.h.track(this.h.enqueue(() => this.writeAcceptance(c)));
   }
 
   markRead(convId: string): void {
@@ -1457,12 +2237,19 @@ export class Messaging {
       c.unread = 0;
       this.h.changed();
     }
-    if (c.request) void this.h.track(this.accept(c)).catch((e) => this.h.error(message(e)));
-    // The "conversation opened" hint: scrollback once per copy and session (§11.10).
+    // The pane is open: scrollback once per copy and session (§11.10), after the claim that ended a copy restored by
+    // its ENDED record is read (its "@by removed you" line, §11.9). It accepts nothing (§11.11).
     if (!c.scrolled)
-      void this.h.track(this.h.enqueue(() => scrollback(this.syncCtx(), c))).catch(() => {
-        c.scrolled = false; // try again the next time it is opened
-      });
+      void this.h
+        .track(
+          this.h.enqueue(async () => {
+            await this.readEndClaim(c, true);
+            await scrollback(this.syncCtx(), c);
+          }),
+        )
+        .catch(() => {
+          c.scrolled = false; // try again the next time it is opened
+        });
   }
 
   // ───────────────────────── creation (§6.1) ─────────────────────────
@@ -1473,6 +2260,7 @@ export class Messaging {
     if (names.length === 0) throw new UserError("add at least one other person");
     cleanName(name); // a name that would look like a person is refused before any request (§5.1)
     this.h.progress("looking up handles…");
+    this.h.api.beginOperation(); // a handle entered again is looked up fresh (§10.6)
     const others = await resolveHandles(this.h.api, names);
     this.h.check();
     return this.createWith(others, name, null);
@@ -1713,16 +2501,24 @@ export class Messaging {
 
   /**
    * An EPOCH_PENDING is established (§6.11): for e = 0 the account holds its CONV_JOIN; for e ≥ 1 its bundle is the
-   * final winning claim of e − 1 (a record whose epoch another claim won is dead).
+   * final winning claim of e − 1 (a record whose epoch another claim won is dead). A legacy copy's record belongs to
+   * the one of its copies (itself, or one that its bit1 records start) whose final winner of e − 1 names that bundle,
+   * or that holds e with it (§7.2).
    */
   private established(rec: P.EpochPendingRec): boolean {
+    const f = this.h.self.fold;
     const k = copyKeyOf(rec);
-    if (rec.e === 0) return this.h.self.fold.joins.has(k);
-    const c = this.byKey(k);
-    const held = c?.epochs.get(rec.e);
-    if (held) return P.equalBytes(held.bundleId, rec.bundleId);
-    const w = c?.epochs.get(rec.e - 1)?.ctl.winner;
-    return !!w?.processed && P.equalBytes(w.claim.bundleId, rec.bundleId);
+    if (rec.e === 0) return f.joins.has(k);
+    const candidates = [
+      this.byKey(k),
+      ...f.skipsOf(k).map((s) => (s.copy ? this.byKey(s.copy) : undefined)),
+    ];
+    return candidates.some((c) => {
+      const held = c?.epochs.get(rec.e);
+      if (held) return P.equalBytes(held.bundleId, rec.bundleId);
+      const w = c?.epochs.get(rec.e - 1)?.ctl.winner;
+      return !!w?.processed && P.equalBytes(w.claim.bundleId, rec.bundleId);
+    });
   }
 
   /**
@@ -1910,6 +2706,7 @@ export class Messaging {
         const names = parseHandleList(handles).filter((h) => h !== this.h.acc.handle);
         if (names.length === 0) throw new UserError("enter at least one handle");
         this.h.progress("looking up handles…");
+        this.h.api.beginOperation();
         const wanted = await resolveHandles(this.h.api, names);
         this.h.check();
         for (const u of wanted) this.learnUser(u, true);
@@ -1990,7 +2787,7 @@ export class Messaging {
             URL.createObjectURL(new Blob([img.bytes as BlobPart], { type: img.mime })),
           ),
         );
-        if (c.request) await this.accept(c);
+        await this.acceptForPost(c);
         const mime = img.mime === "image/webp" ? 1 : 2;
         await sendRow(this.sendCtx(c, echo.key), c, {
           type: P.MT.IMAGE,
@@ -2045,6 +2842,7 @@ export class Messaging {
       kind,
       text,
       status: "sending",
+      reactions: [],
     };
     c.messages.push(m);
     this.h.changed();
@@ -2077,7 +2875,42 @@ export class Messaging {
       },
       beforePutAttempt: this.h.opts.beforePutAttempt,
       progress: (t) => this.h.progress(t),
+      ring: (cc, ep, E, label) => this.h.ring(E, label, this.ringBells(cc, ep)),
     };
+  }
+
+  /**
+   * The bells a TEXT or IMAGE stored in `ep` rings (§11.13): every other lane of `ep`, and, when the copy holds
+   * `ep.e − 1`, the bell there of each member of both epochs, other than self, of whom no valid row in `ep` was seen
+   * (a device that has not processed the epoch change still has that bell registered).
+   */
+  private ringBells(c: Copy, ep: Epoch): Bytes[] {
+    const out: Bytes[] = [];
+    ep.D.members.forEach((_, l) => {
+      if (l !== ep.myIndex) out.push(P.bell(ep.keys.nk, l));
+    });
+    const prev = c.epochs.get(ep.e - 1);
+    prev?.D.members.forEach((m, j) => {
+      const k = P.memberIndex(ep.D, m.uid);
+      if (k >= 0 && k !== ep.myIndex && !ep.lanes[k].seen) out.push(P.bell(prev.keys.nk, j));
+    });
+    return out;
+  }
+
+  /**
+   * The registration set (§11.13): for each copy that is not a request, has not ended, whose leave is not current and
+   * whose `rootBy` is self or a contact (frozen copies included), the bell of self's lane in its current epoch; the
+   * copies with the newest `lastTs` first.
+   */
+  pushBells(): Bytes[] {
+    const out: { bell: Bytes; ts: number }[] = [];
+    for (const c of this.copies.values()) {
+      if (c.probe || c.request || c.left || this.endOf(c) !== null || !this.byContact(c)) continue;
+      const ep = c.epochs.get(c.current);
+      if (!ep || ep.myIndex < 0) continue;
+      out.push({ bell: P.bell(ep.keys.nk, ep.myIndex), ts: c.lastTs });
+    }
+    return out.sort((a, b) => b.ts - a.ts).map((x) => x.bell);
   }
 
   sendText(convId: string, text: string): Promise<void> {
@@ -2089,7 +2922,7 @@ export class Messaging {
     const echo = this.addEcho(c, "text", body);
     const run = async () => {
       try {
-        if (c.request) await this.accept(c);
+        await this.acceptForPost(c);
         await sendRow(this.sendCtx(c, echo.key), c, { type: P.MT.TEXT, text: body });
         if (c.messages.some((m) => m.key === echo.key)) this.markEcho(c, echo.key, "sent");
       } catch (e) {
@@ -2134,19 +2967,37 @@ export class Messaging {
   /**
    * The HEADS entry of a copy: its current epoch's positions, never past an unsealed earlier era, and its followed
    * lanes of epoch c−1 (§7.2, §11.2); with the LEFT records of every member recorded as left in that epoch, which
-   * ride in the same row (§7.3).
+   * ride in the same row (§7.3). While a WELCOME's J found on a lane of epoch e′ is parked, the entry describes e′, or
+   * e′ + 1 with that lane followed, and holds the lane's position before the row (§7.3 "Durability order").
    */
   private headsEntry(c: Copy): { entry: P.HeadsEntry; lefts: P.LeftRec[] } | null {
-    const ep = c.epochs.get(c.current);
-    if (!ep || ep.Estart === null || !ep.lanesOn) return null;
-    const pos = (l: { tail: { E: number; n: number } | null; next: { E: number; n: number } }) => {
-      const at = l.tail ?? l.next;
+    const cur = c.epochs.get(c.current);
+    if (!cur || cur.Estart === null || !cur.lanesOn) return null;
+    const parked = this.parkedWelcomes.filter((x) => x.c === c);
+    const low = parked.length ? Math.min(...parked.map((x) => x.ep.e)) : null;
+    const held = (e: number, j: number, at: Slot): Slot => {
+      let out = at;
+      for (const x of parked) if (x.ep.e === e && x.j === j && P.posCmp(x.at, out) < 0) out = x.at;
+      return out;
+    };
+    const pos = (e: number, j: number, l: { tail: Slot | null; next: Slot }) => {
+      const at = held(e, j, l.tail ?? l.next);
       return { E: at.E, cnt: at.n };
     };
-    const prev = ep.viaSkip ? undefined : c.epochs.get(ep.e - 1);
+    let ep = cur;
+    if (low !== null && low < cur.e) {
+      const prev = c.epochs.get(cur.e - 1);
+      const followedStill =
+        low === cur.e - 1 &&
+        !!prev &&
+        parked.filter((x) => x.ep.e === low).every((x) => !prev.lanes[x.j].swept);
+      if (!followedStill) ep = c.epochs.get(low) ?? cur;
+    }
+    if (ep.Estart === null) return null;
+    const prev = ep === cur ? c.epochs.get(ep.e - 1) : undefined;
     const followed: P.FollowedLane[] = [];
     prev?.lanes.forEach((l, j) => {
-      if (!l.swept) followed.push({ ef: prev.e, lane: j, ...pos(l) });
+      if (!l.swept) followed.push({ ef: prev.e, lane: j, ...pos(prev.e, j, l) });
     });
     const lefts: P.LeftRec[] = [];
     for (const [uidB, src] of ep.left)
@@ -2167,7 +3018,7 @@ export class Messaging {
         e: ep.e,
         lastTs: Math.max(0, Math.floor(c.lastTs)),
         ctl: { E: ep.ctl.next.E, cnt: ep.ctl.next.n },
-        lanes: ep.lanes.map(pos),
+        lanes: ep.lanes.map((l, j) => pos(ep.e, j, l)),
         followed,
       },
       lefts,
@@ -2200,35 +3051,354 @@ export class Messaging {
       ]);
       const recs = this.pendingRecords;
       if (sig === this.lastHeads && recs.length === 0) return;
-      // Split the entries over records that each fit a row with the waiting records, each entry in the same row as
-      // the LEFT records of its epoch (§7.3 "HEADS splitting").
-      const chunks: { entries: P.HeadsEntry[]; lefts: P.LeftRec[] }[] = [
-        { entries: [], lefts: [] },
-      ];
-      let size = recs.reduce((n, r) => n + P.encodeRecord(r).length, 0) + 11;
+      // Split everything over as many self rows as needed (§7.3 "HEADS splitting"): every row stays within the cls-3
+      // budget and the record cap, ends with a HEADS record (the cursor, and the entries placed in it), and holds
+      // each of its entries in the same row as the LEFT records of that entry's epoch.
+      const HEADS_FIXED = 3 + 2 + 4 + 2;
+      const rows: { recs: P.SelfRecord[]; entries: P.HeadsEntry[]; size: number }[] = [];
+      const place = (bytes: number, count: number) => {
+        let row = rows[rows.length - 1];
+        if (
+          !row ||
+          ((row.recs.length > 0 || row.entries.length > 0) &&
+            (row.size + bytes > ROW_BUDGET || row.recs.length + count + 1 > P.MAX_SELF_RECORDS))
+        )
+          rows.push((row = { recs: [], entries: [], size: HEADS_FIXED }));
+        row.size += bytes;
+        return row;
+      };
+      for (const r of recs) place(P.encodeRecord(r).length, 1).recs.push(r);
       for (const { entry: x, lefts } of all) {
-        const len = 68 + 6 * x.lanes.length + 12 * x.followed.length + 80 * lefts.length;
-        const last = chunks[chunks.length - 1];
-        if (last.entries.length > 0 && size + len > ROW_BUDGET) {
-          chunks.push({ entries: [], lefts: [] });
-          size = 11;
-        }
-        chunks[chunks.length - 1].entries.push(x);
-        chunks[chunks.length - 1].lefts.push(...lefts);
-        size += len;
+        const bytes =
+          68 +
+          6 * x.lanes.length +
+          12 * x.followed.length +
+          lefts.reduce((n, l) => n + P.encodeRecord(l).length, 0);
+        const row = place(bytes, lefts.length);
+        row.recs.push(...lefts);
+        row.entries.push(x);
       }
-      for (let i = 0; i < chunks.length; i++) {
+      if (rows.length === 0) rows.push({ recs: [], entries: [], size: HEADS_FIXED });
+      for (const row of rows) {
         const heads: P.HeadsRec = {
           rtype: P.RT.HEADS,
           Ein: cursor.E,
           relIn: cursor.rel,
-          entries: chunks[i].entries,
+          entries: row.entries,
         };
-        await this.h.self.write([...(i === 0 ? recs : []), ...chunks[i].lefts, heads]);
+        await this.h.self.write([...row.recs, heads]);
       }
       this.pendingRecords = this.pendingRecords.filter((r) => !recs.includes(r));
       this.lastHeads = sig;
     });
+  }
+
+  // ───────────────────────── reactions (§11.12) ─────────────────────────
+
+  /**
+   * §11.12: one REACTION row for the TEXT or IMAGE message `messageKey`, sent as a text is (§11.3) but without an echo,
+   * after the user's acceptance that a post makes (§11.5). A reaction that changes nothing by the state this device
+   * holds (an add of an emoji that is on, a remove of one that is off, an add beyond 8) resolves without a row.
+   */
+  react(convId: string, messageKey: string, emoji: string, on: boolean): Promise<void> {
+    const c = this.copy(convId);
+    const size = P.utf8(emoji).length;
+    if (size < 1 || size > P.MAX_EMOJI_BYTES)
+      return Promise.reject(new UserError("pick one emoji"));
+    let target: { e: number; row: { j: number; E: number; n: number; th: Bytes } } | null = null;
+    for (const ep of c.epochs.values()) {
+      const row = ep.rows.get(messageKey);
+      if (row?.shown) target = { e: ep.e, row };
+    }
+    if (!target) return Promise.reject(new UserError("unknown message"));
+    const t = target;
+    return this.chain(convId, async () => {
+      const mine = reactionSets(c).get(messageKey)?.get(this.h.acc.uidB) ?? new Set<string>();
+      if (on ? mine.has(emoji) || mine.size >= MAX_REACTIONS : !mine.has(emoji)) return;
+      await this.acceptForPost(c);
+      await sendRow(this.sendCtx(c, null), c, {
+        type: P.MT.REACTION,
+        reaction: {
+          te: t.e,
+          tl: t.row.j,
+          tE: t.row.E,
+          tn: t.row.n,
+          th: t.row.th,
+          op: on ? 1 : 0,
+          emoji,
+        },
+      });
+    });
+  }
+
+  /** The epoch at which a copy ended, for ⚠: processed, or named by its ENDED record (§6.7 step 6); else null. */
+  private endOf(c: Copy): number | null {
+    if (c.removed) return c.current;
+    return this.h.self.fold.ended.get(copyKeyOf(c))?.e ?? null;
+  }
+
+  // ───────────────────────── snapshots (§7.4) ─────────────────────────
+
+  /**
+   * §7.4 "When to write" and §11.4 step 10: online, and the device holds no snapshot pointer in the era
+   * `max(E_now, regEra)` (a sibling's counts), or it has applied more than 200 self records since the latest snapshot.
+   * A failure is tried again at the next catch-up.
+   */
+  private async maybeSnapshot(): Promise<void> {
+    if (!this.live || this.stopped) return;
+    const self = this.h.self;
+    const E = Math.max(P.era(this.h.api.serverNow()), this.h.acc.regEra);
+    const s = self.snapshot;
+    const many = s !== null && self.fold.applied - s.applied > SNAP_RECORDS;
+    if (s && s.E >= E && !many) return;
+    await this.h.enqueue(async () => {
+      if (this.stopped) return;
+      const cur = self.snapshot;
+      const due = !cur || cur.E < E || self.fold.applied - cur.applied > SNAP_RECORDS;
+      if (!due) return;
+      if (!cur || cur.E < E) {
+        const j = await firstFreePointer(this.h.api, this.h.acc.id.rS, E);
+        if (j > 0 && !(cur && self.fold.applied - cur.applied > SNAP_RECORDS)) {
+          self.snapshot = { E, applied: self.fold.applied, pos: self.position() }; // a sibling's
+          return;
+        }
+      }
+      const snap = this.buildSnapshot();
+      const at = await writeSnapshot(this.h.api, this.h.acc.id, this.h.acc.regEra, snap);
+      self.snapshot = { E: at.E, applied: self.fold.applied, pos: snap.pos };
+    });
+  }
+
+  /**
+   * The snapshot this device would write now (§7.4): the compacted state at the self lane's position, with each copy's
+   * CONV_JOIN or REQUEST at the place of its first record (so a restore numbers copies as this device did), every
+   * record of a copy under its own key, then the contacts, members, links, prefs and the HEADS record.
+   */
+  private buildSnapshot(): P.Snapshot {
+    const f = this.h.self.fold;
+    const Enow = P.era(this.h.api.serverNow());
+    const out: P.SelfRecord[] = [];
+    const tregs = new Set<string>();
+    const uids = new Set<string>();
+    const treg = (bundleId: Bytes, tReg: number | null | undefined) => {
+      const b = P.b64u(bundleId);
+      const t = tReg ?? f.tregs.get(b);
+      if (t === undefined || t === null || tregs.has(b)) return;
+      tregs.add(b);
+      out.push({ rtype: P.RT.TREG, bundleId, tReg: t });
+    };
+    const held = [...this.copies.values()].filter((c) => !c.probe);
+    const placeOf = (k: string): number =>
+      Math.min(
+        f.firstOrder.get(k) ?? Infinity,
+        ...f.skips.filter((s) => s.copy === k).map((s) => s.order),
+      );
+    const heldKeys = new Set(held.map((c) => copyKeyOf(c)));
+    const orphans = [...f.joins.keys()].filter((k) => !heldKeys.has(k));
+    const order: { at: number; c: Copy | null; k: string }[] = [
+      ...held.map((c) => ({ at: placeOf(copyKeyOf(c)), c, k: copyKeyOf(c) })),
+      ...orphans.map((k) => ({ at: placeOf(k), c: null, k })),
+    ].sort((a, b) => a.at - b.at);
+    const pendingRec = <T extends P.SelfRecord>(rtype: number, k: string) =>
+      this.pendingRecords.find(
+        (r) => r.rtype === rtype && "conv" in r && copyKeyOf(r as P.CopyRef) === k,
+      ) as T | undefined;
+    for (const { c, k } of order) {
+      if (!c) {
+        // a copy the account holds that this session could not restore: its records as the fold holds them
+        const join = f.joins.get(k)!;
+        out.push(join);
+        treg(join.bundleId, null);
+        for (const [key, rec] of f.epochs) if (key.startsWith(`${k}:`)) out.push(rec);
+        for (const [key, rec] of f.desc) if (key.startsWith(`${k}:`)) out.push(rec);
+        out.push(...(f.leaves.get(k) ?? []));
+        if (f.confirmed.has(k))
+          out.push({ rtype: P.RT.CONFIRMED, conv: join.conv, root: join.root });
+        const ended = f.ended.get(k);
+        if (ended) out.push(ended);
+        continue;
+      }
+      const ref = { conv: c.conv, root: c.root };
+      const rootEp = c.epochs.get(c.rootE);
+      if (c.request) {
+        const req =
+          f.requestOf(k)?.rec ??
+          (rootEp
+            ? ({
+                rtype: P.RT.REQUEST,
+                ...ref,
+                e: rootEp.e,
+                EK: rootEp.EK,
+                bundleId: rootEp.bundleId,
+                bundleSize: rootEp.bundleSize,
+                tReg: rootEp.tReg ?? 0,
+                rootBy: c.rootBy,
+                via: P.VIA.INBOX,
+                desc: P.concat(rootEp.D.bytes, rootEp.dsig),
+              } satisfies P.RequestRec)
+            : null);
+        if (!req) continue;
+        out.push(req);
+        if (rootEp) for (const m of rootEp.D.members) uids.add(P.b64u(m.uid));
+      } else {
+        const join: P.ConvJoinRec | null =
+          f.joins.get(k) ??
+          (rootEp
+            ? {
+                rtype: P.RT.CONV_JOIN,
+                ...ref,
+                e: rootEp.e,
+                EK: rootEp.EK,
+                bundleId: rootEp.bundleId,
+                bundleSize: rootEp.bundleSize,
+                rootBy: c.rootBy,
+                via: P.VIA.INBOX,
+              }
+            : null);
+        if (!join) continue;
+        out.push(join);
+        treg(join.bundleId, rootEp?.tReg);
+        // an EPOCH record (flags 0) for every held epoch above the root, naming the claim that ended the one before
+        for (let e = c.rootE + 1; e <= c.current; e++) {
+          const ep = c.epochs.get(e);
+          const had = f.epochs.get(`${k}:${e}`);
+          const claim = c.epochs.get(e - 1)?.ended?.at ?? had?.claim;
+          const mat = ep ?? had;
+          if (!mat || !claim) break;
+          out.push({
+            rtype: P.RT.EPOCH,
+            ...ref,
+            e,
+            EK: mat.EK,
+            bundleId: mat.bundleId,
+            bundleSize: mat.bundleSize,
+            claim: { ...claim },
+            flags: 0,
+          });
+          treg(mat.bundleId, ep?.tReg);
+        }
+        for (const e of [c.current, c.current - 1]) {
+          const ep = c.epochs.get(e);
+          if (ep) {
+            out.push({ rtype: P.RT.DESC, ...ref, e, desc: P.concat(ep.D.bytes, ep.dsig) });
+            for (const m of ep.D.members) uids.add(P.b64u(m.uid));
+          } else {
+            const d = f.desc.get(`${k}:${e}`);
+            if (d) out.push({ ...d, ...ref });
+          }
+        }
+        for (const p of this.pendingOf(c)) {
+          out.push(p.rec);
+          if (p.delivered.length)
+            out.push({
+              rtype: P.RT.DELIVERED,
+              ...ref,
+              e: p.rec.e,
+              bundleId: p.rec.bundleId,
+              uids: p.delivered,
+            });
+        }
+      }
+      // the bit1 records that start this copy, kept beside it (§7.2: they still assign a tab's later records)
+      for (const s of f.skips) if (s.copy === k && s.from !== k) out.push(s.rec);
+      const leaves = new Set<number>();
+      for (const r of this.leavesOf(c))
+        if (!leaves.has(r.e)) {
+          leaves.add(r.e);
+          out.push({ rtype: P.RT.LEAVE, ...ref, e: r.e });
+        }
+      if (c.confirmed && !P.equalBytes(c.rootBy, this.h.acc.uid))
+        out.push({ rtype: P.RT.CONFIRMED, ...ref });
+      const last = c.epochs.get(c.current);
+      const w = last?.ctl.winner;
+      const ended =
+        f.ended.get(k) ??
+        pendingRec<P.EndedRec>(P.RT.ENDED, k) ??
+        (c.removed && last && (last.endedAt || (w?.processed && last.ended))
+          ? ({
+              rtype: P.RT.ENDED,
+              ...ref,
+              e: last.e,
+              claim: last.endedAt ? { ...last.endedAt } : { E: w!.E, n: w!.n },
+            } satisfies P.EndedRec)
+          : undefined);
+      if (ended) out.push({ ...ended, ...ref });
+    }
+    // bit1 records whose copy is not known yet (their bundle not read): kept as they are
+    for (const s of f.skips) if (s.copy === null) out.push(s.rec);
+    const contacts = new Map<string, P.ContactRec>(f.contacts);
+    for (const r of this.pendingRecords)
+      if (r.rtype === P.RT.CONTACT && !contacts.has(P.b64u(r.uid))) contacts.set(P.b64u(r.uid), r);
+    out.push(...contacts.values());
+    for (const u of contacts.keys()) uids.add(u);
+    for (const u of uids) {
+      const m =
+        f.members.get(u) ??
+        (this.pendingRecords.find((r) => r.rtype === P.RT.MEMBER && P.b64u(r.uid) === u) as
+          | P.MemberRec
+          | undefined);
+      if (m) out.push(m);
+    }
+    for (const l of f.links.values()) if (l.Eexpires >= Enow) out.push(l);
+    for (const [key, value] of f.prefs) out.push({ rtype: P.RT.PREFS, key, value });
+    // every copy's HEADS entry with the LEFT records of its epoch, then the cursor, over records of at most 64 KiB
+    const cursor = this.cursor ?? f.cursor ?? { E: Enow, rel: 0 };
+    let entries: P.HeadsEntry[] = [];
+    let size = 8;
+    const flush = () => {
+      out.push({ rtype: P.RT.HEADS, Ein: cursor.E, relIn: cursor.rel, entries });
+      entries = [];
+      size = 8;
+    };
+    for (const c of held) {
+      const x = this.headsEntry(c);
+      if (!x) continue;
+      const bytes = 68 + 6 * x.entry.lanes.length + 12 * x.entry.followed.length;
+      if (entries.length && size + bytes > 60_000) flush();
+      out.push(...x.lefts);
+      entries.push(x.entry);
+      size += bytes;
+    }
+    flush();
+    return {
+      pos: this.h.self.position(),
+      ts: Math.max(0, Math.floor(this.h.api.serverNow())),
+      records: out,
+    };
+  }
+
+  /**
+   * The EPOCH_PENDING records a snapshot keeps for a copy (§7.4): those of its own key, and those of a legacy copy's
+   * key that §7.2 gives it by bundle, that are neither dead (another claim won their epoch) nor complete (every
+   * listed uid has a DELIVERED), under the copy's own key, with the uids delivered so far.
+   */
+  private pendingOf(c: Copy): { rec: P.EpochPendingRec; delivered: Bytes[] }[] {
+    const f = this.h.self.fold;
+    const k = copyKeyOf(c);
+    const legacy = new Set(f.skips.filter((s) => s.copy === k && s.from !== k).map((s) => s.from));
+    const seen = new Set<string>();
+    const out: { rec: P.EpochPendingRec; delivered: Bytes[] }[] = [];
+    for (const { rec } of f.pending) {
+      const rk = copyKeyOf(rec);
+      if (rk !== k && !legacy.has(rk)) continue;
+      const id = `${rk}:${rec.e}:${P.b64u(rec.bundleId)}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      // dead: this copy holds e with another bundle, or its final winner of e − 1 names another one
+      const at = c.epochs.get(rec.e);
+      const w = c.epochs.get(rec.e - 1)?.ctl.winner;
+      const mine = at
+        ? P.equalBytes(at.bundleId, rec.bundleId)
+        : rec.e === 0 || !w?.processed || P.equalBytes(w.claim.bundleId, rec.bundleId);
+      if (!mine || (rk !== k && !at && !w?.processed)) continue;
+      const covered = f.delivered.get(id) ?? new Set<string>();
+      if (rec.uids.every((u) => covered.has(P.b64u(u)))) continue; // complete
+      out.push({
+        rec: { ...rec, conv: c.conv, root: c.root },
+        delivered: rec.uids.filter((u) => covered.has(P.b64u(u))),
+      });
+    }
+    return out;
   }
 
   // ───────────────────────── views ─────────────────────────
@@ -2238,12 +3408,15 @@ export class Messaging {
       selfUid: this.h.acc.uid,
       selfHandle: this.h.acc.handle,
       user: (uidB: string) => this.knownUser(uidB),
-      copiesOf: (convB: string) => this.copiesOf(convB).length,
+      contested: (c: Copy) =>
+        this.copiesOf(c.convB).some((y) => y !== c && contest(c, y, (x) => this.endOf(x))),
+      byContact: (c: Copy) => this.byContact(c),
       mono: this.h.clock.mono(),
       processingWait: this.h.delays.processingWait,
     };
     const out: ConversationView[] = [];
     for (const c of this.copies.values()) {
+      if (c.reactionsDirty) refreshReactions(c, this.h.acc.uidB);
       const v = viewOf(c, x);
       if (v) out.push(v);
     }

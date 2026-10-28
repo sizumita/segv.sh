@@ -13,7 +13,7 @@ const STEP = 32;
 
 /**
  * The dense-prefix end of the highest earlier era of lane j with rows, at or above `floor` and below `E`: slot 0 of
- * each era (one key per idle era), then a gallop in exists mode. Null when none of them has rows.
+ * each era (one key per idle era), then the prefix length in exists mode. Null when none of them has rows.
  */
 async function earlierEnd(
   ctx: SyncCtx,
@@ -30,24 +30,107 @@ async function earlierEnd(
   const k = st.findIndex((s) => s.s === "hit");
   if (k < 0) return null;
   const Ex = eras[k];
-  for (let base = 1; ; base += STEP) {
-    const keys: W.GetKey[] = Array.from({ length: STEP }, (_, i) => ({
-      E: Ex,
-      label: P.Lmsg(ep.keys.rk, j, Ex, base + i),
-      mode: 1 as const,
-    }));
-    const s2 = await ctx.api.get(keys);
-    const miss = s2.findIndex((s) => s.s !== "hit");
-    if (miss >= 0) return { E: Ex, n: base + miss };
-  }
+  const [n] = await prefixLengths(ctx, [{ ep, j, E: Ex }]);
+  return { E: Ex, n };
 }
 
-/** The copy's previous held epoch below `ep` (§11.10): e−1, or below a skip re-add the highest held one below. */
-export function previousHeld(c: Copy, ep: Epoch): Epoch | undefined {
-  if (!ep.viaSkip) return c.epochs.get(ep.e - 1);
-  let best: Epoch | undefined;
-  for (const x of c.epochs.values()) if (x.e < ep.e && (!best || x.e > best.e)) best = x;
-  return best;
+/**
+ * The dense-prefix length of each lane j in its era E, whose slot 0 holds a row, all lanes in lockstep: one batched
+ * get of the slots 2^i (i < 32), which brackets each length, then batched gets of 32 evenly spaced slots per lane that
+ * narrow the brackets, in exists mode; so the end of a long lane costs a few requests, not one per 32 rows.
+ */
+async function prefixLengths(
+  ctx: SyncCtx,
+  lanes: readonly { ep: Epoch; j: number; E: number }[],
+): Promise<number[]> {
+  const exist = async (asks: { k: number; n: number }[]): Promise<boolean[]> =>
+    (
+      await ctx.api.get(
+        asks.map(({ k, n }) => {
+          const { ep, j, E } = lanes[k];
+          return { E, label: P.Lmsg(ep.keys.rk, j, E, n), mode: 1 as const };
+        }),
+      )
+    ).map((s) => s.s === "hit");
+  if (lanes.length === 0) return [];
+  const pows = Array.from({ length: 32 }, (_, i) => 2 ** i);
+  const first = await exist(lanes.flatMap((_, k) => pows.map((n) => ({ k, n }))));
+  // every slot below `lo` holds a row, slot `hi` holds none: the length lies in [lo, hi]
+  const lo: number[] = [];
+  const hi: number[] = [];
+  lanes.forEach((_, k) => {
+    const m = first.slice(k * 32, k * 32 + 32).findIndex((x) => !x);
+    lo.push(m < 0 ? pows[31] + 1 : m === 0 ? 1 : pows[m - 1] + 1);
+    hi.push(m < 0 ? pows[31] + 1 : pows[m]);
+  });
+  for (let round = 0; round < 64; round++) {
+    const open = lanes.map((_, k) => k).filter((k) => lo[k] < hi[k]);
+    if (open.length === 0) break;
+    const asks: { k: number; n: number }[] = [];
+    for (const k of open) {
+      const step = Math.max(1, Math.ceil((hi[k] - lo[k]) / STEP));
+      for (let n = lo[k]; n < hi[k]; n += step) asks.push({ k, n });
+    }
+    const got = await exist(asks);
+    for (const k of open) {
+      const mine = asks.map((a, x) => ({ ...a, hit: got[x] })).filter((a) => a.k === k);
+      const miss = mine.findIndex((a) => !a.hit);
+      if (miss < 0) lo[k] = mine[mine.length - 1].n + 1;
+      else {
+        hi[k] = mine[miss].n;
+        if (miss > 0) lo[k] = mine[miss - 1].n + 1;
+      }
+    }
+  }
+  return lo;
+}
+
+/**
+ * The slot after each lane's last row at or before its processed position (§11.4 step 6 "the last slots of each
+ * lane"): the position itself when its era holds rows before it, else the dense-prefix end of the latest earlier era
+ * with rows down to E_start. Every lane is searched at once: one batched get of slot 0 of each idle era (one key per
+ * lane and era), then the prefix lengths in lockstep (a few batched gets in exists mode). Null for a lane with no row.
+ */
+export async function lanesEnd(
+  ctx: SyncCtx,
+  lanes: readonly { ep: Epoch; j: number }[],
+): Promise<(Slot | null)[]> {
+  const out: (Slot | null)[] = lanes.map(() => null);
+  const keys: W.GetKey[] = [];
+  const owner: { i: number; E: number }[] = [];
+  lanes.forEach(({ ep, j }, i) => {
+    const l = ep.lanes[j];
+    const at = l.tail ?? l.next;
+    if (at.n > 0) out[i] = at;
+    else if (l.head && l.head.cnt > 0 && P.posCmp({ E: l.head.E, n: l.head.cnt }, at) <= 0)
+      out[i] = { E: l.head.E, n: l.head.cnt };
+    else
+      for (let E = at.E - 1; E >= (ep.Estart ?? at.E); E--) {
+        keys.push({ E, label: P.Lmsg(ep.keys.rk, j, E, 0), mode: 1 });
+        owner.push({ i, E });
+      }
+  });
+  if (keys.length === 0) return out;
+  const st = await ctx.api.get(keys);
+  const era = new Map<number, number>();
+  st.forEach((s, k) => {
+    const { i, E } = owner[k];
+    if (s.s === "hit" && (era.get(i) ?? -1) < E) era.set(i, E);
+  });
+  const found = await prefixLengths(
+    ctx,
+    [...era].map(([i, E]) => ({ ep: lanes[i].ep, j: lanes[i].j, E })),
+  );
+  [...era].forEach(([i, E], k) => (out[i] = { E, n: found[k] }));
+  return out;
+}
+
+/**
+ * The copy's previous held epoch below `ep` (§11.10): e−1, loaded from the account's records when a restore did not
+ * materialize it; the history ends below the copy's root epoch.
+ */
+export async function previousHeld(ctx: SyncCtx, c: Copy, ep: Epoch): Promise<Epoch | undefined> {
+  return c.epochs.get(ep.e - 1) ?? (await ctx.older?.(c, ep.e - 1));
 }
 
 /**
@@ -166,7 +249,7 @@ export async function scrollback(ctx: SyncCtx, c: Copy): Promise<void> {
   if (c.scrolled) return;
   c.scrolled = true;
   const enough = () => c.messages.length >= VIEW_MESSAGES;
-  for (let ep = c.epochs.get(c.current); ep && !enough(); ep = previousHeld(c, ep)) {
+  for (let ep = c.epochs.get(c.current); ep && !enough(); ep = await previousHeld(ctx, c, ep)) {
     if (ep.Estart === null) break;
     const start =
       ep.e === c.current
@@ -185,8 +268,8 @@ export async function scrollback(ctx: SyncCtx, c: Copy): Promise<void> {
 export async function olderInitialHistory(ctx: SyncCtx, c: Copy): Promise<void> {
   const cur = c.epochs.get(c.current);
   if (!cur) return;
-  const loaded = [...cur.rows.values()].filter((r) => r.shown).length;
-  const prev = loaded < HISTORY_INITIAL ? previousHeld(c, cur) : undefined;
+  // every row of the epoch that was loaded counts, REACTION rows included, so the cost never depends on content
+  const prev = cur.loaded < HISTORY_INITIAL ? await previousHeld(ctx, c, cur) : undefined;
   if (!prev || prev.Estart === null) return;
   const heads = await olderHeads(ctx, prev);
   await walkBack(ctx, c, prev, heads, () => false, 1);

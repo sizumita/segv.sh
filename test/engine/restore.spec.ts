@@ -17,7 +17,8 @@ describe("restore from the self lane", () => {
     await A.sendText(one, "hello bob");
     await A.sendText(team, "hello team");
     await settle(A, B);
-    await B.sendText(one, "hi alice"); // accepts bob's 1:1; the group stays a request on bob's side
+    // bob's post accepts the 1:1 and makes alice a contact, which accepts her group too (§11.5)
+    await B.sendText(one, "hi alice");
     await settle(A, B);
 
     const A2 = await engineFor(alice);
@@ -29,7 +30,8 @@ describe("restore from the self lane", () => {
     expect(mustView(A2, team).name).toBe("# team");
     expect(mustView(B2, team).name).toBe("# team");
     expect(mustView(B2, one).request).toBe(false);
-    expect(mustView(B2, team).request).toBe(true);
+    expect(mustView(B2, team).request).toBe(false);
+    expect(mustView(B2, team).byContact).toBe(true);
     expect(systemLines(A2, one)).toEqual(["you started the conversation"]);
     expect(systemLines(B2, team)).toEqual(["@alice started the conversation"]);
     for (const E of [A2, B2]) for (const v of I(E).views()) expect(v.unread).toBe(0);

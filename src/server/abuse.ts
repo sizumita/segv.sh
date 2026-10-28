@@ -2,13 +2,14 @@
 import { HMAC, POW_WINDOW_MS, hex, powCheck, powDifficulty, powPre, utf8, type PowScope } from "../lib/proto";
 import { HttpError, logErr } from "./http";
 
-const POW_DEFAULTS: Readonly<Record<PowScope, number>> = { register: 20, wrap: 18, put: 16, inbox: 18, blob: 18 };
+const POW_DEFAULTS: Readonly<Record<PowScope, number>> = { register: 20, wrap: 18, put: 16, inbox: 18, blob: 18, push: 20 };
 const POW_VARS: Readonly<Record<PowScope, string>> = {
   register: "POW_REGISTER",
   wrap: "POW_WRAP",
   put: "POW_PUT",
   inbox: "POW_INBOX",
   blob: "POW_BLOB",
+  push: "POW_PUSH",
 };
 
 /**
@@ -26,13 +27,14 @@ export function powBase(env: Env, scope: PowScope): number {
   return POW_DEFAULTS[scope];
 }
 
-/** The params "pow" object (§10.9). */
-export const powParams = (env: Env): Record<PowScope, number> => ({
+/** The params "pow" object (§10.9). `push` only while push is on (§9.8), where its var is known to be valid. */
+export const powParams = (env: Env, pushOn = false): Partial<Record<PowScope, number>> => ({
   register: powBase(env, "register"),
   wrap: powBase(env, "wrap"),
   put: powBase(env, "put"),
   inbox: powBase(env, "inbox"),
   blob: powBase(env, "blob"),
+  ...(pushOn ? { push: powBase(env, "push") } : {}),
 });
 
 export const powWindow = (now = Date.now()): number => Math.floor(now / POW_WINDOW_MS);

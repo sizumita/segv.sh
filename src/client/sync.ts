@@ -37,8 +37,8 @@ export interface SyncCtx {
   changed(): void;
   /** the displayed handle of member j of an epoch */
   handleOf(c: Copy, ep: Epoch, j: number): string;
-  /** a WELCOME's J, found on a lane (§5.2: accepted whenever the row is processed) */
-  onWelcome(c: Copy, ep: Epoch, j: number, J: P.Join): void;
+  /** a WELCOME's J, found on lane j at `at` (§5.2: accepted whenever the row is processed) */
+  onWelcome(c: Copy, ep: Epoch, j: number, at: Slot, J: P.Join): void;
   /** a valid row of member j (corroboration and request acceptance, §6.7 step 6, §11.5) */
   onValidRow(c: Copy, ep: Epoch, j: number): void;
   /** the local echo waiting for this row (rowKey), if any */
@@ -57,6 +57,16 @@ export interface SyncCtx {
     j: number,
     src: { t: number; row: Slot; key: string; order: number[] },
   ): void;
+  /**
+   * A walked row that cannot be decided yet: the copy ended at a claim it has not read (its ENDED record, §11.4 step
+   * 5). True when the host keeps the row, to apply it once the claim is read.
+   */
+  holdRow?(c: Copy, ep: Epoch, j: number, r: FoundRow): boolean;
+  /**
+   * An older held epoch that a restore did not materialize (below its start after a snapshot), loaded for history
+   * (§11.10): undefined below the copy's root, or when its records do not give it.
+   */
+  older?(c: Copy, e: number): Promise<Epoch | undefined>;
 }
 
 export const UNDECRYPTABLE = "ignored an undecryptable message";
@@ -186,7 +196,7 @@ export function targetsOf(copies: Iterable<Copy>): LaneTarget[] {
     if (!ep || ep.Estart === null) continue;
     if (ep.lanesOn && !c.removed) ep.lanes.forEach((_, j) => out.push({ c, ep, lane: j }));
     if (!ep.ctl.winner && !c.removed) out.push({ c, ep, lane: "ctl" });
-    const prev = ep.viaSkip ? undefined : c.epochs.get(c.current - 1);
+    const prev = c.epochs.get(c.current - 1);
     if (prev && prev.Estart !== null)
       prev.lanes.forEach((l, j) => {
         if (!l.swept) out.push({ c, ep: prev, lane: j });
@@ -197,8 +207,8 @@ export function targetsOf(copies: Iterable<Copy>): LaneTarget[] {
 
 /** Lane j of an older epoch is followed: its member is in the next epoch, is not self, and is silent there (§11.2). */
 export function followed(c: Copy, prev: Epoch, j: number): boolean {
-  const next = prev.viaSkip ? undefined : c.epochs.get(prev.e + 1);
-  if (!next || next.viaSkip || c.current !== next.e) return false;
+  const next = c.epochs.get(prev.e + 1);
+  if (!next || c.current !== next.e) return false;
   const k = P.memberIndex(next.D, prev.D.members[j].uid);
   return k >= 0 && k !== next.myIndex && !next.lanes[k].seen;
 }
@@ -255,6 +265,7 @@ export async function syncLanes(
             P.posCmp({ E: r.E, n: r.n + 1 }, { E: lane.head.E, n: lane.head.cnt }) > 0
           )
             lane.head = { E: r.E, cnt: r.n + 1 };
+          if (ctx.holdRow?.(x.c, x.ep, x.lane, r)) continue;
           applyLaneRow(ctx, x.c, x.ep, x.lane, r, quiet);
         }
         lane.next = { ...w.cur };
@@ -321,11 +332,12 @@ export function applyLaneRow(
   ctx.checkRow(c, ep, j, r, m, quiet);
   if (expected && !P.equalBytes(expected, ph)) ctx.prevMismatch(c, ep, j);
   ctx.onValidRow(c, ep, j);
+  ep.loaded++;
   const mine = P.equalBytes(ep.D.members[j].uid, ctx.selfUid);
   const ts = clampTs(m.ts, r.t, ctx.delta());
   const order = rowOrder(ts, ep.e, r.E, j, r.n);
   if (m.type === P.MT.WELCOME) {
-    ctx.onWelcome(c, ep, j, m.join);
+    ctx.onWelcome(c, ep, j, { E: r.E, n: r.n }, m.join);
     c.order.set(key, order);
     return;
   }
@@ -334,12 +346,32 @@ export function applyLaneRow(
     ctx.onLeave(c, ep, j, { t: r.t, row: { E: r.E, n: r.n }, key, order });
     return;
   }
+  if (m.type === P.MT.REACTION) {
+    // A valid row of its member (above), but not a message: no view, no unread, no lastTs (§11.12).
+    c.order.set(key, order);
+    c.reactions.set(key, {
+      e: ep.e,
+      j,
+      E: r.E,
+      n: r.n,
+      t: r.t,
+      uid: P.b64u(ep.D.members[j].uid),
+      shown: !c.left && acceptedOld(c, ep.e, j, { E: r.E, n: r.n }, r.t),
+      reaction: m.reaction,
+    });
+    c.reactionsDirty = true;
+    ctx.changed();
+    return;
+  }
   if (m.type !== P.MT.TEXT && m.type !== P.MT.IMAGE) return;
+  // What a REACTION to this row names: its label and stored body under the epoch's route key (§3.3).
+  const th = P.reactTh(ep.keys.rk, r.label, r.body);
+  if (c.reactions.size) c.reactionsDirty = true; // a waiting reaction's target may have come
   // A leaver processes its lanes for WELCOMEs only (§6.9); a row §6.8 drops is not shown, and an echo of it fails.
   const accepted = !c.left && acceptedOld(c, ep.e, j, { E: r.E, n: r.n }, r.t);
   if (!accepted) {
     c.order.set(key, order);
-    ep.rows.set(key, { j, E: r.E, n: r.n, t: r.t, unread: false, shown: false });
+    ep.rows.set(key, { j, E: r.E, n: r.n, t: r.t, unread: false, shown: false, th });
     ctx.takeEcho(key); // the echo stays as it is; the send reports the failure (§11.3 step 7)
     return;
   }
@@ -352,6 +384,7 @@ export function applyLaneRow(
     ts,
     kind: m.type === P.MT.TEXT ? "text" : "image",
     status: "sent",
+    reactions: [],
     ...(m.type === P.MT.TEXT
       ? { text: m.text }
       : {
@@ -369,7 +402,7 @@ export function applyLaneRow(
   if (!insertMessage(c, view, order)) return;
   const unread = !mine && !quiet && ctx.live();
   if (unread) c.unread++;
-  ep.rows.set(key, { j, E: r.E, n: r.n, t: r.t, unread, shown: true });
+  ep.rows.set(key, { j, E: r.E, n: r.n, t: r.t, unread, shown: true, th });
   ctx.changed();
 }
 

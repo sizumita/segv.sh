@@ -40,7 +40,7 @@ async function pair() {
   const B = await engineFor(bob);
   const id = await A.createConversation(["bob"]);
   await settle(A, B);
-  B.markRead(id);
+  await B.accept(id);
   await settle(A, B);
   return { alice, bob, A, B, id };
 }

@@ -31,7 +31,8 @@
   // Client-side-encrypted, content-addressed blobs: key "b/<b64u(sha256(blob))>".
   "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "segv-blobs" }],
   // docs/PROTOCOL.md §9: SHARD "shard/v2/{E}/{i}" and INBOX "inbox/v2/{E}/{g}" per era, BLOBREG
-  // "blobreg/v2", RT "rt/v2/0" (realtime WebSockets), CKPT "ckpt/v2" (signed checkpoints every 60 s).
+  // "blobreg/v2", RT "rt/v2/0" (realtime WebSockets), CKPT "ckpt/v2" (signed checkpoints every 60 s),
+  // PUSH "push/v2" (Web Push registrations; addressed only while push is on, §9.8).
   "durable_objects": {
     "bindings": [
       { "name": "SHARD", "class_name": "ShardDO" },
@@ -39,14 +40,16 @@
       { "name": "INBOX", "class_name": "InboxDO" },
       { "name": "RT", "class_name": "RealtimeDO" },
       { "name": "CKPT", "class_name": "CheckpointDO" },
+      { "name": "PUSH", "class_name": "PushDO" },
     ],
   },
-  // One migration: nothing was deployed before protocol v2.
   "migrations": [
     {
       "tag": "v1",
       "new_sqlite_classes": ["ShardDO", "BlobRegDO", "InboxDO", "RealtimeDO", "CheckpointDO"],
     },
+    // Web Push (§9.8).
+    { "tag": "v2", "new_sqlite_classes": ["PushDO"] },
   ],
   // Per-IP (IPv6 /64) abuse limits. Keys are never persisted. Period must be 10 or 60 seconds.
   "ratelimits": [
@@ -55,6 +58,8 @@
     { "name": "RL_READ", "namespace_id": "1003", "simple": { "limit": 600, "period": 60 } },
     // Inbox posts (one token per POST of up to 32 invites).
     { "name": "RL_INBOX", "namespace_id": "1004", "simple": { "limit": 10, "period": 60 } },
+    // Rings after each text or image (§10.10): their own binding, so that ringing leaves RL_WRITE to the puts.
+    { "name": "RL_RING", "namespace_id": "1005", "simple": { "limit": 60, "period": 60 } },
   ],
   "vars": {
     // Proof-of-work base difficulty (leading zero bits) per scope, docs/PROTOCOL.md §10.2. Puts, inbox
@@ -70,6 +75,9 @@
     // clock differences between server components, INBOX_SLOT_S = Δin, E_FIRST = the era of the first deploy
     // (lower eras are never instantiated).
     // Secrets (wrangler secret put; .dev.vars for vp dev): ROUTE_KEY (32 B b64u), SRV_KEY (Ed25519 seed b64u).
+    // Web Push is off unless the secrets VAPID_SK (P-256 scalar, 32 B b64u) and PUSH_KEY (32 B b64u) are set, with
+    // VAPID_SUB (mailto: or https: contact). Optional: PUSH_HOSTS, POW_PUSH (20), PUSH_MAX_SUBS (100000),
+    // PUSH_DAY_SUBS (2000). An invalid push setting turns push off and nothing else (docs/PROTOCOL.md §9.8).
     "DELTA_S": "10",
     "SKEW_S": "2",
     "INBOX_SLOT_S": "10",

@@ -18,6 +18,7 @@ export const ConvList = component$(() => {
   const formError = useSignal("");
   const creating = useSignal(false);
   const addingKey = useSignal(false);
+  const pushBusy = useSignal(false);
 
   const me = state.me;
   const formOpen = showNew.value || state.conversations.length === 0;
@@ -198,6 +199,24 @@ export const ConvList = component$(() => {
         >
           {addingKey.value ? "adding passkey…" : "add passkey"}
         </button>
+        {state.notifications !== "unavailable" && (
+          <button
+            type="button"
+            class="link"
+            disabled={pushBusy.value}
+            aria-pressed={state.notifications === "on"}
+            title="a notification that says only “new messages”, on this device only"
+            onClick$={async () => {
+              // Turning on asks for permission: it must start inside this click.
+              const on = state.notifications !== "on";
+              pushBusy.value = true;
+              await act(ui, (e) => e.setNotifications(on));
+              pushBusy.value = false;
+            }}
+          >
+            {state.notifications === "on" ? "notifications: on" : "notifications: off"}
+          </button>
+        )}
         <button type="button" class="link" onClick$={() => act(ui, (e) => e.logout())}>
           sign out
         </button>

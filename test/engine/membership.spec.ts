@@ -26,7 +26,7 @@ describe("add, remove and rename", () => {
     const D = await engineFor(dave);
     const id = await A.createConversation(["bob", "carol"], "team");
     await settle(A, B, C);
-    for (const E of [B, C]) E.markRead(id); // opening a request accepts it (§11.5)
+    for (const E of [B, C]) await E.accept(id); // the user accepts the request (§11.5, §11.11)
     await settle(A, B, C);
 
     await A.addMembers(id, ["dave"]);
@@ -113,7 +113,7 @@ describe("leave", () => {
     const C = await engineFor(carol);
     const id = await A.createConversation(["bob", "carol"]);
     await settle(A, B, C);
-    for (const E of [B, C]) E.markRead(id);
+    for (const E of [B, C]) await E.accept(id);
     await settle(A, B, C);
 
     await B.leave(id);
@@ -150,7 +150,7 @@ describe("leave", () => {
     const C = await engineFor(carol);
     const id = await A.createConversation(["bob", "carol"]);
     await settle(A, B, C);
-    for (const E of [B, C]) E.markRead(id);
+    for (const E of [B, C]) await E.accept(id);
     await settle(A, B, C);
     const mk0 = epoch(A, id).keys.mk;
     await B.leave(id);
@@ -187,7 +187,7 @@ describe("history across epochs (§11.4 step 6, §11.10)", () => {
     const C = await engineFor(carol);
     const id = await A.createConversation(["bob"], "hist");
     await settle(A, B);
-    B.markRead(id);
+    await B.accept(id);
     await settle(A, B);
     for (let i = 0; i < 40; i++) await A.sendText(id, `e0 #${i}`);
     await A.addMembers(id, ["carol"]);
@@ -218,7 +218,7 @@ describe("history across epochs (§11.4 step 6, §11.10)", () => {
     const R = await engineFor(rita);
     const id = await A.createConversation(["bob", "rita"], "cut");
     await settle(A, B, R);
-    for (const X of [B, R]) X.markRead(id);
+    for (const X of [B, R]) await X.accept(id);
     await settle(A, B, R);
     await R.sendText(id, "rita before");
     await settle(A, B, R);

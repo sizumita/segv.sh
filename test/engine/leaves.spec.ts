@@ -1,5 +1,5 @@
-// Leaves, re-adds and rows that land late in an older epoch (docs/PROTOCOL.md §6.7 step 5, §6.8, §6.9, §11.2,
-// §11.3 steps 1–3 and 8).
+// Leaves, re-adds as separate copies and rows that land late in an older epoch (docs/PROTOCOL.md §6.6 step 3,
+// §6.7 steps 4–6, §6.8, §6.9, §11.2, §11.3 steps 1–3 and 8).
 import { describe, expect, it } from "vite-plus/test";
 import type { Engine } from "../../src/client/types";
 import type { EngineOptions } from "../../src/client/options";
@@ -31,7 +31,7 @@ async function group(names: string[], name = "g", opts: Record<string, EngineOpt
   for (const u of users) engines.push(await engineFor(u, opts[u.handle] ?? {}));
   const id = await engines[0].createConversation(names.slice(1), name);
   await settle(...engines);
-  for (const E of engines.slice(1)) E.markRead(id);
+  for (const E of engines.slice(1)) await E.accept(id);
   await settle(...engines);
   return { users, engines, id };
 }
@@ -40,7 +40,7 @@ const LEAVE = P.MT.LEAVE as number;
 const TEXT = P.MT.TEXT as number;
 
 describe("re-adds", () => {
-  it("a removed leaver re-added by a later epoch accepts the skip, live and after a reload", async () => {
+  it("a removed leaver re-added later gets a separate copy; the old one has ended (live and after a reload)", async () => {
     const {
       users: [alice, bob],
       engines: [A, B, C],
@@ -52,33 +52,48 @@ describe("re-adds", () => {
     await A.addMembers(id, ["bob"]); // drops the leaver (e1), then adds bob back (e2)
     await settle(A, B, C);
     expect(mustView(A, id).epoch).toBe(2);
-    expect(mustView(B, id).epoch).toBe(2);
-    expect(systemLines(B, id).at(-1)).toBe("@alice added you");
-    expect(mustView(B, id).canSend).toBe(true);
+    // G has ended at e0's claim: "you left the conversation", no "@alice removed you" (bob had left).
+    const G = mustView(B, id);
+    expect(G.epoch).toBe(0);
+    expect(G.blocked).toBe("removed");
+    expect(systemLines(B, id)).toContain("you left the conversation");
+    expect(systemLines(B, id)).not.toContain("@alice removed you");
+    // The re-add is a separate copy G′, rooted at e2: "@alice added you", no warning, no ⚠.
+    const id1 = `${id}~1`;
+    const G1 = mustView(B, id1);
+    expect(G1.epoch).toBe(2);
+    expect(G1.canSend).toBe(true);
+    expect(G1.name.startsWith("⚠")).toBe(false);
+    expect(G.name.startsWith("⚠")).toBe(false);
+    expect(systemLines(B, id1)).toEqual(["@alice added you"]);
+    expect(conv(B, id1).left).toBe(false);
     expect(B.getState().warnings).toEqual([]);
     for (const X of [A, C]) {
       const m = mustView(X, id).members.find((x) => x.handle === "bob")!;
       expect(m.left).toBe(false);
     }
-    await B.sendText(id, "back again");
+    await B.sendText(id1, "back again");
     await A.sendText(id, "welcome back");
     await settle(A, B, C);
     expect(mustView(A, id).epoch).toBe(2); // no rotation needed
     expect(chat(C, id)).toEqual(["bob: back again", "alice: welcome back"]);
+    expect(chat(B, id1)).toEqual(["bob: back again", "alice: welcome back"]);
     // bob's device puts no LEAVE in the re-added epoch, live or after a reload.
     const leaves = () => readableWith(epoch(A, id).keys.mk).filter((m) => m.type === LEAVE).length;
     expect(leaves()).toBe(0);
     const B2 = await engineFor(bob);
-    expect(mustView(B2, id).epoch).toBe(2);
-    expect(mustView(B2, id).canSend).toBe(true);
-    expect(systemLines(B2, id)).toContain("@alice added you");
+    expect(mustView(B2, id).blocked).toBe("removed");
+    expect(systemLines(B2, id)).not.toContain("@alice removed you");
+    expect(mustView(B2, id1).epoch).toBe(2);
+    expect(mustView(B2, id1).canSend).toBe(true);
+    expect(systemLines(B2, id1)).toContain("@alice added you");
     expect(B2.getState().warnings).toEqual([]);
     await settle(A, B2, C);
     expect(leaves()).toBe(0);
     void alice;
   });
 
-  it("a J for the re-added epoch that arrives before the dropping claim is still accepted as a skip", async () => {
+  it("a J for the re-added epoch that arrives before the dropping claim waits for it, then starts its own copy", async () => {
     const {
       engines: [A, B, C],
       id,
@@ -89,10 +104,18 @@ describe("re-adds", () => {
     server().rt.dropPublish((row) => P.equalBytes(row.topic, ep0.topic));
     await A.addMembers(id, ["bob"]);
     server().rt.dropPublish(null);
-    // bob's next inbox poll finds J(e2) before any frame of the dropping claim reached him.
+    // bob's next inbox poll finds J(e2) before any frame of the dropping claim reached him: settling G processes the
+    // claim first (G ends), and J(e2) starts G′.
     await I(B).catchUp();
     await settle(A, B, C);
-    expect(mustView(B, id).epoch).toBe(2);
+    expect(mustView(B, id).blocked).toBe("removed");
+    expect(systemLines(B, id)).toContain("you left the conversation");
+    expect(systemLines(B, id)).not.toContain("@alice removed you");
+    const G1 = mustView(B, `${id}~1`);
+    expect(G1.epoch).toBe(2);
+    expect(G1.canSend).toBe(true);
+    expect(G1.name.startsWith("⚠")).toBe(false);
+    expect(systemLines(B, `${id}~1`)).toEqual(["@alice added you"]);
     expect(B.getState().warnings).toEqual([]);
   });
 });
@@ -227,7 +250,7 @@ describe("leave order and WELCOMEs", () => {
     const C = await engineFor(carol);
     const one = await A.createConversation(["bob"]);
     await settle(A, B);
-    B.markRead(one);
+    await B.accept(one);
     await B.sendText(one, "hi alice");
     await settle(A, B);
     const ep = epoch(A, one);
@@ -249,7 +272,7 @@ describe("leave order and WELCOMEs", () => {
     const D = await engineFor(dave);
     const one = await A.createConversation(["bob"]);
     await settle(A, B);
-    B.markRead(one);
+    await B.accept(one);
     await B.sendText(one, "hi");
     await settle(A, B);
     const ep = epoch(A, one);

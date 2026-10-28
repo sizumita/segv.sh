@@ -5,6 +5,7 @@ import * as P from "~/lib/proto";
 import { BAD_RECEIPT, RowMemory, type CkptLatest, type CkptRange } from "./integrity";
 import * as W from "~/lib/wire";
 import type { EngineClock } from "./options";
+import type { PushParams, PushSubBody } from "./push";
 
 export type Bytes = Uint8Array;
 export type Progress = (msg: string) => void;
@@ -71,6 +72,8 @@ export interface Params {
     blobMax: number;
     textMax: number;
   };
+  /** only while the deployment offers Web Push (§9.8); read it with pushParams() */
+  push?: unknown;
 }
 
 const POW_SCOPES: readonly P.PowScope[] = ["register", "wrap", "put", "inbox", "blob"];
@@ -123,6 +126,24 @@ export function checkParams(x: unknown): Params {
   )
     bad("limits");
   return x as unknown as Params;
+}
+
+/**
+ * params.push (§10.9), or null when the server offers no push: a `push` whose `vapid` is not 65 bytes starting with
+ * 0x04, whose `window` or `maxTokens` is not a positive integer, or that comes without `pow.push`, counts as none.
+ */
+export function pushParams(p: Params): PushParams | null {
+  const x = p.push;
+  if (
+    !isObj(x) ||
+    !isB64u(x.vapid, 65) ||
+    !isInt(x.window, 1, 2 ** 31) ||
+    !isInt(x.maxTokens, 1, 2 ** 31)
+  )
+    return null;
+  if (!isInt((p.pow as Record<string, unknown>).push, 0, 64)) return null;
+  const vapid = P.fromB64u(x.vapid);
+  return vapid[0] === 4 ? { vapid, window: x.window, maxTokens: x.maxTokens } : null;
 }
 
 // ───────────────────────── server time (§10.1) ─────────────────────────
@@ -301,7 +322,11 @@ export class Api {
   private paramsCache: { p: Params; at: number } | null = null;
   private paramsPending: Promise<Params> | null = null;
   private dirSeqPending: Promise<number> | null = null;
-  private readonly prefixCache = new Map<string, Promise<UserJson[]>>();
+  /** complete prefix answers of the session, each with the sequence number of its fetch */
+  private readonly prefixCache = new Map<string, { seq: number; run: Promise<UserJson[]> }>();
+  /** prefix fetches started so far, and the count when the current operation began (§10.6 "fresh") */
+  private prefixFetches = 0;
+  private operationSince = 0;
 
   constructor(opts: ApiOptions) {
     this.fetchFn = opts.fetch;
@@ -781,6 +806,39 @@ export class Api {
     return { dirseq: j.dirseq, now: now !== null && Number.isSafeInteger(now) ? now : null };
   }
 
+  // ── Web Push (§10.10) ──
+
+  /** `POST /api/v2/push/sub`: replaces this endpoint's registration (an empty `tokens` deletes it). */
+  async pushSub(body: PushSubBody): Promise<void> {
+    const res = await this.postPow(
+      "/api/v2/push/sub",
+      "push",
+      P.utf8(JSON.stringify(body)),
+      "application/json",
+    );
+    await res.body?.cancel();
+  }
+
+  /** `POST /api/v2/ring` for a row just stored: the server answers 204 whatever it then does. */
+  async ring(E: number, label: Bytes, tokens: readonly Bytes[]): Promise<void> {
+    if (tokens.length < 1 || tokens.length > 64)
+      throw new ApiError(0, "a ring carries 1 to 64 bells");
+    const body = P.concat(
+      Uint8Array.of(1),
+      P.u16(E),
+      label,
+      Uint8Array.of(tokens.length),
+      ...tokens,
+    );
+    const res = await this.request("/api/v2/ring", {
+      method: "POST",
+      headers: { "content-type": "application/octet-stream" },
+      body: body as BodyInit,
+    });
+    if (!res.ok) throw await readError(res);
+    await res.body?.cancel();
+  }
+
   postWrap(body: WrapJson, onProgress?: Progress): Promise<{ dirseq: number }> {
     return this.postPowJson("/api/v2/wraps", "wrap", body, onProgress);
   }
@@ -836,15 +894,33 @@ export class Api {
   }
 
   /**
+   * A new operation begins (§10.6): a creation, an add, a restore, a catch-up, or an inbox poll with its joins.
+   * Directory answers fetched from now on are fresh for it, and a cached answer it already fetched is used as is.
+   */
+  beginOperation(): void {
+    this.operationSince = this.prefixFetches;
+  }
+
+  /**
    * Every user whose `hpre` (kind "h") or `upre` (kind "u") shares the top p bits of `pre`: a complete answer (every
    * page, the last with `more = false`), cached for the session unless `fresh`. A 409 `{p}` recomputes p once and
    * retries; any other failure is transient and never means "no such user".
    */
   async prefixUsers(kind: "h" | "u", pre: number, fresh = false): Promise<UserJson[]> {
+    return (await this.prefixAnswer(kind, pre, fresh)).run;
+  }
+
+  /** The prefix answer and whether it is fresh for the current operation (fetched after it began). */
+  private async prefixAnswer(
+    kind: "h" | "u",
+    pre: number,
+    fresh: boolean,
+  ): Promise<{ run: Promise<UserJson[]>; fresh: boolean }> {
     const p = await this.prefixBits();
     const key = `${kind}/${p}/${P.topBits(pre, p)}`;
     const cached = this.prefixCache.get(key);
-    if (cached && !fresh) return cached;
+    if (cached && !fresh) return { run: cached.run, fresh: cached.seq > this.operationSince };
+    const seq = ++this.prefixFetches;
     const run = (async () => {
       try {
         return await this.prefixPages(kind, p, P.topBits(pre, p));
@@ -861,9 +937,12 @@ export class Api {
         }
       }
     })();
-    this.prefixCache.set(key, run);
-    run.catch(() => this.prefixCache.delete(key));
-    return run;
+    const entry = { seq, run };
+    this.prefixCache.set(key, entry);
+    run.catch(() => {
+      if (this.prefixCache.get(key) === entry) this.prefixCache.delete(key);
+    });
+    return { run, fresh: true };
   }
 
   private async prefixPages(kind: "h" | "u", p: number, x: number): Promise<UserJson[]> {
@@ -892,10 +971,9 @@ export class Api {
     throw new ApiError(0, "directory answer did not complete");
   }
 
-  /** The verified user registered under `handle`, or null on a complete answer without it (§10.6). */
   /**
-   * The verified user registered under `uid`, by uid prefix; null on a complete answer without it (§10.6). An answer
-   * from the session cache that lacks it is asked for again once (the user may have registered since).
+   * The verified user registered under `uid`, by uid prefix; null on a fresh complete answer without it (§10.6). A
+   * cached answer that lacks it is asked for again once, unless it is already fresh for the current operation.
    */
   userByUidPrefix(uid: Bytes, fresh = false): Promise<DirUser | null> {
     const uidB = P.b64u(uid);
@@ -921,8 +999,11 @@ export class Api {
       }
       return null;
     };
-    const found = pick(await this.prefixUsers(kind, pre, fresh));
-    if (found || fresh) return found;
-    return pick(await this.prefixUsers(kind, pre, true));
+    // A cached answer serves only the users it lists: one that lacks the user is asked again, fresh, unless it is
+    // already fresh for the current operation (a poll's joins share one fetch per prefix, §10.6).
+    const first = await this.prefixAnswer(kind, pre, fresh);
+    const found = pick(await first.run);
+    if (found || first.fresh) return found;
+    return pick(await (await this.prefixAnswer(kind, pre, true)).run);
   }
 }

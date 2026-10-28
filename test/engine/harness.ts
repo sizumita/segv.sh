@@ -39,6 +39,7 @@ export type { DirUserRow, DirWrapRow, DirlogRow, DirPrefixQuery } from "./fake/d
 export type { CkptEntry, CkptHead } from "./fake/ckpt";
 export { CKPT_PERIOD_MS } from "./fake/ckpt";
 export { RT_LIMITS } from "./fake/rt";
+export { FAKE_VAPID, FakePush, FakePushDevice, bellsB64 } from "./fake/push";
 
 // ───────────────────────── the current world ─────────────────────────
 
@@ -227,6 +228,60 @@ export const junkBody = (cls = 0): Uint8Array => P.random(P.BODY_LENS[cls]);
 export const junkRow = (E: number, label: Uint8Array = P.random(16), cls = 0) =>
   current.shard.commit(E, label, cls, junkBody(cls));
 
+/** The last row of `u`'s self lane at or below era `E` (the eras down to E − 16), as the shard holds it. */
+function lastSelfRow(
+  u: TestUser,
+  E: number,
+): { E: number; n: number; label: Uint8Array; body: Uint8Array } | null {
+  for (let x = E; x >= Math.max(0, E - 16); x--) {
+    let n = 0;
+    while (current.shard.hasLabel(x, P.Lself(u.id.rS, x, n))) n++;
+    if (n === 0) continue;
+    const label = P.Lself(u.id.rS, x, n - 1);
+    return { E: x, n: n - 1, label, body: current.shard.row(x, label)!.body };
+  }
+  return null;
+}
+
+/**
+ * Writes a raw self row of `u`, as an earlier client version or another tab would: `P.sealSelf` at the first free
+ * slot of era `era` (default: now), its prev fields naming the lane's last row, stored with `shard.commit` and
+ * published on `Tself` (plan §2.3).
+ */
+export function writeSelfRow(
+  u: TestUser,
+  records: P.SelfRecord[],
+  opts: { era?: number } = {},
+): { E: number; n: number } {
+  const E = opts.era ?? current.era;
+  let n = 0;
+  while (current.shard.hasLabel(E, P.Lself(u.id.rS, E, n))) n++;
+  const prev = lastSelfRow(u, E);
+  const label = P.Lself(u.id.rS, E, n);
+  const { cls, body } = P.sealSelf(u.id.kS, E, label, {
+    prev: prev ? { E: prev.E, n: prev.n } : P.NONE,
+    prevh: prev ? P.prevh(prev.label, prev.body) : P.ZERO16,
+    ts: current.now(),
+    records,
+  });
+  if (!current.shard.commit(E, label, cls, body, { topic: P.topicSelf(u.id.nS) }))
+    throw new Error("writeSelfRow: slot taken");
+  return { E, n };
+}
+
+/** Every self row of `u` in the eras from `from` to now, opened, in lane order. */
+export function selfRowsOf(u: TestUser, from = current.era - 4): P.SelfRecord[][] {
+  const out: P.SelfRecord[][] = [];
+  for (let E = Math.max(0, from); E <= current.era; E++)
+    for (let n = 0; ; n++) {
+      const label = P.Lself(u.id.rS, E, n);
+      const row = current.shard.row(E, label);
+      if (!row) break;
+      out.push(P.openSelf(u.id.kS, E, label, row.body).records);
+    }
+  return out;
+}
+
 // ───────────────────────── views (through the Engine interface) ─────────────────────────
 
 /**
@@ -410,6 +465,8 @@ export interface EngineI {
   ckpt: { latest: { q: number; C: Uint8Array } | null; verify(): Promise<void> } | null;
   /** the session's API client (its row memory, §12.1) */
   api: { get(keys: W.GetKey[]): Promise<W.GetStatus[]> };
+  /** notifications on this device (§11.13) */
+  push: { restored(): void; changed(): void };
   /** links (§5.5): internal engine operations in stage 1 */
   createLink(opts?: { oneShot?: boolean }): Promise<string>;
   openLink(url: string): Promise<string>;

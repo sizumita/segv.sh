@@ -844,6 +844,8 @@ export const Lmsg = (rk: Bytes, lane: number, E: number, n: number): Bytes =>
 export const Lctl = (rk: Bytes, E: number, k: number): Bytes => t16(HMAC(rk, enc("segv.sh/v2/lab/ctl", u16(E), u32(k))));
 /** T_e: realtime topic of epoch e. */
 export const topicConv = (nk: Bytes): Bytes => t16(HMAC(nk, utf8("segv.sh/v2/topic/conv")));
+/** B_e(ℓ): the Web Push bell of lane ℓ in epoch e (§4.2, §11.13). Every member can compute it; outsiders cannot. */
+export const bell = (nk: Bytes, lane: number): Bytes => t16(HMAC(nk, enc("segv.sh/v2/bell", u16(lane))));
 
 // ───────────────────────── links (§4.3) ─────────────────────────
 
@@ -981,12 +983,14 @@ export const prevh = (label: Bytes, body: Bytes): Bytes => t16(H(enc("segv.sh/v2
 
 // ───────────────────────── proof of work (§10.2) ─────────────────────────
 
-export type PowScope = "register" | "wrap" | "put" | "inbox" | "blob";
+/** `push` exists only while a deployment offers Web Push (§9.8): params report it then, and never otherwise. */
+export type PowScope = "register" | "wrap" | "put" | "inbox" | "blob" | "push";
+/** The scopes every deployment reports in params `pow`. */
 export const POW_SCOPES: readonly PowScope[] = ["register", "wrap", "put", "inbox", "blob"];
 export const POW_WINDOW_MS = 600_000;
 export const POW_MAX_BASE = 26;
 
-const POW_UNIT: Readonly<Record<PowScope, number>> = { register: 0, wrap: 0, put: 4096, inbox: 4096, blob: 1 << 20 };
+const POW_UNIT: Readonly<Record<PowScope, number>> = { register: 0, wrap: 0, put: 4096, inbox: 4096, blob: 1 << 20, push: 0 };
 
 /** base + ⌈log2(bytes / unit)⌉ above the unit, else base. */
 export function powDifficulty(scope: PowScope, base: number, bytes: number): number {
@@ -1813,8 +1817,8 @@ export interface WalkEpoch {
   /** uids of D_j in index order (raw or b64u), to follow the sender across epochs. */
   members: readonly (Bytes | string)[];
   /**
-   * The claim that ended epoch j (its stored t, rm and cuts): the final winning claim C_j, or, for the last epoch
-   * before a skip re-add, the claim that removed self; null when the epoch has no final winning claim yet.
+   * The claim that ended epoch j (its stored t, rm and cuts): the final winning claim C_j; null when the epoch has no
+   * final winning claim yet.
    */
   claim: { t: number; rm: number; cuts: readonly Cut[] } | null;
 }
@@ -1842,11 +1846,11 @@ export class MissingClaimError extends Error {
 /**
  * §6.8 old-epoch acceptance. `selfRemoved`: the claim that ended the last listed epoch removed or dropped the receiver
  * itself (its own rm bit is 1), so the receiver holds no later epoch through it.
- * `epochs` are consecutive held epochs: `epochs[0]` is D_e (the row's epoch) and
- * `epochs[k]` is D_{e+k}, so the list stops before an epoch reached by a skip re-add, and a frozen receiver's at its
- * frozen epoch. The caller passes the claim that ended each listed epoch whenever one exists, read at the position
- * of the next held epoch's EPOCH record when it did not process it (for the epoch before a skip: the claim that
- * removed self). A null claim on the last listed epoch means it has no final winning claim yet: accept. A null claim
+ * `epochs` are consecutive held epochs of one copy (a list never crosses copies): `epochs[0]` is D_e (the row's epoch)
+ * and `epochs[k]` is D_{e+k}, so a frozen receiver's list stops at its frozen epoch. The caller passes the claim that
+ * ended each listed epoch whenever one exists, read at the position of the next held epoch's EPOCH record, or of the
+ * copy's ENDED record, when it did not process it. A null claim on the last listed epoch means it has no final
+ * winning claim yet: accept. A null claim
  * with a next epoch continues by membership, since the sender's bit is 0 iff D_{j+1} lists it ("The bit without
  * C_j"); when D_{j+1} does not list the sender, the bit is 1 and the claim is needed, so the call throws
  * `MissingClaimError`. A row is never accepted for lack of a claim.
@@ -1885,7 +1889,7 @@ export function acceptOldRow(row: WalkRow, epochs: readonly WalkEpoch[], selfRem
 export const M_VER = 2;
 export const M_HEADER_LEN = 62;
 /** The types of M (§3.3): every other value is invalid. */
-export const MT = { TEXT: 1, IMAGE: 2, WELCOME: 8, CLAIM: 16, LEAVE: 17 } as const;
+export const MT = { TEXT: 1, IMAGE: 2, REACTION: 3, WELCOME: 8, CLAIM: 16, LEAVE: 17 } as const;
 export type MsgType = (typeof MT)[keyof typeof MT];
 const MSG_TYPES: readonly number[] = Object.values(MT);
 /** lane of a CLAIM. */
@@ -1926,6 +1930,68 @@ export function encodeImage(x: ImageRef): Bytes {
   return out;
 }
 
+/** A REACTION's emoji is 1..32 bytes of valid UTF-8 (§3.3). */
+export const MAX_EMOJI_BYTES = 32;
+/** REACTION content without its emoji: te, tl, tE, tn, th, op, elen. */
+export const REACTION_FIXED = 30;
+
+/**
+ * REACTION content (§3.3, §11.12): `u32 te | u16 tl | u16 tE | u32 tn | th[16] | u8 op | u8 elen | emoji[elen]`, the
+ * sender's reaction to the row at `(tE, tn)` on lane `tl` of epoch `te` (its target). The target fields have no parse
+ * rule; whether `emoji` is one emoji is not a parse rule either.
+ */
+export interface Reaction {
+  te: number;
+  tl: number;
+  tE: number;
+  tn: number;
+  /** reactTh(rk_te, label_T, body_T): binds the reaction to the target's exact stored row */
+  th: Bytes;
+  /** 1 adds the emoji, 0 removes it */
+  op: 0 | 1;
+  emoji: string;
+}
+
+export function parseReaction(b: Bytes): Reaction {
+  const r = new Rd(b, "reaction");
+  const te = r.u32();
+  const tl = r.u16();
+  const tE = r.u16();
+  const tn = r.u32();
+  const th = r.bytes(16);
+  const op = r.u8();
+  const elen = r.u8();
+  if (op !== 0 && op !== 1) bad("reaction: bad op");
+  if (elen < 1 || elen > MAX_EMOJI_BYTES) bad("reaction: bad emoji length");
+  const emoji = decodeUtf8(r.bytes(elen), "reaction emoji");
+  r.end();
+  return { te, tl, tE, tn, th, op, emoji };
+}
+
+export function encodeReaction(x: Reaction): Bytes {
+  const e = encodeUtf8(x.emoji, "reaction emoji");
+  const out = concat(
+    u32(x.te),
+    u16(x.tl),
+    u16(x.tE),
+    u32(x.tn),
+    fixed(x.th, 16, "reaction th"),
+    u8(x.op),
+    u8(e.length),
+    e,
+  );
+  parseReaction(out);
+  return out;
+}
+
+/**
+ * `th` of a REACTION to the row (label, body) of epoch `te` (§3.3): `t16(HMAC(rk_te, enc("segv.sh/v2/react", label,
+ * body)))`, keyed by the route key of the target's epoch, so only a holder of that epoch can tell which public row a
+ * reaction names.
+ */
+export const reactTh = (rk: Bytes, label: Bytes, body: Bytes): Bytes =>
+  t16(HMAC(rk, enc("segv.sh/v2/react", label, body)));
+
 /** The header fields of M other than ver, type and len. */
 export interface MHeader {
   /** The sender's index in D_e. */
@@ -1949,6 +2015,7 @@ export interface MHeader {
 export type MBody =
   | { type: typeof MT.TEXT; text: string }
   | { type: typeof MT.IMAGE; image: ImageRef }
+  | { type: typeof MT.REACTION; reaction: Reaction }
   | { type: typeof MT.WELCOME; join: Join }
   | { type: typeof MT.CLAIM; claim: Claim }
   | { type: typeof MT.LEAVE };
@@ -1963,6 +2030,8 @@ function encodeContent(m: MBody): Bytes {
     }
     case MT.IMAGE:
       return encodeImage(m.image);
+    case MT.REACTION:
+      return encodeReaction(m.reaction);
     case MT.WELCOME:
       return encodeJ(m.join);
     case MT.CLAIM:
@@ -1981,6 +2050,8 @@ function parseContent(type: number, c: Bytes): MBody {
       return { type: MT.TEXT, text: decodeUtf8(c, "text") };
     case MT.IMAGE:
       return { type: MT.IMAGE, image: parseImage(c) };
+    case MT.REACTION:
+      return { type: MT.REACTION, reaction: parseReaction(c) };
     case MT.WELCOME:
       return { type: MT.WELCOME, join: parseJ(c) };
     case MT.CLAIM:
@@ -1994,7 +2065,7 @@ function parseContent(type: number, c: Bytes): MBody {
 }
 
 /**
- * Parses M and checks every parse rule of §3.3 (none needs epoch context): ver, type ∈ {1, 2, 8, 16, 17}, content,
+ * Parses M and checks every parse rule of §3.3 (none needs epoch context): ver, type ∈ {1, 2, 3, 8, 16, 17}, content,
  * `lane = from` for lane rows and `lane = 0xFFFF` with NONE / ZERO16 prev fields for a CLAIM, `from < 32`, the
  * position rule, prevh = ZERO16 with NONE, ts ≤ 2^53 − 1, ck16 = ZERO16 with ckq = 0, len. `from < |D_e|`, the
  * label, a CLAIM's m = |D_e| and the signature are contextual (acceptRow).
@@ -2276,6 +2347,8 @@ export const RT = {
   DESC: 0x0c,
   MEMBER: 0x0d,
   LEFT: 0x0e,
+  TREG: 0x0f,
+  ENDED: 0x12,
   SNAP: 0x20,
 } as const;
 export type RType = (typeof RT)[keyof typeof RT];
@@ -2285,7 +2358,10 @@ export const VIA = { CREATED: 1, INBOX: 2, WELCOME: 3, HELLO: 4, REQUEST_ACCEPTE
 export type Via = (typeof VIA)[keyof typeof VIA];
 const isVia = (v: number): v is Via => v >= 1 && v <= 5;
 
-/** EPOCH flags: bit1 = accepted by a skip join; every other bit, bit0 included, is 0 (§7.2). */
+/**
+ * EPOCH flags: bit1 marks a legacy skip record, which the first release wrote for a skip re-add and which a reader
+ * reads as the join of a separate copy (§7.2); new code never sets it. Every other bit, bit0 included, is 0.
+ */
 export const EPOCH_SKIP = 2;
 /** LINK flags. */
 export const LINK_ONE_SHOT = 1;
@@ -2312,8 +2388,8 @@ export interface ConvJoinRec extends CopyRef, EpochMaterial {
 export interface EpochRec extends CopyRef, EpochMaterial {
   rtype: typeof RT.EPOCH;
   /**
-   * the winning claim that ended the previous held epoch: on Lctl_{e−1}, or, for a skip re-add (flag bit1), the claim
-   * that removed self, on Lctl_k of the epoch k it removed self from (§7.2)
+   * the winning claim that ended the previous held epoch, on Lctl_{e−1} (§7.2); a legacy skip record (flag bit1) names
+   * the claim that removed self from its copy, which a reader ignores
    */
   claim: Pos;
   flags: number;
@@ -2414,6 +2490,25 @@ export interface LeftRec extends CopyRef {
   /** R's position when e is R's own epoch, or NONE when the leave was carried into e from an earlier epoch */
   row: Pos;
 }
+/**
+ * The registration time `t_reg` of a bundle (§7.2): written in the same row as the CONV_JOIN of an accepted join (and
+ * kept by snapshots), so a restore reads E_start = era(t_reg) without `blob/meta`. Folded by bundleId; the first wins.
+ */
+export interface TregRec {
+  rtype: typeof RT.TREG;
+  bundleId: Bytes;
+  tReg: number;
+}
+/**
+ * The copy ended in its epoch e (§6.6 step 3): the final winning claim of e, at `claim` on Lctl_e (never NONE),
+ * removed or dropped self. Written with the next HEADS row and kept by snapshots, so a restore needs neither that
+ * control lane nor the claim's bundle (§11.4 step 5).
+ */
+export interface EndedRec extends CopyRef {
+  rtype: typeof RT.ENDED;
+  e: number;
+  claim: Pos;
+}
 export interface SnapRec {
   rtype: typeof RT.SNAP;
   blobId: Bytes;
@@ -2438,6 +2533,8 @@ export type SelfRecord =
   | DescRec
   | MemberRec
   | LeftRec
+  | TregRec
+  | EndedRec
   | SnapRec;
 
 const wrCopy = (x: CopyRef): Bytes => concat(fixed(x.conv, 16, "record conv"), fixed(x.root, 32, "record root"));
@@ -2506,6 +2603,11 @@ function recordContent(x: SelfRecord): Bytes {
     }
     case RT.LEFT:
       return concat(wrCopy(x), u32(x.e), fixed(x.uid, 16, "LEFT uid"), u32(x.t), wrPos(x.row, "LEFT"));
+    case RT.TREG:
+      return concat(fixed(x.bundleId, 32, "TREG bundleId"), u32(x.tReg));
+    case RT.ENDED:
+      if (isNone(x.claim)) bad("ENDED: the claim position is NONE");
+      return concat(wrCopy(x), u32(x.e), wrPos(x.claim, "ENDED"));
     case RT.SNAP:
       return concat(
         fixed(x.blobId, 32, "SNAP blobId"),
@@ -2636,6 +2738,13 @@ export function parseRecord(rtype: number, c: Bytes): SelfRecord | null {
     }
     case RT.LEFT:
       x = { rtype, ...rdCopy(r), e: r.u32(), uid: r.bytes(16), t: r.u32(), row: rdPos(r, what) };
+      break;
+    case RT.TREG:
+      x = { rtype, bundleId: r.bytes(32), tReg: r.u32() };
+      break;
+    case RT.ENDED:
+      x = { rtype, ...rdCopy(r), e: r.u32(), claim: rdPos(r, what) };
+      if (isNone(x.claim)) bad(`${what}: the claim position is NONE`);
       break;
     case RT.SNAP:
       x = { rtype, blobId: r.bytes(32), key: r.bytes(32), size: r.u32(), pos: rdPos(r, what) };

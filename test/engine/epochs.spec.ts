@@ -30,7 +30,7 @@ async function group(names: string[], name = "g") {
   for (const u of users) engines.push(await engineFor(u));
   const id = await engines[0].createConversation(names.slice(1), name);
   await settle(...engines);
-  for (const E of engines.slice(1)) E.markRead(id);
+  for (const E of engines.slice(1)) await E.accept(id);
   await settle(...engines);
   return { users, engines, id };
 }
@@ -78,8 +78,9 @@ describe("followed lanes at restore", () => {
     await A.addMembers(id, [makeUser("carol").handle]);
     await settle(A, B);
     await I(A).catchUp();
-    const heads = I(A).self!.fold.heads;
-    const entry = [...heads.values()].find((h) => h.e === 1)!;
+    const c = conv(A, id);
+    const entry = I(A).self!.fold.headsOf(`${P.b64u(c.conv)}.${P.b64u(c.root)}`)!;
+    expect(entry.e).toBe(1);
     const bj = P.memberIndex(conv(A, id).epochs.get(0)!.D, bob.uid);
     expect(entry.followed.map((f) => [f.ef, f.lane])).toEqual([[0, bj]]);
     const A2 = await engineFor(alice);
@@ -148,7 +149,7 @@ describe("forged member slots", () => {
     forgeJoin(alice, { conv: conv0, e: 0, EK, bundleId: P.fromB64u(reg.id), bundleSize: b.size });
     await settle(A);
     const id = P.b64u(conv0);
-    A.markRead(id);
+    await A.accept(id);
     await settle(A);
     const handles = mustView(A, id).members.map((m) => m.handle);
     expect(handles).toContain("mallory");

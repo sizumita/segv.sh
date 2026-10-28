@@ -9,6 +9,7 @@
 //                              ?mock=boot       -> stays in boot
 //                              ?mock=warn       -> adds security warnings + an error
 //                              ?mock=offline    -> connected = false, syncing = true
+//                              ?mock=push       -> notifications can be turned on and off
 // Tests can drive it through `window.__segvMock` (DEV only).
 
 import type {
@@ -76,6 +77,7 @@ interface MockOpts {
   boot: boolean;
   warn: boolean;
   offline: boolean;
+  push: boolean;
 }
 
 function parseOpts(): MockOpts {
@@ -84,6 +86,7 @@ function parseOpts(): MockOpts {
   return {
     ready: f.has("ready") || f.has("warn") || f.has("offline"),
     noprf: f.has("noprf"),
+    push: f.has("push"),
     fatal: f.has("fatal"),
     boot: f.has("boot"),
     warn: f.has("warn"),
@@ -103,6 +106,7 @@ class MockEngine implements Engine {
     syncing: false,
     warnings: [],
     prfSupported: null,
+    notifications: "unavailable",
   };
   private subs = new Set<(s: EngineState) => void>();
   private seq = 1000;
@@ -117,7 +121,10 @@ class MockEngine implements Engine {
   private async boot() {
     if (this.opts.boot) return;
     await sleep(200);
-    this.set({ prfSupported: !this.opts.noprf });
+    this.set({
+      prfSupported: !this.opts.noprf,
+      notifications: this.opts.push ? "off" : "unavailable",
+    });
     if (this.opts.fatal) {
       this.set({
         phase: "fatal",
@@ -185,6 +192,7 @@ class MockEngine implements Engine {
       text: p.text,
       image: p.image,
       status: p.status ?? "sent",
+      reactions: p.reactions ?? [],
     };
   }
 
@@ -210,6 +218,7 @@ class MockEngine implements Engine {
       blocked: "",
       frozen: false,
       request: false,
+      byContact: true,
       lastTs: now - 2 * MIN,
       unread: 0,
       messages: [
@@ -261,6 +270,7 @@ class MockEngine implements Engine {
       blocked: "",
       frozen: false,
       request: false,
+      byContact: true,
       lastTs: now - 9 * MIN,
       unread: 3,
       messages: [
@@ -302,6 +312,7 @@ class MockEngine implements Engine {
       blocked: "removed",
       frozen: false,
       request: false,
+      byContact: true,
       lastTs: now - 6 * DAY,
       unread: 0,
       messages: [
@@ -318,6 +329,7 @@ class MockEngine implements Engine {
       blocked: "",
       frozen: false,
       request: false,
+      byContact: true,
       lastTs: now - 40 * DAY,
       unread: 0,
       messages: [m({ kind: "text", fromHandle: "carol", text: "ping", ts: now - 40 * DAY })],
@@ -331,6 +343,7 @@ class MockEngine implements Engine {
       blocked: "pending",
       frozen: false,
       request: false,
+      byContact: true,
       lastTs: now - 30 * MIN,
       unread: 0,
       messages: [
@@ -346,6 +359,7 @@ class MockEngine implements Engine {
       blocked: "frozen",
       frozen: true,
       request: false,
+      byContact: true,
       lastTs: now - 3 * HOUR,
       unread: 0,
       messages: [m({ kind: "system", text: "@mallory removed @dave", ts: now - 3 * HOUR })],
@@ -359,6 +373,7 @@ class MockEngine implements Engine {
       blocked: "",
       frozen: false,
       request: true,
+      byContact: false,
       lastTs: now - 50 * MIN,
       unread: 1,
       messages: [
@@ -380,6 +395,7 @@ class MockEngine implements Engine {
       blocked: "",
       frozen: false,
       request: true,
+      byContact: false,
       lastTs: now - 4 * HOUR,
       unread: 2,
       messages: [
@@ -407,6 +423,7 @@ class MockEngine implements Engine {
       blocked: "left",
       frozen: false,
       request: false,
+      byContact: true,
       lastTs: now - 9 * DAY,
       unread: 0,
       messages: [
@@ -495,6 +512,7 @@ class MockEngine implements Engine {
       blocked: "",
       frozen: false,
       request: false,
+      byContact: true,
       lastTs: now,
       unread: 0,
       messages: [],
@@ -642,11 +660,46 @@ class MockEngine implements Engine {
     );
   }
 
+  async setNotifications(on: boolean): Promise<void> {
+    if (this.state.notifications === "unavailable") return;
+    await sleep(150);
+    this.set({ notifications: on ? "on" : "off" });
+  }
+
   markRead(convId: string): void {
-    // Also the "opened" hint: it accepts a request copy (§11.11).
+    // The pane is open: it accepts nothing (§11.11).
     const c = this.state.conversations.find((x) => x.id === convId);
-    if (c && (c.unread || c.request))
-      this.updateConv(convId, (x) => ({ ...x, unread: 0, request: false }));
+    if (c?.unread) this.updateConv(convId, (x) => ({ ...x, unread: 0 }));
+  }
+
+  async accept(convId: string): Promise<void> {
+    const c = this.conv(convId);
+    if (c.byContact || !c.canSend) return;
+    await sleep(300);
+    this.updateConv(convId, (x) => ({ ...x, request: false, byContact: true }));
+  }
+
+  async react(convId: string, messageKey: string, emoji: string, on: boolean): Promise<void> {
+    const c = this.conv(convId);
+    if (!c.canSend) this.fail(blockedMessage(c));
+    await sleep(200);
+    this.updateConv(convId, (x) => ({
+      ...x,
+      request: false,
+      byContact: true,
+      messages: x.messages.map((m) => {
+        if (m.key !== messageKey) return m;
+        const had = m.reactions.find((r) => r.emoji === emoji);
+        if (on && had?.mine) return m;
+        if (!on && !had?.mine) return m;
+        const others = (had?.count ?? 0) - (had?.mine ? 1 : 0);
+        const next = on
+          ? { emoji, count: others + 1, mine: true }
+          : { emoji, count: others, mine: false };
+        const rest = m.reactions.filter((r) => r.emoji !== emoji);
+        return { ...m, reactions: next.count > 0 ? [...rest, next] : rest };
+      }),
+    }));
   }
   clearError(): void {
     if (this.state.error) this.set({ error: "" });

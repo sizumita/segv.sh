@@ -166,15 +166,18 @@ textarea:focus {
 }
 
 /* ---- single-column pages: boot, signed-out, recovery, fatal ---- */
+/* env(safe-area-inset-*) is 0 except on screens with a notch or a home indicator (viewport-fit=cover). */
 .boot {
-  padding: 48px 16px;
+  padding: calc(48px + env(safe-area-inset-top)) max(16px, env(safe-area-inset-right))
+    calc(48px + env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
   max-width: 40rem;
   margin: 0 auto;
 }
 .page {
   max-width: 40rem;
   margin: 0 auto;
-  padding: 48px 16px 64px;
+  padding: calc(48px + env(safe-area-inset-top)) max(16px, env(safe-area-inset-right))
+    calc(64px + env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
   display: grid;
   gap: 16px;
 }
@@ -224,6 +227,9 @@ textarea:focus {
   height: 100dvh;
   display: flex;
   flex-direction: column;
+  /* keeps the top bar, the composer and the list footer clear of a notch and the home indicator */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
+    env(safe-area-inset-left);
 }
 .bar {
   display: flex;
@@ -431,6 +437,48 @@ textarea:focus {
   color: var(--fg);
   font-weight: 700;
 }
+.reacts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin: 2px 0;
+}
+.react {
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  padding: 0 6px;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--dim);
+  cursor: pointer;
+}
+.react.mine {
+  border-color: var(--fg);
+  font-weight: 700;
+}
+.react:disabled {
+  cursor: default;
+}
+.react.add {
+  color: var(--dim);
+  border-style: dashed;
+}
+.palette {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 2px;
+}
+@media (hover: hover) {
+  .m .react.add {
+    visibility: hidden;
+  }
+  .m:hover .react.add,
+  .m:focus-within .react.add {
+    visibility: visible;
+  }
+}
 .img {
   position: relative;
   display: inline-block;
@@ -540,7 +588,8 @@ textarea:focus {
   align-items: center;
   justify-content: center;
   gap: 10px;
-  padding: 16px;
+  padding: calc(16px + env(safe-area-inset-top)) calc(16px + env(safe-area-inset-right))
+    calc(16px + env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left));
   cursor: zoom-out;
 }
 .viewer img {
@@ -569,7 +618,7 @@ textarea:focus {
     font-size: 16px; /* no iOS zoom on focus */
   }
   .page {
-    padding-top: 24px;
+    padding-top: calc(24px + env(safe-area-inset-top));
   }
   .panes {
     grid-template-columns: 1fr;

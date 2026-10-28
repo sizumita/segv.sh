@@ -7,6 +7,7 @@ export { BlobRegDO } from "../../src/server/blobreg-do";
 export { InboxDO } from "../../src/server/inbox-do";
 export { RealtimeDO } from "../../src/server/realtime-do";
 export { CheckpointDO } from "../../src/server/ckpt-do";
+export { PushDO } from "../../src/server/push-do";
 
 export default {
   async fetch(request, env, ctx) {

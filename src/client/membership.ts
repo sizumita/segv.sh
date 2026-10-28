@@ -44,22 +44,27 @@ export interface MembershipHost {
   sweep(targets: LaneTarget[]): Promise<void>;
   /** the copy now follows epoch `ep`: its topic, the subscriptions, HEADS (§6.6 step 4) */
   onSwitch(c: Copy, ep: Epoch): void;
+  /** the copy ended at the final winning claim `w` of `ep`: its ENDED record rides in the next HEADS row (§6.6 step 3) */
+  recordEnd(c: Copy, ep: Epoch, w: Winner): void;
   /**
-   * A restore met a claim that removed self from epoch k: the skip re-add that continues the copy, from an EPOCH
-   * record with flag bit1 above k (§11.4 step 5), or null.
+   * The final winning claim `w` of `ep` was processed or read: when its committer is neither `rootBy` nor self, it
+   * confirms the copy, recorded by a CONFIRMED with the next HEADS row (§6.7 step 6).
    */
-  skipAfter(c: Copy, k: number): Promise<Epoch | null>;
+  claimConfirms(c: Copy, ep: Epoch, w: Winner): void;
   /** the copy enters the epoch of its restore's HEADS entry (§11.4 step 5) */
   applyHeads(c: Copy, ep: Epoch): void;
+  /**
+   * The copy enters epoch `ep`: its control lane starts at the furthest control position that the account's HEADS
+   * entries for that epoch give, when one does (§7.3, §11.4 step 5).
+   */
+  ctlFrom(c: Copy, ep: Epoch): void;
   /** an own LEAVE row was applied in epoch e: write its LEAVE record if the account has none (§6.9) */
   ownLeave(c: Copy, e: number): void;
   /** a member's kept leave source changed in this epoch (its LEFT record rides in the next HEADS row, §7.3) */
   leftChanged(c: Copy, ep: Epoch): void;
   /** an own row's message: mark it failed (§11.3 step 7) */
   failOwn(c: Copy, key: string): void;
-  /** the copy's own leave is current: a LEAVE record and no skip re-add above the latest one (§6.9) */
-  leaveCurrent(c: Copy): boolean;
-  /** self had left in epoch k: the copy is left now, or a LEAVE record at or below k with no skip re-add between */
+  /** self had left in epoch k: the copy is left now, or it holds a LEAVE record for an epoch at or below k (§6.6) */
   leftAt(c: Copy, k: number): boolean;
 }
 
@@ -127,14 +132,15 @@ const claimOrder = (h: MembershipHost, ep: Epoch, w: Winner, sub: number): numbe
 ];
 
 /**
- * The lines that follow the leave state (§6.6 step 5, §11.9), derived again from scratch: per processed claim the
- * "removed" and "keys rotated" lines, and per LEAVE row held the "@x left" line while it is the kept source of x's
- * leave in its epoch, §6.8 accepts it, and x is not recorded as left in the epoch below.
+ * The lines that follow the leave state (§6.6 steps 3 and 5, §11.9), derived again from scratch: per processed claim
+ * the "removed" and "keys rotated" lines, or "@by removed you" unless self had left in that epoch, and per LEAVE row
+ * held the "@x left" line while it is the kept source of x's leave in its epoch, §6.8 accepts it, and x is not
+ * recorded as left in the epoch below.
  */
 export function deriveLines(h: MembershipHost, c: Copy): void {
   const want = new Map<string, { order: number[]; render: () => string }>();
   for (const ep of c.epochs.values()) {
-    const prev = ep.viaSkip ? undefined : c.epochs.get(ep.e - 1);
+    const prev = c.epochs.get(ep.e - 1);
     for (const [uidB, s] of ep.left) {
       if (s.key === null || s.order === null || !leftIn(c, ep, uidB)) continue;
       if (prev && leftIn(c, prev, uidB)) continue;
@@ -142,7 +148,16 @@ export function deriveLines(h: MembershipHost, c: Copy): void {
       want.set(`left:${s.key}`, { order: s.order, render: () => `${who(h, c, ep, j)} left` });
     }
     const w = ep.ctl.winner;
-    if (!ep.ended || !w || ep.myIndex < 0 || P.rmHas(w.claim.rm, ep.myIndex)) continue;
+    if (!ep.ended || !w || ep.myIndex < 0) continue;
+    if (P.rmHas(w.claim.rm, ep.myIndex)) {
+      // Removed, or dropped after a leave: derived from the LEAVE records, so a late one takes the line away.
+      if (!h.leftAt(c, ep.e))
+        want.set(`sys:${ep.e}:rmyou`, {
+          order: claimOrder(h, ep, w, 0),
+          render: () => `@${h.handleOf(c, ep, w.from)} removed you`,
+        });
+      continue;
+    }
     const removed: number[] = [];
     const rotated: number[] = [];
     ep.D.members.forEach((m, j) => {
@@ -162,7 +177,7 @@ export function deriveLines(h: MembershipHost, c: Copy): void {
       });
   }
   for (const key of c.lines.keys())
-    if ((key.startsWith("left:") || /^sys:\d+:(rm|rot)$/.test(key)) && !want.has(key))
+    if ((key.startsWith("left:") || /^sys:\d+:(rm|rot|rmyou)$/.test(key)) && !want.has(key))
       dropLine(c, key);
   for (const [key, x] of want) putLine(c, key, x.order, x.render);
 }
@@ -174,6 +189,7 @@ export function deriveLines(h: MembershipHost, c: Copy): void {
  * `unread`; an own row's message is marked failed (§11.3 step 7).
  */
 export function retract(h: MembershipHost, c: Copy): void {
+  if (c.reactions.size) c.reactionsDirty = true; // reactions are decided again with the rows (§11.12)
   for (const ep of c.epochs.values())
     for (const [key, r] of ep.rows) {
       if (!r.shown || acceptedOld(c, ep.e, r.j, { E: r.E, n: r.n }, r.t)) continue;
@@ -204,21 +220,18 @@ export function onLeave(
   const uid = ep.D.members[j].uid;
   const uidB = P.b64u(uid);
   if (P.equalBytes(uid, h.selfUid)) {
-    const skipAbove = [...c.epochs.values()].some((x) => x.viaSkip && x.e > ep.e);
-    if (!skipAbove) {
-      c.left = true;
-      // One line per leave, at the earliest own LEAVE row held (a repeated LEAVE adds none).
-      const since = Math.max(0, ...[...c.epochs.values()].filter((x) => x.viaSkip).map((x) => x.e));
-      putLineEarliest(c, `sys:you-left:${since}`, src.order, () => YOU_LEFT);
-    }
+    c.left = true;
+    // One line per leave, at the earliest own LEAVE row held (a repeated LEAVE adds none).
+    putLineEarliest(c, "sys:you-left", src.order, () => YOU_LEFT);
     h.ownLeave(c, ep.e);
+    deriveLines(h, c); // a removal claim of an epoch at or above this one shows no "removed you" now
     h.changed();
     return;
   }
   c.leaves.add(uidB); // never a WELCOME channel to this member again (§6.12 step 1)
   for (let k = ep.e; ; k++) {
     const x = c.epochs.get(k);
-    if (!x || (k > ep.e && x.viaSkip) || P.memberIndex(x.D, uid) < 0) break;
+    if (!x || P.memberIndex(x.D, uid) < 0) break;
     const s: LeaveSource =
       k === ep.e
         ? { t: src.t, row: { ...src.row }, key: src.key, order: src.order }
@@ -246,16 +259,16 @@ function carryLeaves(from: Epoch, to: Epoch): void {
 
 /** The lanes of epoch e−1 not swept yet: they leave the expected-label map when the copy switches past e (§11.2). */
 function unsweptBelow(c: Copy, ep: Epoch): LaneTarget[] {
-  const prev = ep.viaSkip ? undefined : c.epochs.get(ep.e - 1);
+  const prev = c.epochs.get(ep.e - 1);
   if (!prev) return [];
   return prev.lanes.flatMap((l, j) => (l.swept ? [] : [{ c, ep: prev, lane: j }]));
 }
 
 /**
- * Processes the final winning claim `w` of epoch `ep` (§6.6): self removed (rm bit 1; a restore continues at a
- * recorded skip re-add), frozen (the own entry does not open, or a D′ check fails), or the switch to e+1. In every
- * case the claim is kept as the one that ended e (§6.8), rows are decided again, and the leave-dependent lines are
- * derived again.
+ * Processes the final winning claim `w` of epoch `ep` (§6.6): self removed (rm bit 1: the copy has ended, for good),
+ * frozen (the own entry does not open, or a D′ check fails), or the switch to e+1. In every case the claim is kept as
+ * the one that ended e (§6.8), it confirms the copy when a third member made it, rows are decided again, and the
+ * leave-dependent lines are derived again.
  */
 export async function processWinner(
   h: MembershipHost,
@@ -265,32 +278,21 @@ export async function processWinner(
 ): Promise<void> {
   const claim = w.claim;
   ep.ended = { t: w.t, rm: claim.rm, cuts: claim.cuts, at: { E: w.E, n: w.n } };
+  ep.endedAt = null;
+  h.claimConfirms(c, ep, w);
   const i = ep.myIndex;
   const byOthers = w.from !== i;
   if (i < 0) return;
   if (P.rmHas(claim.rm, i)) {
-    // Removed, or dropped after a leave: the lanes are swept once more (WELCOMEs, §6.9), then the copy stops here.
+    // Removed, or dropped after a leave: the lanes are swept once more (WELCOMEs, §6.9), then the copy has ended
+    // (§6.6 step 3): it never moves to a later epoch, and a re-add starts a separate copy (§6.7 step 6).
     if (ep.lanesOn)
       await h.sweep([...ep.lanes.map((_, j) => ({ c, ep, lane: j })), ...unsweptBelow(c, ep)]);
     for (const l of ep.lanes) l.swept = true;
     for (const t of unsweptBelow(c, ep)) t.ep.lanes[t.lane as number].swept = true;
-    // "@by removed you" is decided at k (a self-leaver gets none) and stays when a skip re-add follows.
-    if (!h.leftAt(c, ep.e))
-      putLine(
-        c,
-        `sys:${ep.e}:rmyou`,
-        claimOrder(h, ep, w, 0),
-        () => `@${h.handleOf(c, ep, w.from)} removed you`,
-      );
-    const skip = await h.skipAfter(c, ep.e);
-    if (skip) {
-      skip.viaSkip = true;
-      enterEpoch(h, c, skip);
-      c.left = h.leaveCurrent(c); // a skip re-add above the latest LEAVE record ends the leave (§6.9)
-    } else {
-      c.removed = true;
-      if (h.live() && byOthers) c.unread++;
-    }
+    c.removed = true;
+    if (h.live() && byOthers) c.unread++;
+    h.recordEnd(c, ep, w);
     retract(h, c);
     deriveLines(h, c);
     h.changed();
@@ -332,13 +334,91 @@ export async function processWinner(
   h.changed();
 }
 
-/** The copy continues at `next` (a switch, or a skip re-add): held, current, its lanes, HEADS, topic. */
+/**
+ * The copy holds the epoch that its ENDED record names (§6.6 step 3, §7.3): it has ended there, latched, without
+ * processing the claim. The lanes of the epoch, and those of e−1 still followed, are swept once more as for a processed
+ * removal; a row that needs the claim waits for it (`SyncCtx.holdRow`), and the claim is read at the record's position
+ * only when such a row, or the copy's history, needs it (§11.4 steps 5–6).
+ */
+export async function endByRecord(h: MembershipHost, c: Copy, ep: Epoch, at: P.Pos): Promise<void> {
+  ep.endedAt = { ...at };
+  c.removed = true;
+  if (ep.lanesOn)
+    await h.sweep([...ep.lanes.map((_, j) => ({ c, ep, lane: j })), ...unsweptBelow(c, ep)]);
+  for (const l of ep.lanes) l.swept = true;
+  for (const t of unsweptBelow(c, ep)) t.ep.lanes[t.lane as number].swept = true;
+  deriveLines(h, c);
+  h.changed();
+}
+
+/**
+ * The claim that ended the copy, read at its ENDED record's position (§6.8, §11.4 step 5): kept as the final winner
+ * of the epoch, as a processed claim would be (it confirms the copy when a third member made it), without evaluating
+ * it again. Rows are decided again and "@by removed you" is derived (§11.9).
+ */
+export function claimRead(h: MembershipHost, c: Copy, ep: Epoch, w: Winner): void {
+  ep.ctl.winner = w;
+  ep.ctl.queue = [];
+  ep.ended = { t: w.t, rm: w.claim.rm, cuts: w.claim.cuts, at: { E: w.E, n: w.n } };
+  ep.endedAt = null;
+  h.claimConfirms(c, ep, w);
+  retract(h, c);
+  deriveLines(h, c);
+  h.changed();
+}
+
+/**
+ * Below a snapshot's top (§11.4 step 5): the epoch's winning claim, read at the position that the next held epoch's
+ * EPOCH record names, is used as a processed claim without evaluating it again: it confirms the copy when a third
+ * member made it, the lanes of e−1 still followed are swept, and the copy switches to the next epoch, whose key the
+ * record gives, with the claim's lines.
+ */
+export async function switchByRecord(
+  h: MembershipHost,
+  c: Copy,
+  ep: Epoch,
+  w: Winner,
+  next: Epoch,
+): Promise<void> {
+  ep.ctl.winner = w;
+  ep.ctl.queue = [];
+  ep.ended = { t: w.t, rm: w.claim.rm, cuts: w.claim.cuts, at: { E: w.E, n: w.n } };
+  h.claimConfirms(c, ep, w);
+  const below = unsweptBelow(c, ep);
+  if (below.length) await h.sweep(below);
+  for (const t of below) t.ep.lanes[t.lane as number].swept = true;
+  if (!ep.lanesOn) for (const l of ep.lanes) l.swept = true;
+  carryLeaves(ep, next);
+  enterEpoch(h, c, next);
+  claimLines(h, c, ep, next, w);
+  retract(h, c);
+  deriveLines(h, c);
+  h.changed();
+}
+
+/**
+ * An older epoch that history loads (§11.10, §11.4 step 6), with the claim that ended it read at a record's position:
+ * its lines show as a processed claim's would (§11.9), and §6.8 decides its rows with it.
+ */
+export function historyClaim(h: MembershipHost, c: Copy, ep: Epoch, w: Winner): void {
+  ep.ctl.winner = w;
+  ep.ctl.queue = [];
+  ep.ended = { t: w.t, rm: w.claim.rm, cuts: w.claim.cuts, at: { E: w.E, n: w.n } };
+  const next = c.epochs.get(ep.e + 1);
+  if (next) claimLines(h, c, ep, next, w);
+  retract(h, c);
+  deriveLines(h, c);
+  h.changed();
+}
+
+/** The copy continues at `next` (the switch of §6.6 step 4): held, current, its lanes, HEADS, topic. */
 export function enterEpoch(h: MembershipHost, c: Copy, next: Epoch): void {
   next.lanesOn = c.heads === null || next.e >= c.heads.e;
   if (!next.lanesOn) for (const l of next.lanes) l.swept = true;
   c.epochs.set(next.e, next);
   c.current = next.e;
   if (c.heads && c.heads.e === next.e) h.applyHeads(c, next);
+  h.ctlFrom(c, next);
   h.onSwitch(c, next);
 }
 

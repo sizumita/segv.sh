@@ -32,6 +32,13 @@ export interface ImageRef {
   h: number;
 }
 
+/** One emoji under a message (§11.12): how many members have it on, and whether self is one of them. */
+export interface ReactionView {
+  emoji: string;
+  count: number;
+  mine: boolean;
+}
+
 export interface MessageView {
   /** stable unique key (era and label hex for a row, `local:<n>` for a local echo) */
   key: string;
@@ -46,6 +53,8 @@ export interface MessageView {
   text?: string; // text body, or the system line ("alice added bob")
   image?: ImageRef;
   status: "sent" | "sending" | "failed";
+  /** the reactions to a TEXT or IMAGE message (§11.12); empty for every other message */
+  reactions: ReactionView[];
 }
 
 /**
@@ -74,8 +83,13 @@ export interface ConversationView {
   blocked: Blocked;
   /** the members can no longer change (§6.6 steps 4 and 6): adding and removing fail; sending and leaving work */
   frozen: boolean;
-  /** a request copy (§11.5): opening it (`markRead`) accepts it and makes its inviter a contact */
+  /** a request copy (§11.5): the user accepts it with `accept`; opening its preview accepts nothing */
   request: boolean;
+  /**
+   * The copy's inviter (`rootBy`) is self or a contact (§11.11). While it is false and the copy has not ended, the UI
+   * shows the copy as a request's read-only preview, whose accept control calls `accept`.
+   */
+  byContact: boolean;
   lastTs: number; // for sorting
   unread: number;
   /** display order (§11.8); local echoes last */
@@ -94,6 +108,11 @@ export interface EngineState {
   syncing: boolean; // restoring or catching up
   warnings: string[]; // security warnings (split view, signature failures, …)
   prfSupported: boolean | null; // getClientCapabilities()['extension:prf'] if known
+  /**
+   * Notifications on this device (§11.13): "unavailable" when the browser has no Web Push (on iOS and iPadOS, outside
+   * a Home Screen web app) or the server offers none; otherwise whether they are on. Per device, never synced.
+   */
+  notifications: "unavailable" | "off" | "on";
 }
 
 export interface Engine {
@@ -127,12 +146,29 @@ export interface Engine {
   removeMember(convId: string, uid: string): Promise<void>;
   leave(convId: string): Promise<void>;
 
+  /**
+   * Adds (`on`) or removes one emoji reaction to the TEXT or IMAGE message `messageKey` (§11.12): one REACTION row,
+   * sent as a text is (§11.3) but without an echo. Resolves when the row counts as delivered; a reaction that would
+   * change nothing resolves at once without a row.
+   */
+  react(convId: string, messageKey: string, emoji: string, on: boolean): Promise<void>;
+  /**
+   * The user's acceptance from the accept control (§11.5, §11.11): for a live copy whose inviter is neither self nor
+   * a contact, writes the request's acceptance and the inviter's CONTACT at once; does nothing for any other copy.
+   */
+  accept(convId: string): Promise<void>;
+
   /** Downloads + decrypts an image. Resolves with an object URL (cached per image id). */
   loadImage(img: ImageRef): Promise<string>;
   /**
-   * Resets `unread`. Also the "conversation opened" hint: it accepts a request copy and starts scrollback once
-   * (§11.10–§11.11), even when `unread` is 0.
+   * Resets `unread` and starts scrollback once (§11.10–§11.11): the "conversation pane is open" hint, even when
+   * `unread` is 0. It accepts nothing.
    */
   markRead(convId: string): void;
+  /**
+   * Turns notifications on this device on or off (§11.13). Turning them on must be called from the user's click: it
+   * may ask for permission.
+   */
+  setNotifications(on: boolean): Promise<void>;
   clearError(): void;
 }

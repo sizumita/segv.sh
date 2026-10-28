@@ -22,8 +22,10 @@ import {
   T0_MS,
   eraEnd,
   eraStart,
+  era,
   receiptMsg,
   routeV,
+  secOf,
   shardOf,
   type Bytes,
 } from "../lib/proto";
@@ -54,6 +56,7 @@ import {
   SECURITY_HEADERS,
   contentLength,
   errorResponse,
+  exactKeys,
   intParam,
   json,
   logErr,
@@ -79,17 +82,22 @@ import {
   eraBounds,
   kcommitFor,
   krouteFor,
+  pushConfig,
+  pushHostAllowed,
   serverKeys,
   srvSign,
   v2Params,
   v2ParamsValid,
+  type PushConfig,
   type ServerKeys,
   type V2Params,
 } from "./env";
+import { PUSH_TOKENS, PUSH_WINDOW } from "./push-do";
 import {
   blobRegStub,
   ckptStub,
   inboxStub,
+  pushStub,
   rtStub,
   shardStub,
   type BlobMeta,
@@ -103,6 +111,7 @@ import {
   type ShardPutResult,
   type ShardPutRow,
 } from "./types";
+import { isP256Point } from "./webpush";
 
 /** Request body caps (bytes, §10.3–§10.6). */
 export const MAX_REGISTER_BODY = 64 * 1024;
@@ -150,7 +159,7 @@ export class ApiError extends HttpError {
   }
 }
 
-const rl = (env: Env, name: "RL_WRITE" | "RL_BLOB" | "RL_READ" | "RL_INBOX"): RateLimit | undefined =>
+const rl = (env: Env, name: "RL_WRITE" | "RL_BLOB" | "RL_READ" | "RL_INBOX" | "RL_RING"): RateLimit | undefined =>
   (env as unknown as Record<string, RateLimit | undefined>)[name];
 
 const readLimit = (c: Ctx) => rateLimit(rl(c.env, "RL_READ"), "read", c.request);
@@ -247,6 +256,7 @@ async function params(c: Ctx): Promise<Response> {
   // Never throws: while D1 fails this is the last good P (or 0), logged and retried by currentP itself.
   const p = await currentP(c.env);
   const E = eraBounds(c.now, c.params.skew).now;
+  const push = pushConfig(c.env);
   return json({
     v: 2,
     now: c.now,
@@ -264,7 +274,7 @@ async function params(c: Ctx): Promise<Response> {
     efirst: c.params.eFirst,
     kcommit: enc64(kcommitFor(c.keys, E)),
     srvKey: enc64(c.keys.srvPk),
-    pow: powParams(c.env),
+    pow: powParams(c.env, push !== null),
     limits: {
       putRows: PUT_MAX_ROWS,
       putBytes: PUT_MAX_BYTES,
@@ -273,6 +283,8 @@ async function params(c: Ctx): Promise<Response> {
       blobMax: BLOB_MAX,
       textMax: TEXT_MAX,
     },
+    // Only while push is on (§9.8), and then always with pow.push.
+    ...(push ? { push: { vapid: enc64(push.vapidPk), window: PUSH_WINDOW, maxTokens: PUSH_TOKENS } } : {}),
   });
 }
 
@@ -879,6 +891,113 @@ async function dirlog(c: Ctx): Promise<Response> {
   return json(await dirlogPage(c.env, after, limit));
 }
 
+// ───────────── Web Push (§10.10) ─────────────
+
+export const MAX_PUSH_SUB_BODY = 16 * 1024;
+/** 20 + 16·64 bytes. */
+export const MAX_RING_BODY = 1044;
+/** A ring is for a row stored in the last RING_FRESH seconds. */
+export const RING_FRESH = 60;
+
+const noContent = (): Response =>
+  new Response(null, { status: 204, headers: { "cache-control": "no-store", ...SECURITY_HEADERS } });
+
+function b64uField(v: unknown, len: number, what: string): Bytes {
+  let b: Bytes;
+  try {
+    b = dec64(v);
+  } catch {
+    throw new HttpError(400, `invalid ${what}`);
+  }
+  if (b.length !== len) throw new HttpError(400, `invalid ${what}`);
+  return b;
+}
+
+/** An absolute https URL equal to its serialization, without userinfo or port, on a PUSH_HOSTS host. */
+function pushEndpoint(cfg: PushConfig, v: unknown): string {
+  if (typeof v !== "string" || new TextEncoder().encode(v).length > 1024) throw new HttpError(400, "invalid endpoint");
+  let u: URL;
+  try {
+    u = new URL(v);
+  } catch {
+    throw new HttpError(400, "invalid endpoint");
+  }
+  if (u.href !== v || u.protocol !== "https:" || u.username !== "" || u.password !== "" || u.port !== "") {
+    throw new HttpError(400, "invalid endpoint");
+  }
+  if (!pushHostAllowed(cfg, u.hostname)) throw new HttpError(400, "endpoint host is not a known push service");
+  return v;
+}
+
+async function pushSub(c: Ctx, cfg: PushConfig): Promise<Response> {
+  await writeLimit(c);
+  const bytes = await readBody(c.request, MAX_PUSH_SUB_BODY);
+  checkPow(c.request, c.env, "push", await sha256(bytes), bytes.length, c.now);
+  const o = exactKeys(parseJsonObject(bytes), ["endpoint", "p256dh", "auth", "tokens"], "push subscription");
+  const endpoint = pushEndpoint(cfg, o.endpoint);
+  const p256dh = b64uField(o.p256dh, 65, "p256dh");
+  if (!isP256Point(p256dh)) throw new HttpError(400, "invalid p256dh");
+  const auth = b64uField(o.auth, 16, "auth");
+  if (!Array.isArray(o.tokens)) throw new HttpError(400, "invalid tokens");
+  const seen = new Map<string, Bytes>();
+  for (const t of o.tokens as unknown[]) {
+    const b = b64uField(t, 16, "token");
+    seen.set(enc64(b), b);
+  }
+  if (seen.size > PUSH_TOKENS) throw new HttpError(400, `at most ${PUSH_TOKENS} tokens`);
+  let r: string;
+  try {
+    r = await pushStub(c.env).sub(endpoint, p256dh, auth, [...seen.values()]);
+  } catch (e) {
+    console.error(JSON.stringify({ msg: "push sub failed", error: logErr(e) }));
+    throw new HttpError(503, "storage unavailable", { "retry-after": "5" });
+  }
+  if (r === "full") throw new HttpError(503, "push full", { "retry-after": "3600" });
+  return noContent();
+}
+
+/**
+ * POST /api/v2/ring: 204 as soon as the request parses, whatever happens next, so the answer never tells whether a
+ * bell is registered, the row exists or was rung before (§10.10). The rest runs after the answer.
+ */
+async function ring(c: Ctx): Promise<Response> {
+  await rateLimit(rl(c.env, "RL_RING"), "ring", c.request);
+  const b = await readBody(c.request, MAX_RING_BODY);
+  if (b.length < 20 || b[0] !== 1) throw new HttpError(400, "bad ring request");
+  const n = b[19];
+  if (n < 1 || n > 64 || b.length !== 20 + 16 * n) throw new HttpError(400, "bad ring request");
+  const E = (b[1] << 8) | b[2];
+  const label = b.slice(3, 19);
+  const seen = new Map<string, Bytes>();
+  for (let i = 0; i < n; i++) {
+    const t = b.slice(20 + 16 * i, 36 + 16 * i);
+    seen.set(enc64(t), t);
+  }
+  c.ctx.waitUntil(ringAfter(c, E, label, [...seen.values()]));
+  return noContent();
+}
+
+/** §10.10 step 1: the eras a row stored in the last RING_FRESH seconds can be in. */
+export function ringEraOk(E: number, nowMs: number, p: Pick<V2Params, "delta" | "skew" | "eFirst">): boolean {
+  const lo = Math.max(p.eFirst, era(nowMs - (RING_FRESH + p.delta + p.skew) * 1000));
+  return E >= lo && E <= era(nowMs + p.skew * 1000);
+}
+
+/** §10.10 step 2: `t` is rounded down to Δ, so a row stored RING_FRESH seconds ago may carry a t up to Δ older. */
+export const ringRowFresh = (t: number, nowMs: number, delta: number): boolean => t + delta >= secOf(nowMs) - RING_FRESH;
+
+async function ringAfter(c: Ctx, E: number, label: Bytes, tokens: Bytes[]): Promise<void> {
+  try {
+    if (!ringEraOk(E, c.now, c.params)) return;
+    const v = routeV(krouteFor(c.keys, E), label);
+    const [r] = (await shardStub(c.env, E, 0).get(E, 0, [{ v, label, mode: 1 } as ShardGetKey])) as ShardGetResult[];
+    if (!r || r.s !== "hit" || !ringRowFresh(r.t, c.now, c.params.delta)) return;
+    await pushStub(c.env).ring(E, label, tokens);
+  } catch (e) {
+    console.error(JSON.stringify({ msg: "ring failed", error: logErr(e) }));
+  }
+}
+
 // ───────────── router ─────────────
 
 const P = "/api/v2";
@@ -924,6 +1043,14 @@ async function route(c: Ctx): Promise<Response> {
     case `${P}/dirlog`:
       methods(c, ["GET"]);
       return dirlog(c);
+    case `${P}/push/sub`:
+    case `${P}/ring`: {
+      // While push is off these paths match no route (§10.1 step 3, §10.10).
+      const cfg = pushConfig(c.env);
+      if (!cfg) break;
+      methods(c, ["POST"]);
+      return path === `${P}/ring` ? ring(c) : pushSub(c, cfg);
+    }
   }
   let m = ERA_PATH.exec(path);
   if (m) {
@@ -989,7 +1116,7 @@ export function routeLabel(path: string): string {
   if (DIR_PREFIX_PATH.test(path)) return `${P}/dir/:kind/:p/:x`;
   if (DIR_UID_PATH.test(path)) return `${P}/dir/uid/:uid`;
   if (DIR_WRAPS_PATH.test(path)) return `${P}/dir/wraps/:id`;
-  const fixed = ["params", "put", "get", "inbox", "rt", "ckpt/latest", "ckpt/range", "register", "wraps", "dirlog"];
+  const fixed = ["params", "put", "get", "inbox", "rt", "ckpt/latest", "ckpt/range", "register", "wraps", "dirlog", "push/sub", "ring"];
   return fixed.some((f) => path === `${P}/${f}`) ? path : `${P}/*`;
 }
 

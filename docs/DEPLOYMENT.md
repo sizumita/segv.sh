@@ -78,6 +78,30 @@ Some settings cannot change once people use a deployment.
 7. Open `https://<your domain>/api/v2/params`. It shows the deployment parameters, the current era, `efirst` and the
    server's public key `srvKey`. A 503 `server misconfigured` means that a secret is missing or a variable is invalid.
 
+### Notifications (optional)
+
+Web Push is off until you set its secrets. With it on, params report `push`, and users can turn notifications on per
+device ([PROTOCOL.md §9.8](PROTOCOL.md)).
+
+1. Set the VAPID key (a P-256 private scalar, 32 bytes base64url), the key that seals the stored registrations
+   (32 random bytes base64url), and a contact the push services can reach:
+
+   ```bash
+   node -e 'const {generateKeyPairSync}=require("node:crypto");console.log(generateKeyPairSync("ec",{namedCurve:"P-256"}).privateKey.export({format:"jwk"}).d)'
+   npx wrangler secret put VAPID_SK
+   node -e 'console.log(require("node:crypto").randomBytes(32).toString("base64url"))'
+   npx wrangler secret put PUSH_KEY
+   npx wrangler secret put VAPID_SUB
+   ```
+
+   `VAPID_SUB` is a `mailto:` or `https:` URI. Keep `VAPID_SK` and `PUSH_KEY` for the life of the deployment: a new
+   `VAPID_SK` breaks every subscription until its device subscribes again, and a new `PUSH_KEY` invalidates every
+   registration (devices register again at their next start).
+
+2. Check `https://<your domain>/api/v2/params`: it now has `push` and `pow.push`. If not, the Worker's logs name the
+   push setting that is missing or invalid (never its value); an invalid push setting turns push off and changes
+   nothing else.
+
 ## Configuration reference
 
 ### Variables
@@ -104,6 +128,12 @@ A variable that is present but invalid (not a decimal number, out of range, or a
 | ----------- | ----------------------------------------------- | ------------------------------------------------------------------ |
 | `ROUTE_KEY` | 32 bytes, base64url without padding             | Routing rows to shards, and the per-era routing commitment         |
 | `SRV_KEY`   | 32-byte Ed25519 seed, base64url without padding | Signing write receipts and checkpoints; clients pin its public key |
+| `VAPID_SK`  | P-256 scalar, 32 bytes, base64url (optional)    | Signing pushes (RFC 8292); its public key is params `push.vapid`   |
+| `PUSH_KEY`  | 32 bytes, base64url (with `VAPID_SK`)           | Sealing the stored notification registrations                      |
+| `VAPID_SUB` | `mailto:` or `https:` URI (with `VAPID_SK`)     | The contact sent to push services                                  |
+
+Optional push variables: `PUSH_HOSTS` (the push service hosts that may receive pushes; default Apple, Google, Mozilla
+and Microsoft), `POW_PUSH` (20), `PUSH_MAX_SUBS` (100 000) and `PUSH_DAY_SUBS` (2 000).
 
 ### Rate limits
 
@@ -115,6 +145,7 @@ Each limit counts requests per IPv4 address or IPv6 /64 over 60 seconds, and the
 | `RL_INBOX` | 10    | Inbox posts, each of up to 32 invites                                                       |
 | `RL_BLOB`  | 20    | Uploads                                                                                     |
 | `RL_READ`  | 600   | Row reads, inbox reads, directory reads, downloads, checkpoints, the feed and the WebSocket |
+| `RL_RING`  | 60    | Rings after a text or an image (notifications)                                              |
 
 ### Logs
 
