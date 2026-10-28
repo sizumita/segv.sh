@@ -253,6 +253,23 @@ describe("QuietClient", () => {
     expect(x.sent).toHaveLength(1);
   });
 
+  it("a retry still waiting is never sent once the setting turns off, the session ends, or another session starts", async () => {
+    for (const end of [
+      (x: ReturnType<typeof make>) => x.c.set(false),
+      (x: ReturnType<typeof make>) => x.c.stop(), // logout
+      (x: ReturnType<typeof make>) => (x.state.secret = P.random(16)), // another account signed in
+      (x: ReturnType<typeof make>) => (x.state.offered = false),
+    ]) {
+      const x = make({ fail: () => 0 });
+      x.c.shown(1, P.random(16), x.nowS());
+      await x.clock.advance(0);
+      expect(x.sent).toHaveLength(1);
+      end(x);
+      await x.clock.advance(SEEN_EVERY_MS * 5);
+      expect(x.sent).toHaveLength(1);
+    }
+  });
+
   it("retries once after a network error or a 5xx, never after a 4xx", async () => {
     for (const [status, want] of [
       [0, 2],

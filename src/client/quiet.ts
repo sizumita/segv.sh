@@ -132,6 +132,10 @@ export class QuietClient {
   private timer: EngineTimer | null = null;
   /** when the last request went out (monotonic) */
   private lastAt = -Infinity;
+  /** retries waiting to go out; `stop()` cancels them */
+  private readonly retries = new Set<EngineTimer>();
+  /** moved on by `stop()`: a retry of an earlier generation is never sent */
+  private gen = 0;
 
   constructor(private readonly o: QuietClientOptions) {}
 
@@ -163,10 +167,13 @@ export class QuietClient {
     this.schedule();
   }
 
-  /** Drops what is queued (at logout, or when the setting turns off). */
+  /** Drops what is queued and every retry still waiting (at logout, or when the setting turns off). */
   stop(): void {
+    this.gen++;
     this.timer?.cancel();
     this.timer = null;
+    for (const t of this.retries) t.cancel();
+    this.retries.clear();
     this.queue = [];
     this.queued.clear();
   }
@@ -188,11 +195,21 @@ export class QuietClient {
     for (const r of rows) this.queued.delete(r.key);
     this.lastAt = this.o.clock.mono();
     const body = rows.map(({ E, label }) => ({ E, label }));
+    const gen = this.gen;
+    // A retry goes out only while nothing has stopped marks since, and for the same session (the same secret).
+    const still = (): boolean => {
+      const now = this.o.secret();
+      return gen === this.gen && this.available && this.on && now !== null && P.equalBytes(now, qS);
+    };
     const attempt = (last: boolean): void => {
       this.o.transport.seen(qS, body).catch((e: unknown) => {
         const s = statusOf(e);
-        if (last || (s !== 0 && s < 500)) return;
-        this.o.clock.setTimer(() => attempt(true), SEEN_EVERY_MS);
+        if (last || (s !== 0 && s < 500) || !still()) return;
+        const t = this.o.clock.setTimer(() => {
+          this.retries.delete(t);
+          if (still()) attempt(true);
+        }, SEEN_EVERY_MS);
+        this.retries.add(t);
       });
     };
     attempt(false);

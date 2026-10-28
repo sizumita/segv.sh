@@ -4051,7 +4051,8 @@ decrypts itself.
   synced; the device keeps it in its own storage, beside the notification setting, or, where that storage cannot keep
   it, in the page's memory until the page closes. A client shows it whenever params
   carry `push`, also while the device's own notifications are off: a device without notifications still keeps the
-  account's other devices quiet while it is in use. While it is off the device sends no `seen`.
+  account's other devices quiet while it is in use. While it is off the device sends no `seen`, not even the retry of
+  one sent before; neither does it after `logout`, or for another session than the one that showed the rows.
 - **While the app is open**, the Service Worker still shows a notification for every push it gets (above). In place
   of the steps above, it MAY show none while a window of the app has focus, where the browser allows that; a push that
   the server held back for a row marked seen never reaches it.
