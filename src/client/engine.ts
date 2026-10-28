@@ -105,6 +105,8 @@ export class SegvEngine implements Engine {
   private readonly previewStore: PreviewStore;
   private cacheTimer: EngineTimer | null = null;
   private cacheDue = Infinity;
+  /** cache writes and deletions, one at a time and in order, so a deletion is never undone by a write before it */
+  private cacheOps: Promise<void> = Promise.resolve();
   /** the session is kept on this device (loaded at boot, or saved at sign-in) */
   private remembered = false;
 
@@ -203,27 +205,39 @@ export class SegvEngine implements Engine {
     }, ms);
   }
 
-  private async writeCacheNow(): Promise<void> {
-    const store = this.cacheStore;
-    const p = this.preview();
-    if (!store || p === "none" || !this.msg || !this.live) return;
-    try {
-      await writeCache(store, {
-        v: 1,
-        preview: p,
-        deltaS: this.api.cachedParams?.delta ?? 10,
-        copies: this.msg.notifyCopies(p === "message"),
-      });
-    } catch (e) {
-      console.error("could not write the notification cache", e);
-    }
+  private cacheOp(fn: () => Promise<void>): Promise<void> {
+    const run = this.cacheOps.then(fn);
+    this.cacheOps = run.catch(() => {});
+    return run;
   }
 
-  private async dropCache(): Promise<void> {
+  private writeCacheNow(): Promise<void> {
+    return this.cacheOp(async () => {
+      // Decided when the write runs, after every deletion queued before it.
+      const store = this.cacheStore;
+      const p = this.preview();
+      if (!store || p === "none" || !this.msg || !this.live) return;
+      try {
+        await writeCache(store, {
+          v: 1,
+          preview: p,
+          deltaS: this.api.cachedParams?.delta ?? 10,
+          copies: this.msg.notifyCopies(p === "message"),
+        });
+      } catch (e) {
+        console.error("could not write the notification cache", e);
+      }
+    });
+  }
+
+  private dropCache(): Promise<void> {
     this.cacheTimer?.cancel();
     this.cacheTimer = null;
     this.cacheDue = Infinity;
-    if (this.cacheStore) await deleteCache(this.cacheStore).catch(() => {});
+    const store = this.cacheStore;
+    return this.cacheOp(async () => {
+      if (store) await deleteCache(store).catch(() => {});
+    });
   }
 
   private newApi(): Api {

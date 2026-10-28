@@ -3916,7 +3916,9 @@ decrypts itself.
   **next slot**: the slot after the lane's head as the client last knew it, or `(E_start(c), 0)`. The client writes
   the cache whenever it sends the registration set, when a copy's name changes, when the page is hidden, and at least
   every 5 minutes while the session runs, each lane's next slot as the later of the stored one and its own. It deletes
-  the cache when the preview becomes `none`, when notifications are turned off, and at `logout`. The cache holds no
+  the cache when the preview becomes `none`, when notifications are turned off, and at `logout`. No write brings back a
+  cache that was deleted or replaced meanwhile: the client writes and deletes it one at a time, deciding each write when
+  it runs, and the Service Worker writes only over the cache it read and never creates the device key. The cache holds no
   key that the kept session does not already give (AK derives every key of every held epoch with the server's
   help, §11.4), but it holds names and handles, which the device keeps nowhere else.
 - **The Service Worker** is registered at scope `/`, without a `fetch` handler and without caching, so it never serves

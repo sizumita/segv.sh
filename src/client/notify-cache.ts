@@ -52,14 +52,26 @@ export interface SealedBox {
   ct: ArrayBuffer;
 }
 
-/** Where the device key and the sealed cache live. */
+/**
+ * Where the device key and the sealed cache live. The page and the Service Worker both write the box, and the page may
+ * delete everything at any time (the preview set to `none`, notifications off, sign-out), so a box is only ever written
+ * over the box its writer read: `putBoxIf` compares and writes in one transaction.
+ */
 export interface CacheStore {
   getKey(): Promise<CryptoKey | null>;
   putKey(k: CryptoKey): Promise<void>;
   getBox(): Promise<SealedBox | null>;
-  putBox(b: SealedBox): Promise<void>;
+  /** Writes `b` only if the stored box is still the one with IV `expect` (null: no box stored); true if written. */
+  putBoxIf(expect: Uint8Array | null, b: SealedBox): Promise<boolean>;
   clear(): Promise<void>;
 }
+
+const sameBytes = (a: Uint8Array, b: Uint8Array): boolean =>
+  a.length === b.length && a.every((x, i) => x === b[i]);
+
+/** Whether `stored` is the box with IV `expect` (null: no box). */
+export const isBox = (stored: SealedBox | null | undefined, expect: Uint8Array | null): boolean =>
+  expect === null ? !stored : !!stored && sameBytes(new Uint8Array(stored.iv), expect);
 
 const AAD = new TextEncoder().encode("segv.sh/notify-cache/v1");
 
@@ -150,49 +162,69 @@ export function applyMoves(stored: NotifyCache, moves: readonly Move[]): NotifyC
   };
 }
 
-export async function readCache(store: CacheStore): Promise<NotifyCache | null> {
+/** What is stored: the key, the box and the cache it opens to (null where missing or unreadable). */
+async function load(
+  store: CacheStore,
+): Promise<{ key: CryptoKey | null; box: SealedBox | null; cache: NotifyCache | null }> {
   const [key, box] = await Promise.all([store.getKey(), store.getBox()]);
-  if (!key || !box) return null;
+  if (!key || !box) return { key, box, cache: null };
   try {
     const pt = await crypto.subtle.decrypt(
       { name: "AES-GCM", iv: box.iv as BufferSource, additionalData: AAD },
       key,
       box.ct,
     );
-    return parseCache(new TextDecoder().decode(pt));
+    return { key, box, cache: parseCache(new TextDecoder().decode(pt)) };
   } catch {
-    return null;
+    return { key, box, cache: null };
   }
 }
 
-async function seal(store: CacheStore, c: NotifyCache): Promise<void> {
-  let key = await store.getKey();
-  if (!key) {
-    key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
-      "encrypt",
-      "decrypt",
-    ]);
-    await store.putKey(key);
-  }
+export async function readCache(store: CacheStore): Promise<NotifyCache | null> {
+  return (await load(store)).cache;
+}
+
+async function sealWith(key: CryptoKey, c: NotifyCache): Promise<SealedBox> {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = await crypto.subtle.encrypt(
     { name: "AES-GCM", iv, additionalData: AAD },
     key,
     new TextEncoder().encode(JSON.stringify(c)),
   );
-  await store.putBox({ iv, ct });
+  return { iv, ct };
 }
 
-/** Writes the app's cache, keeping each lane's stored next slot where it is later. */
+/**
+ * Writes the app's cache, keeping each lane's stored next slot where it is later. Only the app creates the device key.
+ * When the Service Worker wrote in between, it reads and merges again (at most 3 times; a lost move only repeats a
+ * preview). The engine runs these writes and `deleteCache` one at a time.
+ */
 export async function writeCache(store: CacheStore, c: NotifyCache): Promise<void> {
-  await seal(store, mergeNext(c, await readCache(store)));
+  for (let i = 0; i < 3; i++) {
+    const cur = await load(store);
+    let key = cur.key;
+    if (!key) {
+      key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
+        "encrypt",
+        "decrypt",
+      ]);
+      await store.putKey(key);
+    }
+    const box = await sealWith(key, mergeNext(c, cur.cache));
+    if (await store.putBoxIf(cur.box ? new Uint8Array(cur.box.iv) : null, box)) return;
+  }
 }
 
-/** The Service Worker's write: moves lane positions forward in the stored cache, if there is one. */
+/**
+ * The Service Worker's write: moves lane positions forward in the stored cache. It never creates a key, and writes
+ * only over the box it read, so stale work never brings back a cache that the page deleted or replaced meanwhile.
+ */
 export async function advanceCache(store: CacheStore, moves: readonly Move[]): Promise<void> {
   if (moves.length === 0) return;
-  const stored = await readCache(store);
-  if (stored) await seal(store, applyMoves(stored, moves));
+  const cur = await load(store);
+  if (!cur.key || !cur.box || !cur.cache) return;
+  const box = await sealWith(cur.key, applyMoves(cur.cache, moves));
+  await store.putBoxIf(new Uint8Array(cur.box.iv), box);
 }
 
 export const deleteCache = (store: CacheStore): Promise<void> => store.clear();
@@ -236,7 +268,27 @@ export function idbCacheStore(): CacheStore | null {
     getKey: () => get<CryptoKey>("key"),
     putKey: async (k) => void (await tx("readwrite", (s) => s.put(k, "key"))),
     getBox: () => get<SealedBox>("box"),
-    putBox: async (b) => void (await tx("readwrite", (s) => s.put(b, "box"))),
+    async putBoxIf(expect, b) {
+      const db = await openDb();
+      try {
+        return await new Promise<boolean>((resolve, reject) => {
+          const t = db.transaction(STORE, "readwrite");
+          const st = t.objectStore(STORE);
+          let ok = false;
+          const cur = st.get("box");
+          cur.onsuccess = () => {
+            if (!isBox(cur.result as SealedBox | undefined, expect)) return;
+            st.put(b, "box");
+            ok = true;
+          };
+          t.oncomplete = () => resolve(ok);
+          t.onerror = () => reject(t.error);
+          t.onabort = () => reject(t.error);
+        });
+      } finally {
+        db.close();
+      }
+    },
     clear: async () => void (await tx("readwrite", (s) => s.clear())),
   };
 }

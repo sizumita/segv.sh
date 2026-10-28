@@ -5,6 +5,7 @@ import {
   advanceCache,
   applyMoves,
   deleteCache,
+  isBox,
   mergeNext,
   parseCache,
   readCache,
@@ -14,17 +15,56 @@ import {
   type SealedBox,
 } from "./notify-cache";
 
-function memoryStore(): CacheStore & { box: SealedBox | null; key: CryptoKey | null } {
+/** A store whose next `getKey` or `putBoxIf` can be held until a test lets it go on. */
+function memoryStore() {
   const m = {
     key: null as CryptoKey | null,
     box: null as SealedBox | null,
-    getKey: async () => m.key,
+    /** awaited once by the next getKey / putBoxIf, then cleared */
+    holdGet: null as Promise<void> | null,
+    holdPut: null as Promise<void> | null,
+    /** called when a held putBoxIf starts waiting */
+    onHeld: null as (() => void) | null,
+    async getKey() {
+      const h = m.holdGet;
+      m.holdGet = null;
+      if (h) await h;
+      return m.key;
+    },
     putKey: async (k: CryptoKey) => void (m.key = k),
     getBox: async () => m.box,
-    putBox: async (b: SealedBox) => void (m.box = b),
+    async putBoxIf(expect: Uint8Array | null, b: SealedBox) {
+      const h = m.holdPut;
+      m.holdPut = null;
+      if (h) {
+        m.onHeld?.();
+        await h;
+      }
+      // compare and write with no await in between, as one IndexedDB transaction does
+      if (!isBox(m.box, expect)) return false;
+      m.box = b;
+      return true;
+    },
     clear: async () => void ((m.key = null), (m.box = null)),
   };
-  return m;
+  return m satisfies CacheStore;
+}
+
+function gate(): { wait: Promise<void>; open: () => void } {
+  let open = () => {};
+  const wait = new Promise<void>((r) => (open = r));
+  return { wait, open };
+}
+
+/** Holds the store's next putBoxIf (after its caller has read and sealed); resolves once that write is waiting. */
+function holdNextWrite(s: ReturnType<typeof memoryStore>): {
+  reached: Promise<void>;
+  open: () => void;
+} {
+  const g = gate();
+  const reached = new Promise<void>((r) => (s.onHeld = r));
+  s.holdPut = g.wait;
+  return { reached, open: g.open };
 }
 
 const cache = (next: { E: number; n: number }[], e = 2, bell = "bell-1"): NotifyCache => ({
@@ -149,5 +189,60 @@ describe("notification cache", () => {
     const s = memoryStore();
     await advanceCache(s, [{ bell: "bell-1", e: 2, next: [{ E: 60, n: 0 }] }]);
     expect(s.box).toBeNull();
+  });
+
+  it("a worker's move in flight never brings back a cache deleted meanwhile, nor creates a key", async () => {
+    const early = memoryStore();
+    await writeCache(early, cache([{ E: 50, n: 3 }]));
+    const k = gate();
+    early.holdGet = k.wait; // paused while reading the key, as the review reproduced it
+    const m1 = advanceCache(early, [{ bell: "bell-1", e: 2, next: [{ E: 50, n: 9 }] }]);
+    await deleteCache(early);
+    k.open();
+    await m1;
+    expect([early.key, early.box]).toEqual([null, null]);
+
+    const s = memoryStore();
+    await writeCache(s, cache([{ E: 50, n: 3 }]));
+    const g = holdNextWrite(s);
+    const moving = advanceCache(s, [{ bell: "bell-1", e: 2, next: [{ E: 50, n: 9 }] }]);
+    await g.reached; // read and sealed, about to write
+    await deleteCache(s); // the preview set to "new messages", notifications off, or sign-out
+    g.open();
+    await moving;
+    expect(s.key).toBeNull();
+    expect(s.box).toBeNull();
+    expect(await readCache(s)).toBeNull();
+  });
+
+  it("nor overwrites the app's newer cache (a downgrade from `message` to `name`)", async () => {
+    const s = memoryStore();
+    await writeCache(s, cache([{ E: 50, n: 3 }]));
+    const g = holdNextWrite(s);
+    const moving = advanceCache(s, [{ bell: "bell-1", e: 2, next: [{ E: 50, n: 9 }] }]);
+    await g.reached;
+    const named: NotifyCache = {
+      v: 1,
+      preview: "name",
+      deltaS: 10,
+      copies: [{ bell: "bell-1", ref: "AAAAAAAAAAAA", name: "bob" }],
+    };
+    await writeCache(s, named);
+    g.open();
+    await moving;
+    expect(await readCache(s)).toEqual(named);
+  });
+
+  it("the app's write reads again when the worker moved a lane meanwhile, and keeps the move", async () => {
+    const s = memoryStore();
+    await writeCache(s, cache([{ E: 50, n: 3 }]));
+    const g = holdNextWrite(s);
+    const writing = writeCache(s, cache([{ E: 50, n: 4 }]));
+    await g.reached;
+    const advanced = advanceCache(s, [{ bell: "bell-1", e: 2, next: [{ E: 50, n: 9 }] }]);
+    await advanced;
+    g.open();
+    await writing;
+    expect((await readCache(s))!.copies[0].epoch!.next).toEqual([{ E: 50, n: 9 }]);
   });
 });

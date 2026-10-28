@@ -1,7 +1,7 @@
 // Notifications (docs/PROTOCOL.md §11.13): the registration set, its re-sends, the rings after a TEXT or IMAGE, and
 // the device's subscription at logout, against FakeWorld's push endpoints and a fake browser per device.
 import { describe, expect, it } from "vite-plus/test";
-import { readCache, type Preview, type PreviewStore, type SealedBox } from "../../src/client/notify-cache";
+import { isBox, readCache, type Preview, type PreviewStore, type SealedBox } from "../../src/client/notify-cache";
 import { browserDeps, notesFor, type Proposed } from "../../src/client/sw-core";
 import type { Engine } from "../../src/client/types";
 import {
@@ -30,7 +30,20 @@ function notifyOf() {
     getKey: async () => store.key,
     putKey: async (k: CryptoKey) => void (store.key = k),
     getBox: async () => store.box,
-    putBox: async (b: SealedBox) => void (store.box = b),
+    /** the next write waits for this (set by a test), after calling `onHeld` */
+    holdPut: null as Promise<void> | null,
+    onHeld: null as (() => void) | null,
+    async putBoxIf(expect: Uint8Array | null, b: SealedBox) {
+      const h = store.holdPut;
+      store.holdPut = null;
+      if (h) {
+        store.onHeld?.();
+        await h;
+      }
+      if (!isBox(store.box, expect)) return false;
+      store.box = b;
+      return true;
+    },
     clear: async () => void ((store.key = null), (store.box = null)),
   };
   let p: Preview = "none";
@@ -327,5 +340,32 @@ describe("previews (§11.13)", () => {
     // Logout forgets the choice too, so the next account starts with `none`.
     await B.logout();
     expect(n.preview.load()).toBe("none");
+  });
+
+  it("a choice of `none` made while a cache write is in flight leaves no cache", async () => {
+    const [alice, bob] = ["alice", "bob"].map((h) => makeUser(h));
+    const bobDev = new FakePushDevice("bob");
+    const n = notifyOf();
+    const A = await engineFor(alice);
+    const B = await engineFor(bob, { ...bobDev.options, notify: n });
+    const one = await A.createConversation(["bob"]);
+    await settle(A, B);
+    await B.accept(one);
+    await B.setNotifications(true);
+    (B as unknown as { remembered: boolean }).remembered = true;
+    await B.setPreview("message");
+    await waitFor(() => n.store.box !== null, "cache written");
+    // The next write (the switch to `name`) stops just before it stores its box.
+    let open = () => {};
+    n.store.holdPut = new Promise<void>((r) => (open = r));
+    const reached = new Promise<void>((r) => (n.store.onHeld = r));
+    await B.setPreview("name");
+    await reached;
+    const none = B.setPreview("none");
+    open();
+    await none;
+    await settle(A, B);
+    expect([n.store.key, n.store.box]).toEqual([null, null]);
+    expect(B.getState().preview).toBe("none");
   });
 });
