@@ -2,6 +2,7 @@ import { $, component$, useContext, useSignal, useVisibleTask$ } from "@qwik.dev
 import type { ConversationView, MessageView } from "~/client/types";
 import { loadEngine } from "./engine-loader";
 import { MsgImage } from "./msg-image";
+import { MsgText } from "./msg-text";
 import { UiCtx } from "./state";
 import { clock, dayKey, dayLabel, errMsg, fullTime } from "./util";
 
@@ -86,7 +87,7 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
                   {m.kind === "image" && m.image ? (
                     <MsgImage img={m.image} hold={props.conv.request} />
                   ) : (
-                    <p class="body">{m.text ?? ""}</p>
+                    <MsgText text={m.text ?? ""} />
                   )}
                   {m.status === "sending" && <p class="st">sending…</p>}
                   {m.status === "failed" && <p class="st failed">failed — not delivered</p>}

@@ -18,7 +18,8 @@ The reference deployment runs at <https://segv.sh>.
 
 ## Features
 
-- One-to-one and group conversations (up to 32 members) with text and images.
+- One-to-one and group conversations (up to 32 members) with text and images. Text is shown with the Markdown
+  that Discord supports: bold, italics, spoilers, code, quotes, headings, lists and links.
 - Sign-in with a passkey. A recovery code, shown once at registration, unlocks the account without a passkey, and
   more passkeys can be added later.
 - Restore on any device: a passkey or the recovery code brings back every conversation and its history, including the
