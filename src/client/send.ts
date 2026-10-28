@@ -63,6 +63,8 @@ export interface SendCtx {
    */
   welcomeTo?: Bytes;
   qualifies?: (c: Copy, ep: Epoch, uid: Bytes) => boolean;
+  /** a TEXT or IMAGE is stored (also a late one): ring the other members' bells (§11.13); never waits */
+  ring?: (c: Copy, ep: Epoch, E: number, label: Bytes) => void;
 }
 
 /** §11.3 step 2 refused a WELCOME: the epoch no longer qualifies (§6.12 step 1); send an inbox invite instead. */
@@ -245,6 +247,9 @@ export async function sendRow(ctx: SendCtx, c: Copy, content: P.MBody): Promise<
     if (res.s === "ok" || (res.s === "conflict" && P.equalBytes(res.body, row.body))) {
       found.t = res.t;
       ctx.applyOwn(c, ep, found);
+      // Stored: an OK, a lost answer's retry or probe that finds our body, a late row too (§11.3 step 6, §11.13).
+      if (content.type === P.MT.TEXT || content.type === P.MT.IMAGE)
+        ctx.ring?.(c, ep, Estar, row.label);
       // Step 8: a late row counts as delivered only while the copy is still in its epoch, or in e+1 with no own row
       // there (the others still follow self's lane of e).
       if (elapsed(ctx, sent) >= (params.delta + params.skew) * 1000) {

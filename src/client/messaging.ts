@@ -155,6 +155,8 @@ export interface MessagingHost {
   setConnected(on: boolean): void;
   /** the latest verified checkpoint (EngineState.head, §12.3) */
   setHead(q: number, C: Bytes): void;
+  /** a TEXT or IMAGE was stored: ask the server to ring these bells (§11.13); never waits */
+  ring(E: number, label: Bytes, bells: Bytes[]): void;
 }
 
 export class Messaging {
@@ -2873,7 +2875,42 @@ export class Messaging {
       },
       beforePutAttempt: this.h.opts.beforePutAttempt,
       progress: (t) => this.h.progress(t),
+      ring: (cc, ep, E, label) => this.h.ring(E, label, this.ringBells(cc, ep)),
     };
+  }
+
+  /**
+   * The bells a TEXT or IMAGE stored in `ep` rings (§11.13): every other lane of `ep`, and, when the copy holds
+   * `ep.e − 1`, the bell there of each member of both epochs, other than self, of whom no valid row in `ep` was seen
+   * (a device that has not processed the epoch change still has that bell registered).
+   */
+  private ringBells(c: Copy, ep: Epoch): Bytes[] {
+    const out: Bytes[] = [];
+    ep.D.members.forEach((_, l) => {
+      if (l !== ep.myIndex) out.push(P.bell(ep.keys.nk, l));
+    });
+    const prev = c.epochs.get(ep.e - 1);
+    prev?.D.members.forEach((m, j) => {
+      const k = P.memberIndex(ep.D, m.uid);
+      if (k >= 0 && k !== ep.myIndex && !ep.lanes[k].seen) out.push(P.bell(prev.keys.nk, j));
+    });
+    return out;
+  }
+
+  /**
+   * The registration set (§11.13): for each copy that is not a request, has not ended, whose leave is not current and
+   * whose `rootBy` is self or a contact (frozen copies included), the bell of self's lane in its current epoch; the
+   * copies with the newest `lastTs` first.
+   */
+  pushBells(): Bytes[] {
+    const out: { bell: Bytes; ts: number }[] = [];
+    for (const c of this.copies.values()) {
+      if (c.probe || c.request || c.left || this.endOf(c) !== null || !this.byContact(c)) continue;
+      const ep = c.epochs.get(c.current);
+      if (!ep || ep.myIndex < 0) continue;
+      out.push({ bell: P.bell(ep.keys.nk, ep.myIndex), ts: c.lastTs });
+    }
+    return out.sort((a, b) => b.ts - a.ts).map((x) => x.bell);
   }
 
   sendText(convId: string, text: string): Promise<void> {

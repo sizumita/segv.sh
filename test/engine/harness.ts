@@ -39,6 +39,7 @@ export type { DirUserRow, DirWrapRow, DirlogRow, DirPrefixQuery } from "./fake/d
 export type { CkptEntry, CkptHead } from "./fake/ckpt";
 export { CKPT_PERIOD_MS } from "./fake/ckpt";
 export { RT_LIMITS } from "./fake/rt";
+export { FAKE_VAPID, FakePush, FakePushDevice, bellsB64 } from "./fake/push";
 
 // ───────────────────────── the current world ─────────────────────────
 
@@ -464,6 +465,8 @@ export interface EngineI {
   ckpt: { latest: { q: number; C: Uint8Array } | null; verify(): Promise<void> } | null;
   /** the session's API client (its row memory, §12.1) */
   api: { get(keys: W.GetKey[]): Promise<W.GetStatus[]> };
+  /** notifications on this device (§11.13) */
+  push: { restored(): void; changed(): void };
   /** links (§5.5): internal engine operations in stage 1 */
   createLink(opts?: { oneShot?: boolean }): Promise<string>;
   openLink(url: string): Promise<string>;

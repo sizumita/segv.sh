@@ -84,6 +84,7 @@ import {
 } from "./common";
 import { FakeDirectory } from "./dir";
 import { FakeInbox } from "./inbox";
+import { FAKE_VAPID, FakePush } from "./push";
 import { FakeRealtime, FakeWebSocket, type RtHost } from "./rt";
 import { FakeShard } from "./shard";
 
@@ -154,6 +155,8 @@ export interface FakeWorldOptions {
   skew?: number;
   inboxSlot?: number;
   efirst?: number;
+  /** offer Web Push: params `push` and `pow.push`, and the two endpoints of §10.10 (FakePush) */
+  push?: boolean;
 }
 
 interface Req {
@@ -305,6 +308,9 @@ export class FakeWorld implements WorldCtx, RtHost {
   readonly rt: FakeRealtime;
   readonly dir: FakeDirectory;
   readonly ckpt: FakeCheckpoints;
+  /** Web Push (only routed while `pushOn`) */
+  readonly push = new FakePush();
+  pushOn: boolean;
 
   // ── observation and hooks ──
   /** Every HTTP request and WebSocket upgrade, in arrival order. */
@@ -326,6 +332,7 @@ export class FakeWorld implements WorldCtx, RtHost {
       inboxSlot: opts.inboxSlot ?? 1,
       efirst: opts.efirst ?? 0,
     };
+    this.pushOn = opts.push ?? false;
     this.shard = new FakeShard(this);
     this.blobreg = new FakeBlobReg(this);
     this.inbox = new FakeInbox(this);
@@ -743,6 +750,8 @@ export class FakeWorld implements WorldCtx, RtHost {
       r("GET", /^\/api\/v2\/dir\/uid\/([^/]+)$/, "RL_READ", (_q, m) => this.getDirUid(m[1])),
       r("GET", /^\/api\/v2\/dir\/wraps\/([^/]+)$/, "RL_READ", (q, m) => this.getDirWraps(q, m[1])),
       r("GET", /^\/api\/v2\/dirlog$/, "RL_READ", (q) => this.getDirlog(q)),
+      r("POST", /^\/api\/v2\/push\/sub$/, "RL_WRITE", (q) => this.postPushSub(q)),
+      r("POST", /^\/api\/v2\/ring$/, null, (q) => this.postRing(q)),
     ];
   }
 
@@ -768,7 +777,7 @@ export class FakeWorld implements WorldCtx, RtHost {
       efirst: p.efirst,
       kcommit: b64u(this.kcommitOf(E)),
       srvKey: b64u(this.srvKey),
-      pow: { register: 0, wrap: 0, put: 0, inbox: 0, blob: 0 },
+      pow: { register: 0, wrap: 0, put: 0, inbox: 0, blob: 0, ...(this.pushOn ? { push: 0 } : {}) },
       limits: {
         putRows: PUT_MAX_ROWS,
         putBytes: PUT_MAX_BYTES,
@@ -777,7 +786,38 @@ export class FakeWorld implements WorldCtx, RtHost {
         blobMax: BLOB_MAX,
         textMax: TEXT_MAX,
       },
+      ...(this.pushOn ? { push: { vapid: b64u(FAKE_VAPID), window: 60, maxTokens: 256 } } : {}),
     });
+  }
+
+  /** POST /api/v2/push/sub (§10.10): the body's shape only; 404 while push is off. */
+  private postPushSub(req: Req): Res {
+    if (!this.pushOn) return err(404, `not found: ${req.method} ${req.path}`);
+    return this.jsonBody(req, 16 * 1024, (b) => {
+      const o = b as { endpoint?: unknown; tokens?: unknown };
+      if (typeof o.endpoint !== "string" || !Array.isArray(o.tokens))
+        return err(400, "bad push subscription");
+      this.push.sub(o.endpoint, o.tokens as string[]);
+      return { status: 204 };
+    });
+  }
+
+  /** POST /api/v2/ring (§10.10): 204 for any well-formed body; only a row stored in the last minute pushes. */
+  private postRing(req: Req): Res {
+    if (!this.pushOn) return err(404, `not found: ${req.method} ${req.path}`);
+    const b = req.body;
+    const n = b[19];
+    if (b.length < 20 || b[0] !== 1 || n < 1 || n > 64 || b.length !== 20 + 16 * n)
+      return err(400, "bad ring");
+    const E = (b[1] << 8) | b[2];
+    const label = b.slice(3, 19);
+    const tokens = Array.from({ length: n }, (_, i) => b.slice(20 + 16 * i, 36 + 16 * i));
+    const row = this.shard.row(E, label);
+    const fresh =
+      row !== undefined &&
+      row.t + this.params.delta >= Math.floor((this.now() - T0_MS) / 1000) - 60;
+    this.push.ring(E, label, tokens, fresh);
+    return { status: 204 };
   }
 
   /**

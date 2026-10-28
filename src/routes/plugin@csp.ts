@@ -43,8 +43,9 @@ export const onRequest: RequestHandler = ({ headers, sharedMap, url }) => {
     // DOM XSS sinks (innerHTML, script.src, eval-like) are disabled outright: the UI renders
     // user content only as text and needs no Trusted Types policy.
     "require-trusted-types-for 'script'",
-    // The one policy: it creates the inbox Web Worker's URL (src/client/inbox-worker-url.ts; §11.5 step 2).
-    "trusted-types segv-worker",
+    // Two policies, each accepting one URL: the inbox Web Worker's (src/client/inbox-worker-url.ts; §11.5 step 2)
+    // and the push Service Worker's (src/client/sw-url.ts; §11.13).
+    "trusted-types segv-worker segv-sw",
   ].join("; ");
 
   headers.set("Content-Security-Policy", csp);

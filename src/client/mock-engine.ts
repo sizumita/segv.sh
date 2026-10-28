@@ -9,6 +9,7 @@
 //                              ?mock=boot       -> stays in boot
 //                              ?mock=warn       -> adds security warnings + an error
 //                              ?mock=offline    -> connected = false, syncing = true
+//                              ?mock=push       -> notifications can be turned on and off
 // Tests can drive it through `window.__segvMock` (DEV only).
 
 import type {
@@ -76,6 +77,7 @@ interface MockOpts {
   boot: boolean;
   warn: boolean;
   offline: boolean;
+  push: boolean;
 }
 
 function parseOpts(): MockOpts {
@@ -84,6 +86,7 @@ function parseOpts(): MockOpts {
   return {
     ready: f.has("ready") || f.has("warn") || f.has("offline"),
     noprf: f.has("noprf"),
+    push: f.has("push"),
     fatal: f.has("fatal"),
     boot: f.has("boot"),
     warn: f.has("warn"),
@@ -103,6 +106,7 @@ class MockEngine implements Engine {
     syncing: false,
     warnings: [],
     prfSupported: null,
+    notifications: "unavailable",
   };
   private subs = new Set<(s: EngineState) => void>();
   private seq = 1000;
@@ -117,7 +121,10 @@ class MockEngine implements Engine {
   private async boot() {
     if (this.opts.boot) return;
     await sleep(200);
-    this.set({ prfSupported: !this.opts.noprf });
+    this.set({
+      prfSupported: !this.opts.noprf,
+      notifications: this.opts.push ? "off" : "unavailable",
+    });
     if (this.opts.fatal) {
       this.set({
         phase: "fatal",
@@ -651,6 +658,12 @@ class MockEngine implements Engine {
     return await new Promise<Blob>((r, j) =>
       c.toBlob((b) => (b ? r(b) : j(new Error("toBlob"))), "image/png"),
     );
+  }
+
+  async setNotifications(on: boolean): Promise<void> {
+    if (this.state.notifications === "unavailable") return;
+    await sleep(150);
+    this.set({ notifications: on ? "on" : "off" });
   }
 
   markRead(convId: string): void {

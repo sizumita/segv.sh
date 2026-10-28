@@ -108,6 +108,11 @@ export interface EngineState {
   syncing: boolean; // restoring or catching up
   warnings: string[]; // security warnings (split view, signature failures, …)
   prfSupported: boolean | null; // getClientCapabilities()['extension:prf'] if known
+  /**
+   * Notifications on this device (§11.13): "unavailable" when the browser has no Web Push (on iOS and iPadOS, outside
+   * a Home Screen web app) or the server offers none; otherwise whether they are on. Per device, never synced.
+   */
+  notifications: "unavailable" | "off" | "on";
 }
 
 export interface Engine {
@@ -160,5 +165,10 @@ export interface Engine {
    * `unread` is 0. It accepts nothing.
    */
   markRead(convId: string): void;
+  /**
+   * Turns notifications on this device on or off (§11.13). Turning them on must be called from the user's click: it
+   * may ask for permission.
+   */
+  setNotifications(on: boolean): Promise<void>;
   clearError(): void;
 }

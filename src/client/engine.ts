@@ -12,7 +12,7 @@ import {
   registerAccount,
   type Unlocked,
 } from "./accounts";
-import { Api, isTransient } from "./api";
+import { Api, isTransient, pushParams } from "./api";
 import { SessionEnded, UserError, message } from "./errors";
 import {
   DEFAULT_DELAYS,
@@ -24,6 +24,7 @@ import {
 } from "./options";
 import { cursorAt, type InboxCursor } from "./inbox";
 import { Messaging, type MessagingHost } from "./messaging";
+import { PushClient, browserPushPlatform, localPushStore } from "./push";
 import { SelfLane } from "./selflane";
 import { readSnapshot } from "./snapshot";
 import { clearSession, loadSession, saveSession } from "./session";
@@ -67,6 +68,7 @@ const emptyState = (): EngineState => ({
   syncing: false,
   warnings: [],
   prfSupported: null,
+  notifications: "unavailable",
 });
 
 export class SegvEngine implements Engine {
@@ -80,6 +82,8 @@ export class SegvEngine implements Engine {
   private readonly fetchFn: typeof fetch;
   private readonly opts: EngineOptions;
   private api: Api;
+  /** notifications on this device (§11.13); outlives sessions, like the device's setting */
+  private readonly push: PushClient;
 
   private account: Account | null = null;
   private self: SelfLane | null = null;
@@ -110,6 +114,27 @@ export class SegvEngine implements Engine {
     this.delays = { ...DEFAULT_DELAYS, ...opts.delays };
     this.fetchFn = opts.fetch ?? ((input, init) => fetch(input, init));
     this.api = this.newApi();
+    this.push = new PushClient({
+      transport: {
+        pushSub: (b) => this.api.pushSub(b),
+        ring: (E, label, tokens) => this.api.ring(E, label, tokens),
+      },
+      platform: opts.push ? opts.push.platform : browserPushPlatform(),
+      store: opts.push?.store ?? localPushStore(),
+      clock: this.clock,
+      params: () => {
+        const p = this.api.cachedParams;
+        return p ? pushParams(p) : null;
+      },
+      deltaMs: () => (this.api.cachedParams?.delta ?? 10) * 1000,
+      bells: () => this.msg?.pushBells() ?? [],
+      onOff: () => this.patch({ notifications: this.notificationState() }),
+    });
+  }
+
+  private notificationState(): EngineState["notifications"] {
+    if (!this.push.available) return "unavailable";
+    return this.push.on ? "on" : "off";
   }
 
   private newApi(): Api {
@@ -187,6 +212,8 @@ export class SegvEngine implements Engine {
   async logout(): Promise<void> {
     this.generation++;
     this.stopTimers();
+    // The next account on this browser starts with notifications off, and gets none of this one's (§11.13).
+    await this.push.logout().catch(() => {});
     await clearSession();
     for (const p of this.imageCache.values()) p.then((u) => URL.revokeObjectURL(u)).catch(() => {});
     this.resetData();
@@ -196,6 +223,17 @@ export class SegvEngine implements Engine {
     this.api = this.newApi();
     this.state = { ...emptyState(), phase: "signed-out", prfSupported: this.state.prfSupported };
     this.emitNow();
+  }
+
+  async setNotifications(on: boolean): Promise<void> {
+    try {
+      if (on) await this.push.enable();
+      else await this.push.disable();
+    } catch (e) {
+      this.patch({ error: message(e) });
+    } finally {
+      this.patch({ notifications: this.notificationState() });
+    }
   }
 
   async createConversation(handles: string[], name?: string): Promise<string> {
@@ -412,7 +450,8 @@ export class SegvEngine implements Engine {
     if (this.state.error.startsWith("sync failed:")) this.patch({ error: "" });
     this.live = true;
     this.msg!.start();
-    this.patch({ syncing: false });
+    this.push.restored();
+    this.patch({ syncing: false, notifications: this.notificationState() });
   }
 
   /** What the session's Messaging calls back into. */
@@ -437,6 +476,8 @@ export class SegvEngine implements Engine {
       changed: () => {
         this.version++;
         this.scheduleEmit();
+        // The registration set may have changed: computed again within Δ, sent only if it differs (§11.13).
+        if (this.live && gen === this.generation) this.push.changed();
       },
       emitNow: () => this.emitNow(),
       progress: (t) => this.progress(t),
@@ -446,6 +487,9 @@ export class SegvEngine implements Engine {
       track: (p) => this.track(p),
       setConnected: (on) => this.patch({ connected: on }),
       setHead: (q, C) => this.patch({ head: { seq: q, h: P.b64u(C) } }),
+      ring: (E, label, bells) => {
+        if (gen === this.generation) this.push.ring(E, label, bells);
+      },
     };
   }
 

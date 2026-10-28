@@ -5,6 +5,7 @@ import * as P from "~/lib/proto";
 import { BAD_RECEIPT, RowMemory, type CkptLatest, type CkptRange } from "./integrity";
 import * as W from "~/lib/wire";
 import type { EngineClock } from "./options";
+import type { PushParams, PushSubBody } from "./push";
 
 export type Bytes = Uint8Array;
 export type Progress = (msg: string) => void;
@@ -71,6 +72,8 @@ export interface Params {
     blobMax: number;
     textMax: number;
   };
+  /** only while the deployment offers Web Push (§9.8); read it with pushParams() */
+  push?: unknown;
 }
 
 const POW_SCOPES: readonly P.PowScope[] = ["register", "wrap", "put", "inbox", "blob"];
@@ -123,6 +126,24 @@ export function checkParams(x: unknown): Params {
   )
     bad("limits");
   return x as unknown as Params;
+}
+
+/**
+ * params.push (§10.9), or null when the server offers no push: a `push` whose `vapid` is not 65 bytes starting with
+ * 0x04, whose `window` or `maxTokens` is not a positive integer, or that comes without `pow.push`, counts as none.
+ */
+export function pushParams(p: Params): PushParams | null {
+  const x = p.push;
+  if (
+    !isObj(x) ||
+    !isB64u(x.vapid, 65) ||
+    !isInt(x.window, 1, 2 ** 31) ||
+    !isInt(x.maxTokens, 1, 2 ** 31)
+  )
+    return null;
+  if (!isInt((p.pow as Record<string, unknown>).push, 0, 64)) return null;
+  const vapid = P.fromB64u(x.vapid);
+  return vapid[0] === 4 ? { vapid, window: x.window, maxTokens: x.maxTokens } : null;
 }
 
 // ───────────────────────── server time (§10.1) ─────────────────────────
@@ -783,6 +804,39 @@ export class Api {
     const j = await this.json<{ dirseq: number }>(res);
     const now = h !== null && /^\d{1,16}$/.test(h) ? Number(h) : null;
     return { dirseq: j.dirseq, now: now !== null && Number.isSafeInteger(now) ? now : null };
+  }
+
+  // ── Web Push (§10.10) ──
+
+  /** `POST /api/v2/push/sub`: replaces this endpoint's registration (an empty `tokens` deletes it). */
+  async pushSub(body: PushSubBody): Promise<void> {
+    const res = await this.postPow(
+      "/api/v2/push/sub",
+      "push",
+      P.utf8(JSON.stringify(body)),
+      "application/json",
+    );
+    await res.body?.cancel();
+  }
+
+  /** `POST /api/v2/ring` for a row just stored: the server answers 204 whatever it then does. */
+  async ring(E: number, label: Bytes, tokens: readonly Bytes[]): Promise<void> {
+    if (tokens.length < 1 || tokens.length > 64)
+      throw new ApiError(0, "a ring carries 1 to 64 bells");
+    const body = P.concat(
+      Uint8Array.of(1),
+      P.u16(E),
+      label,
+      Uint8Array.of(tokens.length),
+      ...tokens,
+    );
+    const res = await this.request("/api/v2/ring", {
+      method: "POST",
+      headers: { "content-type": "application/octet-stream" },
+      body: body as BodyInit,
+    });
+    if (!res.ok) throw await readError(res);
+    await res.body?.cancel();
   }
 
   postWrap(body: WrapJson, onProgress?: Progress): Promise<{ dirseq: number }> {

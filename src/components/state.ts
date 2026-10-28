@@ -40,6 +40,7 @@ export const initialEngineState = (): EngineState => ({
   syncing: false,
   warnings: [],
   prfSupported: null,
+  notifications: "unavailable",
 });
 
 export const initialUiState = (): UiState => ({
