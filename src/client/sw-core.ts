@@ -1,10 +1,12 @@
 // The push Service Worker (docs/PROTOCOL.md §11.13), built to /sw.js from src/client/sw-main.ts. For every push it
 // shows at least one notification within 8 s: the payload's fixed text, or, with the device's preview, the name of each
 // conversation whose bell rang (from the notification cache), and with `message` its newest message, read with one
-// `get` and decrypted and verified here. The text never comes from the payload, which the operator composes. It has no
-// fetch handler and caches nothing, so it never serves the app's pages or scripts.
+// `get` and decrypted and verified here, and shown without its Markdown (no spoiler's content). The text never comes
+// from the payload, which the operator composes. It has no fetch handler and caches nothing, so it never serves the
+// app's pages or scripts.
 import * as P from "~/lib/proto";
 import * as W from "~/lib/wire";
+import { plainText } from "./markdown";
 import {
   advanceCache,
   idbCacheStore,
@@ -212,7 +214,8 @@ async function readNewest(
       if (!v.ok || v.msg.from !== l.j) return;
       const who = `@${l.ep.members[l.j]?.handle ?? "?"}`;
       let text: string;
-      if (v.msg.type === P.MT.TEXT) text = `${who}: ${v.msg.text}`;
+      // As plain text: a notification can neither style nor hide, and a spoiler must not reach the lock screen.
+      if (v.msg.type === P.MT.TEXT) text = `${who}: ${plainText(v.msg.text)}`;
       else if (v.msg.type === P.MT.IMAGE) text = `${who} sent an image`;
       else return;
       const lo = P.T0_MS + r.t * 1000 - TS_SLACK_MS;

@@ -1,8 +1,8 @@
 import { $, component$, Slot, sync$, useContext, useSignal, type JSXOutput } from "@qwik.dev/core";
-import { parse, type Block, type Inline, type ListBlock } from "./markdown";
+import { parse, type Block, type Inline, type ListBlock } from "~/client/markdown";
 import { UiCtx } from "./state";
 
-/** The text of a message, with its Markdown (./markdown.ts) as elements. */
+/** The text of a message, with its Markdown (src/client/markdown.ts) as elements. */
 export const MsgText = component$<{ text: string }>((props) => (
   <div class="body">{parse(props.text).map(block)}</div>
 ));

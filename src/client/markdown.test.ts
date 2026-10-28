@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
-import { parse, safeHref, type Block, type Inline } from "./markdown";
+import { parse, plainText, safeHref, SPOILER, type Block, type Inline } from "./markdown";
 
 const text = (v: string): Inline => ({ t: "text", v });
 const p = (...c: Inline[]): Block => ({ t: "p", c });
@@ -258,6 +258,49 @@ describe("blocks", () => {
 
   it("normalises CRLF", () => {
     expect(parse("a\r\n# b")).toEqual([p(text("a")), { t: "h", level: 1, c: [text("b")] }]);
+  });
+});
+
+describe("plain text", () => {
+  it("drops the syntax and keeps the words", () => {
+    expect(plainText("plain")).toBe("plain");
+    expect(plainText("**b** *i* __u__ ~~s~~ `c` \\*x\\*")).toBe("b i u s c *x*");
+    expect(plainText("# 見出し\n-# small\nbody")).toBe("見出し\nsmall\nbody");
+    expect(plainText("> a\n> b\nc")).toBe("a\nb\nc");
+    expect(plainText("```js\nlet a = 1;\n```")).toBe("let a = 1;");
+    expect(plainText("a\n\nb")).toBe("a\n\nb");
+  });
+
+  it("shows links by their label or URL", () => {
+    expect(plainText("[the docs](https://example.com) and <https://example.org>")).toBe(
+      "the docs and https://example.org",
+    );
+  });
+
+  it("keeps list markers and numbers", () => {
+    expect(plainText("- a\n  - b\n3. c\n4. d")).toBe("- a\n  - b\n3. c\n4. d");
+  });
+
+  it("shows nothing of a spoiler, not even its length", () => {
+    for (const src of [
+      "||secret||",
+      "||a much longer secret, with **bold** in it||",
+      "> ||secret||",
+      "- ||secret||",
+      "# ||secret||",
+      "[||secret||](https://example.com)",
+      "**||secret||**",
+    ]) {
+      const out = plainText(src);
+      expect(out).toContain(SPOILER);
+      expect(out).not.toMatch(/secret|bold|longer/);
+    }
+    expect(plainText("a ||x|| b")).toBe(`a ${SPOILER} b`);
+    expect(plainText("||x||")).toBe(plainText("||xxxxxxxxxxxxxxxx||"));
+  });
+
+  it("leaves || in code as it is (not a spoiler in the app either)", () => {
+    expect(plainText("`||x||`")).toBe("||x||");
   });
 });
 

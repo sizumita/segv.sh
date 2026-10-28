@@ -31,7 +31,7 @@ export const Leaving = component$(() => {
   } catch {
     // shown whole below
   }
-  // href is a normalised http(s) URL (markdown.ts safeHref): scheme, "//", any user info, host, rest.
+  // href is a normalised http(s) URL (src/client/markdown.ts safeHref): scheme, "//", any user info, host, rest.
   const split = host !== "" && href.endsWith(host + rest);
   const head = split ? href.slice(0, href.length - host.length - rest.length) : href;
   return (

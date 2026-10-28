@@ -2,7 +2,7 @@
 // ~~strikethrough~~, ||spoiler||, `code`, ```code blocks```, > quotes, >>> quotes, # headings, -# subtext,
 // - / 1. lists, links (bare, <url> and [label](url)) and \ escapes. The text is parsed into a small tree that the UI
 // turns into elements: never into HTML, which the CSP would refuse anyway (no innerHTML).
-// Pure functions, no Qwik APIs.
+// Pure functions, no Qwik APIs: the push Service Worker uses them too, for the plain text of a preview.
 
 export type Inline =
   | { t: "text"; v: string }
@@ -35,6 +35,55 @@ const MAX_DEPTH = 8;
 export function parse(text: string): Block[] {
   return blocks(text.replace(/\r\n?/g, "\n"), true);
 }
+
+// ---- plain text ----
+
+/** What a spoiler shows in plain text, whatever it holds. */
+export const SPOILER = "(spoiler)";
+
+/**
+ * The text without its Markdown, for where nothing can be styled or hidden (a notification): each spoiler becomes
+ * SPOILER, with nothing of its content and not its length; links become their label or URL; each block keeps its own
+ * lines, and list items keep a "-" or their number.
+ */
+export function plainText(text: string): string {
+  return plainBlocks(parse(text));
+}
+
+const plainBlocks = (bs: Block[]): string => bs.map(plainBlock).join("\n");
+
+function plainBlock(b: Block): string {
+  switch (b.t) {
+    case "p":
+    case "h":
+    case "sub":
+      return plainInline(b.c);
+    case "quote":
+      return plainBlocks(b.c);
+    case "list":
+      return plainList(b, "");
+    case "pre":
+      return b.v;
+  }
+}
+
+function plainList(b: ListBlock, indent: string): string {
+  return b.items
+    .map((it, j) =>
+      [
+        `${indent}${b.ordered ? `${b.start + j}.` : "-"} ${plainInline(it.c)}`,
+        ...(it.sub ?? []).map((s) => plainList(s, `${indent}  `)),
+      ].join("\n"),
+    )
+    .join("\n");
+}
+
+const plainInline = (ns: Inline[]): string =>
+  ns
+    .map((n) =>
+      n.t === "text" || n.t === "code" ? n.v : n.t === "spoiler" ? SPOILER : plainInline(n.c),
+    )
+    .join("");
 
 // ---- blocks ----
 

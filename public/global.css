@@ -424,7 +424,7 @@ textarea:focus {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
-/* Markdown in messages (src/components/markdown.ts, msg-text.tsx). */
+/* Markdown in messages (src/client/markdown.ts, src/components/msg-text.tsx). */
 .body a {
   text-underline-offset: 3px;
 }
