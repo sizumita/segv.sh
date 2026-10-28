@@ -233,6 +233,14 @@ async function ready(d) {
   await d.page.locator("aside.left").waitFor({ timeout: T });
 }
 
+/** Opens the settings dialog (add passkey, notifications, sign out) and returns it. */
+async function settings(d) {
+  await d.page.getByRole("button", { name: "settings", exact: true }).click({ timeout: T });
+  const dialog = d.page.getByRole("dialog", { name: "settings" });
+  await dialog.waitFor({ timeout: T });
+  return dialog;
+}
+
 async function newConversation(d, handles, name) {
   const btn = d.page.getByRole("button", { name: "new conversation" });
   if (await btn.isVisible()) await btn.click();
@@ -550,9 +558,10 @@ try {
       await open(A2, team);
       await seen(A2, t3);
       await seen(A2, t4);
-      await A2.page.getByRole("button", { name: "add passkey" }).click();
-      await A2.page.getByText("passkey added.").waitFor({ timeout: T });
-      await A2.page.getByRole("button", { name: "sign out" }).click();
+      const prefs = await settings(A2);
+      await prefs.getByRole("button", { name: "add passkey" }).click();
+      await prefs.getByText("passkey added.").waitFor({ timeout: T });
+      await prefs.getByRole("button", { name: "sign out" }).click();
       await signedOut(A2);
       await A2.page.getByRole("button", { name: "sign in with passkey" }).click();
       await ready(A2);
@@ -574,7 +583,7 @@ try {
     await D.page.reload({ waitUntil: "load" });
     await ready(D);
     await D.page.getByText(`@${H.dave}`).first().waitFor({ timeout: T });
-    await D.page.getByRole("button", { name: "sign out" }).click();
+    await (await settings(D)).getByRole("button", { name: "sign out" }).click();
     await signedOut(D);
     await D.page.reload({ waitUntil: "load" });
     await signedOut(D);

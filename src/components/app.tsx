@@ -66,7 +66,7 @@ export const App = component$(() => {
             ui.list = "chats";
             ui.members = false;
             ui.viewer = undefined;
-            ui.notice = "";
+            ui.settings = false;
           }
           lastPhase = snap.phase;
         }

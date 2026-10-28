@@ -2,6 +2,7 @@ import { component$, useContext } from "@qwik.dev/core";
 import { ConvList } from "./conv-list";
 import { ConversationPane } from "./conversation";
 import { Errors } from "./errors";
+import { Settings } from "./settings";
 import { StateCtx, UiCtx } from "./state";
 
 /** Signed-in screen: status bar, alerts, then list | conversation. */
@@ -23,7 +24,6 @@ export const Chat = component$(() => {
             {state.progress}
           </span>
         )}
-        {ui.notice && <span role="status">{ui.notice}</span>}
         <span
           class="dim push"
           title={
@@ -59,6 +59,7 @@ export const Chat = component$(() => {
           )}
         </section>
       </div>
+      {ui.settings && <Settings />}
     </div>
   );
 });
