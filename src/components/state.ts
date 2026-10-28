@@ -43,6 +43,7 @@ export const initialEngineState = (): EngineState => ({
   warnings: [],
   prfSupported: null,
   notifications: "unavailable",
+  preview: "unavailable",
 });
 
 export const initialUiState = (): UiState => ({

@@ -25,6 +25,15 @@ import {
 import { refKeyOf } from "./conv";
 import { cursorAt, type InboxCursor } from "./inbox";
 import { Messaging, type MessagingHost } from "./messaging";
+import {
+  deleteCache,
+  idbCacheStore,
+  localPreviewStore,
+  writeCache,
+  type CacheStore,
+  type Preview,
+  type PreviewStore,
+} from "./notify-cache";
 import { PushClient, browserPushPlatform, localPushStore } from "./push";
 import { SelfLane } from "./selflane";
 import { readSnapshot } from "./snapshot";
@@ -70,7 +79,13 @@ const emptyState = (): EngineState => ({
   warnings: [],
   prfSupported: null,
   notifications: "unavailable",
+  preview: "unavailable",
 });
+
+/** The notification cache is written at least this often while the session runs (§11.13). */
+const CACHE_EVERY_MS = 5 * 60_000;
+/** Bursts of changes are written together. */
+const CACHE_DEBOUNCE_MS = 2_000;
 
 export class SegvEngine implements Engine {
   private state: EngineState = emptyState();
@@ -85,6 +100,13 @@ export class SegvEngine implements Engine {
   private api: Api;
   /** notifications on this device (§11.13); outlives sessions, like the device's setting */
   private readonly push: PushClient;
+  /** the notification cache (null: no storage) and the preview setting (§11.13) */
+  private readonly cacheStore: CacheStore | null;
+  private readonly previewStore: PreviewStore;
+  private cacheTimer: EngineTimer | null = null;
+  private cacheDue = Infinity;
+  /** the session is kept on this device (loaded at boot, or saved at sign-in) */
+  private remembered = false;
 
   private account: Account | null = null;
   private self: SelfLane | null = null;
@@ -129,13 +151,79 @@ export class SegvEngine implements Engine {
       },
       deltaMs: () => (this.api.cachedParams?.delta ?? 10) * 1000,
       bells: () => this.msg?.pushBells() ?? [],
-      onOff: () => this.patch({ notifications: this.notificationState() }),
+      onOff: () => {
+        void this.dropCache();
+        this.patch(this.notificationPatch());
+      },
     });
+    this.cacheStore = opts.notify ? opts.notify.store : idbCacheStore();
+    this.previewStore = opts.notify?.preview ?? localPreviewStore();
+    if (typeof document !== "undefined")
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden") this.scheduleCache(0);
+      });
   }
 
   private notificationState(): EngineState["notifications"] {
     if (!this.push.available) return "unavailable";
     return this.push.on ? "on" : "off";
+  }
+
+  private previewState(): EngineState["preview"] {
+    if (!this.push.available || !this.remembered || this.cacheStore === null) return "unavailable";
+    return this.previewStore.load();
+  }
+
+  private notificationPatch(): Pick<EngineState, "notifications" | "preview"> {
+    return { notifications: this.notificationState(), preview: this.previewState() };
+  }
+
+  /** The preview in effect: `none` unless notifications are on and the session is kept (§11.13). */
+  private preview(): Preview {
+    const p = this.previewState();
+    return p === "unavailable" || !this.push.on ? "none" : p;
+  }
+
+  /**
+   * Writes the notification cache within `ms` (§11.13): after a restore, when the registration set or a name may have
+   * changed, when the page is hidden, and every 5 minutes while the session runs.
+   */
+  private scheduleCache(ms: number): void {
+    if (!this.live || this.preview() === "none") return;
+    const now = this.clock.mono();
+    if (now + ms >= this.cacheDue) return;
+    this.cacheTimer?.cancel();
+    this.cacheDue = now + ms;
+    const gen = this.generation;
+    this.cacheTimer = this.clock.setTimer(() => {
+      this.cacheTimer = null;
+      this.cacheDue = Infinity;
+      if (gen !== this.generation) return;
+      void this.writeCacheNow().finally(() => this.scheduleCache(CACHE_EVERY_MS));
+    }, ms);
+  }
+
+  private async writeCacheNow(): Promise<void> {
+    const store = this.cacheStore;
+    const p = this.preview();
+    if (!store || p === "none" || !this.msg || !this.live) return;
+    try {
+      await writeCache(store, {
+        v: 1,
+        preview: p,
+        deltaS: this.api.cachedParams?.delta ?? 10,
+        copies: this.msg.notifyCopies(p === "message"),
+      });
+    } catch (e) {
+      console.error("could not write the notification cache", e);
+    }
+  }
+
+  private async dropCache(): Promise<void> {
+    this.cacheTimer?.cancel();
+    this.cacheTimer = null;
+    this.cacheDue = Infinity;
+    if (this.cacheStore) await deleteCache(this.cacheStore).catch(() => {});
   }
 
   private newApi(): Api {
@@ -164,10 +252,12 @@ export class SegvEngine implements Engine {
     this.patch({ prfSupported: await prfCapability() });
     const s = await loadSession();
     if (!s) return this.patch({ phase: "signed-out" });
+    this.remembered = true;
     try {
       await this.unlock(s.AK, P.fromB64u(s.uid), "");
     } catch (e) {
       await clearSession();
+      this.remembered = false;
       this.patch({ phase: "signed-out", error: `could not restore session: ${message(e)}` });
     }
   }
@@ -215,6 +305,9 @@ export class SegvEngine implements Engine {
     this.stopTimers();
     // The next account on this browser starts with notifications off, and gets none of this one's (§11.13).
     await this.push.logout().catch(() => {});
+    await this.dropCache();
+    this.previewStore.save("none");
+    this.remembered = false;
     await clearSession();
     for (const p of this.imageCache.values()) p.then((u) => URL.revokeObjectURL(u)).catch(() => {});
     this.resetData();
@@ -229,12 +322,24 @@ export class SegvEngine implements Engine {
   async setNotifications(on: boolean): Promise<void> {
     try {
       if (on) await this.push.enable();
-      else await this.push.disable();
+      else {
+        await this.push.disable();
+        await this.dropCache();
+      }
     } catch (e) {
       this.patch({ error: message(e) });
     } finally {
-      this.patch({ notifications: this.notificationState() });
+      this.patch(this.notificationPatch());
+      if (on) this.scheduleCache(0);
     }
+  }
+
+  async setPreview(p: Preview): Promise<void> {
+    if (this.previewState() === "unavailable") return;
+    this.previewStore.save(p);
+    if (p === "none") await this.dropCache();
+    this.patch(this.notificationPatch());
+    this.scheduleCache(0);
   }
 
   async createConversation(handles: string[], name?: string): Promise<string> {
@@ -452,7 +557,8 @@ export class SegvEngine implements Engine {
     this.live = true;
     this.msg!.start();
     this.push.restored();
-    this.patch({ syncing: false, notifications: this.notificationState() });
+    this.patch({ syncing: false, ...this.notificationPatch() });
+    this.scheduleCache(0);
   }
 
   /** What the session's Messaging calls back into. */
@@ -479,7 +585,10 @@ export class SegvEngine implements Engine {
         this.version++;
         this.scheduleEmit();
         // The registration set may have changed: computed again within Δ, sent only if it differs (§11.13).
-        if (this.live && gen === this.generation) this.push.changed();
+        if (this.live && gen === this.generation) {
+          this.push.changed();
+          this.scheduleCache(CACHE_DEBOUNCE_MS);
+        }
       },
       emitNow: () => this.emitNow(),
       progress: (t) => this.progress(t),
@@ -572,6 +681,8 @@ export class SegvEngine implements Engine {
   private async remember(u: Unlocked): Promise<void> {
     try {
       await saveSession(P.b64u(u.uid), u.AK);
+      this.remembered = true;
+      this.patch(this.notificationPatch());
     } catch (e) {
       this.patch({
         error: `this browser could not remember the session (${message(e)}); you will need to sign in again next time`,

@@ -1,6 +1,6 @@
 /**
  * Web Push sending primitives for PushDO (docs/PROTOCOL.md §9.8 "Sending a push"): the VAPID key and its JWT
- * (RFC 8292, ES256), the message encryption to a subscription (RFC 8291, aes128gcm), and the fixed payload.
+ * (RFC 8292, ES256), the message encryption to a subscription (RFC 8291, aes128gcm), and the payload.
  *
  * The elliptic-curve parts use noble (P-256), so the encryption is deterministic under a fixed salt and key pair,
  * which the tests check against RFC 8291 Appendix A. Payloads are tiny (one record), so the pure-JS AES-GCM and
@@ -87,10 +87,21 @@ export class VapidSigner {
   }
 }
 
-/** The exact payload bytes of §9.8 for the given host (UTF-8): the same for every device and push. */
-export function pushPayload(host: string): Uint8Array {
+/** The most bells one push names (§9.8 `PUSH_BELLS`). */
+export const PUSH_BELLS = 4;
+
+/**
+ * The payload of §9.8 for the given host (UTF-8): `bells` are the endpoint's `rang` (16 bytes each, newest first), of
+ * which the first PUSH_BELLS go in, zero-padded to 64 bytes. Every push therefore has the same length.
+ */
+export function pushPayload(host: string, bells: readonly Bytes[] = []): Uint8Array {
+  const b = new Uint8Array(16 * PUSH_BELLS);
+  bells.slice(0, PUSH_BELLS).forEach((x, i) => {
+    if (x.length !== 16) throw new RangeError("a bell is 16 bytes");
+    b.set(x, 16 * i);
+  });
   return utf8(
-    `{"web_push":8030,"notification":{"title":"segv.sh","body":"new messages","navigate":"https://${host}/","tag":"segv"}}`,
+    `{"web_push":8030,"mutable":true,"notification":{"title":"segv.sh","body":"new messages","navigate":"https://${host}/","tag":"segv","data":{"bells":"${b64u(b)}"}}}`,
   );
 }
 

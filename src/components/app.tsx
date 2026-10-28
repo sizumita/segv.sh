@@ -12,7 +12,14 @@ import { Chat } from "./chat";
 import { loadEngine } from "./engine-loader";
 import { Fatal } from "./fatal";
 import { Recovery } from "./recovery";
-import { followUrl, refOfHash, resolveWanted, writeUrl } from "./route";
+import {
+  closeNotifications,
+  followUrl,
+  openFromWorker,
+  refOfHash,
+  resolveWanted,
+  writeUrl,
+} from "./route";
 import { SignedOut } from "./signed-out";
 import { initialEngineState, initialUiState, StateCtx, UiCtx } from "./state";
 import { errMsg } from "./util";
@@ -43,6 +50,10 @@ export const App = component$(() => {
     async ({ cleanup }) => {
       // A link, a reload or a notification may name a conversation (route.ts): show it once it is loaded.
       ui.wanted = refOfHash(location.hash);
+      // A tapped notification of a conversation, while this window is open.
+      const onWorker = (e: MessageEvent) => openFromWorker(e.data);
+      navigator.serviceWorker?.addEventListener("message", onWorker);
+      cleanup(() => navigator.serviceWorker?.removeEventListener("message", onWorker));
       ui.visible = document.visibilityState === "visible";
       ui.now = Date.now();
       const tick = window.setInterval(() => (ui.now = Date.now()), 30_000);
@@ -106,6 +117,7 @@ export const App = component$(() => {
       if (phase === "boot" || wanted) return;
       const c = id ? state.conversations.find((x) => x.id === id) : undefined;
       writeUrl(c ? c.ref : "");
+      if (c) closeNotifications(c.ref);
     },
     { strategy: "document-ready" },
   );

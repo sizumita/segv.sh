@@ -1,6 +1,8 @@
 // Notifications (docs/PROTOCOL.md §11.13): the registration set, its re-sends, the rings after a TEXT or IMAGE, and
 // the device's subscription at logout, against FakeWorld's push endpoints and a fake browser per device.
 import { describe, expect, it } from "vite-plus/test";
+import { readCache, type Preview, type PreviewStore, type SealedBox } from "../../src/client/notify-cache";
+import { browserDeps, notesFor, type Proposed } from "../../src/client/sw-core";
 import type { Engine } from "../../src/client/types";
 import {
   FakePushDevice,
@@ -19,6 +21,22 @@ import {
 } from "./harness";
 
 freshWorldPerTest({ push: true });
+
+/** An in-memory notification cache and preview setting, as one device keeps them. */
+function notifyOf() {
+  const store = {
+    key: null as CryptoKey | null,
+    box: null as SealedBox | null,
+    getKey: async () => store.key,
+    putKey: async (k: CryptoKey) => void (store.key = k),
+    getBox: async () => store.box,
+    putBox: async (b: SealedBox) => void (store.box = b),
+    clear: async () => void ((store.key = null), (store.box = null)),
+  };
+  let p: Preview = "none";
+  const preview: PreviewStore = { load: () => p, save: (x) => void (p = x) };
+  return { store, preview };
+}
 
 /** `u`'s bell in the current epoch of `id`, as engine `e` computes it. */
 function bellOf(e: Engine, id: string, u: TestUser): string {
@@ -249,5 +267,65 @@ describe("rings (§11.3 step 6, §11.13)", () => {
     await new Promise((r) => setTimeout(r, 50));
     expect(pushes()).toBe(1);
     expect(chat(B, id)).toContain("alice: hello bob");
+  });
+});
+
+describe("previews (§11.13)", () => {
+  const ORIGIN = "https://segv.test";
+  const pushOf = (bells: string[]): Proposed => ({ title: "segv.sh", body: "new messages", tag: "segv", navigate: `${ORIGIN}/`, bells });
+
+  it("the cache names each registered copy, and the worker reads, verifies and previews the newest message", async () => {
+    const [alice, bob] = ["alice", "bob"].map((h) => makeUser(h));
+    const bobDev = new FakePushDevice("bob");
+    const n = notifyOf();
+    const A = await engineFor(alice);
+    const B = await engineFor(bob, { ...bobDev.options, notify: n });
+    const one = await A.createConversation(["bob"]);
+    await settle(A, B);
+    await B.accept(one);
+    await B.setNotifications(true);
+    // Not kept on this device: no preview to choose.
+    expect(B.getState().preview).toBe("unavailable");
+    (B as unknown as { remembered: boolean }).remembered = true;
+    await B.setPreview("message");
+    expect(B.getState().preview).toBe("message");
+    await settle(A, B);
+    let cache = await readCache(n.store);
+    await waitFor(() => (void readCache(n.store).then((c) => (cache = c)), cache !== null), "cache written");
+    const bell = bellOf(A, one, bob);
+    const ref = mustView(B, one).ref;
+    expect(cache!.preview).toBe("message");
+    expect(cache!.copies.map((c) => [c.bell, c.ref, c.name])).toEqual([[bell, ref, "@alice"]]);
+    const ep = cache!.copies[0].epoch!;
+    expect(ep.members.map((m) => m.handle)).toEqual(mustView(B, one).members.map((m) => m.handle));
+
+    // The device is closed now: its cache stays as it was while alice writes.
+    const frozen = cache;
+    await A.sendText(one, "hello bob");
+    await settle(A, B);
+    const deps = { ...browserDeps(ORIGIN, { fetch: server().fetchAs("bob-sw"), store: null }), readCache: async () => frozen };
+    const moves: unknown[] = [];
+    deps.advance = async (m) => void moves.push(m);
+    expect(await notesFor(pushOf([bell]), deps, Infinity)).toEqual([
+      { title: "@alice", body: "@alice: hello bob", tag: ref, navigate: `${ORIGIN}/#c/${ref}` },
+    ]);
+    expect(moves).toHaveLength(1);
+    // A bell this device never registered names nothing.
+    expect(await notesFor(pushOf([bellOf(A, one, alice)]), deps, Infinity)).toEqual([
+      { title: "segv.sh", body: "new messages", tag: "segv", navigate: `${ORIGIN}/` },
+    ]);
+
+    // `none` deletes the cache; so does turning notifications off.
+    await B.setPreview("none");
+    expect(await readCache(n.store)).toBeNull();
+    await B.setPreview("name");
+    await waitFor(() => n.store.box !== null, "cache written again");
+    expect((await readCache(n.store))!.copies[0].epoch).toBeUndefined();
+    await B.setNotifications(false);
+    expect(await readCache(n.store)).toBeNull();
+    expect(B.getState().preview).toBe("name");
+    // Logout forgets the choice too, so the next account starts with `none`.
+    await B.logout();
+    expect(n.preview.load()).toBe("none");
   });
 });

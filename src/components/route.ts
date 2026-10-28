@@ -86,3 +86,25 @@ export function leaveChat(ui: UiState) {
   ui.active = "";
   ui.members = false;
 }
+
+/** Closes the notifications of a conversation once it is shown: their tag is its ref (§11.13). */
+export function closeNotifications(ref: string): void {
+  if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return;
+  navigator.serviceWorker
+    .getRegistration("/")
+    .then((r) => r?.getNotifications({ tag: ref }))
+    .then((ns) => ns?.forEach((n) => n.close()))
+    .catch(() => {});
+}
+
+/** A tapped notification: the Service Worker asks an open window to show its URL (src/client/sw-core.ts). */
+export function openFromWorker(data: unknown): void {
+  const m = data as { type?: unknown; url?: unknown } | null;
+  if (m?.type !== "segv.open" || typeof m.url !== "string") return;
+  try {
+    const u = new URL(m.url);
+    if (u.origin === location.origin && u.hash && location.hash !== u.hash) location.hash = u.hash;
+  } catch {
+    // not a URL: stay where we are
+  }
+}

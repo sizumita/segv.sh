@@ -112,6 +112,7 @@ class MockEngine implements Engine {
     warnings: [],
     prfSupported: null,
     notifications: "unavailable",
+    preview: "unavailable",
   };
   private subs = new Set<(s: EngineState) => void>();
   private seq = 1000;
@@ -129,6 +130,7 @@ class MockEngine implements Engine {
     this.set({
       prfSupported: !this.opts.noprf,
       notifications: this.opts.push ? "off" : "unavailable",
+      preview: this.opts.push ? "none" : "unavailable",
     });
     if (this.opts.fatal) {
       this.set({
@@ -679,6 +681,11 @@ class MockEngine implements Engine {
     if (this.state.notifications === "unavailable") return;
     await sleep(150);
     this.set({ notifications: on ? "on" : "off" });
+  }
+
+  async setPreview(p: "none" | "name" | "message"): Promise<void> {
+    if (this.state.preview === "unavailable") return;
+    this.set({ preview: p });
   }
 
   markRead(convId: string): void {

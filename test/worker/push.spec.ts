@@ -73,9 +73,12 @@ interface Call {
   at: number;
 }
 interface PushState {
+  ep?: Bytes;
   due: number | null;
   last: number | null;
   tries: number;
+  first?: number;
+  rang?: Bytes[];
 }
 interface Hooks {
   clock: () => number;
@@ -598,8 +601,78 @@ describe("the push request (§9.8)", () => {
     expect(cl.exp).toBeLessThanOrEqual(Math.floor((BASE + 1000) / 1000) + 12 * 3600);
     expect(p256.verify(P.fromB64u(sig), P.utf8(`${h}.${claims}`), VAPID_PK, { lowS: false })).toBe(true);
     expect(new TextDecoder().decode(decrypt(c.body, d))).toBe(
-      '{"web_push":8030,"notification":{"title":"segv.sh","body":"new messages","navigate":"https://segv.test/","tag":"segv"}}',
+      `{"web_push":8030,"mutable":true,"notification":{"title":"segv.sh","body":"new messages","navigate":"https://segv.test/","tag":"segv","data":{"bells":"${P.b64u(P.concat(b, new Uint8Array(48)))}"}}}`,
     );
+  });
+});
+
+// ───────────── 8b. the bells a push names ─────────────
+
+describe("the bells a push names (§9.8 `rang`)", () => {
+  /** The bells named by the payload of a call, without the zero padding. */
+  const named = (c: Call, d: Dev): string[] => {
+    const j = JSON.parse(new TextDecoder().decode(decrypt(c.body, d))) as { notification: { data: { bells: string } } };
+    const raw = P.fromB64u(j.notification.data.bells);
+    expect(raw.length).toBe(64);
+    const out: string[] = [];
+    for (let i = 0; i < 64; i += 16) {
+      const b = raw.subarray(i, i + 16);
+      if (b.some((x) => x !== 0)) out.push(P.hex(b));
+    }
+    return out;
+  };
+
+  it("names the endpoint's bells that rang since its last push, newest first, at most 4, and only its own", async () => {
+    await reset(BASE);
+    const d = dev();
+    const bs = bells(5);
+    const other = P.random(16);
+    await sub(d, bs);
+    await sub(dev(), [other]);
+    for (const b of bs) await ring([other, b]);
+    await ring([bs[1]]); // a repeat moves to the front
+    await run(BASE + DELTA * 1000);
+    expect(callsTo(d)).toHaveLength(1);
+    expect(named(callsTo(d)[0], d)).toEqual([bs[1], bs[4], bs[3], bs[2]].map(P.hex));
+  });
+
+  it("starts again after a push is sent, and after one is dropped", async () => {
+    await reset(BASE);
+    const d = dev();
+    const [b1, b2, b3] = bells(3);
+    await sub(d, [b1, b2, b3]);
+    await ring([b1]);
+    await run(BASE + DELTA * 1000);
+    expect(named(callsTo(d)[0], d)).toEqual([P.hex(b1)]);
+    await ring([b2]);
+    await run(BASE + (PUSH_WINDOW + 2 * DELTA) * 1000);
+    expect(callsTo(d)).toHaveLength(2);
+    expect(named(callsTo(d)[1], d)).toEqual([P.hex(b2)]);
+    expect((await stateOf(d)).rang).toEqual([]);
+
+    fake.respond = () => new Response(null, { status: 500 });
+    await ring([b3]);
+    const t = BASE + (2 * PUSH_WINDOW + 3 * DELTA) * 1000;
+    await run(t);
+    await run(t + 10_000); // the retry fails too: dropped
+    expect(callsTo(d)).toHaveLength(4);
+    expect(named(callsTo(d)[3], d)).toEqual([P.hex(b3)]);
+    expect((await stateOf(d)).rang).toEqual([]);
+  });
+
+  it("a push with no bell is as long as one with four", async () => {
+    await reset(BASE);
+    const d = dev();
+    const e = dev();
+    const bs = bells(4);
+    await sub(d, bs);
+    await sub(e, [P.random(16)]);
+    for (const b of bs) await ring([b]);
+    await inDO((h) => h.pushes.set(P.hex(e.ep), { ep: e.ep, last: null, due: BASE, tries: 0, first: 0, rang: [] }));
+    await run(BASE + DELTA * 1000);
+    expect(named(callsTo(d)[0], d)).toHaveLength(4);
+    expect(named(callsTo(e)[0], e)).toHaveLength(0);
+    expect(callsTo(d)[0].body.length).toBe(callsTo(e)[0].body.length);
   });
 });
 
