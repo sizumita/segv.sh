@@ -9,6 +9,7 @@ import {
 } from "@qwik.dev/core";
 import type { EngineState } from "~/client/types";
 import { Chat } from "./chat";
+import { refreshServiceWorker } from "~/client/sw-url";
 import { loadEngine } from "./engine-loader";
 import { Fatal } from "./fatal";
 import { Recovery } from "./recovery";
@@ -50,6 +51,8 @@ export const App = component$(() => {
     async ({ cleanup }) => {
       // A link, a reload or a notification may name a conversation (route.ts): show it once it is loaded.
       ui.wanted = refOfHash(location.hash);
+      // A new /sw.js applies from this launch on, not whenever the browser gets round to checking it.
+      refreshServiceWorker();
       // A tapped notification of a conversation, while this window is open.
       const onWorker = (e: MessageEvent) => openFromWorker(e.data);
       navigator.serviceWorker?.addEventListener("message", onWorker);
@@ -135,6 +138,8 @@ export const App = component$(() => {
     "visibilitychange",
     $(() => {
       ui.visible = document.visibilityState === "visible";
+      // A web app on a phone is often resumed rather than launched again.
+      if (ui.visible) refreshServiceWorker();
     }),
   );
   useOnDocument(

@@ -305,7 +305,7 @@ interface Shown {
   opts: { body: string; tag: string; data: { navigate: string } };
 }
 
-function load(deps: Partial<SwDeps>, windows: { url: string }[] = []) {
+function load(deps: Partial<SwDeps>, windows: { url: string; refuseFocus?: boolean }[] = []) {
   const listeners = new Map<string, (ev: never) => void>();
   const shown: Shown[] = [];
   const opened: string[] = [];
@@ -328,6 +328,7 @@ function load(deps: Partial<SwDeps>, windows: { url: string }[] = []) {
           windows.map((w) => ({
             url: w.url,
             focus: () => {
+              if (w.refuseFocus) return Promise.reject(new Error("InvalidAccessError"));
               focused.push(w.url);
               return Promise.resolve();
             },
@@ -425,5 +426,14 @@ describe("the worker", () => {
     await closed.dispatch("notificationclick", note(`${ORIGIN}/#c/AAAAAAAAAAAA`));
     await closed.dispatch("notificationclick", note("https://evil.test/"));
     expect(closed.opened).toEqual([`${ORIGIN}/#c/AAAAAAAAAAAA`, `${ORIGIN}/`]);
+  });
+
+  it("still asks the window to show the conversation when the browser refuses to focus it", async () => {
+    const note = {
+      notification: { data: { navigate: `${ORIGIN}/#c/AAAAAAAAAAAA` }, close: () => {} },
+    };
+    const sw = load({}, [{ url: `${ORIGIN}/`, refuseFocus: true }]);
+    await sw.dispatch("notificationclick", note);
+    expect(sw.posted).toEqual([{ type: "segv.open", url: `${ORIGIN}/#c/AAAAAAAAAAAA` }]);
   });
 });
