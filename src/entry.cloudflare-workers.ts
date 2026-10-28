@@ -15,12 +15,13 @@ import { handleApi, stampResponse } from "./server/api";
 import { pinHost } from "./server/hosts";
 
 // Durable Object classes must be exported from the Worker's main module (docs/PROTOCOL.md §9): per-era
-// shards and inboxes, the blob registry, realtime WebSockets and checkpoints.
+// shards and inboxes, the blob registry, realtime WebSockets, checkpoints and Web Push.
 export { ShardDO } from "./server/shard-do";
 export { BlobRegDO } from "./server/blobreg-do";
 export { InboxDO } from "./server/inbox-do";
 export { RealtimeDO } from "./server/realtime-do";
 export { CheckpointDO } from "./server/ckpt-do";
+export { PushDO } from "./server/push-do";
 
 export interface PlatformCloudflareWorkers extends PlatformCloudflarePages {
   env: Env;

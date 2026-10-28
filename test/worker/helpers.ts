@@ -22,6 +22,7 @@ export const DIFF2: Readonly<Record<P.PowScope, number>> = {
   put: 4,
   inbox: 4,
   blob: 5,
+  push: 4,
 };
 /** Deployment parameters of ../wrangler.test.jsonc (Δ, SKEW, Δin, E_FIRST). */
 export const DELTA = 1;

@@ -8,10 +8,12 @@
  *   BlobRegDO    "blobreg/v2"
  *   RealtimeDO   "rt/v2/0"
  *   CheckpointDO "ckpt/v2"
+ *   PushDO       "push/v2"            (only while push is on, §9.8)
  */
 import type { BlobRegDO } from "./blobreg-do";
 import type { CheckpointDO } from "./ckpt-do";
 import type { InboxDO } from "./inbox-do";
+import type { PushDO } from "./push-do";
 import type { RealtimeDO } from "./realtime-do";
 import type { ShardDO } from "./shard-do";
 
@@ -153,6 +155,11 @@ export interface CkptRange {
   latest: { q: number; C: Bytes; sig: Bytes };
 }
 
+// ───────────── PushDO (§9.8) ─────────────
+
+/** PushDO.sub: "full" when PUSH_MAX_SUBS endpoints are stored, or PUSH_DAY_SUBS others changed today. */
+export type PushSubResult = "ok" | "full";
+
 // ───────────── stubs ─────────────
 
 const ns = <T extends Rpc.DurableObjectBranded | undefined>(env: Env, name: string): DurableObjectNamespace<T> =>
@@ -163,6 +170,7 @@ export const inboxName = (E: number, g: number): string => `inbox/v2/${E}/${g}`;
 export const BLOBREG_NAME = "blobreg/v2";
 export const RT_NAME = "rt/v2/0";
 export const CKPT_NAME = "ckpt/v2";
+export const PUSH_NAME = "push/v2";
 
 export const shardStub = (env: Env, E: number, i: number): DurableObjectStub<ShardDO> =>
   ns<ShardDO>(env, "SHARD").getByName(shardName(E, i));
@@ -171,6 +179,7 @@ export const inboxStub = (env: Env, E: number, g: number): DurableObjectStub<Inb
 export const blobRegStub = (env: Env): DurableObjectStub<BlobRegDO> => ns<BlobRegDO>(env, "BLOBREG").getByName(BLOBREG_NAME);
 export const rtStub = (env: Env): DurableObjectStub<RealtimeDO> => ns<RealtimeDO>(env, "RT").getByName(RT_NAME);
 export const ckptStub = (env: Env): DurableObjectStub<CheckpointDO> => ns<CheckpointDO>(env, "CKPT").getByName(CKPT_NAME);
+export const pushStub = (env: Env): DurableObjectStub<PushDO> => ns<PushDO>(env, "PUSH").getByName(PUSH_NAME);
 
 /** Parses "shard/v2/{E}/{i}" / "inbox/v2/{E}/{g}" (decimal, no padding). */
 export function parseEraName(name: string | undefined, kind: "shard" | "inbox"): { E: number; i: number } {

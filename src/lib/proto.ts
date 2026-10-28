@@ -844,6 +844,8 @@ export const Lmsg = (rk: Bytes, lane: number, E: number, n: number): Bytes =>
 export const Lctl = (rk: Bytes, E: number, k: number): Bytes => t16(HMAC(rk, enc("segv.sh/v2/lab/ctl", u16(E), u32(k))));
 /** T_e: realtime topic of epoch e. */
 export const topicConv = (nk: Bytes): Bytes => t16(HMAC(nk, utf8("segv.sh/v2/topic/conv")));
+/** B_e(ℓ): the Web Push bell of lane ℓ in epoch e (§4.2, §11.13). Every member can compute it; outsiders cannot. */
+export const bell = (nk: Bytes, lane: number): Bytes => t16(HMAC(nk, enc("segv.sh/v2/bell", u16(lane))));
 
 // ───────────────────────── links (§4.3) ─────────────────────────
 
@@ -981,12 +983,14 @@ export const prevh = (label: Bytes, body: Bytes): Bytes => t16(H(enc("segv.sh/v2
 
 // ───────────────────────── proof of work (§10.2) ─────────────────────────
 
-export type PowScope = "register" | "wrap" | "put" | "inbox" | "blob";
+/** `push` exists only while a deployment offers Web Push (§9.8): params report it then, and never otherwise. */
+export type PowScope = "register" | "wrap" | "put" | "inbox" | "blob" | "push";
+/** The scopes every deployment reports in params `pow`. */
 export const POW_SCOPES: readonly PowScope[] = ["register", "wrap", "put", "inbox", "blob"];
 export const POW_WINDOW_MS = 600_000;
 export const POW_MAX_BASE = 26;
 
-const POW_UNIT: Readonly<Record<PowScope, number>> = { register: 0, wrap: 0, put: 4096, inbox: 4096, blob: 1 << 20 };
+const POW_UNIT: Readonly<Record<PowScope, number>> = { register: 0, wrap: 0, put: 4096, inbox: 4096, blob: 1 << 20, push: 0 };
 
 /** base + ⌈log2(bytes / unit)⌉ above the unit, else base. */
 export function powDifficulty(scope: PowScope, base: number, bytes: number): number {

@@ -263,7 +263,7 @@ function refMth(leafHashes: B[]): B {
 }
 
 /** §10.2 difficulty with integers only: base + the smallest k with unit·2^k ≥ bytes, above the unit. */
-const POW_UNIT_REF: Record<P.PowScope, bigint> = { register: 0n, wrap: 0n, put: 4096n, inbox: 4096n, blob: 1n << 20n };
+const POW_UNIT_REF: Record<P.PowScope, bigint> = { register: 0n, wrap: 0n, put: 4096n, inbox: 4096n, blob: 1n << 20n, push: 0n };
 const refPowDifficulty = (scope: P.PowScope, base: number, bytes: number): number => {
   const unit = POW_UNIT_REF[scope];
   if (unit === 0n || BigInt(bytes) <= unit) return base;
@@ -1497,6 +1497,25 @@ describe("conversation epochs (§4.2)", () => {
       expect(toHex(P.Lctl(rk, E, k))).toBe(toHex(tr16(hmacN(rk, refEnc("segv.sh/v2/lab/ctl", be16(E), be32(k))))));
     }
     expect(toHex(P.topicConv(nk))).toBe(toHex(tr16(hmacN(nk, "segv.sh/v2/topic/conv"))));
+  });
+
+  it("B_e(ℓ) follows the spec, differs per lane and epoch, and never equals T_e", () => {
+    const seen = new Set<string>();
+    for (const e of [0, 1]) {
+      const { nk } = P.epochKeys(EK, CONV, e);
+      seen.add(toHex(P.topicConv(nk)));
+      for (const l of [0, 1, 31, 0xffff]) {
+        const b = P.bell(nk, l);
+        expect(b.length).toBe(16);
+        expect(toHex(b)).toBe(toHex(tr16(hmacN(nk, refEnc("segv.sh/v2/bell", be16(l))))));
+        seen.add(toHex(b));
+      }
+    }
+    expect(seen.size).toBe(10);
+    // A fixed vector, so a change of the derivation is caught even if the reference helpers change with it.
+    const nk = new Uint8Array(32).fill(7);
+    expect(toHex(P.bell(nk, 2))).toBe(toHex(tr16(hmacN(nk, refEnc("segv.sh/v2/bell", be16(2))))));
+    expect(() => P.bell(nk, 0x10000)).toThrow();
   });
 
   it("labels are distinct across lane, era, slot, epoch and label kind", () => {

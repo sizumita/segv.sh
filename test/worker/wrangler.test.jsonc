@@ -21,6 +21,7 @@
       { "name": "INBOX", "class_name": "InboxDO" },
       { "name": "RT", "class_name": "RealtimeDO" },
       { "name": "CKPT", "class_name": "CheckpointDO" },
+      { "name": "PUSH", "class_name": "PushDO" },
     ],
   },
   "migrations": [
@@ -28,12 +29,14 @@
       "tag": "v1",
       "new_sqlite_classes": ["ShardDO", "BlobRegDO", "InboxDO", "RealtimeDO", "CheckpointDO"],
     },
+    { "tag": "v2", "new_sqlite_classes": ["PushDO"] },
   ],
   "ratelimits": [
     { "name": "RL_WRITE", "namespace_id": "1001", "simple": { "limit": 60, "period": 60 } },
     { "name": "RL_BLOB", "namespace_id": "1002", "simple": { "limit": 20, "period": 60 } },
     { "name": "RL_READ", "namespace_id": "1003", "simple": { "limit": 600, "period": 60 } },
     { "name": "RL_INBOX", "namespace_id": "1004", "simple": { "limit": 10, "period": 60 } },
+    { "name": "RL_RING", "namespace_id": "1005", "simple": { "limit": 60, "period": 60 } },
   ],
   // APP_HOSTS: the tests talk to https://segv.test (helpers.ts ORIGIN).
   "vars": {
@@ -42,6 +45,7 @@
     "POW_BLOB": "5",
     "POW_PUT": "4",
     "POW_INBOX": "4",
+    "POW_PUSH": "4",
     // v2: Δ = 1 s, SKEW = 0, Δin = 1 s. E_FIRST = 1 (era 0 is "before the
     // first deploy" for the era-bound tests).
     "DELTA_S": "1",
@@ -52,5 +56,11 @@
     "ROUTE_KEY": "dGVzdC1yb3V0ZS1rZXktc2Vndi5zaC12Mi0wMDAwMDA",
     "SRV_KEY": "dGVzdC1zcnYta2V5LXNlZ3Yuc2gtdjItMDAwMDAwMDA",
     "APP_HOSTS": "segv.test,localhost",
+    // Web Push on, with fixed test keys. Pushes only ever go to the *.push.test hosts below, which never
+    // resolve: the push tests replace PushDO's fetch.
+    "VAPID_SK": "dGVzdC12YXBpZC1rZXktc2Vndi5zaC12Mi0wMDAwMDA",
+    "PUSH_KEY": "dGVzdC1wdXNoLWtleS1zZWd2LnNoLXYyLTAwMDAwMDA",
+    "VAPID_SUB": "mailto:push@segv.test",
+    "PUSH_HOSTS": "push.test,*.push.test",
   },
 }

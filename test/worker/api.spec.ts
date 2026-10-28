@@ -136,6 +136,7 @@ describe("GET /api/v2/params", () => {
       "srvKey",
       "pow",
       "limits",
+      "push",
     ]);
     const now = p.now as number;
     expect(now).toBeGreaterThanOrEqual(before);
@@ -161,6 +162,8 @@ describe("GET /api/v2/params", () => {
     expect(Number.isInteger(p.p) && (p.p as number) >= 0 && (p.p as number) <= 32).toBe(true);
     expect(p.pow).toEqual(DIFF2);
     expect(p.limits).toEqual({ putRows: 16, putBytes: 263345, getKeys: 256, topics: 256, blobMax: 12582912, textMax: 12000 });
+    // The test config turns Web Push on (test/worker/push.spec.ts covers it).
+    expect(Object.keys(p.push as object)).toEqual(["vapid", "window", "maxTokens"]);
   });
 
   it("405 with allow on wrong methods; 404 on unknown /api/v2 paths", async () => {
