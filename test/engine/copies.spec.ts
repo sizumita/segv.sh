@@ -503,13 +503,23 @@ describe("a sibling's ENDED record (§11.7)", () => {
     await I(B2).unlock(bob.AK, bob.uid, bob.handle);
     await waitFor(() => !B2.getState().syncing, "bob2's restore");
     await settle(A, B, B2, C);
+    // One of bob's devices at a time is online, so that bob2 reads B1's ENDED record only once the claim is visible
+    // to it: a device that reads the record while it cannot read the claim keeps the rows stored after it.
+    const offline = new Set<string>(["bob"]);
+    server().hooks.fail = (_m, _p, who) => (who !== null && offline.has(who) ? "before" : null);
     const r = await commitChange(alice, epoch(A, id), [alice, carol], undefined, { hideFrom: ["bob2"] });
     // carol's row of epoch 0 stored after C_0: bob2, which never saw the claim, shows it
     const ep = conv(C, id).epochs.get(0)!;
     const j = P.memberIndex(ep.D, carol.uid);
     postRow(ep, buildMessage(carol, ep, { E: server().era, n: ep.lanes[j].next.n }, { type: P.MT.TEXT, text: "after" } as P.MBody));
+    await settle(A, B2, C);
+    expect(chat(B2, id)).toContain("carol: after");
+    offline.clear();
+    offline.add("bob2");
     await settle(A, B, C);
     expect(chat(B, id)).not.toContain("carol: after");
+    expect(selfRowsOf(bob).flat().some((x) => x.rtype === P.RT.ENDED)).toBe(true);
+    offline.clear();
     server().shard.unhide(r.claim.E, r.claim.label, "bob2");
     await settle(A, B, B2, C);
     expect(mustView(B2, id).blocked).toBe("removed");

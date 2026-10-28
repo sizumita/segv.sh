@@ -1,7 +1,7 @@
 // HEADS rows (docs/PROTOCOL.md §7.3 "HEADS splitting"): the records waiting for the next HEADS row and the entries are
 // spread over as many self rows as needed, each within the cls-3 budget and the record cap.
 import { describe, expect, it } from "vite-plus/test";
-import { I, P, engineFor, makeUser, freshWorldPerTest, selfRowsOf, server } from "./harness";
+import { I, P, engineFor, makeUser, freshWorldPerTest, selfRowsOf, server, settleTimeout } from "./harness";
 
 freshWorldPerTest();
 
@@ -38,6 +38,7 @@ describe("HEADS rows", () => {
 
 describe("HEADS entries over several rows (M6 test 11)", () => {
   it("an account with more entries than one row holds writes them over several rows, and restores from them", async () => {
+    settleTimeout(240_000); // the restore of 70 conversations of 32 members takes over a minute on a slow machine
     const users = Array.from({ length: 31 }, (_, i) => makeUser(`m${String(i).padStart(2, "0")}`));
     const alice = makeUser("alice");
     const A = await engineFor(alice);

@@ -153,6 +153,7 @@ export function freshWorldPerTest(opts: FakeWorldOptions = {}): void {
   beforeEach(() => {
     current = new FakeWorld(opts);
     storage.clear();
+    settleMs = SETTLE_MS;
   });
   afterEach(async () => {
     for (const fn of cleanups.splice(0)) {
@@ -513,6 +514,17 @@ export function newEngine(who: string | null = null, opts: EngineOptions = {}): 
   return e;
 }
 
+const SETTLE_MS = 60_000;
+let settleMs = SETTLE_MS;
+
+/**
+ * Lets `settle` run for up to `ms` of real time in the current test, for worlds large enough to take more than a
+ * minute on a slow machine. Keep it under the test's own timeout.
+ */
+export function settleTimeout(ms: number): void {
+  settleMs = ms;
+}
+
 /** Unlocks `u` on a new engine, waits for the restore (`!syncing`), then settles. */
 export async function engineFor(u: TestUser, opts: EngineOptions = {}): Promise<SegvEngine> {
   const e = newEngine(u.handle, opts);
@@ -536,10 +548,12 @@ export async function engineFor(u: TestUser, opts: EngineOptions = {}): Promise<
  * on it). A test that needs a fresh checkpoint first calls `server().tick(CKPT_PERIOD_MS)`, which moves the world and
  * every engine's clocks together; the server-only `advance` would leave the engines' clocks behind. Never use
  * `tick({ force: true })` here: it models a server minting faster than the spec allows.
+ *
+ * It fails after 60 s of real time, or what `settleTimeout` set for the current test.
  */
 export async function settle(...es: Engine[]): Promise<void> {
   const w = current;
-  const end = Date.now() + 60_000;
+  const end = Date.now() + settleMs;
   let last = -1;
   let same = 0;
   for (let round = 0; ; round++) {
