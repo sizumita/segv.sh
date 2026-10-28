@@ -408,6 +408,9 @@ const claim3: P.Claim = {
     { E: 2, cnt: 9 },
   ],
 };
+const reaction1: P.Reaction = { te: 5, tl: 2, tE: 9, tn: 300, th: fill(16, 0x55), op: 1, emoji: "👍" };
+const refReaction = (x: P.Reaction, emoji: B = s2b(x.emoji)): B =>
+  cat(be32(x.te), be16(x.tl), be16(x.tE), be32(x.tn), x.th, be8(x.op), be8(emoji.length), emoji);
 const claimMsg = (c: P.Claim = claim3, k = 0, from = 0): P.Msg => ({
   ...hdr({ from, lane: P.CTL_LANE, n: k }),
   type: P.MT.CLAIM,
@@ -429,6 +432,11 @@ describe("envelope M: layout", () => {
       { type: 2, content: cat(fill(32, 0x31), fill(32, 0x32), be8(1), be16(640), be16(480)) },
     ],
     ["WELCOME", { ...hdr(), type: P.MT.WELCOME, join: join1 }, { type: 8, content: J }],
+    [
+      "REACTION",
+      { ...hdr(), type: P.MT.REACTION, reaction: reaction1 },
+      { type: 3, content: refReaction(reaction1) },
+    ],
     [
       "CLAIM",
       claimMsg(claim3, 7, 2),
@@ -566,6 +574,77 @@ describe("envelope M: strict parsing", () => {
   });
 });
 
+describe("REACTION (§3.3, §11.12)", () => {
+  const refPrevh = (label: B, body: B): B =>
+    new Uint8Array(createHash("sha256").update(refEnc("segv.sh/v2/prev", label, body)).digest()).slice(0, 16);
+  const withContent = (content: B, o: Partial<RefM> = {}) => baseRefM({ type: 3, content, ...o });
+
+  it("is 30 + elen bytes, op 0 or 1, 1..32 bytes of strict UTF-8, with no rule on the target fields", () => {
+    expect(refReaction(reaction1).length).toBe(30 + 4);
+    const any: P.Reaction = { te: 0xffffffff, tl: 0xffff, tE: 0xffff, tn: 0xffffffff, th: fill(16, 0), op: 0, emoji: "x" };
+    expect(P.parseReaction(P.encodeReaction(any))).toEqual(any);
+    const bom: P.Reaction = { ...reaction1, emoji: "\ufeffa" };
+    expect(P.parseReaction(P.encodeReaction(bom)).emoji).toBe("\ufeffa"); // BOM kept
+    const long = { ...reaction1, emoji: "a".repeat(32) };
+    expect(P.parseReaction(P.encodeReaction(long))).toEqual(long);
+  });
+
+  it("rejects a bad op, emoji length, total length or UTF-8, and lane ≠ from", () => {
+    const ok = refReaction(reaction1);
+    const bads: B[] = [
+      cat(ok.slice(0, 28), be8(2), ok.slice(29)),
+      cat(ok.slice(0, 28), be8(255), ok.slice(29)),
+      refReaction(reaction1, new Uint8Array(0)),
+      refReaction({ ...reaction1, emoji: "a".repeat(33) }),
+      ok.slice(0, -1),
+      cat(ok, be8(0x61)),
+      refReaction(reaction1, new Uint8Array([0xc0, 0xaf])), // an overlong form
+      refReaction(reaction1, new Uint8Array([0xed, 0xa0, 0x80])), // a surrogate
+      refReaction(reaction1, new Uint8Array([0xff])),
+    ];
+    for (const c of bads) {
+      expect(throwsError(() => P.parseReaction(c))).toBe(true);
+      expect(throwsError(() => P.parseM(withContent(c)))).toBe(true);
+    }
+    expect(throwsError(() => P.parseM(withContent(ok, { lane: 2 })))).toBe(true);
+    for (const r of [{ ...reaction1, op: 2 as 0 | 1 }, { ...reaction1, emoji: "" }, { ...reaction1, emoji: "a".repeat(33) }])
+      expect(throwsError(() => P.encodeReaction(r))).toBe(true);
+  });
+
+  it("the largest REACTION seals to class 0, and the other unassigned types stay invalid", () => {
+    const m: P.Msg = { ...hdr(), type: P.MT.REACTION, reaction: { ...reaction1, emoji: "👍".repeat(8) } };
+    expect(P.encodeReaction(m.type === P.MT.REACTION ? m.reaction : reaction1).length).toBe(62);
+    expect(P.buildRow(ctx0(), E, m).cls).toBe(0);
+    for (const type of [0, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 18])
+      expect(throwsError(() => P.parseM(baseRefM({ type, content: new Uint8Array(0) })))).toBe(true);
+  });
+
+  it("is junk to the first release's type set, and the next row's prevh over its stored body matches without a parse", () => {
+    const m: P.Msg = { ...hdr({ n: 6 }), type: P.MT.REACTION, reaction: reaction1 };
+    const row = P.buildRow(ctx0(), E, m);
+    const firstRelease = [1, 2, 8, 16, 17];
+    const opened = P.openRow(keys0.mk, E, row.label, row.body);
+    expect(firstRelease.includes(opened.M[1])).toBe(false); // its parseM says "M: bad type"
+    const next: P.Msg = {
+      ...hdr({ n: 7, prev: { E, n: 6 }, prevh: P.prevh(row.label, row.body) }),
+      type: P.MT.TEXT,
+      text: "after",
+    };
+    const nextRow = P.buildRow(ctx0(), E, next);
+    const v = P.acceptRow(rowCtx0, E, nextRow.label, nextRow.body);
+    expect(v.ok && toHex(v.msg.prevh)).toBe(toHex(refPrevh(row.label, row.body)));
+  });
+
+  it("th is keyed with the target epoch's route key", () => {
+    const rk = fill(32, 0x2a);
+    const label = fill(16, 0x2b);
+    const body = fill(48, 0x2c);
+    const th = P.reactTh(rk, label, body);
+    expect(toHex(th)).toBe(toHex(hmacN(rk, refEnc("segv.sh/v2/react", label, body)).slice(0, 16)));
+    expect(toHex(th)).not.toBe(toHex(P.reactTh(fill(32, 0x2d), label, body)));
+  });
+});
+
 describe("conversation rows: seal, sign, open (§3.3)", () => {
   const msg: P.Msg = { ...hdr({ n: 6 }), type: P.MT.TEXT, text: "hi bob" };
   const label = P.Lmsg(keys0.rk, 1, E, 6);
@@ -655,7 +734,7 @@ describe("conversation rows: seal, sign, open (§3.3)", () => {
       const body = P.sealRow(keys0.mk, E, label, M, P.signRow(bob.id.sigSk, conv, 0, E, label, M)).body;
       expect(P.acceptRow(rowCtx0, E, label, body)).toEqual({ ok: false, why: "malformed" });
     }
-    expect(Object.values(P.MT)).toEqual([1, 2, 8, 16, 17]);
+    expect(Object.values(P.MT)).toEqual([1, 2, 3, 8, 16, 17]);
   });
 
   it("flipping any byte of a body, or changing the label or E, makes the row fail to open", () => {
@@ -2351,6 +2430,8 @@ function computeKat() {
     left: toHex(P.encodeRecord(record("LEFT"))),
     treg: toHex(P.encodeRecord(record("TREG"))),
     ended: toHex(P.encodeRecord(record("ENDED"))),
+    reactionM: toHex(P.encodeM({ ...hdr(), type: P.MT.REACTION, reaction: reaction1 })),
+    reactTh: toHex(P.reactTh(fill(32, 0x2a), fill(16, 0x2b), fill(48, 0x2c))),
   };
 }
 
@@ -2403,6 +2484,9 @@ const KAT = {
   // a TREG record (36 bytes): bundleId | t_reg
   treg: "0f002434343434343434343434343434343434343434343434343434343434343434340184931c",
   ended: "12003a606162636465666768696a6b6c6d6e6f525252525252525252525252525252525252525252525252525252525252525200000006000700000003",
+  reactionM:
+    "02030001000100000005ffffffffffff000000000000000000000000000000000000019b93216d000000000000000000000000000000000000000000002200000005000200090000012c555555555555555555555555555555550104f09f918d",
+  reactTh: "4a4d6976201f97cf0139c71d73f782bf",
 };
 
 describe("known-answer vectors", () => {

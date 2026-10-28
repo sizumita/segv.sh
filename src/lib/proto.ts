@@ -1885,7 +1885,7 @@ export function acceptOldRow(row: WalkRow, epochs: readonly WalkEpoch[], selfRem
 export const M_VER = 2;
 export const M_HEADER_LEN = 62;
 /** The types of M (§3.3): every other value is invalid. */
-export const MT = { TEXT: 1, IMAGE: 2, WELCOME: 8, CLAIM: 16, LEAVE: 17 } as const;
+export const MT = { TEXT: 1, IMAGE: 2, REACTION: 3, WELCOME: 8, CLAIM: 16, LEAVE: 17 } as const;
 export type MsgType = (typeof MT)[keyof typeof MT];
 const MSG_TYPES: readonly number[] = Object.values(MT);
 /** lane of a CLAIM. */
@@ -1926,6 +1926,68 @@ export function encodeImage(x: ImageRef): Bytes {
   return out;
 }
 
+/** A REACTION's emoji is 1..32 bytes of valid UTF-8 (§3.3). */
+export const MAX_EMOJI_BYTES = 32;
+/** REACTION content without its emoji: te, tl, tE, tn, th, op, elen. */
+export const REACTION_FIXED = 30;
+
+/**
+ * REACTION content (§3.3, §11.12): `u32 te | u16 tl | u16 tE | u32 tn | th[16] | u8 op | u8 elen | emoji[elen]`, the
+ * sender's reaction to the row at `(tE, tn)` on lane `tl` of epoch `te` (its target). The target fields have no parse
+ * rule; whether `emoji` is one emoji is not a parse rule either.
+ */
+export interface Reaction {
+  te: number;
+  tl: number;
+  tE: number;
+  tn: number;
+  /** reactTh(rk_te, label_T, body_T): binds the reaction to the target's exact stored row */
+  th: Bytes;
+  /** 1 adds the emoji, 0 removes it */
+  op: 0 | 1;
+  emoji: string;
+}
+
+export function parseReaction(b: Bytes): Reaction {
+  const r = new Rd(b, "reaction");
+  const te = r.u32();
+  const tl = r.u16();
+  const tE = r.u16();
+  const tn = r.u32();
+  const th = r.bytes(16);
+  const op = r.u8();
+  const elen = r.u8();
+  if (op !== 0 && op !== 1) bad("reaction: bad op");
+  if (elen < 1 || elen > MAX_EMOJI_BYTES) bad("reaction: bad emoji length");
+  const emoji = decodeUtf8(r.bytes(elen), "reaction emoji");
+  r.end();
+  return { te, tl, tE, tn, th, op, emoji };
+}
+
+export function encodeReaction(x: Reaction): Bytes {
+  const e = encodeUtf8(x.emoji, "reaction emoji");
+  const out = concat(
+    u32(x.te),
+    u16(x.tl),
+    u16(x.tE),
+    u32(x.tn),
+    fixed(x.th, 16, "reaction th"),
+    u8(x.op),
+    u8(e.length),
+    e,
+  );
+  parseReaction(out);
+  return out;
+}
+
+/**
+ * `th` of a REACTION to the row (label, body) of epoch `te` (§3.3): `t16(HMAC(rk_te, enc("segv.sh/v2/react", label,
+ * body)))`, keyed by the route key of the target's epoch, so only a holder of that epoch can tell which public row a
+ * reaction names.
+ */
+export const reactTh = (rk: Bytes, label: Bytes, body: Bytes): Bytes =>
+  t16(HMAC(rk, enc("segv.sh/v2/react", label, body)));
+
 /** The header fields of M other than ver, type and len. */
 export interface MHeader {
   /** The sender's index in D_e. */
@@ -1949,6 +2011,7 @@ export interface MHeader {
 export type MBody =
   | { type: typeof MT.TEXT; text: string }
   | { type: typeof MT.IMAGE; image: ImageRef }
+  | { type: typeof MT.REACTION; reaction: Reaction }
   | { type: typeof MT.WELCOME; join: Join }
   | { type: typeof MT.CLAIM; claim: Claim }
   | { type: typeof MT.LEAVE };
@@ -1963,6 +2026,8 @@ function encodeContent(m: MBody): Bytes {
     }
     case MT.IMAGE:
       return encodeImage(m.image);
+    case MT.REACTION:
+      return encodeReaction(m.reaction);
     case MT.WELCOME:
       return encodeJ(m.join);
     case MT.CLAIM:
@@ -1981,6 +2046,8 @@ function parseContent(type: number, c: Bytes): MBody {
       return { type: MT.TEXT, text: decodeUtf8(c, "text") };
     case MT.IMAGE:
       return { type: MT.IMAGE, image: parseImage(c) };
+    case MT.REACTION:
+      return { type: MT.REACTION, reaction: parseReaction(c) };
     case MT.WELCOME:
       return { type: MT.WELCOME, join: parseJ(c) };
     case MT.CLAIM:
@@ -1994,7 +2061,7 @@ function parseContent(type: number, c: Bytes): MBody {
 }
 
 /**
- * Parses M and checks every parse rule of §3.3 (none needs epoch context): ver, type ∈ {1, 2, 8, 16, 17}, content,
+ * Parses M and checks every parse rule of §3.3 (none needs epoch context): ver, type ∈ {1, 2, 3, 8, 16, 17}, content,
  * `lane = from` for lane rows and `lane = 0xFFFF` with NONE / ZERO16 prev fields for a CLAIM, `from < 32`, the
  * position rule, prevh = ZERO16 with NONE, ts ≤ 2^53 − 1, ck16 = ZERO16 with ckq = 0, len. `from < |D_e|`, the
  * label, a CLAIM's m = |D_e| and the signature are contextual (acceptRow).
