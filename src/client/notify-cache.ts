@@ -52,17 +52,36 @@ export interface SealedBox {
   ct: ArrayBuffer;
 }
 
+/** What the store holds: the device key, the sealed cache, and the generation. */
+export interface Stored {
+  key: CryptoKey | null;
+  box: SealedBox | null;
+  /**
+   * Moves on at every deletion and every change of the preview, in any tab, and survives deletion: a write decided
+   * under an earlier generation is stale, and is never stored.
+   */
+  gen: number;
+}
+
 /**
- * Where the device key and the sealed cache live. The page and the Service Worker both write the box, and the page may
- * delete everything at any time (the preview set to `none`, notifications off, sign-out), so a box is only ever written
- * over the box its writer read: `putBoxIf` compares and writes in one transaction.
+ * Where the device key, the sealed cache and its generation live, shared by every tab of the app and by the Service
+ * Worker. Writes compare and store in one transaction, so stale work never undoes a deletion, a change of the preview
+ * or a newer cache.
  */
 export interface CacheStore {
-  getKey(): Promise<CryptoKey | null>;
-  putKey(k: CryptoKey): Promise<void>;
-  getBox(): Promise<SealedBox | null>;
-  /** Writes `b` only if the stored box is still the one with IV `expect` (null: no box stored); true if written. */
-  putBoxIf(expect: Uint8Array | null, b: SealedBox): Promise<boolean>;
+  read(): Promise<Stored>;
+  /**
+   * Stores `box` (and `key`, when given) only if the generation is still `gen` and the stored box is still the one with
+   * IV `iv` (null: no box), in one transaction; true if stored.
+   */
+  writeIf(
+    gen: number,
+    iv: Uint8Array | null,
+    w: { box: SealedBox; key?: CryptoKey },
+  ): Promise<boolean>;
+  /** Moves the generation on (a change of the preview). */
+  bump(): Promise<void>;
+  /** Deletes the key and the box and moves the generation on, in one transaction. */
   clear(): Promise<void>;
 }
 
@@ -162,26 +181,29 @@ export function applyMoves(stored: NotifyCache, moves: readonly Move[]): NotifyC
   };
 }
 
-/** What is stored: the key, the box and the cache it opens to (null where missing or unreadable). */
-async function load(
-  store: CacheStore,
-): Promise<{ key: CryptoKey | null; box: SealedBox | null; cache: NotifyCache | null }> {
-  const [key, box] = await Promise.all([store.getKey(), store.getBox()]);
-  if (!key || !box) return { key, box, cache: null };
+/** What is stored, with the cache it opens to (null where missing or unreadable). */
+async function load(store: CacheStore): Promise<Stored & { cache: NotifyCache | null }> {
+  const cur = await store.read();
+  if (!cur.key || !cur.box) return { ...cur, cache: null };
   try {
     const pt = await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv: box.iv as BufferSource, additionalData: AAD },
-      key,
-      box.ct,
+      { name: "AES-GCM", iv: cur.box.iv as BufferSource, additionalData: AAD },
+      cur.key,
+      cur.box.ct,
     );
-    return { key, box, cache: parseCache(new TextDecoder().decode(pt)) };
+    return { ...cur, cache: parseCache(new TextDecoder().decode(pt)) };
   } catch {
-    return { key, box, cache: null };
+    return { ...cur, cache: null };
   }
 }
 
 export async function readCache(store: CacheStore): Promise<NotifyCache | null> {
   return (await load(store)).cache;
+}
+
+/** The generation now: read it before deciding to write, and pass it to `writeCache`. */
+export async function cacheGen(store: CacheStore): Promise<number> {
+  return (await store.read()).gen;
 }
 
 async function sealWith(key: CryptoKey, c: NotifyCache): Promise<SealedBox> {
@@ -195,37 +217,43 @@ async function sealWith(key: CryptoKey, c: NotifyCache): Promise<SealedBox> {
 }
 
 /**
- * Writes the app's cache, keeping each lane's stored next slot where it is later. Only the app creates the device key.
- * When the Service Worker wrote in between, it reads and merges again (at most 3 times; a lost move only repeats a
- * preview). The engine runs these writes and `deleteCache` one at a time.
+ * Writes the app's cache, decided under generation `gen` (read before the decision), keeping each lane's stored next
+ * slot where it is later. Only the app creates the device key, and only together with the box. When the Service Worker
+ * wrote in between, it reads and merges again (at most 3 times; a lost move only repeats a preview); once the
+ * generation has moved on (a deletion or a change of the preview, in any tab) it stops. True if stored.
  */
-export async function writeCache(store: CacheStore, c: NotifyCache): Promise<void> {
+export async function writeCache(store: CacheStore, c: NotifyCache, gen: number): Promise<boolean> {
   for (let i = 0; i < 3; i++) {
     const cur = await load(store);
-    let key = cur.key;
-    if (!key) {
-      key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
+    if (cur.gen !== gen) return false;
+    const key =
+      cur.key ??
+      (await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
         "encrypt",
         "decrypt",
-      ]);
-      await store.putKey(key);
-    }
+      ]));
     const box = await sealWith(key, mergeNext(c, cur.cache));
-    if (await store.putBoxIf(cur.box ? new Uint8Array(cur.box.iv) : null, box)) return;
+    const iv = cur.box ? new Uint8Array(cur.box.iv) : null;
+    if (await store.writeIf(gen, iv, cur.key ? { box } : { box, key })) return true;
   }
+  return false;
 }
 
 /**
- * The Service Worker's write: moves lane positions forward in the stored cache. It never creates a key, and writes
- * only over the box it read, so stale work never brings back a cache that the page deleted or replaced meanwhile.
+ * The Service Worker's write: moves lane positions forward in the stored cache. It never creates a key, and stores
+ * only over the box it read under the same generation, so stale work never brings back a cache that was deleted or
+ * replaced meanwhile.
  */
 export async function advanceCache(store: CacheStore, moves: readonly Move[]): Promise<void> {
   if (moves.length === 0) return;
   const cur = await load(store);
   if (!cur.key || !cur.box || !cur.cache) return;
   const box = await sealWith(cur.key, applyMoves(cur.cache, moves));
-  await store.putBoxIf(new Uint8Array(cur.box.iv), box);
+  await store.writeIf(cur.gen, new Uint8Array(cur.box.iv), { box });
 }
+
+/** A change of the preview: writes decided before it are stale. */
+export const bumpCache = (store: CacheStore): Promise<void> => store.bump();
 
 export const deleteCache = (store: CacheStore): Promise<void> => store.clear();
 
@@ -241,16 +269,18 @@ function openDb(): Promise<IDBDatabase> {
   });
 }
 
-async function tx<T>(
+/** One transaction over the store; `fn` queues its requests and returns the result to resolve with. */
+async function txn<T>(
   mode: IDBTransactionMode,
-  fn: (s: IDBObjectStore) => IDBRequest<T>,
+  fn: (s: IDBObjectStore, done: (v: T) => void) => void,
 ): Promise<T> {
   const db = await openDb();
   try {
     return await new Promise<T>((resolve, reject) => {
       const t = db.transaction(STORE, mode);
-      const req = fn(t.objectStore(STORE));
-      t.oncomplete = () => resolve(req.result);
+      let out: T;
+      fn(t.objectStore(STORE), (v) => (out = v));
+      t.oncomplete = () => resolve(out);
       t.onerror = () => reject(t.error);
       t.onabort = () => reject(t.error);
     });
@@ -259,37 +289,48 @@ async function tx<T>(
   }
 }
 
+/** Reads key, box and generation in one transaction, then calls `then` (still inside it). */
+function readIn(s: IDBObjectStore, then: (cur: Stored) => void): void {
+  const k = s.get("key");
+  const b = s.get("box");
+  const g = s.get("gen");
+  g.onsuccess = () =>
+    then({
+      key: (k.result as CryptoKey | undefined) ?? null,
+      box: (b.result as SealedBox | undefined) ?? null,
+      gen: typeof g.result === "number" ? g.result : 0,
+    });
+}
+
 /** The cache in this origin's IndexedDB, or null where there is none (Node, blocked storage). */
 export function idbCacheStore(): CacheStore | null {
   if (typeof indexedDB === "undefined") return null;
-  const get = async <T>(k: string): Promise<T | null> =>
-    ((await tx("readonly", (s) => s.get(k))) as T | undefined) ?? null;
   return {
-    getKey: () => get<CryptoKey>("key"),
-    putKey: async (k) => void (await tx("readwrite", (s) => s.put(k, "key"))),
-    getBox: () => get<SealedBox>("box"),
-    async putBoxIf(expect, b) {
-      const db = await openDb();
-      try {
-        return await new Promise<boolean>((resolve, reject) => {
-          const t = db.transaction(STORE, "readwrite");
-          const st = t.objectStore(STORE);
-          let ok = false;
-          const cur = st.get("box");
-          cur.onsuccess = () => {
-            if (!isBox(cur.result as SealedBox | undefined, expect)) return;
-            st.put(b, "box");
-            ok = true;
-          };
-          t.oncomplete = () => resolve(ok);
-          t.onerror = () => reject(t.error);
-          t.onabort = () => reject(t.error);
+    read: () => txn<Stored>("readonly", (s, done) => readIn(s, done)),
+    writeIf: (gen, iv, w) =>
+      txn<boolean>("readwrite", (s, done) => {
+        done(false);
+        readIn(s, (cur) => {
+          if (cur.gen !== gen || !isBox(cur.box, iv)) return;
+          if (w.key) s.put(w.key, "key");
+          s.put(w.box, "box");
+          done(true);
         });
-      } finally {
-        db.close();
-      }
-    },
-    clear: async () => void (await tx("readwrite", (s) => s.clear())),
+      }),
+    bump: () =>
+      txn<void>("readwrite", (s, done) => {
+        done(undefined);
+        readIn(s, (cur) => void s.put(cur.gen + 1, "gen"));
+      }),
+    clear: () =>
+      txn<void>("readwrite", (s, done) => {
+        done(undefined);
+        readIn(s, (cur) => {
+          s.delete("key");
+          s.delete("box");
+          s.put(cur.gen + 1, "gen");
+        });
+      }),
   };
 }
 

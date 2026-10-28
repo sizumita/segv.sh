@@ -1,7 +1,14 @@
 // Notifications (docs/PROTOCOL.md §11.13): the registration set, its re-sends, the rings after a TEXT or IMAGE, and
 // the device's subscription at logout, against FakeWorld's push endpoints and a fake browser per device.
 import { describe, expect, it } from "vite-plus/test";
-import { isBox, readCache, type Preview, type PreviewStore, type SealedBox } from "../../src/client/notify-cache";
+import {
+  isBox,
+  readCache,
+  type Preview,
+  type PreviewStore,
+  type SealedBox,
+  type Stored,
+} from "../../src/client/notify-cache";
 import { browserDeps, notesFor, type Proposed } from "../../src/client/sw-core";
 import type { Engine } from "../../src/client/types";
 import {
@@ -27,24 +34,29 @@ function notifyOf() {
   const store = {
     key: null as CryptoKey | null,
     box: null as SealedBox | null,
-    getKey: async () => store.key,
-    putKey: async (k: CryptoKey) => void (store.key = k),
-    getBox: async () => store.box,
+    gen: 0,
     /** the next write waits for this (set by a test), after calling `onHeld` */
-    holdPut: null as Promise<void> | null,
+    holdWrite: null as Promise<void> | null,
     onHeld: null as (() => void) | null,
-    async putBoxIf(expect: Uint8Array | null, b: SealedBox) {
-      const h = store.holdPut;
-      store.holdPut = null;
+    read: async (): Promise<Stored> => ({ key: store.key, box: store.box, gen: store.gen }),
+    async writeIf(gen: number, iv: Uint8Array | null, w: { box: SealedBox; key?: CryptoKey }) {
+      const h = store.holdWrite;
+      store.holdWrite = null;
       if (h) {
         store.onHeld?.();
         await h;
       }
-      if (!isBox(store.box, expect)) return false;
-      store.box = b;
+      if (store.gen !== gen || !isBox(store.box, iv)) return false;
+      if (w.key) store.key = w.key;
+      store.box = w.box;
       return true;
     },
-    clear: async () => void ((store.key = null), (store.box = null)),
+    bump: async () => void store.gen++,
+    clear: async () => {
+      store.key = null;
+      store.box = null;
+      store.gen++;
+    },
   };
   let p: Preview = "none";
   const preview: PreviewStore = { load: () => p, save: (x) => void (p = x) };
@@ -357,7 +369,7 @@ describe("previews (§11.13)", () => {
     await waitFor(() => n.store.box !== null, "cache written");
     // The next write (the switch to `name`) stops just before it stores its box.
     let open = () => {};
-    n.store.holdPut = new Promise<void>((r) => (open = r));
+    n.store.holdWrite = new Promise<void>((r) => (open = r));
     const reached = new Promise<void>((r) => (n.store.onHeld = r));
     await B.setPreview("name");
     await reached;

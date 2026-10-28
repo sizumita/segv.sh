@@ -26,6 +26,8 @@ import { refKeyOf } from "./conv";
 import { cursorAt, type InboxCursor } from "./inbox";
 import { Messaging, type MessagingHost } from "./messaging";
 import {
+  bumpCache,
+  cacheGen,
   deleteCache,
   idbCacheStore,
   localPreviewStore,
@@ -213,17 +215,24 @@ export class SegvEngine implements Engine {
 
   private writeCacheNow(): Promise<void> {
     return this.cacheOp(async () => {
-      // Decided when the write runs, after every deletion queued before it.
       const store = this.cacheStore;
-      const p = this.preview();
-      if (!store || p === "none" || !this.msg || !this.live) return;
+      if (!store) return;
       try {
-        await writeCache(store, {
-          v: 1,
-          preview: p,
-          deltaS: this.api.cachedParams?.delta ?? 10,
-          copies: this.msg.notifyCopies(p === "message"),
-        });
+        // The generation first, then the decision (the settings are shared by every tab): a deletion or a change of
+        // the preview made anywhere after this read voids the write.
+        const gen = await cacheGen(store);
+        const p = this.preview();
+        if (p === "none" || !this.msg || !this.live) return;
+        await writeCache(
+          store,
+          {
+            v: 1,
+            preview: p,
+            deltaS: this.api.cachedParams?.delta ?? 10,
+            copies: this.msg.notifyCopies(p === "message"),
+          },
+          gen,
+        );
       } catch (e) {
         console.error("could not write the notification cache", e);
       }
@@ -350,8 +359,11 @@ export class SegvEngine implements Engine {
 
   async setPreview(p: Preview): Promise<void> {
     if (this.previewState() === "unavailable") return;
+    // Saved before the cache changes, so that a write decided after it, in any tab, sees it.
     this.previewStore.save(p);
+    const store = this.cacheStore;
     if (p === "none") await this.dropCache();
+    else if (store) await this.cacheOp(() => bumpCache(store).catch(() => {}));
     this.patch(this.notificationPatch());
     this.scheduleCache(0);
   }
