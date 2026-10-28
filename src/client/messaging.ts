@@ -1883,8 +1883,9 @@ export class Messaging {
         await this.syncCopies([c], !this.live);
         const ep = c.epochs.get(c.current);
         // An ended copy needs nothing more (§6.7 step 4): its last winner was processed, or it holds the epoch its
-        // ENDED record names; one whose record names a later epoch is settled up to it and ends there.
-        return !!ep && (c.removed || controlSettled(ep));
+        // ENDED record names; one whose record names a later epoch is settled up to it and ends there, so the join
+        // waits until the copy holds that epoch (a lagging device would otherwise count it as a live copy).
+        return !!ep && (c.removed || (controlSettled(ep) && !this.endAhead(c)));
       },
       settleOwn: (x) => this.settleOwn(x),
     };

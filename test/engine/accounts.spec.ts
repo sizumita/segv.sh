@@ -5,6 +5,7 @@
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { ACCOUNT_KEYS_MISMATCH, ACCOUNT_MISSING } from "../../src/client/engine";
 import {
+  FakeWorld,
   I,
   P,
   engineFor,
@@ -15,6 +16,7 @@ import {
   server,
   settle,
   sleep,
+  useWorld as installWorld,
   waitFor,
 } from "./harness";
 
@@ -239,6 +241,12 @@ describe("engine-12: registration", () => {
 
 describe("v2: the registration's self row and the account check (§7.3, §11.1)", () => {
   it("the first self row is a HEADS record with the inbox cursor at the registration's slot, and a restore reads it", async () => {
+    // Δin = 1 h, from the start of a slot: no inbox slot closes during the test. With 1 s slots, one that closes
+    // between the registration's last poll and the restore's first moves the cursor, and the restore then rightly
+    // writes a HEADS row for it.
+    const w = installWorld(new FakeWorld({ inboxSlot: 3600 }));
+    const slotMs = w.params.inboxSlot * 1000;
+    w.tick(slotMs - ((w.now() - P.T0_MS) % slotMs));
     let regAt = 0;
     server().hooks.beforeRequest = (m, p) => {
       if (m === "POST" && p === "/api/v2/register") regAt = server().now();
