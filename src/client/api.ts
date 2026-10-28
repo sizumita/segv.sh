@@ -301,7 +301,11 @@ export class Api {
   private paramsCache: { p: Params; at: number } | null = null;
   private paramsPending: Promise<Params> | null = null;
   private dirSeqPending: Promise<number> | null = null;
-  private readonly prefixCache = new Map<string, Promise<UserJson[]>>();
+  /** complete prefix answers of the session, each with the sequence number of its fetch */
+  private readonly prefixCache = new Map<string, { seq: number; run: Promise<UserJson[]> }>();
+  /** prefix fetches started so far, and the count when the current operation began (§10.6 "fresh") */
+  private prefixFetches = 0;
+  private operationSince = 0;
 
   constructor(opts: ApiOptions) {
     this.fetchFn = opts.fetch;
@@ -836,15 +840,33 @@ export class Api {
   }
 
   /**
+   * A new operation begins (§10.6): a creation, an add, a restore, a catch-up, or an inbox poll with its joins.
+   * Directory answers fetched from now on are fresh for it, and a cached answer it already fetched is used as is.
+   */
+  beginOperation(): void {
+    this.operationSince = this.prefixFetches;
+  }
+
+  /**
    * Every user whose `hpre` (kind "h") or `upre` (kind "u") shares the top p bits of `pre`: a complete answer (every
    * page, the last with `more = false`), cached for the session unless `fresh`. A 409 `{p}` recomputes p once and
    * retries; any other failure is transient and never means "no such user".
    */
   async prefixUsers(kind: "h" | "u", pre: number, fresh = false): Promise<UserJson[]> {
+    return (await this.prefixAnswer(kind, pre, fresh)).run;
+  }
+
+  /** The prefix answer and whether it is fresh for the current operation (fetched after it began). */
+  private async prefixAnswer(
+    kind: "h" | "u",
+    pre: number,
+    fresh: boolean,
+  ): Promise<{ run: Promise<UserJson[]>; fresh: boolean }> {
     const p = await this.prefixBits();
     const key = `${kind}/${p}/${P.topBits(pre, p)}`;
     const cached = this.prefixCache.get(key);
-    if (cached && !fresh) return cached;
+    if (cached && !fresh) return { run: cached.run, fresh: cached.seq > this.operationSince };
+    const seq = ++this.prefixFetches;
     const run = (async () => {
       try {
         return await this.prefixPages(kind, p, P.topBits(pre, p));
@@ -861,9 +883,12 @@ export class Api {
         }
       }
     })();
-    this.prefixCache.set(key, run);
-    run.catch(() => this.prefixCache.delete(key));
-    return run;
+    const entry = { seq, run };
+    this.prefixCache.set(key, entry);
+    run.catch(() => {
+      if (this.prefixCache.get(key) === entry) this.prefixCache.delete(key);
+    });
+    return { run, fresh: true };
   }
 
   private async prefixPages(kind: "h" | "u", p: number, x: number): Promise<UserJson[]> {
@@ -892,10 +917,9 @@ export class Api {
     throw new ApiError(0, "directory answer did not complete");
   }
 
-  /** The verified user registered under `handle`, or null on a complete answer without it (§10.6). */
   /**
-   * The verified user registered under `uid`, by uid prefix; null on a complete answer without it (§10.6). An answer
-   * from the session cache that lacks it is asked for again once (the user may have registered since).
+   * The verified user registered under `uid`, by uid prefix; null on a fresh complete answer without it (§10.6). A
+   * cached answer that lacks it is asked for again once, unless it is already fresh for the current operation.
    */
   userByUidPrefix(uid: Bytes, fresh = false): Promise<DirUser | null> {
     const uidB = P.b64u(uid);
@@ -921,8 +945,11 @@ export class Api {
       }
       return null;
     };
-    const found = pick(await this.prefixUsers(kind, pre, fresh));
-    if (found || fresh) return found;
-    return pick(await this.prefixUsers(kind, pre, true));
+    // A cached answer serves only the users it lists: one that lacks the user is asked again, fresh, unless it is
+    // already fresh for the current operation (a poll's joins share one fetch per prefix, §10.6).
+    const first = await this.prefixAnswer(kind, pre, fresh);
+    const found = pick(await first.run);
+    if (found || first.fresh) return found;
+    return pick(await (await this.prefixAnswer(kind, pre, true)).run);
   }
 }

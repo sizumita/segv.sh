@@ -78,8 +78,9 @@ describe("followed lanes at restore", () => {
     await A.addMembers(id, [makeUser("carol").handle]);
     await settle(A, B);
     await I(A).catchUp();
-    const heads = I(A).self!.fold.heads;
-    const entry = [...heads.values()].find((h) => h.e === 1)!;
+    const c = conv(A, id);
+    const entry = I(A).self!.fold.headsOf(`${P.b64u(c.conv)}.${P.b64u(c.root)}`)!;
+    expect(entry.e).toBe(1);
     const bj = P.memberIndex(conv(A, id).epochs.get(0)!.D, bob.uid);
     expect(entry.followed.map((f) => [f.ef, f.lane])).toEqual([[0, bj]]);
     const A2 = await engineFor(alice);

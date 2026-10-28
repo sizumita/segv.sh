@@ -147,6 +147,45 @@ describe("parked joins", () => {
   });
 });
 
+describe("a parked WELCOME (§6.7 step 4, §7.3)", () => {
+  it("holds its lane's HEADS position before the row until the J is accepted, live and after a reload", async () => {
+    const [alice, carol, dave] = ["alice", "carol", "dave"].map((h) => makeUser(h));
+    const A = await engineFor(alice);
+    const D = await engineFor(dave);
+    const one = await A.createConversation(["dave"]);
+    await settle(A, D);
+    await D.sendText(one, "hi alice"); // the 1:1 qualifies as dave's WELCOME channel (§6.12 step 1)
+    await settle(A, D);
+    let failing = true;
+    const oneBundle = P.b64u(epoch(A, one).bundleId);
+    server().hooks.fail = (m, p, who) =>
+      failing && who === "dave" && m === "GET" && p.startsWith("/api/v2/blob/") && !p.includes(oneBundle)
+        ? "before"
+        : undefined;
+    const g = await A.createConversation(["carol", "dave"], "g");
+    await settle(A, D);
+    expect(view(D, g)).toBeUndefined(); // parked, not dropped
+    const ep = epoch(A, one);
+    const j = P.memberIndex(ep.D, alice.uid);
+    const row = ep.lanes[j].last!; // alice's WELCOME row in the 1:1
+    const key = `${P.b64u(ep.D.conv)}.${P.b64u(epoch(D, one).D.hash)}`; // the 1:1 is at its root epoch
+    const entry = I(D).self!.fold.headsOf(key)!;
+    expect(entry.e).toBe(0);
+    expect(entry.lanes[j]).toEqual({ E: row.E, cnt: row.n });
+    // a reload starts from that entry, finds the WELCOME again, and parks it again
+    await D.logout();
+    const D2 = await engineFor(dave);
+    expect(view(D2, g)).toBeUndefined();
+    failing = false;
+    server().hooks.fail = undefined;
+    await settle(A, D2);
+    expect(mustView(D2, g).name).toBe("# g");
+    const after = I(D2).self!.fold.headsOf(key)!;
+    expect(after.lanes[j].cnt).toBeGreaterThan(row.n);
+    void carol;
+  });
+});
+
 describe("stale server time", () => {
   it("cacheable responses with a weeks-old x-segv-now never move the estimate", async () => {
     const [alice, bob] = ["alice", "bob"].map((h) => makeUser(h));

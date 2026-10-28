@@ -154,12 +154,15 @@ export interface Epoch {
   myIndex: number;
   lanes: Lane[];
   ctl: ControlLane;
-  /** the claim that ended this epoch, once processed */
+  /** the claim that ended this epoch, once processed (or read at its record's position) */
   ended: Ended | null;
+  /**
+   * The position of the claim that ended the copy here, from its ENDED record, while that claim is not read yet: the
+   * copy has ended, and the claim is read only when a row of the epoch is decided or its history loads (§11.4 step 5).
+   */
+  endedAt: P.Pos | null;
   /** the kept leave source of each member recorded as left here, by b64u uid (self's own leave is `Copy.left`) */
   left: Map<string, LeaveSource>;
-  /** the copy reached this epoch by a skip re-add (§6.7 step 5): it does not continue the epoch below it */
-  viaSkip: boolean;
   /** its lanes are processed (false only below the HEADS epoch of a restore, §11.4 step 5) */
   lanesOn: boolean;
   /** applied TEXT and IMAGE rows by message key (§6.8 retraction) */
@@ -199,6 +202,24 @@ export interface Copy {
   lines: Map<string, () => string>;
   /** the HEADS entry a restore starts from, until the copy reaches its epoch (§11.4 step 5) */
   heads: P.HeadsEntry | null;
+  /**
+   * The copy that a J below the root of every live copy would start, settled before §6.7 step 6 decides the J: not
+   * held (no topics, records, warnings or welcomes) until it is kept as an ended copy.
+   */
+  probe: boolean;
+}
+
+/** The epoch the copy was joined at: its root epoch (every epoch above it is held, §6.6 step 3). */
+export const rootEpoch = (c: Copy): number => Math.min(...c.epochs.keys());
+
+/**
+ * Two held copies of one conversation contest each other (§6.7 step 6): two that have not ended always do; an ended
+ * one and another do while the other holds one of its epochs or the epoch after its last.
+ */
+export function contest(a: Copy, b: Copy): boolean {
+  if (!a.removed && !b.removed) return true;
+  const hits = (x: Copy, y: Copy) => rootEpoch(y) <= x.current + 1 && y.current >= rootEpoch(x);
+  return (a.removed && hits(a, b)) || (b.removed && hits(b, a));
 }
 
 /** The fold key of a copy: (conv, root). */
@@ -253,8 +274,8 @@ export function newEpoch(x: {
     lanes: x.D.members.map(() => newLane(start)),
     ctl: newControl(start),
     ended: null,
+    endedAt: null,
     left: new Map(),
-    viaSkip: false,
     lanesOn: true,
     rows: new Map(),
   };
@@ -400,8 +421,8 @@ export interface ViewCtx {
   selfHandle: string;
   /** a user by b64u uid */
   user(uidB: string): KnownUser | undefined;
-  /** how many copies of this conv the device holds */
-  copiesOf(convB: string): number;
+  /** the copy is contested by another held copy of its conversation (§6.7 step 6: ⚠ unless confirmed) */
+  contested(c: Copy): boolean;
   /** monotonic now (for the 30 s processing wait) */
   mono: number;
   processingWait: number;
@@ -409,12 +430,12 @@ export interface ViewCtx {
 
 // ───────────────────────── leaves and the §6.8 walk ─────────────────────────
 
-/** The consecutive held epochs from e on, as §6.8 walks them: it stops before an epoch reached by a skip re-add. */
+/** The consecutive held epochs from e on, as §6.8 walks them (a walk never crosses copies). */
 export function walkEpochs(c: Copy, e: number): P.WalkEpoch[] {
   const out: P.WalkEpoch[] = [];
   for (let k = e; ; k++) {
     const ep = c.epochs.get(k);
-    if (!ep || (k > e && ep.viaSkip)) break;
+    if (!ep) break;
     out.push({
       members: ep.D.members.map((m) => m.uid),
       claim: ep.ended ? { t: ep.ended.t, rm: ep.ended.rm, cuts: ep.ended.cuts } : null,
@@ -498,7 +519,7 @@ export function viewOf(c: Copy, x: ViewCtx): ConversationView | null {
   return {
     id: c.key,
     name:
-      (!c.confirmed && x.copiesOf(c.convB) > 1 ? "⚠ " : "") +
+      (!c.confirmed && x.contested(c) ? "⚠ " : "") +
       (name ? `# ${name}` : others.join(", ") || "just you"),
     members,
     epoch: ep.e,

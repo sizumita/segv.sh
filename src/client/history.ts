@@ -42,12 +42,9 @@ async function earlierEnd(
   }
 }
 
-/** The copy's previous held epoch below `ep` (§11.10): e−1, or below a skip re-add the highest held one below. */
+/** The copy's previous held epoch below `ep` (§11.10): e−1; the history ends below the copy's root epoch. */
 export function previousHeld(c: Copy, ep: Epoch): Epoch | undefined {
-  if (!ep.viaSkip) return c.epochs.get(ep.e - 1);
-  let best: Epoch | undefined;
-  for (const x of c.epochs.values()) if (x.e < ep.e && (!best || x.e > best.e)) best = x;
-  return best;
+  return c.epochs.get(ep.e - 1);
 }
 
 /**

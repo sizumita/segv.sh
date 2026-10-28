@@ -252,7 +252,6 @@ export async function sendRow(ctx: SendCtx, c: Copy, content: P.MBody): Promise<
           c.current === ep.e ||
           (c.current === ep.e + 1 &&
             next !== undefined &&
-            !next.viaSkip &&
             next.myIndex >= 0 &&
             !next.lanes[next.myIndex].seen);
         if (!r || r.timedOut || !stillFollowed) throw new UserError(NOT_DELIVERED);

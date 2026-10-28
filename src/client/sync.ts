@@ -37,8 +37,8 @@ export interface SyncCtx {
   changed(): void;
   /** the displayed handle of member j of an epoch */
   handleOf(c: Copy, ep: Epoch, j: number): string;
-  /** a WELCOME's J, found on a lane (§5.2: accepted whenever the row is processed) */
-  onWelcome(c: Copy, ep: Epoch, j: number, J: P.Join): void;
+  /** a WELCOME's J, found on lane j at `at` (§5.2: accepted whenever the row is processed) */
+  onWelcome(c: Copy, ep: Epoch, j: number, at: Slot, J: P.Join): void;
   /** a valid row of member j (corroboration and request acceptance, §6.7 step 6, §11.5) */
   onValidRow(c: Copy, ep: Epoch, j: number): void;
   /** the local echo waiting for this row (rowKey), if any */
@@ -57,6 +57,11 @@ export interface SyncCtx {
     j: number,
     src: { t: number; row: Slot; key: string; order: number[] },
   ): void;
+  /**
+   * A walked row that cannot be decided yet: the copy ended at a claim it has not read (its ENDED record, §11.4 step
+   * 5). True when the host keeps the row, to apply it once the claim is read.
+   */
+  holdRow?(c: Copy, ep: Epoch, j: number, r: FoundRow): boolean;
 }
 
 export const UNDECRYPTABLE = "ignored an undecryptable message";
@@ -186,7 +191,7 @@ export function targetsOf(copies: Iterable<Copy>): LaneTarget[] {
     if (!ep || ep.Estart === null) continue;
     if (ep.lanesOn && !c.removed) ep.lanes.forEach((_, j) => out.push({ c, ep, lane: j }));
     if (!ep.ctl.winner && !c.removed) out.push({ c, ep, lane: "ctl" });
-    const prev = ep.viaSkip ? undefined : c.epochs.get(c.current - 1);
+    const prev = c.epochs.get(c.current - 1);
     if (prev && prev.Estart !== null)
       prev.lanes.forEach((l, j) => {
         if (!l.swept) out.push({ c, ep: prev, lane: j });
@@ -197,8 +202,8 @@ export function targetsOf(copies: Iterable<Copy>): LaneTarget[] {
 
 /** Lane j of an older epoch is followed: its member is in the next epoch, is not self, and is silent there (§11.2). */
 export function followed(c: Copy, prev: Epoch, j: number): boolean {
-  const next = prev.viaSkip ? undefined : c.epochs.get(prev.e + 1);
-  if (!next || next.viaSkip || c.current !== next.e) return false;
+  const next = c.epochs.get(prev.e + 1);
+  if (!next || c.current !== next.e) return false;
   const k = P.memberIndex(next.D, prev.D.members[j].uid);
   return k >= 0 && k !== next.myIndex && !next.lanes[k].seen;
 }
@@ -255,6 +260,7 @@ export async function syncLanes(
             P.posCmp({ E: r.E, n: r.n + 1 }, { E: lane.head.E, n: lane.head.cnt }) > 0
           )
             lane.head = { E: r.E, cnt: r.n + 1 };
+          if (ctx.holdRow?.(x.c, x.ep, x.lane, r)) continue;
           applyLaneRow(ctx, x.c, x.ep, x.lane, r, quiet);
         }
         lane.next = { ...w.cur };
@@ -325,7 +331,7 @@ export function applyLaneRow(
   const ts = clampTs(m.ts, r.t, ctx.delta());
   const order = rowOrder(ts, ep.e, r.E, j, r.n);
   if (m.type === P.MT.WELCOME) {
-    ctx.onWelcome(c, ep, j, m.join);
+    ctx.onWelcome(c, ep, j, { E: r.E, n: r.n }, m.join);
     c.order.set(key, order);
     return;
   }
