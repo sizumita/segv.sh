@@ -413,7 +413,11 @@ export function install(self: SwScope, deps: SwDeps = browserDeps(self.location.
         const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
         for (const w of windows) {
           if (new URL(w.url).origin !== origin) continue;
-          await w.focus?.();
+          try {
+            await w.focus?.();
+          } catch {
+            // a browser may refuse; the tap brings the app forward anyway, and the message still has to go
+          }
           const m: OpenMessage = { type: "segv.open", url: target };
           w.postMessage(m);
           return;
