@@ -334,6 +334,25 @@ describe("previews (§11.13)", () => {
       { title: "@alice", body: "@alice: hello bob", tag: ref, navigate: `${ORIGIN}/#c/${ref}` },
     ]);
     expect(moves).toHaveLength(1);
+    // The device is open instead: it read the row and moved its cache past it before the push came. The worker still
+    // previews the row, which was stored moments ago.
+    let open: Awaited<ReturnType<typeof readCache>> = null;
+    await waitFor(
+      () => (
+        void readCache(n.store).then((c) => (open = c)),
+        open?.copies[0].epoch?.next.some((s, j) => j !== open!.copies[0].epoch!.self && s.n > 0) ?? false
+      ),
+      "cache moved past alice's row",
+    );
+    const openDeps = {
+      ...browserDeps(ORIGIN, { fetch: server().fetchAs("bob-sw"), store: null }),
+      readCache: async () => open,
+      advance: async () => {},
+      now: () => server().now(),
+    };
+    expect(await notesFor(pushOf([bell]), openDeps, Infinity)).toEqual([
+      { title: "@alice", body: "@alice: hello bob", tag: ref, navigate: `${ORIGIN}/#c/${ref}` },
+    ]);
     // A bell this device never registered names nothing.
     expect(await notesFor(pushOf([bellOf(A, one, alice)]), deps, Infinity)).toEqual([
       { title: "segv.sh", body: "new messages", tag: "segv", navigate: `${ORIGIN}/` },

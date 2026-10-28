@@ -3935,16 +3935,18 @@ decrypts itself.
      when the payload is not that JSON. It does nothing else.
   2. Otherwise one notification per distinct copy that the bells name, in their order. With `name` its title is the
      copy's name and its body the payload's `body`; its `tag` is the copy's `ref`, and it opens the copy's URL (below).
-  3. With `message` it first makes one `POST /api/v2/get` (§10.4) for those copies: for each lane of each copy's
-     cached epoch other than self's, the slots from the lane's next slot on, at most `W` per lane and at most 256 keys
-     in all, with slot 0 of `E_now` in place of the last of them when the next slot's era is below `E_now`. It keeps a
-     row only when it opens under the cached `mk_c` and parses (§3.3), its label recomputes as `Lmsg_c(from, E, n)`
-     with `from` its lane, its signature verifies under the cached `sigPk`, and it is a TEXT or IMAGE. A copy's
+  3. With `message` it first makes one `POST /api/v2/get` (§10.4) for those copies: for each lane of each copy's cached
+     epoch other than self's, the slot before the lane's next slot when it is in the same era, and the slots from the
+     next slot on, at most `W` of those per lane and at most 256 keys in all, with slot 0 of `E_now` in place of the
+     last of them when the next slot's era is below `E_now`. It keeps a row only when it opens under the cached `mk_c`
+     and parses (§3.3), its label recomputes as `Lmsg_c(from, E, n)` with `from` its lane, its signature verifies under
+     the cached `sigPk`, and it is a TEXT or IMAGE; a row in the slot before the next slot, which the client has already
+     read (as it does when it is open while the push comes), only when it was stored in the last 5 minutes. A copy's
      notification is then that of step 2 with, as its body, the copy's newest such row by clamped `ts` (§11.8):
      `@handle: ` and its text, cut to 200 characters, or `@handle sent an image`, followed by ` (+k)` when it found k
      more. A copy without such a row, or whose answer has not come 8 s after the push event, gets the notification of
-     step 2 as it is. Then it moves each lane's next slot past the
-     dense prefix it found, keeping the later of the stored one and its own.
+     step 2 as it is. Then it moves each lane's next slot past the dense prefix it found from that slot on, keeping the
+     later of the stored one and its own.
 
   It takes the text of these notifications from the cache and from rows that verify only, never from the payload,
   which O composes. It reads no key but the cache's device key, makes no request but that `get`, and stores nothing

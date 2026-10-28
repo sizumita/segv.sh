@@ -263,9 +263,10 @@ describe("the notifications of a push (§11.13)", () => {
     const notes = await notesFor(proposed([a.bell]), w.deps, later);
     expect(notes[0].body).toBe(`@bob: ${"あ".repeat(193)}…`);
     expect(Array.from(notes[0].body)).toHaveLength(200);
-    const lane1 = w.asked[0].slice(0, 8);
-    expect(lane1.slice(0, 7).every((k) => k.E === E - 1)).toBe(true);
-    expect(lane1[7].E).toBe(E);
+    // the slot before the next one, 7 from it in the old era, then slot 0 of the current era
+    const lane1 = w.asked[0].slice(0, 9);
+    expect(lane1.slice(0, 8).every((k) => k.E === E - 1)).toBe(true);
+    expect(lane1[8].E).toBe(E);
     expect(w.moves[0][0].next[1]).toEqual({ E, n: 1 });
   });
 
@@ -280,6 +281,43 @@ describe("the notifications of a push (§11.13)", () => {
     v.deps.readCache = async () => (reads++, null);
     expect(await notesFor(proposed([]), v.deps, later)).toEqual([FIXED_NOTE]);
     expect(reads).toBe(0);
+  });
+
+  it("shows the row that rang although the app read it first (stored in the last 5 minutes), and never moves back", async () => {
+    // With the app open, the app reads the new row and moves the cache past it before the push arrives.
+    const a = makeConv();
+    a.copy.epoch!.next = [
+      { E, n: 0 },
+      { E, n: 2 },
+      { E, n: 0 },
+    ];
+    const c: NotifyCache = { v: 1, preview: "message", deltaS: 10, copies: [a.copy] };
+    const w = world(c);
+    w.put(a.row(1, 0, { type: P.MT.TEXT, text: "older" }, { ts: NOW - 9000 }), tSec - 600);
+    w.put(a.row(1, 1, { type: P.MT.TEXT, text: "just now" }, { ts: NOW - 20_000 }), tSec - 20);
+    const notes = await notesFor(proposed([a.bell]), w.deps, later);
+    expect(notes[0].body).toBe("@bob: just now");
+    // only the slot before the next one is read back, and the lanes stay where they were
+    expect(w.asked[0].filter((k) => k.E === E).length).toBe(1 + 8 + 8);
+    expect(w.moves[0][0].next).toEqual([
+      { E, n: 0 },
+      { E, n: 2 },
+      { E, n: 0 },
+    ]);
+  });
+
+  it("does not preview a row the app read more than 5 minutes ago", async () => {
+    const a = makeConv("bob");
+    a.copy.epoch!.next = [
+      { E, n: 0 },
+      { E, n: 1 },
+      { E, n: 0 },
+    ];
+    const c: NotifyCache = { v: 1, preview: "message", deltaS: 10, copies: [a.copy] };
+    const w = world(c);
+    w.put(a.row(1, 0, { type: P.MT.TEXT, text: "old" }), tSec - 301);
+    const notes = await notesFor(proposed([a.bell]), w.deps, later);
+    expect(notes[0].body).toBe("new messages");
   });
 
   it("past the deadline, or when the read fails: the names", async () => {
