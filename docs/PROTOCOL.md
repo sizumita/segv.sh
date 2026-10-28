@@ -4034,8 +4034,10 @@ decrypts itself.
   `ref` once the restore has ended. A notification of a copy opens that URL, and the client closes the notifications
   whose `tag` is a copy's `ref` when it shows that copy.
 - **Seen elsewhere.** A device is **in use** while its page is visible (`document.visibilityState` is `visible`), its
-  window has focus (`document.hasFocus()`), and the user's last input on the page (a key, a pointer press or move, a
-  touch, a wheel or a scroll) is at most `IN_USE` = 60 s old. While it is in use, a device whose setting (below) is on
+  window has focus (`document.hasFocus()`), and the user's last input on the page (a key, a pointer press, a pointer
+  move to another screen position, a touch or a wheel) is at most `IN_USE` = 60 s old. A scroll is not input: the page
+  scrolls itself to follow new rows, so a page left open would stay in use for as long as rows keep coming; neither is
+  a pointer move at the same position, which a browser may report when content moves under a still pointer. While it is in use, a device whose setting (below) is on
   **marks seen** each TEXT or IMAGE row of another member that it shows and counts as unread (§11.8), when the row was
   stored recently enough to have rung (`t + Δ ≥ sec(now) − RING_FRESH`, §10.10): it sends `POST /api/v2/seen`
   (§10.10) with `qS` and the rows, gathering the rows of up to 1 s, at most 16 per request. It does not wait for the
@@ -4046,7 +4048,8 @@ decrypts itself.
   and nothing at all while no row comes, so the server never learns when a device is in use apart from the moments at
   which rows reach it (§13.4).
 - **The quiet setting**, "quiet my other devices while I use this one", belongs to the device, is on by default and is never
-  synced; the device keeps it in its own storage, beside the notification setting. A client shows it whenever params
+  synced; the device keeps it in its own storage, beside the notification setting, or, where that storage cannot keep
+  it, in the page's memory until the page closes. A client shows it whenever params
   carry `push`, also while the device's own notifications are off: a device without notifications still keeps the
   account's other devices quiet while it is in use. While it is off the device sends no `seen`.
 - **While the app is open**, the Service Worker still shows a notification for every push it gets (above). In place

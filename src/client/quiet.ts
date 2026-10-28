@@ -24,10 +24,16 @@ export interface QuietStore {
   save(on: boolean): void;
 }
 
-/** The setting in localStorage (storage that throws or is missing reads as on, the default). */
+/**
+ * The setting in localStorage, on by default. Where storage is missing or a write throws, the choice is kept in memory
+ * for this page instead, so that turning the setting off holds until the page closes.
+ */
 export function localQuietStore(key = "segv.quiet"): QuietStore {
+  /** the choice storage could not keep; null while storage keeps it */
+  let mem: boolean | null = null;
   return {
     load() {
+      if (mem !== null) return mem;
       try {
         return globalThis.localStorage?.getItem(key) !== "off";
       } catch {
@@ -36,10 +42,14 @@ export function localQuietStore(key = "segv.quiet"): QuietStore {
     },
     save(on) {
       try {
-        if (on) globalThis.localStorage?.removeItem(key);
-        else globalThis.localStorage?.setItem(key, "off");
+        const ls = globalThis.localStorage;
+        if (!ls) throw new Error("no localStorage");
+        if (on) ls.removeItem(key);
+        else ls.setItem(key, "off");
+        mem = null;
       } catch {
         // private mode or blocked storage: the setting lasts for this page only
+        mem = on;
       }
     },
   };
@@ -49,11 +59,16 @@ export function localQuietStore(key = "segv.quiet"): QuietStore {
 export interface PageLike {
   readonly visibilityState: DocumentVisibilityState;
   hasFocus(): boolean;
-  addEventListener(type: string, f: () => void, o: AddEventListenerOptions): void;
+  addEventListener(type: string, f: (ev: Event) => void, o: AddEventListenerOptions): void;
 }
 
-/** Input that shows someone is at the device. Focus alone is not: a window keeps it after its user has left. */
-const INPUT = ["keydown", "pointerdown", "pointermove", "touchstart", "wheel", "scroll"];
+/**
+ * Input that shows someone is at the device. Focus alone is not: a window keeps it after its user has left. Neither is
+ * a scroll: the page scrolls itself to follow new rows, so an unattended page would stay in use while rows keep coming.
+ * A pointer move counts only when the pointer is somewhere else: content that moves under a still pointer can make a
+ * browser report one.
+ */
+const INPUT = ["keydown", "pointerdown", "touchstart", "wheel"];
 
 /**
  * Whether this page is in use now: visible, focused, and the user's last input on it at most IN_USE_MS old. Without a
@@ -68,7 +83,20 @@ export function pageInUse(
   const touch = () => {
     last = now();
   };
-  for (const t of INPUT) page.addEventListener(t, touch, { capture: true, passive: true });
+  const opts = { capture: true, passive: true };
+  for (const t of INPUT) page.addEventListener(t, touch, opts);
+  let at: string | null = null;
+  page.addEventListener(
+    "pointermove",
+    (ev) => {
+      const p = ev as PointerEvent;
+      const here = `${p.screenX},${p.screenY}`;
+      if (here === at) return;
+      at = here;
+      touch();
+    },
+    opts,
+  );
   return () => page.visibilityState === "visible" && page.hasFocus() && now() - last <= IN_USE_MS;
 }
 

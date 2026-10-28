@@ -46,15 +46,15 @@ const settle = async () => {
 class FakePage implements PageLike {
   visibilityState: DocumentVisibilityState = "visible";
   focused = true;
-  private readonly fns = new Map<string, (() => void)[]>();
+  private readonly fns = new Map<string, ((ev: Event) => void)[]>();
   hasFocus(): boolean {
     return this.focused;
   }
-  addEventListener(type: string, f: () => void): void {
+  addEventListener(type: string, f: (ev: Event) => void): void {
     this.fns.set(type, [...(this.fns.get(type) ?? []), f]);
   }
-  fire(type: string): void {
-    for (const f of this.fns.get(type) ?? []) f();
+  fire(type: string, ev: Partial<PointerEvent> = {}): void {
+    for (const f of this.fns.get(type) ?? []) f(ev as Event);
   }
 }
 
@@ -64,10 +64,10 @@ describe("pageInUse", () => {
     const page = new FakePage();
     const inUse = pageInUse(page, () => now);
     expect(inUse()).toBe(false); // focused, but no input yet
-    for (const t of ["keydown", "pointerdown", "pointermove", "touchstart", "wheel", "scroll"]) {
+    for (const t of ["keydown", "pointerdown", "pointermove", "touchstart", "wheel"]) {
       now += IN_USE_MS + 1;
       expect(inUse()).toBe(false);
-      page.fire(t);
+      page.fire(t, { screenX: now, screenY: 1 });
       expect(inUse()).toBe(true);
     }
     now += IN_USE_MS;
@@ -84,14 +84,67 @@ describe("pageInUse", () => {
     expect(inUse()).toBe(false);
   });
 
+  it("a scroll, which the page makes itself to follow new rows, and a pointer move in place are not input", () => {
+    let now = 1_000;
+    const page = new FakePage();
+    const inUse = pageInUse(page, () => now);
+    page.fire("pointermove", { screenX: 10, screenY: 20 });
+    expect(inUse()).toBe(true);
+    // Left alone: rows keep coming, the list scrolls to them, and content moves under the still pointer.
+    for (let i = 0; i < 5; i++) {
+      now += IN_USE_MS / 2;
+      page.fire("scroll");
+      page.fire("pointermove", { screenX: 10, screenY: 20 });
+    }
+    expect(inUse()).toBe(false);
+    page.fire("pointermove", { screenX: 11, screenY: 20 });
+    expect(inUse()).toBe(true);
+  });
+
   it("is never in use without a page", () => {
     expect(pageInUse(null)()).toBe(false);
   });
 });
 
 describe("localQuietStore", () => {
-  it("reads as on without storage", () => {
-    expect(localQuietStore("segv.quiet.test").load()).toBe(true);
+  it("reads as on without storage, and keeps a choice for the page where storage cannot", () => {
+    const g = globalThis as { localStorage?: unknown };
+    const saved = g.localStorage;
+    try {
+      g.localStorage = undefined;
+      const s = localQuietStore("segv.quiet.test");
+      expect(s.load()).toBe(true);
+      s.save(false);
+      expect(s.load()).toBe(false);
+      s.save(true);
+      expect(s.load()).toBe(true);
+      // Storage that reads but refuses writes (a full quota) does not bring the old value back either.
+      const items = new Map<string, string>();
+      g.localStorage = {
+        getItem: (k: string) => items.get(k) ?? null,
+        setItem: () => {
+          throw new Error("QuotaExceededError");
+        },
+        removeItem: (k: string) => void items.delete(k),
+      };
+      const t = localQuietStore("segv.quiet.test");
+      t.save(false);
+      expect(t.load()).toBe(false);
+      // Working storage keeps it, and the page follows what storage holds.
+      const kept = new Map<string, string>();
+      g.localStorage = {
+        getItem: (k: string) => kept.get(k) ?? null,
+        setItem: (k: string, v: string) => void kept.set(k, v),
+        removeItem: (k: string) => void kept.delete(k),
+      };
+      const u = localQuietStore("segv.quiet.test");
+      u.save(false);
+      expect(kept.get("segv.quiet.test")).toBe("off");
+      kept.delete("segv.quiet.test"); // another tab turned it back on
+      expect(u.load()).toBe(true);
+    } finally {
+      g.localStorage = saved;
+    }
   });
 });
 
