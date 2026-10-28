@@ -115,12 +115,29 @@ export interface SwDeps {
 
 const urlOf = (origin: string, ref: string): string => `${origin}/#c/${ref}`;
 
-/** The slots read for one lane (§11.13 step 3): from its next slot, `k` in all, the last one slot 0 of E_now when the next slot's era is below. */
-function slotsOf(next: P.Pos, k: number, Enow: number): { E: number; n: number }[] {
-  const out: { E: number; n: number }[] = [];
+/**
+ * A row before the lane's next slot (one the app has already read) is still previewed when it was stored this recently:
+ * with the app open, the app reads the row that rang, and moves the cache past it, before the push arrives.
+ */
+const SEEN_RECENT_MS = 300_000;
+
+interface Slot {
+  E: number;
+  n: number;
+  /** the slot before the lane's next slot: read for the preview only, never moved past */
+  seen: boolean;
+}
+
+/**
+ * The slots read for one lane (§11.13 step 3): the slot before its next slot when that is in the same era, then `k`
+ * slots from the next slot on, the last of them slot 0 of E_now when the next slot's era is below.
+ */
+function slotsOf(next: P.Pos, k: number, Enow: number): Slot[] {
+  const out: Slot[] = [];
+  if (next.n > 0) out.push({ E: next.E, n: next.n - 1, seen: true });
   const room = next.E < Enow ? k - 1 : k;
-  for (let i = 0; i < room; i++) out.push({ E: next.E, n: next.n + i });
-  if (next.E < Enow) out.push({ E: Enow, n: 0 });
+  for (let i = 0; i < room; i++) out.push({ E: next.E, n: next.n + i, seen: false });
+  if (next.E < Enow) out.push({ E: Enow, n: 0, seen: false });
   return out;
 }
 
@@ -143,9 +160,10 @@ async function readNewest(
     });
   const found = new Map<string, Found[]>();
   if (lanes.length === 0) return { found, moves: [] };
-  const per = Math.max(1, Math.min(W_SLOTS, Math.floor(MAX_KEYS / lanes.length)));
+  // W slots from each lane's next slot, plus the one before it, within one get.
+  const per = Math.max(1, Math.min(W_SLOTS, Math.floor(MAX_KEYS / lanes.length) - 1));
   const keys: W.GetKey[] = [];
-  const at: { lane: number; E: number; n: number }[] = [];
+  const at: ({ lane: number } & Slot)[] = [];
   const keysOf = new Map<
     CacheCopy,
     { rk: Uint8Array; mk: Uint8Array; conv: Uint8Array; members: { sigPk: Uint8Array }[] }
@@ -178,7 +196,10 @@ async function readNewest(
     const next = reach[a.lane];
     if (r.s === "hit") {
       // Any row occupies its slot: the dense prefix reaches past it (§4.2).
-      if (a.E === next.E && a.n === next.n && walking[a.lane])
+      if (a.seen) {
+        // read already: only a row that has just rung counts
+        if (P.T0_MS + r.t * 1000 < d.now() - SEEN_RECENT_MS) return;
+      } else if (a.E === next.E && a.n === next.n && walking[a.lane])
         reach[a.lane] = { E: a.E, n: a.n + 1 };
       else if (a.E > l.ep.next[l.j].E && a.n === 0) reach[a.lane] = { E: a.E, n: 1 };
       if (!r.body) return;
@@ -200,7 +221,7 @@ async function readNewest(
       const list = found.get(l.copy.bell) ?? [];
       list.push({ ts, text });
       found.set(l.copy.bell, list);
-    } else if (a.E === next.E) walking[a.lane] = false;
+    } else if (!a.seen && a.E === next.E) walking[a.lane] = false;
   });
   const moves = new Map<string, Move>();
   lanes.forEach((l, li) => {
