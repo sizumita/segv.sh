@@ -124,6 +124,12 @@ export interface EngineState {
    * is not kept on this device (the Service Worker needs the notification cache, which is kept only then).
    */
   preview: "unavailable" | "none" | "name" | "message";
+  /**
+   * "Quiet my other devices while I use this one" (§11.13): "unavailable" when the server offers no push; otherwise
+   * whether this device marks the rows it shows seen while in use, so that the account's devices get no push for them.
+   * Per device, on by default, never synced; it works whether or not this device's own notifications are on.
+   */
+  quiet: "unavailable" | "off" | "on";
 }
 
 export interface Engine {
@@ -183,5 +189,7 @@ export interface Engine {
   setNotifications(on: boolean): Promise<void>;
   /** Chooses what notifications show on this device (§11.13). */
   setPreview(p: "none" | "name" | "message"): Promise<void>;
+  /** Turns "quiet my other devices while I use this one" on or off for this device (§11.13). */
+  setQuiet(on: boolean): Promise<void>;
   clearError(): void;
 }

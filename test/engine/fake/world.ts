@@ -752,6 +752,7 @@ export class FakeWorld implements WorldCtx, RtHost {
       r("GET", /^\/api\/v2\/dirlog$/, "RL_READ", (q) => this.getDirlog(q)),
       r("POST", /^\/api\/v2\/push\/sub$/, "RL_WRITE", (q) => this.postPushSub(q)),
       r("POST", /^\/api\/v2\/ring$/, null, (q) => this.postRing(q)),
+      r("POST", /^\/api\/v2\/seen$/, null, (q) => this.postSeen(q)),
     ];
   }
 
@@ -794,10 +795,12 @@ export class FakeWorld implements WorldCtx, RtHost {
   private postPushSub(req: Req): Res {
     if (!this.pushOn) return err(404, `not found: ${req.method} ${req.path}`);
     return this.jsonBody(req, 16 * 1024, (b) => {
-      const o = b as { endpoint?: unknown; tokens?: unknown };
+      const o = b as { endpoint?: unknown; tokens?: unknown; quiet?: unknown };
       if (typeof o.endpoint !== "string" || !Array.isArray(o.tokens))
         return err(400, "bad push subscription");
-      this.push.sub(o.endpoint, o.tokens as string[]);
+      if (o.quiet !== undefined && (typeof o.quiet !== "string" || fromB64u(o.quiet).length !== 16))
+        return err(400, "bad quiet tag");
+      this.push.sub(o.endpoint, o.tokens as string[], (o.quiet as string | undefined) ?? null);
       return { status: 204 };
     });
   }
@@ -817,6 +820,21 @@ export class FakeWorld implements WorldCtx, RtHost {
       row !== undefined &&
       row.t + this.params.delta >= Math.floor((this.now() - T0_MS) / 1000) - 60;
     this.push.ring(E, label, tokens, fresh);
+    return { status: 204 };
+  }
+
+  /** POST /api/v2/seen (§10.10): 204 for any well-formed body; marks rows for the account whose tag the secret hashes to. */
+  private postSeen(req: Req): Res {
+    if (!this.pushOn) return err(404, `not found: ${req.method} ${req.path}`);
+    const b = req.body;
+    const n = b[17];
+    if (b.length < 18 || b[0] !== 1 || n < 1 || n > 16 || b.length !== 18 + 18 * n)
+      return err(400, "bad seen");
+    const rows = Array.from({ length: n }, (_, i) => {
+      const o = 18 + 18 * i;
+      return { E: (b[o] << 8) | b[o + 1], label: b.slice(o + 2, o + 18) };
+    });
+    this.push.seen(b.slice(1, 17), rows);
     return { status: 204 };
   }
 

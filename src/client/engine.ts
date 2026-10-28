@@ -36,6 +36,7 @@ import {
   type PreviewStore,
 } from "./notify-cache";
 import { PushClient, browserPushPlatform, localPushStore } from "./push";
+import { QuietClient, localQuietStore, pageInUse } from "./quiet";
 import { SelfLane } from "./selflane";
 import { readSnapshot } from "./snapshot";
 import { clearSession, loadSession, saveSession } from "./session";
@@ -57,6 +58,8 @@ interface Account {
   uid: Uint8Array;
   uidB: string;
   AK: Uint8Array;
+  /** the quiet secret qS and its tag Qself (§2.1, §4.1), derived once per session */
+  quiet?: { qS: Uint8Array; Q: Uint8Array };
   id: P.Identity;
   handle: string;
   /** era of registration, from the directory (§11.1); null until the account check */
@@ -81,6 +84,7 @@ const emptyState = (): EngineState => ({
   prfSupported: null,
   notifications: "unavailable",
   preview: "unavailable",
+  quiet: "unavailable",
 });
 
 /** The notification cache is written at least this often while the session runs (§11.13). */
@@ -101,6 +105,8 @@ export class SegvEngine implements Engine {
   private api: Api;
   /** notifications on this device (§11.13); outlives sessions, like the device's setting */
   private readonly push: PushClient;
+  /** marks of the rows this device shows while in use (§11.13 "Seen elsewhere") */
+  private readonly quiet: QuietClient;
   /** the notification cache (null: no storage) and the preview setting (§11.13) */
   private readonly cacheStore: CacheStore | null;
   private readonly previewStore: PreviewStore;
@@ -154,10 +160,24 @@ export class SegvEngine implements Engine {
       },
       deltaMs: () => (this.api.cachedParams?.delta ?? 10) * 1000,
       bells: () => this.msg?.pushBells() ?? [],
+      quiet: () => this.quietKeys()?.Q ?? null,
       onOff: () => {
         void this.dropCache();
         this.patch(this.notificationPatch());
       },
+    });
+    this.quiet = new QuietClient({
+      transport: { seen: (qS, rows) => this.api.seen(qS, rows) },
+      store: opts.quiet?.store ?? localQuietStore(),
+      clock: this.clock,
+      inUse: opts.quiet?.inUse ?? pageInUse(),
+      offered: () => {
+        const p = this.api.cachedParams;
+        return !!p && pushParams(p) !== null;
+      },
+      secret: () => this.quietKeys()?.qS ?? null,
+      delta: () => this.api.cachedParams?.delta ?? 10,
+      serverNow: () => this.api.serverNow(),
     });
     this.cacheStore = opts.notify ? opts.notify.store : idbCacheStore();
     this.previewStore = opts.notify?.preview ?? localPreviewStore();
@@ -177,8 +197,23 @@ export class SegvEngine implements Engine {
     return this.previewStore.load();
   }
 
-  private notificationPatch(): Pick<EngineState, "notifications" | "preview"> {
-    return { notifications: this.notificationState(), preview: this.previewState() };
+  private notificationPatch(): Pick<EngineState, "notifications" | "preview" | "quiet"> {
+    return {
+      notifications: this.notificationState(),
+      preview: this.previewState(),
+      quiet: this.quiet.available ? (this.quiet.on ? "on" : "off") : "unavailable",
+    };
+  }
+
+  /** The account's quiet secret and tag (§2.1, §4.1), or null without a session. */
+  private quietKeys(): { qS: Uint8Array; Q: Uint8Array } | null {
+    const acc = this.account;
+    if (!acc) return null;
+    if (!acc.quiet) {
+      const qS = P.quietSecret(acc.AK);
+      acc.quiet = { qS, Q: P.quietTag(qS) };
+    }
+    return acc.quiet;
   }
 
   /** The preview in effect: `none` unless notifications are on and the session is kept (§11.13). */
@@ -327,6 +362,7 @@ export class SegvEngine implements Engine {
     this.stopTimers();
     // The next account on this browser starts with notifications off, and gets none of this one's (§11.13).
     await this.push.logout().catch(() => {});
+    this.quiet.stop();
     await this.dropCache();
     this.previewStore.save("none");
     this.remembered = false;
@@ -354,6 +390,11 @@ export class SegvEngine implements Engine {
       this.patch(this.notificationPatch());
       if (on) this.scheduleCache(0);
     }
+  }
+
+  async setQuiet(on: boolean): Promise<void> {
+    this.quiet.set(on);
+    this.patch(this.notificationPatch());
   }
 
   async setPreview(p: Preview): Promise<void> {
@@ -625,6 +666,9 @@ export class SegvEngine implements Engine {
       setHead: (q, C) => this.patch({ head: { seq: q, h: P.b64u(C) } }),
       ring: (E, label, bells) => {
         if (gen === this.generation) this.push.ring(E, label, bells);
+      },
+      shown: (E, label, t) => {
+        if (this.live && gen === this.generation) this.quiet.shown(E, label, t);
       },
     };
   }

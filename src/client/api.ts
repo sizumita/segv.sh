@@ -839,6 +839,25 @@ export class Api {
     await res.body?.cancel();
   }
 
+  /** `POST /api/v2/seen`: these rows were shown on a device of the account in use (§10.10). Answered 204 alike. */
+  async seen(qS: Bytes, rows: readonly { E: number; label: Bytes }[]): Promise<void> {
+    if (qS.length !== 16 || rows.length < 1 || rows.length > 16)
+      throw new ApiError(0, "a mark carries the quiet secret and 1 to 16 rows");
+    const body = P.concat(
+      Uint8Array.of(1),
+      qS,
+      Uint8Array.of(rows.length),
+      ...rows.flatMap((r) => [P.u16(r.E), r.label]),
+    );
+    const res = await this.request("/api/v2/seen", {
+      method: "POST",
+      headers: { "content-type": "application/octet-stream" },
+      body: body as BodyInit,
+    });
+    if (!res.ok) throw await readError(res);
+    await res.body?.cancel();
+  }
+
   postWrap(body: WrapJson, onProgress?: Progress): Promise<{ dirseq: number }> {
     return this.postPowJson("/api/v2/wraps", "wrap", body, onProgress);
   }
