@@ -102,8 +102,15 @@ interface ItemLine {
 /**
  * Splits text into blocks. A heading, subtext, list or quote starts at the start of a line and a code block
  * anywhere; the newline that ends a block belongs to it. Quotes do not nest.
+ *
+ * No block cuts a spoiler: a line within a spoiler starts no block (a code block included), and a line whose
+ * spoiler runs on past its end (past the quote, for a quote's lines) is no heading, subtext, list item or quote. The
+ * spoiler then stays in one paragraph, and hides all of its lines.
  */
 function blocks(s: string, quotes: boolean): Block[] {
+  const spoilers = spoilerRanges(s);
+  const within = (p: number) => inSpoiler(spoilers, p);
+  const runsPast = (from: number, to: number) => spoilerRunsPast(spoilers, from, to);
   const out: Block[] = [];
   const n = s.length;
   let para = -1; // start of the open paragraph
@@ -120,7 +127,7 @@ function blocks(s: string, quotes: boolean): Block[] {
     const end = eol < 0 ? n : eol;
     const next = eol < 0 ? n : eol + 1;
 
-    if (i === 0 || s[i - 1] === "\n") {
+    if ((i === 0 || s[i - 1] === "\n") && !within(i)) {
       const line = s.slice(i, end);
       let m: RegExpExecArray | null;
       if (quotes && (m = QUOTE_REST.exec(line))) {
@@ -130,7 +137,6 @@ function blocks(s: string, quotes: boolean): Block[] {
         return out;
       }
       if (quotes && line.startsWith("> ")) {
-        flush(i);
         const lines: string[] = [];
         let k = i;
         while (k < n && s.startsWith("> ", k)) {
@@ -138,29 +144,34 @@ function blocks(s: string, quotes: boolean): Block[] {
           lines.push(s.slice(k + 2, e < 0 ? n : e));
           k = e < 0 ? n : e + 1;
         }
-        out.push({ t: "quote", c: blocks(lines.join("\n"), false) });
-        i = k;
-        continue;
+        if (!runsPast(i, s[k - 1] === "\n" ? k - 1 : k)) {
+          flush(i);
+          out.push({ t: "quote", c: blocks(lines.join("\n"), false) });
+          i = k;
+          continue;
+        }
       }
-      if ((m = HEADING.exec(line))) {
+      if ((m = HEADING.exec(line)) && !runsPast(i, end)) {
         flush(i);
         out.push({ t: "h", level: m[1].length as 1 | 2 | 3, c: inline(m[2], 0, true) });
         i = next;
         continue;
       }
-      if ((m = SUBTEXT.exec(line))) {
+      if ((m = SUBTEXT.exec(line)) && !runsPast(i, end)) {
         flush(i);
         out.push({ t: "sub", c: inline(m[1], 0, true) });
         i = next;
         continue;
       }
-      if (ITEM.test(line)) {
+      if (ITEM.test(line) && !runsPast(i, end)) {
         flush(i);
         const items: ItemLine[] = [];
         let k = i;
         while (k < n) {
           const e = s.indexOf("\n", k);
-          const im = ITEM.exec(s.slice(k, e < 0 ? n : e));
+          const ke = e < 0 ? n : e;
+          if (within(k) || runsPast(k, ke)) break;
+          const im = ITEM.exec(s.slice(k, ke));
           if (!im) break;
           const ordered = im[2] !== "-" && im[2] !== "*";
           items.push({
@@ -180,6 +191,7 @@ function blocks(s: string, quotes: boolean): Block[] {
     // A code block may open anywhere in this line and close on a later one.
     let fence: Fence | null = null;
     for (let f = s.indexOf("```", i); f >= 0 && f <= end; f = s.indexOf("```", f + 1)) {
+      if (within(f)) continue;
       fence = codeBlock(s, f);
       if (fence) break;
       if (s.indexOf("```", f + 3) < 0) break; // no closing fence for this one, nor for any later one
@@ -196,6 +208,60 @@ function blocks(s: string, quotes: boolean): Block[] {
   }
   flush(n);
   return out;
+}
+
+/**
+ * The spoilers of a text as [start, end) pairs, in order: each ||…|| that the inline parser would find, reading
+ * escapes and code (code blocks too) as it does.
+ */
+function spoilerRanges(s: string): number[] {
+  const out: number[] = [];
+  const none = new Map<string, number>();
+  let k = 0;
+  while (k < s.length) {
+    if (s[k] === "\\" && k + 1 < s.length && ESCAPABLE.test(s[k + 1])) {
+      k += 2;
+      continue;
+    }
+    if (s[k] === "`") {
+      k = skip(s, k, false, none);
+      continue;
+    }
+    if (s[k] === "|" && s[k + 1] === "|") {
+      const close = closeDouble(s, k + 2, "|", none);
+      if (close >= 0) {
+        out.push(k, close + 2);
+        k = close + 2;
+        continue;
+      }
+    }
+    k++;
+  }
+  return out;
+}
+
+/** The index in `r` of the last spoiler that starts before p, or -2. */
+function lastBefore(r: number[], p: number): number {
+  let lo = 0;
+  let hi = r.length / 2;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (r[mid * 2] < p) lo = mid + 1;
+    else hi = mid;
+  }
+  return (lo - 1) * 2;
+}
+
+/** p is strictly within a spoiler (after its opening ||). */
+function inSpoiler(r: number[], p: number): boolean {
+  const j = lastBefore(r, p);
+  return j >= 0 && p < r[j + 1];
+}
+
+/** A spoiler that opens in [from, to) closes after `to`. */
+function spoilerRunsPast(r: number[], from: number, to: number): boolean {
+  const j = lastBefore(r, to);
+  return j >= 0 && r[j] >= from && r[j + 1] > to;
 }
 
 interface Fence {
@@ -265,9 +331,10 @@ export function safeHref(raw: string): string | null {
   return u.protocol === "https:" || u.protocol === "http:" ? u.href : null;
 }
 
-const URL_RE = /https?:\/\/[^\s<]+[^<.,:;"')\]\s]/iy;
-const AUTOLINK = /<(https?:\/\/[^\s>]+)>/iy;
-const MASKED = /\[((?:\\.|[^\\[\]])+)\]\(\s*<?(https?:\/\/(?:\([^\s()]*\)|[^\s()<>])+)>?\s*\)/iy;
+// A URL ends before a backtick and before ||, so that it never swallows the code or the spoiler that follows it.
+const URL_RE = /https?:\/\/(?:[^\s<|`]|\|(?!\|))+[^\s<|`.,:;"')\]]/iy;
+const AUTOLINK = /<(https?:\/\/[^\s>`]+)>/iy;
+const MASKED = /\[((?:\\.|[^\\[\]])+)\]\(\s*<?(https?:\/\/(?:\([^\s()`]*\)|[^\s()<>`])+)>?\s*\)/iy;
 const ESCAPABLE = /[^0-9A-Za-z\s]/;
 const WORD = /\w/;
 const SPACE = /\s/;
@@ -401,42 +468,66 @@ function codeClose(s: string, from: number, r: number, none: Map<string, number>
 function styled(s: string, i: number, none: Map<string, number>): Span | null {
   const c = s[i];
   const double = s[i + 1] === c;
-  if (c === "|" || c === "~")
-    return double ? pair(s, i, c, c === "|" ? "spoiler" : "s", none) : null;
   if (double) {
-    const sp = pair(s, i, c, c === "*" ? "b" : "u", none);
-    if (sp) return sp;
-  }
-  return c === "*" ? emStar(s, i, none) : emUnderscore(s, i, none);
-}
-
-/** A doubled delimiter: the first doubled one after a non-empty content (for ** and __, one not followed by a third). */
-function pair(
-  s: string,
-  i: number,
-  c: string,
-  t: Span["t"],
-  none: Map<string, number>,
-): Span | null {
-  const from = i + 3;
-  if (from >= (none.get(c + c) ?? Infinity)) return null;
-  const third = c === "*" || c === "_";
-  for (let k = from; k < s.length; k++) {
-    if (s[k] === "\\") {
-      k++;
-      continue;
-    }
-    if (s[k] === c && s[k + 1] === c && !(third && s[k + 2] === c)) {
+    const k = closeDouble(s, i + 2, c, none);
+    if (k >= 0) {
+      const t = c === "|" ? "spoiler" : c === "~" ? "s" : c === "*" ? "b" : "u";
       return { t, a: i + 2, b: k, end: k + 2 };
     }
   }
-  none.set(c + c, Math.min(from, none.get(c + c) ?? Infinity));
-  return null;
+  if (c === "|" || c === "~") return null;
+  return c === "*" ? emStar(s, i, none) : emUnderscore(s, i, none);
+}
+
+/**
+ * The closing cc (||, ~~, ** or __) of a content that starts at `from` and is not empty, or -1: the first one that is
+ * not inside code, nor, unless c is |, inside a spoiler. So `||` in code never closes a spoiler, and a whole ||…||
+ * always stays a spoiler. ** and __ do not close where a third * or _ follows.
+ */
+function closeDouble(s: string, from: number, c: string, none: Map<string, number>): number {
+  const key = c + c;
+  if (from >= (none.get(key) ?? Infinity)) return -1;
+  const third = c === "*" || c === "_";
+  let k = from;
+  while (k < s.length) {
+    if (s[k] === "\\") {
+      k += 2;
+      continue;
+    }
+    const e = skip(s, k, c !== "|", none);
+    if (e >= 0) {
+      k = e;
+      continue;
+    }
+    if (k > from && s[k] === c && s[k + 1] === c && !(third && s[k + 2] === c)) return k;
+    k++;
+  }
+  none.set(key, Math.min(from, none.get(key) ?? Infinity));
+  return -1;
+}
+
+/**
+ * Where a closing delimiter cannot be: the end of the code (and, with `spoilers`, of the spoiler) that opens at k, or
+ * -1. A run of backticks that opens no code is passed whole, as the parser reads it.
+ */
+function skip(s: string, k: number, spoilers: boolean, none: Map<string, number>): number {
+  if (s[k] === "`") {
+    let r = 1;
+    while (s[k + r] === "`") r++;
+    const close = codeClose(s, k + r, r, none);
+    return close >= 0 ? close + r : k + r;
+  }
+  if (spoilers && s[k] === "|" && s[k + 1] === "|") {
+    const close = closeDouble(s, k + 2, "|", none);
+    return close >= 0 ? close + 2 : -1;
+  }
+  return -1;
 }
 
 /**
  * *italic*: it opens before a non-space, and closes at a single * after a non-space. Within it, ** pairs are
- * content (bold inside italic), and a lone * after a space ends the attempt.
+ * content (bold inside italic), and a lone * after a space ends the attempt. Code and spoilers within it are passed
+ * whole, as in closeDouble.
  */
 function emStar(s: string, i: number, none: Map<string, number>): Span | null {
   const n = s.length;
@@ -445,7 +536,10 @@ function emStar(s: string, i: number, none: Map<string, number>): Span | null {
   let k = i + 1;
   while (k < n) {
     const ch = s[k];
-    if (ch === "\\") {
+    const e = skip(s, k, true, none);
+    if (e >= 0) {
+      k = e;
+    } else if (ch === "\\") {
       k += 2;
     } else if (ch === "*") {
       if (s[k + 1] === "*") {
@@ -462,7 +556,10 @@ function emStar(s: string, i: number, none: Map<string, number>): Span | null {
   return null;
 }
 
-/** _italic_: only between word boundaries (snake_case_names stay as they are); __ pairs are content. */
+/**
+ * _italic_: only between word boundaries (snake_case_names stay as they are); __ pairs are content, and code and
+ * spoilers are passed whole.
+ */
 function emUnderscore(s: string, i: number, none: Map<string, number>): Span | null {
   const n = s.length;
   if (i > 0 && WORD.test(s[i - 1])) return null;
@@ -470,7 +567,10 @@ function emUnderscore(s: string, i: number, none: Map<string, number>): Span | n
   let k = i + 1;
   while (k < n) {
     const ch = s[k];
-    if (ch === "\\") {
+    const e = skip(s, k, true, none);
+    if (e >= 0) {
+      k = e;
+    } else if (ch === "\\") {
       k += 2;
     } else if (ch === "_") {
       if (s[k + 1] === "_") {

@@ -261,6 +261,71 @@ describe("blocks", () => {
   });
 });
 
+describe("code and spoilers stay whole", () => {
+  const code = (v: string): Inline => ({ t: "code", v });
+  const spoiler = (...c: Inline[]): Inline => ({ t: "spoiler", c });
+
+  it("does not close a style inside code", () => {
+    expect(one("||before `a||secret` after||")).toEqual([
+      spoiler(text("before "), code("a||secret"), text(" after")),
+    ]);
+    expect(one("**a `**` b**")).toEqual([{ t: "b", c: [text("a "), code("**"), text(" b")] }]);
+    expect(one("*a `*` b*")).toEqual([{ t: "i", c: [text("a "), code("*"), text(" b")] }]);
+    expect(one("_a `_` b_")).toEqual([{ t: "i", c: [text("a "), code("_"), text(" b")] }]);
+  });
+
+  it("keeps a whole ||…|| a spoiler when another style overlaps it", () => {
+    expect(one("**a ||b** c||")).toEqual([text("**a "), spoiler(text("b** c"))]);
+    expect(one("*a ||b* c||")).toEqual([text("*a "), spoiler(text("b* c"))]);
+  });
+
+  it("ends a bare URL before ||", () => {
+    expect(one("https://example.com/a||secret||")).toEqual([
+      {
+        t: "link",
+        href: "https://example.com/a",
+        masked: false,
+        c: [text("https://example.com/a")],
+      },
+      spoiler(text("secret")),
+    ]);
+  });
+
+  it("keeps a spoiler across lines that look like blocks", () => {
+    expect(parse("||first line\n# secret||")).toEqual([p(spoiler(text("first line\n# secret")))]);
+    expect(parse("a\n||b\n- c\n> d\n-# e||\nf")).toEqual([
+      p(text("a\n"), spoiler(text("b\n- c\n> d\n-# e")), text("\nf")),
+    ]);
+    const doc = parse("||a\n```\nb\n```||");
+    expect(doc).toHaveLength(1);
+    expect((doc[0] as { c: Inline[] }).c).toHaveLength(1);
+    expect((doc[0] as { c: Inline[] }).c[0].t).toBe("spoiler");
+  });
+
+  it("does not start a block on a line whose spoiler runs on past it", () => {
+    expect(parse("- ||a\nb||")).toEqual([p(text("- "), spoiler(text("a\nb")))]);
+    expect(parse("# ||a\nb||")).toEqual([p(text("# "), spoiler(text("a\nb")))]);
+    expect(parse("> ||a\nb||")).toEqual([p(text("> "), spoiler(text("a\nb")))]);
+    expect(parse("- a\n- ||b\n- c||")).toEqual([
+      { t: "list", ordered: false, start: 1, items: [{ c: [text("a")] }] },
+      p(text("- "), spoiler(text("b\n- c"))),
+    ]);
+  });
+
+  it("still parses blocks around spoilers that close on their line", () => {
+    expect(parse("# ||a||\n- ||b||\nc")).toEqual([
+      { t: "h", level: 1, c: [spoiler(text("a"))] },
+      { t: "list", ordered: false, start: 1, items: [{ c: [spoiler(text("b"))] }] },
+      p(text("c")),
+    ]);
+    expect(parse("> ||a\n> b||")).toEqual([{ t: "quote", c: [p(spoiler(text("a\nb")))] }]);
+    expect(parse("```\n||x\n```\n||y||")).toEqual([
+      { t: "pre", lang: "", v: "||x" },
+      p(spoiler(text("y"))),
+    ]);
+  });
+});
+
 describe("plain text", () => {
   it("drops the syntax and keeps the words", () => {
     expect(plainText("plain")).toBe("plain");
@@ -290,6 +355,11 @@ describe("plain text", () => {
       "# ||secret||",
       "[||secret||](https://example.com)",
       "**||secret||**",
+      "||before `a||secret` after||",
+      "||first line\n# secret||",
+      "- ||a\n- secret||",
+      "**a ||secret** b||",
+      "https://example.com/||secret||",
     ]) {
       const out = plainText(src);
       expect(out).toContain(SPOILER);
@@ -341,6 +411,16 @@ describe("hostile input", () => {
       "- ",
       "\n - ",
       "\\",
+      "||`a ",
+      "`||a ",
+      "**||a ",
+      "*||a ",
+      "_||a ",
+      "||a\n# ",
+      "||a\n- ",
+      "\n- ||a",
+      "> ||a\n",
+      "||```a\n",
     ];
     for (const unit of units) {
       for (const src of [unit.repeat(Math.ceil(15_000 / unit.length)), unit + "a ".repeat(7_500)]) {
