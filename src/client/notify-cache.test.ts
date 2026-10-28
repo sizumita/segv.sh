@@ -5,7 +5,6 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   advanceCache,
   applyMoves,
-  bumpCache,
   cacheGen,
   deleteCache,
   isBox,
@@ -50,7 +49,6 @@ function memoryStore() {
       m.box = w.box;
       return true;
     },
-    bump: async () => void m.gen++,
     clear: async () => {
       m.key = null;
       m.box = null;
@@ -220,7 +218,7 @@ describe("notification cache", () => {
     const g = holdNextWrite(s);
     const moving = advanceCache(s, moveTo9);
     await g.reached;
-    await bumpCache(s);
+    await deleteCache(s); // a change of the preview deletes the cache first
     await write(s, named);
     g.open();
     await moving;
@@ -270,7 +268,7 @@ describe("notification cache", () => {
     const g = holdNextWrite(s);
     const tabA = write(s, cache([{ E: 50, n: 4 }]));
     await g.reached;
-    await bumpCache(s);
+    await deleteCache(s); // a change of the preview deletes the cache first
     await write(s, named);
     g.open();
     expect(await tabA).toBe(false);
@@ -279,7 +277,7 @@ describe("notification cache", () => {
     const t = memoryStore();
     await write(t, cache([{ E: 50, n: 3 }]));
     const gen = await cacheGen(t);
-    await bumpCache(t);
+    await deleteCache(t);
     expect(await writeCache(t, cache([{ E: 50, n: 4 }]), gen)).toBe(false);
     await write(t, named);
     expect(await readCache(t)).toEqual(named);

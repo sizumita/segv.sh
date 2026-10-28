@@ -26,7 +26,6 @@ import { refKeyOf } from "./conv";
 import { cursorAt, type InboxCursor } from "./inbox";
 import { Messaging, type MessagingHost } from "./messaging";
 import {
-  bumpCache,
   cacheGen,
   deleteCache,
   idbCacheStore,
@@ -359,11 +358,11 @@ export class SegvEngine implements Engine {
 
   async setPreview(p: Preview): Promise<void> {
     if (this.previewState() === "unavailable") return;
-    // Saved before the cache changes, so that a write decided after it, in any tab, sees it.
+    // Saved before the cache changes, so that a write decided after it, in any tab, sees it. The old cache goes before
+    // the change is reported, whatever the new preview: a `message` cache's names and keys never outlive a downgrade,
+    // even when the page closes before the new cache is written.
     this.previewStore.save(p);
-    const store = this.cacheStore;
-    if (p === "none") await this.dropCache();
-    else if (store) await this.cacheOp(() => bumpCache(store).catch(() => {}));
+    await this.dropCache();
     this.patch(this.notificationPatch());
     this.scheduleCache(0);
   }

@@ -51,7 +51,6 @@ function notifyOf() {
       store.box = w.box;
       return true;
     },
-    bump: async () => void store.gen++,
     clear: async () => {
       store.key = null;
       store.box = null;
@@ -379,5 +378,28 @@ describe("previews (§11.13)", () => {
     await settle(A, B);
     expect([n.store.key, n.store.box]).toEqual([null, null]);
     expect(B.getState().preview).toBe("none");
+  });
+
+  it("a downgrade from `message` deletes the old cache before it is reported", async () => {
+    const [alice, bob] = ["alice", "bob"].map((h) => makeUser(h));
+    const bobDev = new FakePushDevice("bob");
+    const n = notifyOf();
+    const A = await engineFor(alice);
+    const B = await engineFor(bob, { ...bobDev.options, notify: n });
+    const one = await A.createConversation(["bob"]);
+    await settle(A, B);
+    await B.accept(one);
+    await B.setNotifications(true);
+    (B as unknown as { remembered: boolean }).remembered = true;
+    await B.setPreview("message");
+    await waitFor(() => n.store.box !== null, "cache written");
+    expect((await readCache(n.store))!.copies[0].epoch).toBeDefined();
+    await B.setPreview("name");
+    // Once the change is reported no message data is stored, whether or not the `name` cache has been written yet: a
+    // page that closes now leaves none behind.
+    const after = await readCache(n.store);
+    expect(after === null || after.copies.every((c) => c.epoch === undefined)).toBe(true);
+    await waitFor(() => n.store.box !== null, "the name cache");
+    expect((await readCache(n.store))!.copies.map((c) => c.epoch)).toEqual([undefined]);
   });
 });

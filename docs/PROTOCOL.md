@@ -3909,20 +3909,21 @@ decrypts itself.
   learning when messages are sent and by which of the silent members (§13.4).
 - **The notification cache.** While notifications are on, the preview is `name` or `message` and the device keeps its
   session, the client keeps a cache for the Service Worker in the origin's storage, sealed with AEAD under a device key
-  that the browser cannot export (a non-extractable WebCrypto key kept beside it), and never sends it anywhere. For
-  each copy whose bell is in the registration set it holds that bell, the copy's `ref` (below) and the name that the
-  client shows for it. With `message` it also holds the copy's current epoch c, `conv`, `mk_c`, `rk_c`, self's lane
-  index, the `sigPk` of each member of `D_c` and the handle that the client shows for it, and for each lane of c its
-  **next slot**: the slot after the lane's head as the client last knew it, or `(E_start(c), 0)`. The client writes
-  the cache whenever it sends the registration set, when a copy's name changes, when the page is hidden, and at least
-  every 5 minutes while the session runs, each lane's next slot as the later of the stored one and its own. It deletes
-  the cache when the preview becomes `none`, when notifications are turned off, and at `logout`. No write brings back a
-  cache that was deleted, or one decided under an earlier preview, from any tab: the cache keeps a generation, which
-  every deletion and every change of the preview moves on; a client reads it before it decides to write, and its write
-  is stored only while the generation is unchanged; the Service Worker's write is stored only while the cache it read is
-  still the one stored; and only a client creates the device key, together with the cache. The cache holds no
-  key that the kept session does not already give (AK derives every key of every held epoch with the server's
-  help, §11.4), but it holds names and handles, which the device keeps nowhere else.
+  that the browser cannot export (a non-extractable WebCrypto key kept beside it), and never sends it anywhere. For each
+  copy whose bell is in the registration set it holds that bell, the copy's `ref` (below) and the name that the client
+  shows for it. With `message` it also holds the copy's current epoch c, `conv`, `mk_c`, `rk_c`, self's lane index, the
+  `sigPk` of each member of `D_c` and the handle that the client shows for it, and for each lane of c its **next slot**:
+  the slot after the lane's head as the client last knew it, or `(E_start(c), 0)`. The client writes the cache whenever
+  it sends the registration set, when a copy's name changes, when the page is hidden, and at least every 5 minutes while
+  the session runs, each lane's next slot as the later of the stored one and its own. It deletes the cache whenever the
+  preview changes, before the change takes effect (and then writes it again for a preview other than `none`), when
+  notifications are turned off, and at `logout`, so that no name or key of a `message` cache outlives a downgrade. No
+  write brings back a cache that was deleted, or one decided under an earlier preview, from any tab: the cache keeps a
+  generation, which every deletion moves on; a client reads it before it decides to write, and its write is stored only
+  while the generation is unchanged; the Service Worker's write is stored only while the cache it read is still the one
+  stored; and only a client creates the device key, together with the cache. The cache holds no key that the kept
+  session does not already give (AK derives every key of every held epoch with the server's help, §11.4), but it holds
+  names and handles, which the device keeps nowhere else.
 - **The Service Worker** is registered at scope `/`, without a `fetch` handler and without caching, so it never serves
   the app's pages or scripts; its registration takes a Trusted Types policy in the app's CSP. A browser that supports
   declarative push messages hands it the proposed notification of the payload (§9.8), and other browsers the payload

@@ -57,8 +57,8 @@ export interface Stored {
   key: CryptoKey | null;
   box: SealedBox | null;
   /**
-   * Moves on at every deletion and every change of the preview, in any tab, and survives deletion: a write decided
-   * under an earlier generation is stale, and is never stored.
+   * Moves on at every deletion, in any tab (a change of the preview deletes the cache too), and survives it: a write
+   * decided under an earlier generation is stale, and is never stored.
    */
   gen: number;
 }
@@ -79,8 +79,6 @@ export interface CacheStore {
     iv: Uint8Array | null,
     w: { box: SealedBox; key?: CryptoKey },
   ): Promise<boolean>;
-  /** Moves the generation on (a change of the preview). */
-  bump(): Promise<void>;
   /** Deletes the key and the box and moves the generation on, in one transaction. */
   clear(): Promise<void>;
 }
@@ -220,7 +218,8 @@ async function sealWith(key: CryptoKey, c: NotifyCache): Promise<SealedBox> {
  * Writes the app's cache, decided under generation `gen` (read before the decision), keeping each lane's stored next
  * slot where it is later. Only the app creates the device key, and only together with the box. When the Service Worker
  * wrote in between, it reads and merges again (at most 3 times; a lost move only repeats a preview); once the
- * generation has moved on (a deletion or a change of the preview, in any tab) it stops. True if stored.
+ * generation has moved on (a deletion, in any tab: a change of the preview deletes the cache) it stops. True if
+ * stored.
  */
 export async function writeCache(store: CacheStore, c: NotifyCache, gen: number): Promise<boolean> {
   for (let i = 0; i < 3; i++) {
@@ -251,9 +250,6 @@ export async function advanceCache(store: CacheStore, moves: readonly Move[]): P
   const box = await sealWith(cur.key, applyMoves(cur.cache, moves));
   await store.writeIf(cur.gen, new Uint8Array(cur.box.iv), { box });
 }
-
-/** A change of the preview: writes decided before it are stale. */
-export const bumpCache = (store: CacheStore): Promise<void> => store.bump();
 
 export const deleteCache = (store: CacheStore): Promise<void> => store.clear();
 
@@ -316,11 +312,6 @@ export function idbCacheStore(): CacheStore | null {
           s.put(w.box, "box");
           done(true);
         });
-      }),
-    bump: () =>
-      txn<void>("readwrite", (s, done) => {
-        done(undefined);
-        readIn(s, (cur) => void s.put(cur.gen + 1, "gen"));
       }),
     clear: () =>
       txn<void>("readwrite", (s, done) => {
