@@ -817,6 +817,10 @@ export const Lself = (rS: Bytes, E: number, n: number): Bytes =>
 export const Lsnap = (rS: Bytes, E: number, j: number): Bytes =>
   t16(HMAC(rS, enc("segv.sh/v2/lab/snap", u16(E), u32(j))));
 export const topicSelf = (nS: Bytes): Bytes => t16(HMAC(nS, utf8("segv.sh/v2/topic/self")));
+/** qS: the account's quiet secret (§2.1). Only the account's devices know it; it marks rows seen (§10.10). */
+export const quietSecret = (AK: Bytes): Bytes => HKDF(AK, "", "segv.sh/v2/self/quiet", 16);
+/** Qself = t16(H(enc("segv.sh/v2/quiet", qS))): the quiet tag a device registers with its push subscription (§4.1). */
+export const quietTag = (qS: Bytes): Bytes => t16(H(enc("segv.sh/v2/quiet", qS)));
 
 export interface EpochKeys {
   rk: Bytes;

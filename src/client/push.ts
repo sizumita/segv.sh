@@ -16,6 +16,8 @@ export interface PushSubBody {
   p256dh: string;
   auth: string;
   tokens: string[];
+  /** the account's quiet tag Qself (§4.1), so that its marks reach this endpoint; absent when deleting */
+  quiet?: string;
 }
 
 /** The two endpoints of §10.10. Errors carry `status` (0: no answer) and `retryAfter` (seconds or null). */
@@ -123,6 +125,8 @@ export interface PushClientOptions {
   deltaMs: () => number;
   /** the registration set (§11.13), newest `lastTs` first */
   bells: () => Uint8Array[];
+  /** the account's quiet tag Qself (§4.1), registered with the set; null without a session */
+  quiet?: () => Uint8Array | null;
   /** told when the setting turns off by itself (push gone from the server, or a subscription that needs a click) */
   onOff?: () => void;
   random?: () => number;
@@ -369,10 +373,12 @@ export class PushClient {
         tokens.push(t);
         if (tokens.length >= params.maxTokens) break;
       }
+      const q = this.o.quiet?.() ?? null;
+      const quiet = q ? P.b64u(q) : null;
       // Each registration costs a proof of work: an unchanged set for the same endpoint waits for the daily refresh.
-      const key = `${s.endpoint} ${tokens.join(",")}`;
+      const key = `${s.endpoint} ${quiet ?? ""} ${tokens.join(",")}`;
       if (force || key !== this.lastKey || st.endpoint !== s.endpoint) {
-        await this.o.transport.pushSub(bodyOf(s, tokens));
+        await this.o.transport.pushSub({ ...bodyOf(s, tokens), ...(quiet ? { quiet } : {}) });
         this.o.store.save({ on: true, endpoint: s.endpoint });
         this.lastKey = key;
         this.lastAt = this.o.clock.mono();

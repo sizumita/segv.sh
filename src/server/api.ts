@@ -23,6 +23,8 @@ import {
   eraEnd,
   eraStart,
   era,
+  hex,
+  quietTag,
   receiptMsg,
   routeV,
   secOf,
@@ -159,7 +161,7 @@ export class ApiError extends HttpError {
   }
 }
 
-const rl = (env: Env, name: "RL_WRITE" | "RL_BLOB" | "RL_READ" | "RL_INBOX" | "RL_RING"): RateLimit | undefined =>
+const rl = (env: Env, name: "RL_WRITE" | "RL_BLOB" | "RL_READ" | "RL_INBOX" | "RL_RING" | "RL_SEEN"): RateLimit | undefined =>
   (env as unknown as Record<string, RateLimit | undefined>)[name];
 
 const readLimit = (c: Ctx) => rateLimit(rl(c.env, "RL_READ"), "read", c.request);
@@ -898,6 +900,10 @@ export const MAX_PUSH_SUB_BODY = 16 * 1024;
 export const MAX_RING_BODY = 1044;
 /** A ring is for a row stored in the last RING_FRESH seconds. */
 export const RING_FRESH = 60;
+/** The most rows one `seen` marks. */
+export const SEEN_ROWS = 16;
+/** 18 + 18·16 bytes. */
+export const MAX_SEEN_BODY = 18 + 18 * SEEN_ROWS;
 
 const noContent = (): Response =>
   new Response(null, { status: 204, headers: { "cache-control": "no-store", ...SECURITY_HEADERS } });
@@ -933,7 +939,11 @@ async function pushSub(c: Ctx, cfg: PushConfig): Promise<Response> {
   await writeLimit(c);
   const bytes = await readBody(c.request, MAX_PUSH_SUB_BODY);
   checkPow(c.request, c.env, "push", await sha256(bytes), bytes.length, c.now);
-  const o = exactKeys(parseJsonObject(bytes), ["endpoint", "p256dh", "auth", "tokens"], "push subscription");
+  const raw = parseJsonObject(bytes);
+  // `quiet` may be absent: a tab still open on an earlier release registers without one (§10.10).
+  const keys = ["endpoint", "p256dh", "auth", "tokens"];
+  if (Object.prototype.hasOwnProperty.call(raw, "quiet")) keys.push("quiet");
+  const o = exactKeys(raw, keys, "push subscription");
   const endpoint = pushEndpoint(cfg, o.endpoint);
   const p256dh = b64uField(o.p256dh, 65, "p256dh");
   if (!isP256Point(p256dh)) throw new HttpError(400, "invalid p256dh");
@@ -945,9 +955,10 @@ async function pushSub(c: Ctx, cfg: PushConfig): Promise<Response> {
     seen.set(enc64(b), b);
   }
   if (seen.size > PUSH_TOKENS) throw new HttpError(400, `at most ${PUSH_TOKENS} tokens`);
+  const quiet = o.quiet === undefined ? null : b64uField(o.quiet, 16, "quiet");
   let r: string;
   try {
-    r = await pushStub(c.env).sub(endpoint, p256dh, auth, [...seen.values()]);
+    r = await pushStub(c.env).sub(endpoint, p256dh, auth, [...seen.values()], quiet);
   } catch (e) {
     console.error(JSON.stringify({ msg: "push sub failed", error: logErr(e) }));
     throw new HttpError(503, "storage unavailable", { "retry-after": "5" });
@@ -998,6 +1009,37 @@ async function ringAfter(c: Ctx, E: number, label: Bytes, tokens: Bytes[]): Prom
   }
 }
 
+/**
+ * POST /api/v2/seen: a device of an account in use has shown these rows, so no device of the account is pushed for them
+ * (§10.10). The request carries the account's quiet secret, whose hash is the tag the account's endpoints registered:
+ * only its own devices know it. 204 as soon as the request parses, so the answer never tells whether the tag is
+ * registered; the rest runs after the answer.
+ */
+async function seen(c: Ctx): Promise<Response> {
+  await rateLimit(rl(c.env, "RL_SEEN"), "seen", c.request);
+  const b = await readBody(c.request, MAX_SEEN_BODY);
+  if (b.length < 18 || b[0] !== 1) throw new HttpError(400, "bad seen request");
+  const n = b[17];
+  if (n < 1 || n > SEEN_ROWS || b.length !== 18 + 18 * n) throw new HttpError(400, "bad seen request");
+  const Q = quietTag(b.subarray(1, 17));
+  const rows = new Map<string, { E: number; label: Bytes }>();
+  for (let i = 0; i < n; i++) {
+    const o = 18 + 18 * i;
+    const row = { E: (b[o] << 8) | b[o + 1], label: b.slice(o + 2, o + 18) };
+    rows.set(hex(b.subarray(o, o + 18)), row);
+  }
+  c.ctx.waitUntil(seenAfter(c, Q, [...rows.values()]));
+  return noContent();
+}
+
+async function seenAfter(c: Ctx, Q: Bytes, rows: { E: number; label: Bytes }[]): Promise<void> {
+  try {
+    await pushStub(c.env).seen(Q, rows);
+  } catch (e) {
+    console.error(JSON.stringify({ msg: "seen failed", error: logErr(e) }));
+  }
+}
+
 // ───────────── router ─────────────
 
 const P = "/api/v2";
@@ -1044,12 +1086,15 @@ async function route(c: Ctx): Promise<Response> {
       methods(c, ["GET"]);
       return dirlog(c);
     case `${P}/push/sub`:
-    case `${P}/ring`: {
+    case `${P}/ring`:
+    case `${P}/seen`: {
       // While push is off these paths match no route (§10.1 step 3, §10.10).
       const cfg = pushConfig(c.env);
       if (!cfg) break;
       methods(c, ["POST"]);
-      return path === `${P}/ring` ? ring(c) : pushSub(c, cfg);
+      if (path === `${P}/ring`) return ring(c);
+      if (path === `${P}/seen`) return seen(c);
+      return pushSub(c, cfg);
     }
   }
   let m = ERA_PATH.exec(path);

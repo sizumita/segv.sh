@@ -422,3 +422,93 @@ describe("previews (§11.13)", () => {
     expect((await readCache(n.store))!.copies.map((c) => c.epoch)).toEqual([undefined]);
   });
 });
+
+describe("seen elsewhere (§11.13)", () => {
+  /** A device's quiet setting (in memory, on by default) and whether it is in use. */
+  function quietOf(inUse: () => boolean) {
+    let on = true;
+    return { store: { load: () => on, save: (x: boolean) => void (on = x) }, inUse };
+  }
+  const tagOf = (u: TestUser): string => P.b64u(P.quietTag(P.quietSecret(u.AK)));
+
+  /** alice and bob in an accepted 1:1; bob has a phone with notifications on and a desktop without. */
+  async function setup() {
+    const [alice, bob] = ["alice", "bob"].map((h) => makeUser(h));
+    const phone = new FakePushDevice("bob-phone");
+    const use = { desktop: true };
+    const desk = quietOf(() => use.desktop);
+    const A = await engineFor(alice);
+    const Bp = await engineFor(bob, phone.options);
+    const Bd = await engineFor(bob, { quiet: desk });
+    await Bp.setNotifications(true);
+    const id = await A.createConversation(["bob"]);
+    await settle(A, Bp, Bd);
+    await Bd.accept(id);
+    await settle(A, Bp, Bd);
+    await registeredAs(phone, [bellOf(A, id, bob)]);
+    const pushes = () => server().push.pushes.filter((p) => p.endpoint === phone.endpoint).length;
+    return { alice, bob, phone, use, desk, A, Bp, Bd, id, pushes };
+  }
+
+  it("every device registers the account's quiet tag; a device without notifications offers the setting, on by default", async () => {
+    const x = await setup();
+    const phone2 = new FakePushDevice("bob-tablet");
+    const Bt = await engineFor(x.bob, phone2.options);
+    await Bt.setNotifications(true);
+    await settle(x.A, x.Bp, x.Bd, Bt);
+    expect(server().push.subsOf(x.phone.endpoint).at(-1)!.quiet).toBe(tagOf(x.bob));
+    expect(server().push.subsOf(phone2.endpoint).at(-1)!.quiet).toBe(tagOf(x.bob));
+    expect(tagOf(x.bob)).not.toBe(tagOf(x.alice));
+    expect(x.Bd.getState()).toMatchObject({ notifications: "unavailable", quiet: "on" });
+  });
+
+  it("a device in use marks the rows of others that it shows, and the account's phone gets no push for them", async () => {
+    const x = await setup();
+    server().push.holdMs = 2_000;
+    await x.A.sendText(x.id, "are you there?");
+    await settle(x.A, x.Bp, x.Bd);
+    await waitFor(() => server().push.seens().length === 1, "one mark", 5_000);
+    const [mark] = server().push.seens();
+    expect(mark.quiet).toBe(tagOf(x.bob));
+    const row = server().push.rings().at(-1)!;
+    expect(mark.rows).toEqual([{ E: row.E, label: row.label }]);
+    await new Promise((r) => setTimeout(r, 2_500)); // past the hold
+    expect(x.pushes()).toBe(0);
+    expect(chat(x.Bp, x.id)).toContain("alice: are you there?");
+    // bob's own message is never marked (it rings nobody of his).
+    await x.Bd.sendText(x.id, "yes");
+    await settle(x.A, x.Bp, x.Bd);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(server().push.seens()).toHaveLength(1);
+  });
+
+  it("a device not in use, or whose setting is off, marks nothing, and the phone is notified", async () => {
+    const x = await setup();
+    server().push.holdMs = 200;
+    x.use.desktop = false;
+    await x.A.sendText(x.id, "one");
+    await settle(x.A, x.Bp, x.Bd);
+    await waitFor(() => x.pushes() === 1, "a push", 5_000);
+    x.use.desktop = true;
+    await x.Bd.setQuiet(false);
+    expect(x.Bd.getState().quiet).toBe("off");
+    await x.A.sendText(x.id, "two");
+    await settle(x.A, x.Bp, x.Bd);
+    await waitFor(() => x.pushes() === 2, "a second push", 5_000);
+    expect(server().push.seens()).toHaveLength(0);
+    await x.Bd.setQuiet(true);
+    expect(x.Bd.getState().quiet).toBe("on");
+  });
+
+  it("rows applied at a restore are never marked", async () => {
+    const x = await setup();
+    x.use.desktop = false;
+    await x.A.sendText(x.id, "while you were away");
+    await settle(x.A, x.Bp, x.Bd);
+    const Bn = await engineFor(x.bob, { quiet: quietOf(() => true) });
+    await settle(x.A, x.Bp, x.Bd, Bn);
+    expect(chat(Bn, x.id)).toContain("alice: while you were away");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(server().push.seens()).toHaveLength(0);
+  });
+});

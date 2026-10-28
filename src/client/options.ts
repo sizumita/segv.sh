@@ -2,6 +2,7 @@
 // them. The app constructs the engine without options.
 import type { CacheStore, PreviewStore } from "./notify-cache";
 import type { PushPlatform, PushStore } from "./push";
+import type { QuietStore } from "./quiet";
 
 /** A scheduled callback; `cancel()` is idempotent. */
 export interface EngineTimer {
@@ -88,4 +89,9 @@ export interface EngineOptions {
   push?: { platform: PushPlatform | null; store?: PushStore };
   /** The notification cache and the preview setting (§11.13); defaults: IndexedDB and localStorage. */
   notify?: { store: CacheStore | null; preview: PreviewStore };
+  /**
+   * "Quiet my other devices while I use this one" (§11.13): the setting (default localStorage) and whether the device is
+   * in use (default: the page's visibility, focus and input; never without a page).
+   */
+  quiet?: { store?: QuietStore; inUse?: () => boolean };
 }

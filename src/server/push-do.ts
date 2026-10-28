@@ -5,8 +5,11 @@
  * - Durable storage holds the registrations only (`sub`, `tok`), keyed and sealed under PUSH_KEY, and only the daily
  *   pass writes them, a change only after its UTC day has ended: the platform keeps a 30-day point-in-time history of
  *   the storage, which must not date anything finer than a day, nor show which devices a message reached.
- * - Memory holds the day's registration changes (in effect at once) and everything a ring causes (due pushes, windows,
- *   the dedup of rings). A restart loses both; devices register again at their next start (§11.13).
+ * - Memory holds the day's registration changes (in effect at once), everything a ring causes (due pushes, windows,
+ *   the dedup of rings) and the rows each account marked seen. A restart loses all three; devices register again at
+ *   their next start (§11.13), and a push that a lost mark would have prevented is sent.
+ * - Every push waits at least PUSH_HOLD after its ring, so that a device of the account in use can mark its row seen
+ *   first (`seen`, §9.8): a push whose rows were all marked is cancelled.
  * - The alarm ticks every PUSH_TICK seconds of Unix time whatever happens, so its stored time follows the clock alone.
  *
  * Bells are never held in Maps keyed by strings: a day's changes may hold 2 000 endpoints of 256 bells, so the index
@@ -35,9 +38,19 @@ export const PUSH_EXPIRY = 30;
 export const PUSH_ROWS = 20_000;
 /** Seconds a ring (its row and bells) is remembered, so that a retry changes nothing. */
 export const RING_DEDUP = 120;
+/** Seconds a push waits at least after the ring that made it due, for a mark of its row (§9.8 `ring`). */
+export const PUSH_HOLD = 5;
+/** Rows remembered per waiting push; once more ring it, it can no longer be cancelled. */
+export const PUSH_PENDING = 16;
+/** Seconds a row marked seen is remembered per endpoint. */
+export const SEEN_TTL = 120;
+/** Rows marked seen kept per endpoint (a mark beyond them drops the one that expires first). */
+export const PUSH_SEEN = 64;
 
 const TICK_MS = PUSH_TICK * 1000;
 const WINDOW_MS = PUSH_WINDOW * 1000;
+const HOLD_MS = PUSH_HOLD * 1000;
+const SEEN_MS = SEEN_TTL * 1000;
 const DAY_MS = 86_400_000;
 const PUSH_BATCH = 50;
 const PUSH_TIMEOUT_MS = 10_000;
@@ -256,6 +269,10 @@ interface PushState {
   first: number;
   /** the endpoint's bells that rang it since its last push, newest first, at most PUSH_BELLS (§9.8 `rang`) */
   rang: Bytes[];
+  /** the rows that rang it since its last push and that its account has not marked seen; null: too many to cancel */
+  rows: Set<string> | null;
+  /** its request is in flight: a mark no longer cancels it */
+  sending: boolean;
 }
 
 /** `fresh` in front of `rang`, without repeats, at most PUSH_BELLS (§9.8 `ring` step 2). */
@@ -301,6 +318,10 @@ export interface PassPart {
 
 const epOf = (key: Bytes, endpoint: string): Bytes => t16(HMAC(key, enc("segv.sh/v2/push/ep", endpoint)));
 const tkOf = (key: Bytes, bell: Bytes): Bytes => t16(HMAC(key, enc("segv.sh/v2/push/bell", bell)));
+/** The `tk` of a quiet tag: another label than a bell's, so neither ever matches the other. */
+const qkOf = (key: Bytes, quiet: Bytes): Bytes => t16(HMAC(key, enc("segv.sh/v2/push/quiet", quiet)));
+/** A row as rings and marks name it. */
+const rowIdOf = (E: number, label: Bytes): string => hex(t16(H(enc("segv.sh/v2/push/row", u16(E), label))));
 const boxAad = (ep: Bytes): Bytes => enc("segv.sh/v2/push/sub", ep);
 const sealBox = (key: Bytes, ep: Bytes, t: Target): Bytes => aeadSeal(key, enc(t.endpoint, t.p256dh, t.auth), boxAad(ep));
 
@@ -345,6 +366,8 @@ export class PushDO extends DurableObject<Env> {
 
   private readonly pushes = new Map<string, PushState>();
   private readonly dedup = new Map<string, number>();
+  /** per endpoint: the rows its account marked seen, each with when it expires, in that order */
+  private readonly marks = new Map<string, Map<string, number>>();
 
   // The daily pass: the day it started, the last committed ep, and whether it went through every endpoint.
   private passDay: number | null = null;
@@ -450,9 +473,10 @@ export class PushDO extends DurableObject<Env> {
 
   /**
    * Replaces an endpoint's registration as a whole, in memory, at once (§9.8 `sub`). The Worker has checked every
-   * field (§10.10); `tokens` are bells. Empty `tokens` delete the registration.
+   * field (§10.10); `tokens` are bells, `quiet` the account's quiet tag (or null). Empty `tokens` delete the
+   * registration.
    */
-  async sub(endpoint: string, p256dh: Bytes, auth: Bytes, tokens: Bytes[]): Promise<PushSubResult> {
+  async sub(endpoint: string, p256dh: Bytes, auth: Bytes, tokens: Bytes[], quiet: Bytes | null = null): Promise<PushSubResult> {
     const cfg = this.config();
     if (!cfg) throw new Error("push is off");
     const now = this.clock();
@@ -462,12 +486,15 @@ export class PushDO extends DurableObject<Env> {
     const row = this.storedRow(ep);
     if (tokens.length === 0) {
       this.pushes.delete(hex(ep));
+      this.marks.delete(hex(ep));
       this.setChange(ep, row ? { kind: "del", day } : null);
       return "ok";
     }
     const registered = ch ? ch.kind !== "del" : row !== null;
     if (!registered && this.registeredCount() >= cfg.maxSubs) return "full";
-    const kept = sortedDistinct(tokens.map((b) => tkOf(cfg.pushKey, b))).filter((tk) => this.holders(tk, ep).length < PUSH_PER_BELL);
+    const tks0 = tokens.map((b) => tkOf(cfg.pushKey, b));
+    if (quiet) tks0.push(qkOf(cfg.pushKey, quiet));
+    const kept = sortedDistinct(tks0).filter((tk) => this.holders(tk, ep).length < PUSH_PER_BELL);
     const tks = concat(...kept);
     if (row) {
       const o = openBox(cfg.pushKey, ep, row.box);
@@ -491,6 +518,7 @@ export class PushDO extends DurableObject<Env> {
     const seen = this.dedup.get(id);
     if (seen !== undefined && seen > now) return;
     this.dedup.set(id, now + RING_DEDUP * 1000);
+    const row = rowIdOf(E, label);
     // Each endpoint's registered bells among `tokens`, in their order there.
     const eps = new Map<string, { ep: Bytes; bells: Bytes[] }>();
     const order = new Set<string>();
@@ -506,15 +534,49 @@ export class PushDO extends DurableObject<Env> {
     }
     const jitter = v2Params(this.env).delta * 1000;
     for (const [k, { ep, bells }] of eps) {
+      // A device of its account has shown this row while in use (§9.8 `seen`).
+      if ((this.marks.get(k)?.get(row) ?? 0) > now) continue;
       const st = this.pushes.get(k);
       const rang = rangWith(bells, st?.rang ?? []);
       if (st && st.due !== null) {
         st.rang = rang;
+        if (st.rows) {
+          st.rows.add(row);
+          if (st.rows.size > PUSH_PENDING) st.rows = null;
+        }
         continue;
       }
       const last = st?.last ?? null;
-      const due = (last === null ? now : Math.max(now, last + WINDOW_MS)) + Math.floor(this.rand() * (jitter + 1));
-      this.pushes.set(k, { ep, last, due, tries: 0, first: 0, rang });
+      const due = Math.max(now + HOLD_MS, last === null ? 0 : last + WINDOW_MS) + Math.floor(this.rand() * (jitter + 1));
+      this.pushes.set(k, { ep, last, due, tries: 0, first: 0, rang, rows: new Set([row]), sending: false });
+    }
+  }
+
+  /**
+   * A device of the account whose quiet tag is `Q` has shown `rows` while in use (§9.8 `seen`): its endpoints get no
+   * push for them. Cancels a waiting push all of whose rows are now marked. Writes nothing, not even the alarm.
+   */
+  async seen(Q: Bytes, rows: { E: number; label: Bytes }[]): Promise<void> {
+    const cfg = this.config();
+    if (!cfg || rows.length === 0) return;
+    const eps = this.holders(qkOf(cfg.pushKey, Q));
+    if (eps.length === 0) return;
+    const now = this.clock();
+    const ids = [...new Set(rows.map((r) => rowIdOf(r.E, r.label)))];
+    for (const ep of eps) {
+      const k = hex(ep);
+      const m = this.marks.get(k) ?? new Map<string, number>();
+      for (const id of ids) {
+        // Deleted and set again, so the map stays in the order in which its marks expire.
+        m.delete(id);
+        m.set(id, now + SEEN_MS);
+      }
+      while (m.size > PUSH_SEEN) m.delete(m.keys().next().value as string);
+      this.marks.set(k, m);
+      const st = this.pushes.get(k);
+      if (!st || st.due === null || !st.rows) continue;
+      for (const id of ids) st.rows.delete(id);
+      if (st.rows.size === 0 && !st.sending) Object.assign(st, { due: null, tries: 0, rang: [], rows: new Set() });
     }
   }
 
@@ -555,6 +617,14 @@ export class PushDO extends DurableObject<Env> {
 
   private cleanup(now: number): void {
     for (const [k, exp] of this.dedup) if (exp <= now) this.dedup.delete(k);
+    for (const [k, m] of this.marks) {
+      // In expiry order: stop at the first mark still in force.
+      for (const [id, exp] of m) {
+        if (exp > now) break;
+        m.delete(id);
+      }
+      if (m.size === 0) this.marks.delete(k);
+    }
     for (const [k, st] of this.pushes) if (st.due === null && (st.last === null || st.last + WINDOW_MS <= now)) this.pushes.delete(k);
   }
 
@@ -698,7 +768,7 @@ export class PushDO extends DurableObject<Env> {
     const cfg = this.config();
     if (!cfg) {
       // While push is off nothing is sent, and what is due is dropped.
-      for (const st of this.pushes.values()) Object.assign(st, { due: null, rang: [] });
+      for (const st of this.pushes.values()) Object.assign(st, { due: null, rang: [], rows: new Set() });
       return;
     }
     const tally = { sent: 0, retried: 0, dropped: 0, deleted: 0 };
@@ -710,8 +780,18 @@ export class PushDO extends DurableObject<Env> {
         .sort((a, b) => (a.due as number) - (b.due as number))
         .slice(0, PUSH_BATCH);
       if (due.length === 0) break;
-      // Their `due` stays set while they are sent: a ring meanwhile coalesces into them (§9.8 `ring` step 2).
-      const results = await Promise.all(due.map((s) => this.sendOne(cfg, s)));
+      // Their `due` stays set while they are sent: a ring meanwhile coalesces into them (§9.8 `ring` step 2), and a
+      // mark no longer cancels them.
+      const results = await Promise.all(
+        due.map(async (s) => {
+          s.sending = true;
+          try {
+            return await this.sendOne(cfg, s);
+          } finally {
+            s.sending = false;
+          }
+        }),
+      );
       for (const r of results) if (r) tally[r]++;
       const more = [...this.pushes.values()].some((s) => s.due !== null && s.due <= this.clock());
       const wait = start + 1000 - this.clock();
@@ -794,16 +874,21 @@ export class PushDO extends DurableObject<Env> {
       clearTimeout(timer);
     }
     if (typeof status === "number" && status >= 200 && status < 300) {
-      Object.assign(s, { last: at, due: null, tries: 0, rang: [] });
+      Object.assign(s, { last: at, due: null, tries: 0, rang: [], rows: new Set() });
       return "sent";
     }
     if (status === "error" || status === 429 || status >= 500) {
+      if (s.rows?.size === 0) {
+        // Every row that rang it was marked seen while this attempt was out: cancelled rather than retried.
+        Object.assign(s, { due: null, tries: 0, rang: [], rows: new Set() });
+        return null;
+      }
       if (s.tries === 0) {
         const ra = retryAfterS(retryAfter);
         Object.assign(s, { tries: 1, due: this.clock() + (ra !== null && ra <= 60 ? ra * 1000 : RETRY_MS) });
         return "retried";
       }
-      Object.assign(s, { last: s.first, due: null, tries: 0, rang: [] });
+      Object.assign(s, { last: s.first, due: null, tries: 0, rang: [], rows: new Set() });
       return "dropped";
     }
     // A 3xx (never followed) or any other 4xx: no push service accepts this endpoint any more.

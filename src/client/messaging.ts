@@ -161,6 +161,8 @@ export interface MessagingHost {
   setHead(q: number, C: Bytes): void;
   /** a TEXT or IMAGE was stored: ask the server to ring these bells (§11.13); never waits */
   ring(E: number, label: Bytes, bells: Bytes[]): void;
+  /** a TEXT or IMAGE of another member was shown as it arrived: marked seen while in use (§11.13); never waits */
+  shown(E: number, label: Bytes, t: number): void;
 }
 
 export class Messaging {
@@ -1415,6 +1417,9 @@ export class Messaging {
       changed: () => {
         this.markHeads();
         this.h.changed();
+      },
+      shown: (E, label, t) => {
+        if (!quiet) this.h.shown(E, label, t);
       },
       handleOf: (c, ep, j) => this.handleOf(c, ep, j),
       onWelcome: (c, ep, j, at, J) => {
