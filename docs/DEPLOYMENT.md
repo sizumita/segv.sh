@@ -185,8 +185,8 @@ Worker that already exists. For your own instance, change the URL in the workflo
    ```
 
 4. Under **Actions › General** in the repository's settings, require actions to be pinned to a full-length commit SHA,
-   and allow only actions created by GitHub. The workflows use nothing else: `.github/actions/setup` installs pnpm with
-   npm and verifies its registry signatures.
+   and allow only actions created by GitHub, plus `pnpm/action-setup@*` in the list of specified actions. The workflows
+   use nothing else.
 
 The token cannot apply D1 migrations, and a change to `routes` in `wrangler.jsonc` makes the deployment fail at the
 Custom Domain step after the new version is live. Apply both by hand (the next section).
