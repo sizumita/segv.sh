@@ -12,6 +12,7 @@ import { Chat } from "./chat";
 import { refreshServiceWorker } from "~/client/sw-url";
 import { loadEngine } from "./engine-loader";
 import { Fatal } from "./fatal";
+import { Leaving } from "./leaving";
 import { Recovery } from "./recovery";
 import {
   closeNotifications,
@@ -89,6 +90,7 @@ export const App = component$(() => {
             ui.members = false;
             ui.viewer = undefined;
             ui.settings = false;
+            ui.leaving = "";
           }
           lastPhase = snap.phase;
         }
@@ -170,6 +172,7 @@ export const App = component$(() => {
         <SignedOut />
       )}
       {ui.viewer && <Viewer />}
+      {ui.leaving && <Leaving />}
       <noscript>segv.sh needs javascript: all encryption happens in your browser.</noscript>
     </div>
   );

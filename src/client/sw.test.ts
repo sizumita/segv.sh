@@ -270,6 +270,24 @@ describe("the notifications of a push (§11.13)", () => {
     expect(w.moves[0][0].next[1]).toEqual({ E, n: 1 });
   });
 
+  it("shows the text without its Markdown, and nothing of a spoiler, before cutting it", async () => {
+    const a = makeConv();
+    const c: NotifyCache = { v: 1, preview: "message", deltaS: 10, copies: [a.copy] };
+    const w = world(c);
+    w.put(
+      a.row(1, 0, { type: P.MT.TEXT, text: "**look**: ||the butler did it||" }, { ts: NOW - 2000 }),
+    );
+    w.put(a.row(2, 0, { type: P.MT.TEXT, text: `~~${"あ".repeat(300)}~~` }, { ts: NOW - 3000 }));
+    const notes = await notesFor(proposed([a.bell]), w.deps, later);
+    expect(notes[0].body).toBe("@bob: look: (spoiler) (+1)");
+
+    const b = makeConv();
+    const w2 = world({ v: 1, preview: "message", deltaS: 10, copies: [b.copy] });
+    w2.put(b.row(2, 0, { type: P.MT.TEXT, text: `~~${"あ".repeat(300)}~~` }));
+    const [note] = await notesFor(proposed([b.bell]), w2.deps, later);
+    expect(note.body).toBe(`@carol: ${"あ".repeat(191)}…`);
+  });
+
   it("a cache read that stalls past the deadline gives the fixed notification; a push without bells reads nothing", async () => {
     const a = makeConv();
     const w = world(null);

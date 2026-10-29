@@ -29,6 +29,8 @@ export interface UiState {
   now: number;
   /** full-size image overlay */
   viewer: NoSerialize<{ src: string; w: number; h: number; mime: string }>;
+  /** the URL of a [label](url) link the user clicked, to confirm before it opens ('' = none) */
+  leaving: string;
 }
 
 export const initialEngineState = (): EngineState => ({
@@ -58,6 +60,7 @@ export const initialUiState = (): UiState => ({
   visible: true,
   now: 0,
   viewer: undefined,
+  leaving: "",
 });
 
 export const StateCtx = createContextId<EngineState>("segv.state");
