@@ -1,6 +1,7 @@
 # Checks every pull request: formatting, lint, type checks, tests, the production build, the Wrangler configuration,
-# the end-to-end test, and the dependencies' advisories and registry signatures. The audit also runs every week, since
-# advisories are published against versions that are already locked. Pushes to main are checked by the Deploy workflow.
+# the end-to-end test, the dependencies' advisories and registry signatures, and the format of the lockfile. The audit
+# also runs every week, since advisories are published against versions that are already locked. Pushes to main are
+# checked by the Deploy workflow.
 #
 # - No job has secrets, and the GITHUB_TOKEN can only read the repository.
 # - Dependencies come from pnpm-lock.yaml, without install scripts and without a cache.
@@ -139,6 +140,15 @@ jobs:
       # The version comes from "packageManager" in package.json.
       - name: Set up pnpm
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      # GitHub's dependency graph reads only the first YAML document of pnpm-lock.yaml, so Dependabot sees the
+      # dependencies only while the lockfile is a single document (pmOnFail in pnpm-workspace.yaml).
+      - name: Check that the lockfile is one YAML document
+        run: |
+          if grep -qx -- '---' pnpm-lock.yaml; then
+            echo "::error file=pnpm-lock.yaml::pnpm-lock.yaml holds more than one YAML document; see pmOnFail in pnpm-workspace.yaml."
+            exit 1
+          fi
 
       - name: Check for advisories
         run: pnpm audit

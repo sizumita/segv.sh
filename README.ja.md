@@ -200,9 +200,9 @@ Durable Objects（SQLite）、D1、R2。暗号はすべて [noble](https://paulm
 
 ## はじめかた
 
-Node.js 22.18 以降・24.11 以降・26 以降のどれかと、pnpm 10 以降、パスキーの保存先が WebAuthn PRF 拡張に対応したブラウザが
+Node.js 22.18 以降・24.11 以降・26 以降のどれかと、pnpm 12、パスキーの保存先が WebAuthn PRF 拡張に対応したブラウザが
 必要です。PRF に対応していなくても、リカバリーコードでなら解錠できます。pnpm は `package.json` の `packageManager` が固定
-する版に自動で切り替わります。
+する版を使ってください。自動では切り替わらないので、`pnpm self-update <版>` で入れます。
 
 ```bash
 pnpm install

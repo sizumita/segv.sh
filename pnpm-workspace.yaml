@@ -35,3 +35,9 @@ allowBuilds:
 # once it is a day old (2026-10-29 17:21 UTC).
 minimumReleaseAgeExclude:
   - "@cloudflare/vite-plugin@1.66.0"
+
+# pnpm neither switches itself to the release that "packageManager" in package.json pins nor records that release in
+# pnpm-lock.yaml. The record makes the lockfile two YAML documents, and GitHub's dependency graph reads only the first:
+# Dependabot would see no dependencies, raise no alerts and open no security updates. CI checks that the lockfile stays
+# one document. Revisit once GitHub reads such lockfiles (dependabot/dependabot-core#15904).
+pmOnFail: ignore
