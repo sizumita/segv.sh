@@ -220,9 +220,10 @@ Durable Objects (SQLite), D1 and R2. All cryptography comes from the [noble](htt
 
 ## Getting started
 
-You need Node.js 22.18+, 24.11+ or 26+, pnpm 10 or later, and a browser whose passkey provider supports the WebAuthn
-PRF extension. Without PRF support you can still unlock an account with its recovery code. pnpm switches itself to the
-release that `packageManager` in `package.json` pins.
+You need Node.js 22.18+, 24.11+ or 26+, pnpm 12, and a browser whose passkey provider supports the WebAuthn PRF
+extension. Without PRF support you can still unlock an account with its recovery code. Use the pnpm release that
+`packageManager` in `package.json` pins: pnpm does not switch to it by itself, and `pnpm self-update <version>`
+installs it.
 
 ```bash
 pnpm install

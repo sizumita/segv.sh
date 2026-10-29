@@ -1,0 +1,45 @@
+# Dependabot proposes an upgrade only once the new release has been published for 30 days (cooldown), and has pnpm
+# hold the transitive dependencies it resolves for the upgrade to the same window where a release that old satisfies
+# them. Security updates do not wait: they ignore the cooldown, and Dependabot opens them as soon as an advisory affects
+# a locked version. They are turned on in the repository's settings (docs/DEVELOPMENT.md).
+
+version: 2
+
+updates:
+  # pnpm uses the npm ecosystem.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 30
+    groups:
+      # Each plugin depends on the exact Wrangler it was released with.
+      cloudflare:
+        patterns:
+          - wrangler
+          - "@cloudflare/*"
+      qwik:
+        patterns:
+          - "@qwik.dev/*"
+          - eslint-plugin-qwik
+    ignore:
+      # The vite alias (npm:@voidzero-dev/vite-plus-core) and vitest move with vite-plus, together with their overrides
+      # in pnpm-workspace.yaml, which Dependabot does not edit. Upgrade them in the pull request that upgrades vite-plus
+      # (docs/DEVELOPMENT.md).
+      - dependency-name: "@voidzero-dev/vite-plus-core"
+      - dependency-name: vitest
+
+  # The actions stay pinned to full commit SHAs; Dependabot updates the SHA and the version in the comment beside it.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 30
+    groups:
+      actions:
+        patterns:
+          - "*"

@@ -6,7 +6,8 @@ This guide sets up a local instance of segv.sh and runs its tests. For the overa
 ## Requirements
 
 - Node.js `^22.18.0`, `^24.11.0` or `>=26.0.0`.
-- pnpm 10 or later. It switches itself to the release that `packageManager` in `package.json` pins.
+- pnpm 12, at the release that `packageManager` in `package.json` pins. pnpm does not switch to that release by itself
+  (`pmOnFail` in `pnpm-workspace.yaml`); install it with `pnpm self-update <version>`.
 - To use the app by hand: a browser whose passkey provider supports the WebAuthn PRF extension. Passkeys created on
   `localhost` are separate from the passkeys of any deployment.
 - For the end-to-end tests: Playwright's Chromium, installed once with `pnpm exec playwright install chromium`.
@@ -98,9 +99,25 @@ same checks, the end-to-end test and the dependency audit on every pull request.
   reason.
 - No dependency runs install scripts (`allowBuilds`), and pnpm installs a release only once it has been published for a
   day (`minimumReleaseAge`).
+- Upgrades wait 30 days. Dependabot proposes one only once the new release has been published for 30 days (`cooldown`
+  in `.github/dependabot.yml`), and holds the transitive dependencies it resolves for it to the same window where a
+  release that old satisfies them. It looks every Monday, for the dependencies and for the actions of the workflows.
+- Security fixes do not wait. Dependabot opens a security update as soon as an advisory affects a locked version. A fix
+  published less than a day ago installs only once `minimumReleaseAgeExclude` in `pnpm-workspace.yaml` names its
+  version. Security updates need Dependabot alerts and Dependabot security updates turned on for the repository:
+
+  ```bash
+  gh api -X PUT 'repos/{owner}/{repo}/vulnerability-alerts'
+  gh api -X PUT 'repos/{owner}/{repo}/automated-security-fixes'
+  ```
+
+- `pnpm-lock.yaml` stays a single YAML document, which CI checks. GitHub's dependency graph reads only the first
+  document, so a second one would hide every dependency from Dependabot. pnpm adds the second document when it records
+  its own release in the lockfile, which `pmOnFail: ignore` in `pnpm-workspace.yaml` prevents.
 - Some versions move together:
   - `vite-plus`, the `vite` alias (`npm:@voidzero-dev/vite-plus-core`) and `vitest` in `package.json`, and the `vite`
     and `vitest` overrides in `pnpm-workspace.yaml`. `vp toolchain vitest` prints the Vitest version that Vite+ bundles.
+    Dependabot proposes only `vite-plus`; upgrade the rest in its pull request.
   - `wrangler`, `@cloudflare/vite-plugin` and `@cloudflare/vitest-plugin`. Each plugin depends on the exact Wrangler it
     was released with, so choose the plugin releases that depend on the chosen Wrangler.
 - `pnpm audit` must report nothing. CI checks it, and the registry signatures (`pnpm audit signatures`), on every pull
