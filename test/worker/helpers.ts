@@ -49,6 +49,21 @@ export const freshIp = (): string => {
   return `10.${ipSeq >> 16}.${(ipSeq >> 8) & 255}.${ipSeq & 255}`;
 };
 
+/**
+ * Runs `burst` until a run ends in the rate-limit window it started in, and returns that run's result. Miniflare counts
+ * each limit in windows aligned to the wall clock (⌊now / period⌋) and restarts every count when the window rolls over,
+ * so a burst that runs across a boundary sees its later requests allowed again. `burst` must take a fresh client IP on
+ * each run: an earlier run's counts stay with its IP.
+ */
+export async function inOneRateWindow<T>(burst: () => Promise<T>, periodS = 60): Promise<T> {
+  const window = () => Math.floor(Date.now() / (periodS * 1000));
+  for (let run = 1; ; run++) {
+    const start = window();
+    const result = await burst();
+    if (window() === start || run === 3) return result;
+  }
+}
+
 export type ApiInit = Omit<RequestInit, "body"> & {
   body?: BodyInit | Uint8Array | null;
   ip?: string;

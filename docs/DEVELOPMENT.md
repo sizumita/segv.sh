@@ -5,17 +5,18 @@ This guide sets up a local instance of segv.sh and runs its tests. For the overa
 
 ## Requirements
 
-- Node.js `^22.18.0`, `^24.11.0` or `>=26.0.0`, with npm.
+- Node.js `^22.18.0`, `^24.11.0` or `>=26.0.0`.
+- pnpm 10 or later. It switches itself to the release that `packageManager` in `package.json` pins.
 - To use the app by hand: a browser whose passkey provider supports the WebAuthn PRF extension. Passkeys created on
   `localhost` are separate from the passkeys of any deployment.
-- For the end-to-end tests: Playwright's Chromium, installed once with `npx playwright install chromium`.
+- For the end-to-end tests: Playwright's Chromium, installed once with `pnpm exec playwright install chromium`.
 
 ## Local setup
 
 1. Install the dependencies:
 
    ```bash
-   npm install
+   pnpm install
    ```
 
 2. Create `.dev.vars` with the two server secrets, each 32 random bytes in base64url. `ROUTE_KEY` keys the routing of
@@ -29,29 +30,29 @@ This guide sets up a local instance of segv.sh and runs its tests. For the overa
 3. Create the local D1 database:
 
    ```bash
-   npm run db:migrate:local
+   pnpm run db:migrate:local
    ```
 
 4. Start the development server:
 
    ```bash
-   npm run dev
+   pnpm run dev
    ```
 
    `vp dev` runs the Qwik app with server-side rendering, the API and every Durable Object inside workerd, through
    `@cloudflare/vite-plugin`. Open the local URL that it prints.
 
 Local data (D1, R2 and the Durable Objects' storage) lives in `.wrangler/state`; delete that directory and run
-`npm run db:migrate:local` again to start over. The deployment parameters in `wrangler.jsonc` apply locally too, so
+`pnpm run db:migrate:local` again to start over. The deployment parameters in `wrangler.jsonc` apply locally too, so
 proof of work costs as much as in production, and a membership change or a new conversation takes at least
 Δ + SKEW = 12 seconds to become visible to the other members.
 
-To try the production build locally, run `npm run preview`: it builds the app and serves it with `wrangler dev`, which
+To try the production build locally, run `pnpm run preview`: it builds the app and serves it with `wrangler dev`, which
 also reads `.dev.vars`.
 
 ## Tests
 
-`npm test` runs `vp test run`, which has three Vitest projects:
+`pnpm test` runs `vp test run`, which has three Vitest projects:
 
 | Project   | Files                   | What it covers                                                                                                                                                                                       |
 | --------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -62,31 +63,50 @@ also reads `.dev.vars`.
 To run one project or one file:
 
 ```bash
-npx vp test run --project engine
-npx vp test run test/engine/restore.spec.ts
+pnpm exec vp test run --project engine
+pnpm exec vp test run test/engine/restore.spec.ts
 ```
 
-The test directories have TypeScript configurations of their own. Check them with `npx tsc --noEmit -p test/engine` and
-`npx tsc --noEmit -p test/worker`, and the app with `npx tsc --noEmit -p .`.
+The test directories have TypeScript configurations of their own. Check them with
+`pnpm exec tsc --noEmit -p test/engine` and `pnpm exec tsc --noEmit -p test/worker`, and the app with
+`pnpm exec tsc --noEmit -p .`.
 
 ### End-to-end tests
 
-`npm run test:e2e` builds the app, starts `wrangler dev` on port 8817 with a generated configuration (low proof of
+`pnpm run test:e2e` builds the app, starts `wrangler dev` on port 8817 with a generated configuration (low proof of
 work, Δ = 1 s, fresh secrets and its own state in `.wrangler/e2e`), and drives headless Chromium with virtual
-authenticators that support PRF. It never touches the data of `npm run dev`.
+authenticators that support PRF. It never touches the data of `pnpm run dev`.
 
 ```bash
-npm run test:e2e -- --no-build   # reuse the last build
-HEADED=1 npm run test:e2e        # watch the browsers
-E2E_PORT=9000 npm run test:e2e   # use another port
+pnpm run test:e2e --no-build      # reuse the last build
+HEADED=1 pnpm run test:e2e        # watch the browsers
+E2E_PORT=9000 pnpm run test:e2e   # use another port
 ```
 
 Screenshots are written to `.wrangler/e2e/shots`, or to the directory in `E2E_SHOTS`.
 
 ## Before a pull request
 
-Run the checks listed in [CONTRIBUTING.md](../CONTRIBUTING.md#development). `npm run check` runs the formatter in check
-mode and the linter; `npm run fmt` formats the sources.
+Run the checks listed in [CONTRIBUTING.md](../CONTRIBUTING.md#development). `pnpm run check` runs the formatter in
+check mode and the linter; `pnpm run fmt` formats the sources. The CI workflow (`.github/workflows/ci.yml`) runs the
+same checks, the end-to-end test and the dependency audit on every pull request.
+
+## Dependencies
+
+- Every dependency in `package.json` is pinned to an exact version, and `pnpm add` keeps it that way (`saveExact` in
+  `pnpm-workspace.yaml`). pnpm takes its settings from that file only; it also holds the overrides, each with its
+  reason.
+- No dependency runs install scripts (`allowBuilds`), and pnpm installs a release only once it has been published for a
+  day (`minimumReleaseAge`).
+- Some versions move together:
+  - `vite-plus`, the `vite` alias (`npm:@voidzero-dev/vite-plus-core`) and `vitest` in `package.json`, and the `vite`
+    and `vitest` overrides in `pnpm-workspace.yaml`. `vp toolchain vitest` prints the Vitest version that Vite+ bundles.
+  - `wrangler`, `@cloudflare/vite-plugin` and `@cloudflare/vitest-plugin`. Each plugin depends on the exact Wrangler it
+    was released with, so choose the plugin releases that depend on the chosen Wrangler.
+- `pnpm audit` must report nothing. CI checks it, and the registry signatures (`pnpm audit signatures`), on every pull
+  request and every week. Fix an advisory by upgrading, or with an override scoped to the version of the package that
+  brings it in; accept one only by listing its GHSA under `auditConfig.ignoreGhsas` in `pnpm-workspace.yaml`, with the
+  reason.
 
 ## Reading the code
 

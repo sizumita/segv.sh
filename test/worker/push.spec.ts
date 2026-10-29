@@ -29,7 +29,7 @@ import {
 } from "../../src/server/push-do";
 import { pushStub } from "../../src/server/types";
 import { vapidPublicKey } from "../../src/server/webpush";
-import { DELTA, DIFF2, direct, errorOf, freshIp, makeRow, powHeader, putOk, type Bytes } from "./helpers";
+import { DELTA, DIFF2, direct, errorOf, freshIp, inOneRateWindow, makeRow, powHeader, putOk, type Bytes } from "./helpers";
 
 const ENV = env as unknown as Record<string, string>;
 const PUSH_KEY = P.fromB64u(ENV.PUSH_KEY);
@@ -374,9 +374,14 @@ describe("POST /api/v2/push/sub (§10.10)", () => {
     expect((await post(body(), { pow: false })).status).toBe(403);
     const big = P.utf8(JSON.stringify(body({ pad: "x".repeat(16 * 1024) })));
     expect((await post(null, { raw: big, pow: false })).status).toBe(413);
-    const ip = freshIp();
-    for (let i = 0; i < 60; i++) expect((await post(body(), { pow: false, ip })).status).toBe(403);
-    expect((await post(body(), { ip })).status).toBe(429);
+    const { statuses, over } = await inOneRateWindow(async () => {
+      const ip = freshIp();
+      const statuses: number[] = [];
+      for (let i = 0; i < 60; i++) statuses.push((await post(body(), { pow: false, ip })).status);
+      return { statuses, over: (await post(body(), { ip })).status };
+    });
+    expect(statuses.every((s) => s === 403)).toBe(true);
+    expect(over).toBe(429);
   });
 });
 
@@ -512,9 +517,14 @@ describe("POST /api/v2/ring (§10.10)", () => {
     expect((await post(P.concat(ringBody(1, l, bells(2)), P.random(1)))).status).toBe(400);
     expect((await post(ringBody(1, l, bells(2)).subarray(0, 40))).status).toBe(400);
     expect(MAX_RING_BODY).toBe(20 + 16 * 64);
-    const ip = freshIp();
-    for (let i = 0; i < 60; i++) expect((await post(ringBody(1, P.random(16), [P.random(16)]), ip)).status).toBe(204);
-    expect((await post(ringBody(1, P.random(16), [P.random(16)]), ip)).status).toBe(429);
+    const { statuses, over } = await inOneRateWindow(async () => {
+      const ip = freshIp();
+      const statuses: number[] = [];
+      for (let i = 0; i < 60; i++) statuses.push((await post(ringBody(1, P.random(16), [P.random(16)]), ip)).status);
+      return { statuses, over: (await post(ringBody(1, P.random(16), [P.random(16)]), ip)).status };
+    });
+    expect(statuses.every((s) => s === 204)).toBe(true);
+    expect(over).toBe(429);
   });
 });
 
@@ -1209,9 +1219,14 @@ describe("POST /api/v2/seen (§10.10)", () => {
     expect((await post(seenBody(qS, rows(2)).subarray(0, 36))).status).toBe(400);
     expect((await post(P.concat(seenBody(qS, rows(2)), P.random(1)))).status).toBe(400);
     expect((await post(P.concat(seenBody(qS, rows(16)), P.random(1)))).status).toBe(413);
-    const ip = freshIp();
-    for (let i = 0; i < 60; i++) expect((await post(seenBody(P.random(16), rows(1)), ip)).status).toBe(204);
-    expect((await post(seenBody(P.random(16), rows(1)), ip)).status).toBe(429);
+    const { ip, statuses, over } = await inOneRateWindow(async () => {
+      const ip = freshIp();
+      const statuses: number[] = [];
+      for (let i = 0; i < 60; i++) statuses.push((await post(seenBody(P.random(16), rows(1)), ip)).status);
+      return { ip, statuses, over: (await post(seenBody(P.random(16), rows(1)), ip)).status };
+    });
+    expect(statuses.every((s) => s === 204)).toBe(true);
+    expect(over).toBe(429);
     const ringBody = P.concat(Uint8Array.of(1), P.u16(1), P.random(16), Uint8Array.of(1), P.random(16));
     expect((await direct("/api/v2/ring", { method: "POST", body: ringBody, ip })).status).toBe(204);
   });

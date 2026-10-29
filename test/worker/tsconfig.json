@@ -1,5 +1,5 @@
 {
-  // Type-checks the Workers-runtime tests: npx tsc -p test/worker
+  // Type-checks the Workers-runtime tests: pnpm exec tsc -p test/worker
   "extends": "../../tsconfig.json",
   "compilerOptions": {
     "types": ["@cloudflare/vitest-plugin/types", "node"],

@@ -30,6 +30,7 @@ import {
   freshIp,
   getKeys,
   getRaw,
+  inOneRateWindow,
   inboxPostOk,
   inboxPostRaw,
   inboxReadRaw,
@@ -1521,13 +1522,15 @@ describe("proof of work", () => {
 
 describe("rate limiting", () => {
   it("429 once an IP exceeds the blob budget (20/min); other IPs are unaffected", async () => {
-    const ip = freshIp();
     const id = P.b64u(P.random(32));
-    const statuses: number[] = [];
-    for (let i = 0; i < 21; i++) statuses.push((await putBlob(id, new Uint8Array(64), {}, ip)).status);
+    const { statuses, last } = await inOneRateWindow(async () => {
+      const ip = freshIp();
+      const statuses: number[] = [];
+      for (let i = 0; i < 21; i++) statuses.push((await putBlob(id, new Uint8Array(64), {}, ip)).status);
+      return { statuses, last: await putBlob(id, new Uint8Array(64), {}, ip) };
+    });
     expect(statuses.slice(0, 20).every((s) => s === 403)).toBe(true); // no PoW
     expect(statuses[20]).toBe(429);
-    const last = await putBlob(id, new Uint8Array(64), {}, ip);
     expect(last.status).toBe(429);
     expect(last.headers.get("retry-after")).toBe("60");
     expectApiHeaders(last);
@@ -1536,43 +1539,55 @@ describe("rate limiting", () => {
 
   it("IPv6 clients share a budget per /64", async () => {
     const id = P.b64u(P.random(32));
-    const prefix = `2001:db8:${((Math.random() * 0xffff) | 0).toString(16)}:1`;
-    const statuses: number[] = [];
-    for (let i = 0; i < 21; i++) statuses.push((await putBlob(id, new Uint8Array(64), {}, `${prefix}::${(i + 1).toString(16)}`)).status);
+    const statuses = await inOneRateWindow(async () => {
+      const prefix = `2001:db8:${((Math.random() * 0xffff) | 0).toString(16)}:1`;
+      const statuses: number[] = [];
+      for (let i = 0; i < 21; i++) statuses.push((await putBlob(id, new Uint8Array(64), {}, `${prefix}::${(i + 1).toString(16)}`)).status);
+      return statuses;
+    });
     expect(statuses[20]).toBe(429);
   });
 
   it("RL_INBOX: 10 posts per minute per IP, one token per request", async () => {
-    const ip = freshIp();
     const body = W.encodeInboxPost({ E: eraNow(), bucket: 0, rows: Array.from({ length: 2 }, randomInvite) });
-    const statuses: number[] = [];
-    for (let i = 0; i < 11; i++) statuses.push((await api("/api/v2/inbox", { method: "POST", body, ip })).status);
+    const statuses = await inOneRateWindow(async () => {
+      const ip = freshIp();
+      const statuses: number[] = [];
+      for (let i = 0; i < 11; i++) statuses.push((await api("/api/v2/inbox", { method: "POST", body, ip })).status);
+      return statuses;
+    });
     expect(statuses.slice(0, 10).every((s) => s === 403)).toBe(true);
     expect(statuses[10]).toBe(429);
     expect((await api("/api/v2/inbox", { method: "POST", body })).status).toBe(403);
   });
 
   it("RL_WRITE is shared by put, register and wraps (60/min)", async () => {
-    const ip = freshIp();
     const put = W.encodePutRequest([makeRow()]);
-    const statuses: number[] = [];
-    for (let i = 0; i < 60; i++) {
-      const path = ["/api/v2/put", "/api/v2/register", "/api/v2/wraps"][i % 3];
-      statuses.push((await api(path, { method: "POST", body: put, ip })).status);
-    }
+    const { statuses, over } = await inOneRateWindow(async () => {
+      const ip = freshIp();
+      const statuses: number[] = [];
+      for (let i = 0; i < 60; i++) {
+        const path = ["/api/v2/put", "/api/v2/register", "/api/v2/wraps"][i % 3];
+        statuses.push((await api(path, { method: "POST", body: put, ip })).status);
+      }
+      return { statuses, over: (await api("/api/v2/register", { method: "POST", body: put, ip })).status };
+    });
     expect(statuses.every((s) => s === 403)).toBe(true);
-    expect((await api("/api/v2/register", { method: "POST", body: put, ip })).status).toBe(429);
+    expect(over).toBe(429);
     expect((await api("/api/v2/put", { method: "POST", body: put })).status).toBe(403);
   });
 
   it("RL_READ: 600 reads per minute per IP; params are never rate limited", async () => {
-    const ip = freshIp();
     const E = eraNow();
-    const statuses: number[] = [];
-    for (let i = 0; i < 601; i++) statuses.push((await api(`/api/v2/era/${E}`, { ip })).status);
+    const { ip, statuses, dir } = await inOneRateWindow(async () => {
+      const ip = freshIp();
+      const statuses: number[] = [];
+      for (let i = 0; i < 601; i++) statuses.push((await api(`/api/v2/era/${E}`, { ip })).status);
+      return { ip, statuses, dir: (await api(`/api/v2/dir/uid/${P.b64u(P.random(16))}`, { ip })).status };
+    });
     expect(statuses.slice(0, 600).every((s) => s === 200)).toBe(true);
     expect(statuses[600]).toBe(429);
-    expect((await api(`/api/v2/dir/uid/${P.b64u(P.random(16))}`, { ip })).status).toBe(429);
+    expect(dir).toBe(429);
     expect((await api("/api/v2/params", { ip })).status).toBe(200);
   });
 

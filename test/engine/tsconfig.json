@@ -1,5 +1,5 @@
 {
-  // Type-checks the engine-v2 harness and specs: npx tsc -p test/engine
+  // Type-checks the engine-v2 harness and specs: pnpm exec tsc -p test/engine
   "extends": "../../tsconfig.json",
   "compilerOptions": {
     "incremental": false,

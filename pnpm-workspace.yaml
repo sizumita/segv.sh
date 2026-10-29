@@ -1,0 +1,37 @@
+# pnpm reads its settings from this file only: not from .npmrc, and not from the "pnpm" field of package.json.
+
+# `pnpm add` writes exact versions, so every dependency in package.json stays pinned.
+saveExact: true
+
+overrides:
+  # Vite+ needs every package to resolve vite and vitest to the toolchain's own copies. Keep both in step with the
+  # vite-plus version in package.json; `vp toolchain vitest` prints the Vitest version that Vite+ bundles.
+  vite@*: npm:@voidzero-dev/vite-plus-core@1.4.0
+  vitest@*: 5.0.5
+  # @qwik.dev/router 2.0.0-rc.4 pins these packages to versions with security advisories. The deployed Worker contains
+  # none of them: @azure/functions serves only the Azure adapter, zod only zod$(), and vite-imagetools only image
+  # imports with "?jsx". Each override names the exact version of its parent, so it stops applying when the parent is
+  # upgraded; delete it then and run `pnpm audit`.
+  "@azure/functions@3.5.1>uuid": 11.1.1 # GHSA-w5hq-g745-h8pq
+  "@qwik.dev/router@2.0.0-rc.4>zod": 4.6.6 # GHSA-mrhx-c7xc-m3w5
+  vite-imagetools@10.0.0>sharp: 0.35.5 # GHSA-f88m-g3jw-g9cj, GHSA-rgj7-g3m4-5g8c, GHSA-wq5f-xc86-pv6w
+
+# vite resolves to @voidzero-dev/vite-plus-core, whose version (1.x) is outside the vite ranges that plugins declare.
+peerDependencyRules:
+  allowAny:
+    - vite
+    - vitest
+  allowedVersions:
+    vite: "*"
+    vitest: "*"
+
+# No dependency runs install scripts. esbuild and workerd take their binaries from platform packages instead.
+allowBuilds:
+  esbuild: false
+  workerd: false
+
+# pnpm installs a version only once it has been published for a day (minimumReleaseAge, on by default). This release
+# fixes the undici advisories (GHSA-xjj6-f33q-929c and others) and was hours old when it was adopted. Delete the entry
+# once it is a day old (2026-10-29 17:21 UTC).
+minimumReleaseAgeExclude:
+  - "@cloudflare/vite-plugin@1.66.0"

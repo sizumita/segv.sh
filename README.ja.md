@@ -200,38 +200,40 @@ Durable Objects（SQLite）、D1、R2。暗号はすべて [noble](https://paulm
 
 ## はじめかた
 
-Node.js 22.18 以降・24.11 以降・26 以降のどれかと、パスキーの保存先が WebAuthn PRF 拡張に対応したブラウザが必要です。PRF に
-対応していなくても、リカバリーコードでなら解錠できます。
+Node.js 22.18 以降・24.11 以降・26 以降のどれかと、pnpm 10 以降、パスキーの保存先が WebAuthn PRF 拡張に対応したブラウザが
+必要です。PRF に対応していなくても、リカバリーコードでなら解錠できます。pnpm は `package.json` の `packageManager` が固定
+する版に自動で切り替わります。
 
 ```bash
-npm install
+pnpm install
 # ローカルのサーバー秘密鍵：32 バイトの乱数 2 つを base64url で（このファイルは gitignore 済み）
 node -e 'const k = () => require("node:crypto").randomBytes(32).toString("base64url"); console.log(`ROUTE_KEY=${k()}\nSRV_KEY=${k()}`)' > .dev.vars
-npm run db:migrate:local
-npm run dev
+pnpm run db:migrate:local
+pnpm run dev
 ```
 
-`npm run dev` が表示するローカルの URL を開きます。開発中のパスキーの RP ID は `localhost` です。詳しくは
+`pnpm run dev` が表示するローカルの URL を開きます。開発中のパスキーの RP ID は `localhost` です。詳しくは
 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)（英語）を見てください。
 
 ## チェックとテスト
 
 ```bash
-npm run check                    # 整形と lint
-npx tsc --noEmit -p .            # 型チェック：アプリ
-npx tsc --noEmit -p test/engine  # 型チェック：エンジンのテスト
-npx tsc --noEmit -p test/worker  # 型チェック：Workers ランタイムのテスト
-npm test                         # 単体・Workers ランタイム・エンジンのテスト
-npm run build                    # 本番ビルド（型チェックと lint を含む）
-npm run test:e2e                 # 本番ビルド + wrangler dev + ヘッドレス Chromium
+pnpm run check                         # 整形と lint
+pnpm exec tsc --noEmit -p .            # 型チェック：アプリ
+pnpm exec tsc --noEmit -p test/engine  # 型チェック：エンジンのテスト
+pnpm exec tsc --noEmit -p test/worker  # 型チェック：Workers ランタイムのテスト
+pnpm test                              # 単体・Workers ランタイム・エンジンのテスト
+pnpm run build                         # 本番ビルド（型チェックと lint を含む）
+pnpm run test:e2e                      # 本番ビルド + wrangler dev + ヘッドレス Chromium
 ```
 
-E2E テストには Playwright の Chromium が要ります（`npx playwright install chromium`）。E2E テストは専用のローカル状態で、
-低い Proof of Work と生成した秘密鍵を使って動くので、開発用のデータには触れません。
+E2E テストには Playwright の Chromium が要ります（`pnpm exec playwright install chromium`）。E2E テストは専用のローカル
+状態で、低い Proof of Work と生成した秘密鍵を使って動くので、開発用のデータには触れません。プルリクエストごとに、GitHub
+Actions がこれらすべてと `pnpm audit` を実行します。
 
 ## デプロイ
 
-D1 データベース・R2 バケット・秘密鍵・ドメインを用意すれば、`npm run deploy` で Cloudflare にデプロイできます。手順は
+D1 データベース・R2 バケット・秘密鍵・ドメインを用意すれば、`pnpm run deploy` で Cloudflare にデプロイできます。手順は
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)（英語）にあります。後から変えられない選択があります。
 
 - **最初のユーザーが登録する前にドメインを確定させること。** パスキーと PRF 出力はドメイン（WebAuthn の RP ID）に

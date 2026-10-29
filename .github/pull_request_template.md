@@ -7,8 +7,8 @@
 
 ## Checks
 
-- [ ] `npm run check`
-- [ ] `npx tsc --noEmit -p .`, `npx tsc --noEmit -p test/engine` and `npx tsc --noEmit -p test/worker`
-- [ ] `npm test`
-- [ ] `npm run build`
-- [ ] `npm run test:e2e` (for changes to the client, the UI or the Worker)
+- [ ] `pnpm run check`
+- [ ] `pnpm exec tsc --noEmit -p .`, `pnpm exec tsc --noEmit -p test/engine` and `pnpm exec tsc --noEmit -p test/worker`
+- [ ] `pnpm test`
+- [ ] `pnpm run build`
+- [ ] `pnpm run test:e2e` (for changes to the client, the UI or the Worker)

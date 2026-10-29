@@ -26,26 +26,26 @@ Some settings cannot change once people use a deployment.
 
 - A Cloudflare account that also holds the DNS zone of your domain: the Worker is attached to the domain as a Custom
   Domain.
-- Wrangler, which `npm install` provides. Sign in with `npx wrangler login`.
+- Wrangler, which `pnpm install` provides. Sign in with `pnpm exec wrangler login`.
 
 ## Steps
 
 1. Create the D1 database, and put its id into `d1_databases[0].database_id` in `wrangler.jsonc`:
 
    ```bash
-   npx wrangler d1 create segv
+   pnpm exec wrangler d1 create segv
    ```
 
 2. Create the R2 bucket. If you choose another name, change `r2_buckets[0].bucket_name`.
 
    ```bash
-   npx wrangler r2 bucket create segv-blobs
+   pnpm exec wrangler r2 bucket create segv-blobs
    ```
 
 3. Apply the D1 migrations:
 
    ```bash
-   npx wrangler d1 migrations apply DB --remote
+   pnpm exec wrangler d1 migrations apply DB --remote
    ```
 
 4. Edit the rest of `wrangler.jsonc`:
@@ -65,14 +65,14 @@ Some settings cannot change once people use a deployment.
 
    ```bash
    node -e 'console.log(require("node:crypto").randomBytes(32).toString("base64url"))'
-   npx wrangler secret put ROUTE_KEY
-   npx wrangler secret put SRV_KEY
+   pnpm exec wrangler secret put ROUTE_KEY
+   pnpm exec wrangler secret put SRV_KEY
    ```
 
-6. Deploy:
+6. Deploy. Run the script with `pnpm run`: `pnpm deploy` is a different command, built into pnpm.
 
    ```bash
-   npm run deploy
+   pnpm run deploy
    ```
 
 7. Open `https://<your domain>/api/v2/params`. It shows the deployment parameters, the current era, `efirst` and the
@@ -88,10 +88,10 @@ device ([PROTOCOL.md §9.8](PROTOCOL.md)).
 
    ```bash
    node -e 'const {generateKeyPairSync}=require("node:crypto");console.log(generateKeyPairSync("ec",{namedCurve:"P-256"}).privateKey.export({format:"jwk"}).d)'
-   npx wrangler secret put VAPID_SK
+   pnpm exec wrangler secret put VAPID_SK
    node -e 'console.log(require("node:crypto").randomBytes(32).toString("base64url"))'
-   npx wrangler secret put PUSH_KEY
-   npx wrangler secret put VAPID_SUB
+   pnpm exec wrangler secret put PUSH_KEY
+   pnpm exec wrangler secret put VAPID_SUB
    ```
 
    `VAPID_SUB` is a `mailto:` or `https:` URI. Keep `VAPID_SK` and `PUSH_KEY` for the life of the deployment: a new
@@ -185,18 +185,19 @@ Worker that already exists. For your own instance, change the URL in the workflo
    ```
 
 4. Under **Actions › General** in the repository's settings, require actions to be pinned to a full-length commit SHA,
-   and allow only actions created by GitHub. The workflow uses nothing else.
+   and allow only actions created by GitHub, plus `pnpm/action-setup@*` in the list of specified actions. The workflows
+   use nothing else.
 
 The token cannot apply D1 migrations, and a change to `routes` in `wrangler.jsonc` makes the deployment fail at the
 Custom Domain step after the new version is live. Apply both by hand (the next section).
 
 ## Updating
 
-- A push to `main` deploys it (the previous section). Without the workflow, deploy new code with `npm run deploy`.
-- When a change adds a D1 migration, apply it with `npx wrangler d1 migrations apply DB --remote` before deploying the
-  code that needs it, that is, before merging the pull request when `main` deploys itself. Changes to Durable Object
-  classes are declared in `migrations` in `wrangler.jsonc`.
-- To change `routes`, deploy the change with `npm run deploy` from an account that has Workers Routes Write on the
+- A push to `main` deploys it (the previous section). Without the workflow, deploy new code with `pnpm run deploy`.
+- When a change adds a D1 migration, apply it with `pnpm exec wrangler d1 migrations apply DB --remote` before
+  deploying the code that needs it, that is, before merging the pull request when `main` deploys itself. Changes to
+  Durable Object classes are declared in `migrations` in `wrangler.jsonc`.
+- To change `routes`, deploy the change with `pnpm run deploy` from an account that has Workers Routes Write on the
   zone, then push it to `main`.
-- Check a change to `wrangler.jsonc` with `npm run build` followed by `npx wrangler deploy --dry-run` before you deploy
-  it.
+- Check a change to `wrangler.jsonc` with `pnpm run build` followed by `pnpm exec wrangler deploy --dry-run` before
+  you deploy it.
