@@ -1,9 +1,9 @@
 // End-to-end test: production build + `wrangler dev` + headless Chromium with virtual passkeys (PRF), on protocol v2
 // (docs/PROTOCOL.md).
 //
-//   npm run test:e2e              # build, then test
-//   npm run test:e2e -- --no-build
-//   HEADED=1 npm run test:e2e     # watch it
+//   pnpm run test:e2e              # build, then test
+//   pnpm run test:e2e --no-build
+//   HEADED=1 pnpm run test:e2e     # watch it
 //
 // Uses a throwaway local state dir and a generated wrangler config with low proof-of-work and
 // relaxed rate limits, so it never touches your dev database.
@@ -111,6 +111,7 @@ function e2eConfig() {
 
 async function startServer() {
   rmSync(STATE, { recursive: true, force: true });
+  mkdirSync(STATE, { recursive: true });
   mkdirSync(SHOTS, { recursive: true });
   const config = e2eConfig();
   const env = { ...process.env, CI: "1", NO_COLOR: "1" };
@@ -398,7 +399,7 @@ async function inboxOf(E) {
 
 if (!process.argv.includes("--no-build")) {
   console.log("building…");
-  execFileSync("npm", ["run", "build"], { cwd: ROOT, stdio: "inherit" });
+  execFileSync("pnpm", ["run", "build"], { cwd: ROOT, stdio: "inherit" });
 }
 console.log("starting wrangler dev…");
 const server = await startServer();

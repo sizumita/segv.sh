@@ -1,0 +1,132 @@
+# Checks every pull request: formatting, lint, type checks, tests, the production build, the Wrangler configuration,
+# the end-to-end test, and the dependencies' advisories and registry signatures. The audit also runs every week, since
+# advisories are published against versions that are already locked. Pushes to main are checked by the Deploy workflow.
+#
+# - No job has secrets, and the GITHUB_TOKEN can only read the repository.
+# - Dependencies come from pnpm-lock.yaml, without install scripts and without a cache.
+# - pnpm is the release that "packageManager" in package.json pins, installed by npm with its registry signatures
+#   verified (.github/actions/setup): the repository allows only actions created by GitHub.
+# - Every action is pinned to a full commit SHA.
+
+name: CI
+
+on:
+  pull_request:
+  schedule:
+    # Mondays, 00:00 UTC: the audit only.
+    - cron: "0 0 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+# A newer push to a pull request cancels the run that is still checking the previous one.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  WRANGLER_SEND_METRICS: "false"
+
+jobs:
+  # The same checks as the build job of the Deploy workflow.
+  check:
+    name: Check, test and build
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js and pnpm
+        uses: ./.github/actions/setup
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Format and lint
+        run: pnpm run check
+
+      - name: Type-check the tests
+        run: |
+          pnpm exec tsc --noEmit -p test/engine
+          pnpm exec tsc --noEmit -p test/worker
+
+      - name: Test
+        run: pnpm test
+
+      # qwik build also type-checks and lints the app.
+      - name: Build
+        run: pnpm run build
+
+      - name: Check the Wrangler configuration
+        run: pnpm exec wrangler deploy --dry-run
+
+  e2e:
+    name: End-to-end test
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js and pnpm
+        uses: ./.github/actions/setup
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      # Headless runs need only Chromium's headless shell.
+      - name: Install Chromium
+        run: pnpm exec playwright install --with-deps --only-shell chromium
+
+      # Builds the app, serves it with wrangler dev, and drives it with headless Chromium.
+      - name: End-to-end test
+        env:
+          E2E_SHOTS: ${{ runner.temp }}/e2e-shots
+        run: pnpm run test:e2e
+
+      - name: Upload the screenshots
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-screenshots
+          path: ${{ runner.temp }}/e2e-shots
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Reads pnpm-lock.yaml only: the project's dependencies are not installed. To accept an advisory, list its GHSA
+  # under auditConfig.ignoreGhsas in pnpm-workspace.yaml, with the reason.
+  audit:
+    name: Audit dependencies
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js and pnpm
+        uses: ./.github/actions/setup
+
+      - name: Check for advisories
+        run: pnpm audit
+
+      - name: Verify registry signatures
+        run: pnpm audit signatures

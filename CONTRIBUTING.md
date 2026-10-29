@@ -31,16 +31,17 @@ Set up a local instance as described in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.m
 run:
 
 ```bash
-npm run check
-npx tsc --noEmit -p .
-npx tsc --noEmit -p test/engine
-npx tsc --noEmit -p test/worker
-npm test
-npm run build
+pnpm run check
+pnpm exec tsc --noEmit -p .
+pnpm exec tsc --noEmit -p test/engine
+pnpm exec tsc --noEmit -p test/worker
+pnpm test
+pnpm run build
 ```
 
-When you change the client, the UI or the Worker, also run `npm run test:e2e`. When you change `wrangler.jsonc`, also
-run `npx wrangler deploy --dry-run` after `npm run build`.
+When you change the client, the UI or the Worker, also run `pnpm run test:e2e`. When you change `wrangler.jsonc`, also
+run `pnpm exec wrangler deploy --dry-run` after `pnpm run build`. GitHub Actions runs all of these, the end-to-end test
+and `pnpm audit` on every pull request.
 
 ## Guidelines
 
@@ -54,7 +55,10 @@ run `npx wrangler deploy --dry-run` after `npm run build`.
 - **Served code.** Every byte of JavaScript the site serves can read users' keys. Do not add third-party scripts,
   styles, fonts or network requests: the Content Security Policy in `src/routes/plugin@csp.ts` allows only the site's
   own origin. Add runtime dependencies only for a strong reason.
-- **Formatting.** `npm run fmt` formats the sources; `npm run check` must pass.
+- **Dependencies.** Pin every dependency to an exact version (`pnpm add` does, through `saveExact` in
+  `pnpm-workspace.yaml`), and keep `pnpm audit` clean. [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#dependencies) has the
+  details.
+- **Formatting.** `pnpm run fmt` formats the sources; `pnpm run check` must pass.
 - **Commits.** Keep each commit focused, and explain in its message why the change is needed.
 
 ## License

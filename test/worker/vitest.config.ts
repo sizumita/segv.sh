@@ -1,5 +1,5 @@
 /**
- * Workers-runtime tests (project "workers"): `npx vp test run --project workers`.
+ * Workers-runtime tests (project "workers"): `pnpm exec vp test run --project workers`.
  * Runs src/server/** inside workerd via @cloudflare/vitest-plugin with test/worker/entry.ts as the Worker
  * (no Qwik SSR) and test/worker/wrangler.test.jsonc bindings. D1 migrations are applied in ./setup.ts.
  */

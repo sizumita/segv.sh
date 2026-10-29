@@ -220,38 +220,40 @@ Durable Objects (SQLite), D1 and R2. All cryptography comes from the [noble](htt
 
 ## Getting started
 
-You need Node.js 22.18+, 24.11+ or 26+, and a browser whose passkey provider supports the WebAuthn PRF extension.
-Without PRF support you can still unlock an account with its recovery code.
+You need Node.js 22.18+, 24.11+ or 26+, pnpm 10 or later, and a browser whose passkey provider supports the WebAuthn
+PRF extension. Without PRF support you can still unlock an account with its recovery code. pnpm switches itself to the
+release that `packageManager` in `package.json` pins.
 
 ```bash
-npm install
+pnpm install
 # Local server secrets: two random 32-byte values in base64url (the file is gitignored).
 node -e 'const k = () => require("node:crypto").randomBytes(32).toString("base64url"); console.log(`ROUTE_KEY=${k()}\nSRV_KEY=${k()}`)' > .dev.vars
-npm run db:migrate:local
-npm run dev
+pnpm run db:migrate:local
+pnpm run dev
 ```
 
-Open the local URL that `npm run dev` prints. In development the passkey's relying party is `localhost`.
+Open the local URL that `pnpm run dev` prints. In development the passkey's relying party is `localhost`.
 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) covers the details.
 
 ## Checks and tests
 
 ```bash
-npm run check                    # formatting and lint
-npx tsc --noEmit -p .            # type check: the app
-npx tsc --noEmit -p test/engine  # type check: the engine tests
-npx tsc --noEmit -p test/worker  # type check: the Workers-runtime tests
-npm test                         # unit, Workers-runtime and engine tests
-npm run build                    # production build, including a type check and lint
-npm run test:e2e                 # production build + wrangler dev + headless Chromium
+pnpm run check                         # formatting and lint
+pnpm exec tsc --noEmit -p .            # type check: the app
+pnpm exec tsc --noEmit -p test/engine  # type check: the engine tests
+pnpm exec tsc --noEmit -p test/worker  # type check: the Workers-runtime tests
+pnpm test                              # unit, Workers-runtime and engine tests
+pnpm run build                         # production build, including a type check and lint
+pnpm run test:e2e                      # production build + wrangler dev + headless Chromium
 ```
 
-The end-to-end tests need Playwright's Chromium (`npx playwright install chromium`). They run against their own local
-state, with low proof of work and generated secrets, and do not touch your development data.
+The end-to-end tests need Playwright's Chromium (`pnpm exec playwright install chromium`). They run against their own
+local state, with low proof of work and generated secrets, and do not touch your development data. GitHub Actions runs
+all of these, and `pnpm audit`, on every pull request.
 
 ## Deployment
 
-segv.sh deploys to Cloudflare with `npm run deploy` once the D1 database, the R2 bucket, the secrets and the domain are
+segv.sh deploys to Cloudflare with `pnpm run deploy` once the D1 database, the R2 bucket, the secrets and the domain are
 set up; [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) walks through it. Some choices cannot be changed later:
 
 - **Fix the domain before the first user registers.** Passkeys and their PRF outputs are bound to the domain (the
