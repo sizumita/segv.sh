@@ -1,7 +1,7 @@
 # Deployment
 
 segv.sh runs on Cloudflare: one Worker with static assets, five Durable Object classes with SQLite storage, a D1
-database, an R2 bucket and the Workers rate-limiting binding. The repository's `wrangler.jsonc` configures the
+database, an R2 bucket and the Workers rate-limiting binding. The web app's `apps/web/wrangler.jsonc` configures the
 deployment at <https://segv.sh>; to run your own instance, change the values that the steps below name.
 
 ## Decide these first
@@ -30,6 +30,8 @@ Some settings cannot change once people use a deployment.
 
 ## Steps
 
+Run the commands of these steps in `apps/web`, the directory of `wrangler.jsonc`.
+
 1. Create the D1 database, and put its id into `d1_databases[0].database_id` in `wrangler.jsonc`:
 
    ```bash
@@ -42,7 +44,7 @@ Some settings cannot change once people use a deployment.
    pnpm exec wrangler r2 bucket create segv-blobs
    ```
 
-3. Apply the D1 migrations:
+3. Apply the D1 migrations (`packages/server/migrations`):
 
    ```bash
    pnpm exec wrangler d1 migrations apply DB --remote
@@ -119,8 +121,8 @@ device ([PROTOCOL.md §9.8](PROTOCOL.md)).
 | `E_FIRST`      | 42                  | The era of the first deployment                                                                                                                                                              |
 | `APP_HOSTS`    | `segv.sh,localhost` | The host names the Worker answers on, comma-separated; the first is canonical. Pages on other hosts are redirected to it (308), and API requests are refused (421). Empty disables the check |
 
-A variable that is present but invalid (not a decimal number, out of range, or a `DELTA_S` that does not divide
-604 800) makes every `/api/v2/*` request answer 503 `server misconfigured`. Clients refuse a proof-of-work base above 26.
+A variable that is present but invalid (not a decimal number, out of range, or a `DELTA_S` that does not divide 604 800)
+makes every `/api/v2/*` request answer 503 `server misconfigured`. Clients refuse a proof-of-work base above 26.
 
 ### Secrets
 
@@ -194,10 +196,10 @@ Custom Domain step after the new version is live. Apply both by hand (the next s
 ## Updating
 
 - A push to `main` deploys it (the previous section). Without the workflow, deploy new code with `pnpm run deploy`.
-- When a change adds a D1 migration, apply it with `pnpm exec wrangler d1 migrations apply DB --remote` before
-  deploying the code that needs it, that is, before merging the pull request when `main` deploys itself. Changes to
-  Durable Object classes are declared in `migrations` in `wrangler.jsonc`.
+- When a change adds a D1 migration, apply it with `pnpm exec wrangler d1 migrations apply DB --remote` in `apps/web`
+  before deploying the code that needs it, that is, before merging the pull request when `main` deploys itself. Changes
+  to Durable Object classes are declared in `migrations` in `wrangler.jsonc`.
 - To change `routes`, deploy the change with `pnpm run deploy` from an account that has Workers Routes Write on the
   zone, then push it to `main`.
-- Check a change to `wrangler.jsonc` with `pnpm run build` followed by `pnpm exec wrangler deploy --dry-run` before
-  you deploy it.
+- Check a change to `wrangler.jsonc` with `pnpm run build` followed by `pnpm exec wrangler deploy --dry-run` in
+  `apps/web` before you deploy it.

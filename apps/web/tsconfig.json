@@ -1,0 +1,17 @@
+{
+  // The Worker entry, Qwik Router's shell and the build configs. Type-checking them also checks the packages they
+  // import (@segv/ui, @segv/engine, @segv/server) against this app's Env (worker-configuration.d.ts, `pnpm run
+  // cf-typegen`), so a binding the server needs but wrangler.jsonc lacks fails here.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "allowJs": true,
+    "lib": ["es2022", "DOM", "WebWorker", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "jsxImportSource": "@qwik.dev/core",
+    // Named, since TypeScript 6 includes no @types package by default; qwik.env.d.ts adds vite/client.
+    "types": ["node"],
+    "incremental": true,
+    "outDir": "tmp"
+  },
+  "include": ["src", "./*.d.ts", "./*.config.ts", "adapters"]
+}

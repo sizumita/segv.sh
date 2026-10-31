@@ -1,0 +1,26 @@
+{
+  "name": "@segv/ui",
+  "private": true,
+  "description": "The Qwik UI. It renders the engine's state and calls the Engine interface; each app mounts <App /> and supplies the platform.",
+  "type": "module",
+  "exports": {
+    ".": "./src/app.tsx"
+  },
+  "scripts": {
+    "test": "vp test run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@segv/engine": "workspace:*"
+  },
+  "devDependencies": {
+    "@qwik.dev/core": "catalog:",
+    "@segv/protocol": "workspace:*",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vite-plus": "catalog:"
+  },
+  "peerDependencies": {
+    "@qwik.dev/core": "catalog:"
+  }
+}

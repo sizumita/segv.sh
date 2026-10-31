@@ -1,0 +1,9 @@
+{
+  // Runs in browsers, in Workers and in Node (the end-to-end test imports it with type stripping): no DOM.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["es2022"],
+    "types": ["node"]
+  },
+  "include": ["src", "*.config.ts"]
+}

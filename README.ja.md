@@ -183,20 +183,18 @@ Durable Objects（SQLite）、D1、R2。暗号はすべて [noble](https://paulm
 
 ### ディレクトリ構成
 
-| 場所                              | 中身                                                                                                 |
-| --------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `src/lib/proto.ts`                | プロトコルの暗号コアと符号化。ブラウザ・Worker・Durable Object で共有し、`@noble/*` だけを使う       |
-| `src/lib/wire.ts`                 | API のバイナリ形式（put / get / inbox / feed / リアルタイムのフレーム）の厳格なエンコーダとデコーダ  |
-| `src/client/`                     | ブラウザ専用のエンジン：解錠とアカウント、会話、メンバー変更、配送、復元、整合性、パスキー、画像     |
-| `src/routes/`, `src/components/`  | Qwik の UI                                                                                           |
-| `src/server/`                     | Worker の API、Durable Objects、D1 のディレクトリ                                                    |
-| `src/entry.cloudflare-workers.ts` | Worker のエントリ。`/api/*` は API へ、それ以外は Qwik のサーバーサイドレンダリングへ                |
-| `migrations/`                     | D1 のスキーマ                                                                                        |
-| `src/**/*.test.ts`                | 単体テスト：暗号コアとバイナリ形式（突き合わせ、改ざん、既知解ベクトル、ファジング）と UI の補助関数 |
-| `test/worker/`                    | Workers ランタイム上の API・Durable Object・ディレクトリのテスト                                     |
-| `test/engine/`                    | インメモリの偽サーバー `FakeWorld` と、その上で本物のクライアントエンジンを動かすテスト              |
-| `test/e2e/`                       | Playwright と、PRF に対応した仮想パスキーによる E2E テスト                                           |
-| `docs/`                           | 仕様と設計の文書                                                                                     |
+pnpm のワークスペースです。出荷するアプリは `apps/` に、それを組み立てるコードは `packages/` にあります。
+
+| 場所                 | 中身                                                                                                                                                                        |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `apps/web/`          | segv.sh を配信する Worker：エントリ（`/api/*` は API へ、それ以外は Qwik のサーバーサイドレンダリングへ）、Qwik Router のルート、静的ファイル、`wrangler.jsonc`、E2E テスト |
+| `packages/protocol/` | プロトコルの暗号コアと符号化（`proto.ts`）と、API のバイナリ形式の厳格なエンコーダ・デコーダ（`wire.ts`）。ブラウザ・Worker・Durable Object で共有し、`@noble/*` だけを使う |
+| `packages/engine/`   | クライアントエンジン：解錠とアカウント、会話、メンバー変更、配送、復元、整合性、パスキー、画像、通知。インメモリの偽サーバー `FakeWorld` でテストする                       |
+| `packages/ui/`       | Qwik の UI。エンジンとは `Engine` インターフェースだけで話す                                                                                                                |
+| `packages/server/`   | Worker の API、Durable Objects、D1 のディレクトリとそのスキーマ（`migrations/`）。Workers ランタイム上でテストする                                                          |
+| `docs/`              | 仕様と設計の文書                                                                                                                                                            |
+
+単体テストは対象のコードの隣に（`*.test.ts`）、エンジンとサーバーの大きなテストは各パッケージの `test/` にあります。
 
 ## はじめかた
 
@@ -207,7 +205,7 @@ Node.js 22.18 以降・24.11 以降・26 以降のどれかと、pnpm 12、パ�
 ```bash
 pnpm install
 # ローカルのサーバー秘密鍵：32 バイトの乱数 2 つを base64url で（このファイルは gitignore 済み）
-node -e 'const k = () => require("node:crypto").randomBytes(32).toString("base64url"); console.log(`ROUTE_KEY=${k()}\nSRV_KEY=${k()}`)' > .dev.vars
+node -e 'const k = () => require("node:crypto").randomBytes(32).toString("base64url"); console.log(`ROUTE_KEY=${k()}\nSRV_KEY=${k()}`)' > apps/web/.dev.vars
 pnpm run db:migrate:local
 pnpm run dev
 ```
@@ -218,17 +216,16 @@ pnpm run dev
 ## チェックとテスト
 
 ```bash
-pnpm run check                         # 整形と lint
-pnpm exec tsc --noEmit -p .            # 型チェック：アプリ
-pnpm exec tsc --noEmit -p test/engine  # 型チェック：エンジンのテスト
-pnpm exec tsc --noEmit -p test/worker  # 型チェック：Workers ランタイムのテスト
-pnpm test                              # 単体・Workers ランタイム・エンジンのテスト
-pnpm run build                         # 本番ビルド（型チェックと lint を含む）
-pnpm run test:e2e                      # 本番ビルド + wrangler dev + ヘッドレス Chromium
+pnpm run check      # 整形と lint
+pnpm run check:workspace  # ワークスペースの依存ルール
+pnpm run typecheck  # 型チェック：全パッケージ
+pnpm test           # 全パッケージのテスト：単体・エンジン・Workers ランタイム
+pnpm run build      # 本番ビルド（web アプリの型チェックを含む）
+pnpm run test:e2e   # 本番ビルド + wrangler dev + ヘッドレス Chromium
 ```
 
-E2E テストには Playwright の Chromium が要ります（`pnpm exec playwright install chromium`）。E2E テストは専用のローカル
-状態で、低い Proof of Work と生成した秘密鍵を使って動くので、開発用のデータには触れません。プルリクエストごとに、GitHub
+E2E テストには Playwright の Chromium が要ります（`pnpm --filter @segv/web exec playwright install chromium`）。E2E
+テストは専用のローカル状態で、低い Proof of Work と生成した秘密鍵を使って動くので、開発用のデータには触れません。プルリクエストごとに、GitHub
 Actions がこれらすべてと `pnpm audit` を実行します。
 
 ## デプロイ

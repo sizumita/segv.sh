@@ -63,19 +63,24 @@ jobs:
       - name: Format and lint
         run: pnpm run check
 
-      - name: Type-check the tests
-        run: |
-          pnpm exec tsc --noEmit -p test/engine
-          pnpm exec tsc --noEmit -p test/worker
+      # The rules of the workspace (docs/DEVELOPMENT.md): catalog versions, the direction of dependencies, declared
+      # imports, a deduplicated lockfile and satisfied peer dependencies.
+      - name: Check the workspace's dependencies
+        run: pnpm run check:workspace
+
+      # Every package of the workspace, with its own globals (packages/server sees only the Workers runtime).
+      - name: Type-check every package
+        run: pnpm run typecheck
 
       - name: Test
         run: pnpm test
 
-      # qwik build also type-checks and lints the app.
+      # qwik build also type-checks the web app.
       - name: Build
         run: pnpm run build
 
       - name: Check the Wrangler configuration
+        working-directory: apps/web
         run: pnpm exec wrangler deploy --dry-run
 
   e2e:
@@ -106,6 +111,7 @@ jobs:
 
       # Headless runs need only Chromium's headless shell.
       - name: Install Chromium
+        working-directory: apps/web
         run: pnpm exec playwright install --with-deps --only-shell chromium
 
       # Builds the app, serves it with wrangler dev, and drives it with headless Chromium.

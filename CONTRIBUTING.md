@@ -32,32 +32,32 @@ run:
 
 ```bash
 pnpm run check
-pnpm exec tsc --noEmit -p .
-pnpm exec tsc --noEmit -p test/engine
-pnpm exec tsc --noEmit -p test/worker
+pnpm run check:workspace
+pnpm run typecheck
 pnpm test
 pnpm run build
 ```
 
-When you change the client, the UI or the Worker, also run `pnpm run test:e2e`. When you change `wrangler.jsonc`, also
-run `pnpm exec wrangler deploy --dry-run` after `pnpm run build`. GitHub Actions runs all of these, the end-to-end test
-and `pnpm audit` on every pull request.
+When you change the client, the UI or the Worker, also run `pnpm run test:e2e`. When you change
+`apps/web/wrangler.jsonc`, also run `pnpm exec wrangler deploy --dry-run` in `apps/web` after `pnpm run build`. GitHub
+Actions runs all of these, the end-to-end test and `pnpm audit` on every pull request.
 
 ## Guidelines
 
 - **Tests.** Test each rule where it is enforced: unit tests for the cryptographic core and the wire formats
-  (`src/lib/*.test.ts`), Workers-runtime tests for the server (`test/worker/`), and engine tests against `FakeWorld`
-  for client behaviour (`test/engine/`). Cite the section of the specification that a test checks, such as `§6.4`.
-- **Cryptographic core.** `src/lib/proto.ts` runs in the browser, the Worker and the Durable Objects. Keep its only
-  dependencies the `@noble/*` libraries.
+  (`packages/protocol/src/*.test.ts`), Workers-runtime tests for the server (`packages/server/test/`), and engine tests
+  against `FakeWorld` for client behaviour (`packages/engine/test/`). Cite the section of the specification that a test
+  checks, such as `§6.4`.
+- **Cryptographic core.** `packages/protocol/src/proto.ts` runs in the browser, the Worker and the Durable Objects. Keep
+  its only dependencies the `@noble/*` libraries.
 - **Logs.** Server logs must not contain request bodies, client addresses or headers, uids, handles, labels, topics,
   blob ids or credential ids (§9.7 of the specification). Workers invocation logs stay disabled.
 - **Served code.** Every byte of JavaScript the site serves can read users' keys. Do not add third-party scripts,
-  styles, fonts or network requests: the Content Security Policy in `src/routes/plugin@csp.ts` allows only the site's
-  own origin. Add runtime dependencies only for a strong reason.
-- **Dependencies.** Pin every dependency to an exact version (`pnpm add` does, through `saveExact` in
-  `pnpm-workspace.yaml`), and keep `pnpm audit` clean. [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#dependencies) has the
-  details.
+  styles, fonts or network requests: the Content Security Policy in `apps/web/src/routes/plugin@csp.ts` allows only the
+  site's own origin. Add runtime dependencies only for a strong reason.
+- **Dependencies.** Give every third-party package one exact version, in the catalog of `pnpm-workspace.yaml`, and let
+  each workspace package declare what it imports. Keep `pnpm audit` clean.
+  [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#dependencies) has the details.
 - **Formatting.** `pnpm run fmt` formats the sources; `pnpm run check` must pass.
 - **Commits.** Keep each commit focused, and explain in its message why the change is needed.
 

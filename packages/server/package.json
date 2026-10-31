@@ -1,0 +1,29 @@
+{
+  "name": "@segv/server",
+  "private": true,
+  "description": "The Worker's API (/api/v2/*), its Durable Objects and the D1 directory, with the directory's migrations.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vp test run",
+    "typecheck": "tsc --noEmit",
+    "cf-typegen": "wrangler types -c test/wrangler.test.jsonc"
+  },
+  "dependencies": {
+    "@noble/ciphers": "catalog:",
+    "@noble/curves": "catalog:",
+    "@segv/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "catalog:",
+    "@noble/hashes": "catalog:",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vite-plus": "catalog:",
+    "vitest": "catalog:",
+    "wrangler": "catalog:"
+  }
+}
