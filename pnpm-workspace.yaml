@@ -1,13 +1,50 @@
 # pnpm reads its settings from this file only: not from .npmrc, and not from the "pnpm" field of package.json.
 
-# `pnpm add` writes exact versions, so every dependency in package.json stays pinned.
+# Apps under apps/ (each one ships), shared code under packages/. Nothing here is published.
+packages:
+  - apps/*
+  - packages/*
+
+# The one version of each third-party package in the workspace: every package.json names "catalog:" instead of a
+# version, so that no two packages can drift apart (two copies of @qwik.dev/core in one bundle would break the UI).
+# Every entry is an exact version. `pnpm add <name>@<version> --filter <package>` adds a new package here and names
+# "catalog:" in that package.json; catalogMode: strict refuses a version other than the one listed here.
+catalog:
+  "@cloudflare/vite-plugin": 1.66.0
+  "@cloudflare/vitest-plugin": 1.4.9
+  "@noble/ciphers": 2.4.0
+  "@noble/curves": 2.4.0
+  "@noble/hashes": 2.4.0
+  "@noble/post-quantum": 0.7.1
+  "@qwik.dev/core": 2.0.0-rc.4
+  "@qwik.dev/router": 2.0.0-rc.4
+  "@types/node": 25.6.0
+  eslint-plugin-qwik: 2.0.0-rc.4
+  playwright: 1.64.1
+  typescript: 5.9.3
+  vite: npm:@voidzero-dev/vite-plus-core@1.4.0
+  vite-plus: 1.4.0
+  vitest: 5.0.5
+  wrangler: 4.154.0
+catalogMode: strict
+# An entry that no package names any more is deleted.
+catalogPrune: true
+
+# Dependencies between workspace packages go one way only (docs/DEVELOPMENT.md, "Workspace").
+disallowWorkspaceCycles: true
+
+# `pnpm --filter <name>` fails when no package matches, so that a renamed package cannot turn a script (such as the
+# root's `deploy`) into one that does nothing and succeeds.
+failIfNoMatch: true
+
+# `pnpm add` writes exact versions, so every dependency stays pinned.
 saveExact: true
 
 overrides:
-  # Vite+ needs every package to resolve vite and vitest to the toolchain's own copies. Keep both in step with the
-  # vite-plus version in package.json; `vp toolchain vitest` prints the Vitest version that Vite+ bundles.
-  vite@*: npm:@voidzero-dev/vite-plus-core@1.4.0
-  vitest@*: 5.0.5
+  # Vite+ needs every package to resolve vite and vitest to the toolchain's own copies: the catalog's entries, which
+  # move with the catalog's vite-plus (`vp toolchain vitest` prints the Vitest version it bundles).
+  vite@*: "catalog:"
+  vitest@*: "catalog:"
   # @qwik.dev/router 2.0.0-rc.4 pins these packages to versions with security advisories. The deployed Worker contains
   # none of them: @azure/functions serves only the Azure adapter, zod only zod$(), and vite-imagetools only image
   # imports with "?jsx". Each override names the exact version of its parent, so it stops applying when the parent is
@@ -29,12 +66,6 @@ peerDependencyRules:
 allowBuilds:
   esbuild: false
   workerd: false
-
-# pnpm installs a version only once it has been published for a day (minimumReleaseAge, on by default). This release
-# fixes the undici advisories (GHSA-xjj6-f33q-929c and others) and was hours old when it was adopted. Delete the entry
-# once it is a day old (2026-10-29 17:21 UTC).
-minimumReleaseAgeExclude:
-  - "@cloudflare/vite-plugin@1.66.0"
 
 # pnpm neither switches itself to the release that "packageManager" in package.json pins nor records that release in
 # pnpm-lock.yaml. The record makes the lockfile two YAML documents, and GitHub's dependency graph reads only the first:

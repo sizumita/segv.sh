@@ -1,134 +1,45 @@
 /**
- * Vite+ config.
- *  - `vp dev`  : Qwik SSR + /api + Durable Objects run inside workerd via @cloudflare/vite-plugin
- *                (Qwik's Node dev-SSR middleware is disabled so requests fall through to the Worker).
- *  - `vp build`: plain Qwik client build; adapters/cloudflare-workers/vite.config.ts extends this
- *                for the server bundle that wrangler deploys.
+ * Vite+ config for the whole workspace: `vp lint`, `vp fmt` and `vp check` cover every package, and `vp test` runs
+ * each package's test project (its own vite.config.ts). Each app keeps its dev and build config in its own directory
+ * (apps/web/vite.config.ts).
  */
-import { cloudflare } from "@cloudflare/vite-plugin";
-import { qwikVite } from "@qwik.dev/core/optimizer";
-import { qwikRouter } from "@qwik.dev/router/vite";
-import type { Plugin } from "vite";
-import { defineConfig, lazyPlugins } from "vite-plus";
+import { defineConfig } from "vite-plus";
 
-const SRC = `${import.meta.dirname}/src`;
-/** The push Service Worker's own CSP: it loads nothing, and reads rows from this origin's API only (§11.13). */
-const SW_CSP = "default-src 'none'; connect-src 'self'";
-
-/** Bundles src/client/sw-main.ts into one classic script (a Service Worker at a fixed URL, /sw.js). */
-async function bundleSw(minify: boolean): Promise<string> {
-  const { build } = await import("vite");
-  const out = await build({
-    configFile: false,
-    logLevel: "warn",
-    resolve: { alias: { "~": SRC } },
-    build: {
-      write: false,
-      minify,
-      target: "es2022",
-      lib: { entry: `${SRC}/client/sw-main.ts`, formats: ["iife"], name: "segvSw", fileName: () => "sw.js" },
+export default defineConfig({
+  // `vp lint` (oxlint). eslint-plugin-qwik runs as an oxlint JS plugin; its
+  // qwik/valid-lexical-scope rule needs TS type info that JS plugins don't get -> off.
+  lint: {
+    plugins: ["oxc", "typescript", "unicorn"],
+    jsPlugins: ["eslint-plugin-qwik"],
+    categories: { correctness: "warn" },
+    rules: {
+      "qwik/valid-lexical-scope": "off",
+      "qwik/use-method-usage": "error",
+      "qwik/no-react-props": "error",
+      "qwik/loader-location": "warn",
+      "qwik/jsx-key": "warn",
+      "qwik/unused-server": "error",
+      "qwik/jsx-img": "warn",
+      "qwik/jsx-a": "warn",
+      "qwik/serializer-signal-usage": "error",
+      "qwik/scope-use-task": "error",
     },
-  });
-  const outputs = (Array.isArray(out) ? out : [out]) as { output: { type: string; code?: string }[] }[];
-  const code = outputs.flatMap((o) => o.output).find((o) => o.type === "chunk")?.code;
-  if (!code) throw new Error("sw.js: the bundle has no chunk");
-  return code;
-}
-
-/** Serves /sw.js in dev and emits it at the root of the client build. */
-function swPlugin(): Plugin {
-  return {
-    name: "segv:sw",
-    configureServer(server) {
-      server.middlewares.use((req, res, next) => {
-        if (req.url?.split("?")[0] !== "/sw.js") return next();
-        bundleSw(false).then(
-          (code) => {
-            res.setHeader("Content-Type", "application/javascript");
-            res.setHeader("Cache-Control", "no-store");
-            res.setHeader("Content-Security-Policy", SW_CSP);
-            res.end(code);
-          },
-          (e: unknown) => next(e),
-        );
-      });
-    },
-    async generateBundle() {
-      if (this.environment?.config.consumer !== "client") return;
-      this.emitFile({ type: "asset", fileName: "sw.js", source: await bundleSw(true) });
-    },
-  };
-}
-
-// In workerd dev, Qwik libs must be transformed by the Qwik optimizer instead of being
-// pre-bundled by Vite's dep optimizer, otherwise their QRL segments 404 in the browser.
-const QWIK_LIBS = [
-  "@qwik.dev/core",
-  "@qwik.dev/core/internal",
-  "@qwik.dev/core/build",
-  "@qwik.dev/core/server",
-  "@qwik.dev/core/jsx-runtime",
-  "@qwik.dev/core/jsx-dev-runtime",
-  "@qwik.dev/router",
-  "@qwik.dev/router/middleware/cloudflare-pages",
-  "@qwik.dev/router/middleware/request-handler",
-];
-
-export default defineConfig(({ command, mode }) => {
-  const dev = command === "serve" && mode !== "test";
-  return {
-    resolve: { tsconfigPaths: true }, // "~/*" alias from tsconfig (replaces vite-tsconfig-paths)
-    environments: dev ? { ssr: { optimizeDeps: { exclude: QWIK_LIBS } } } : undefined,
-    // `vp lint` (oxlint). eslint-plugin-qwik runs as an oxlint JS plugin; its
-    // qwik/valid-lexical-scope rule needs TS type info that JS plugins don't get -> off.
-    lint: {
-      plugins: ["oxc", "typescript", "unicorn"],
-      jsPlugins: ["eslint-plugin-qwik"],
-      categories: { correctness: "warn" },
-      rules: {
-        "qwik/valid-lexical-scope": "off",
-        "qwik/use-method-usage": "error",
-        "qwik/no-react-props": "error",
-        "qwik/loader-location": "warn",
-        "qwik/jsx-key": "warn",
-        "qwik/unused-server": "error",
-        "qwik/jsx-img": "warn",
-        "qwik/jsx-a": "warn",
-        "qwik/serializer-signal-usage": "error",
-        "qwik/scope-use-task": "error",
-      },
-    },
-    // docs/PROTOCOL.md is the protocol specification, copied verbatim from its author's text on every
-    // revision, so it is never reformatted here.
-    fmt: { ignorePatterns: ["worker-configuration.d.ts", "dist/**", "server/**", "docs/PROTOCOL.md"] },
-    // lazyPlugins: factories are skipped by `vp lint` / `vp fmt` / `vp check`.
-    // `vp test`: unit tests (pure TS, Node) + Workers-runtime tests (test/worker/vitest.config.ts).
-    test: {
-      projects: [
-        { test: { name: "unit", include: ["src/**/*.test.ts"], environment: "node" } },
-        "test/worker/vitest.config.ts",
-        // The client engine (src/client/engine.ts) against the in-memory FakeWorld (test/engine/harness.ts).
-        {
-          resolve: { alias: { "~": `${import.meta.dirname}/src` } },
-          test: { name: "engine", include: ["test/engine/**/*.spec.ts"], environment: "node", testTimeout: 120_000, hookTimeout: 60_000 },
-        },
-      ],
-    },
-    plugins: lazyPlugins(() => mode === "test" ? [] : [
-      swPlugin(),
-      qwikRouter(dev ? { devSsrServer: false } : {}),
-      qwikVite(),
-      ...(dev
-        ? [
-            cloudflare({
-              viteEnvironment: { name: "ssr" },
-              // wrangler.jsonc "main" is the built bundle; in dev run the TS source instead.
-              config: { main: "./src/entry.cloudflare-workers.ts" },
-            }),
-          ]
-        : []),
-    ]),
-    server: { headers: { "Cache-Control": "public, max-age=0" } },
-    preview: { headers: { "Cache-Control": "public, max-age=600" } },
-  };
+  },
+  // docs/PROTOCOL.md is the protocol specification, copied verbatim from its author's text on every
+  // revision, so it is never reformatted here. The sources of packages/protocol and packages/server have never been
+  // formatted (the bare "lib" and "server" patterns of .prettierignore matched their old directories): they are
+  // formatted in a change of their own, which then removes them from this list.
+  fmt: {
+    ignorePatterns: [
+      "**/worker-configuration.d.ts",
+      "**/dist/**",
+      "apps/web/server/**",
+      "docs/PROTOCOL.md",
+      "packages/protocol/src/**",
+      "packages/server/src/**",
+    ],
+  },
+  test: {
+    projects: ["packages/*"],
+  },
 });

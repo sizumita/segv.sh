@@ -1,0 +1,27 @@
+{
+  "name": "@segv/engine",
+  "private": true,
+  "description": "The client engine that every app's UI talks to through the Engine interface: unlock and accounts, conversations, membership, delivery, restore, integrity, passkeys, images and notifications.",
+  "type": "module",
+  "exports": {
+    ".": "./src/engine.ts",
+    "./types": "./src/types.ts",
+    "./markdown": "./src/markdown.ts",
+    "./conv": "./src/conv.ts",
+    "./sw-url": "./src/sw-url.ts",
+    "./sw-main": "./src/sw-main.ts"
+  },
+  "scripts": {
+    "test": "vp test run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@segv/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vite-plus": "catalog:"
+  }
+}

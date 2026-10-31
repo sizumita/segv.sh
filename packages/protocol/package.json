@@ -1,0 +1,26 @@
+{
+  "name": "@segv/protocol",
+  "private": true,
+  "description": "The protocol's cryptographic core, derivations and record formats (proto), and the binary API formats (wire). Shared by the engine, the Worker and its Durable Objects, and the end-to-end test.",
+  "type": "module",
+  "exports": {
+    "./proto": "./src/proto.ts",
+    "./wire": "./src/wire.ts"
+  },
+  "scripts": {
+    "test": "vp test run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@noble/ciphers": "catalog:",
+    "@noble/curves": "catalog:",
+    "@noble/hashes": "catalog:",
+    "@noble/post-quantum": "catalog:"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vite-plus": "catalog:"
+  }
+}

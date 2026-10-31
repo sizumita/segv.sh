@@ -62,19 +62,24 @@ jobs:
       - name: Format and lint
         run: pnpm run check
 
-      - name: Type-check the tests
-        run: |
-          pnpm exec tsc --noEmit -p test/engine
-          pnpm exec tsc --noEmit -p test/worker
+      # The rules of the workspace (docs/DEVELOPMENT.md): catalog versions, the direction of dependencies, declared
+      # imports, a deduplicated lockfile and satisfied peer dependencies.
+      - name: Check the workspace's dependencies
+        run: pnpm run check:workspace
+
+      # Every package of the workspace, with its own globals (packages/server sees only the Workers runtime).
+      - name: Type-check every package
+        run: pnpm run typecheck
 
       - name: Test
         run: pnpm test
 
-      # qwik build also type-checks and lints the app.
+      # qwik build also type-checks the web app.
       - name: Build
         run: pnpm run build
 
       - name: Check the Wrangler configuration
+        working-directory: apps/web
         run: pnpm exec wrangler deploy --dry-run
 
       - name: Upload the build
@@ -82,9 +87,10 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: build
+          # The artifact holds dist/ and server/ at its root (their common parent, apps/web/, is left out).
           path: |
-            dist
-            server
+            apps/web/dist
+            apps/web/server
           # dist/.assetsignore keeps _worker.js and _routes.json out of the static assets.
           include-hidden-files: true
           if-no-files-found: error
@@ -124,10 +130,12 @@ jobs:
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: apps/web
 
       # Runs Wrangler's binary itself, not through pnpm, so that no package-manager code (such as pnpm's check that
       # node_modules is up to date, which can start an install) runs with the credentials.
       - name: Deploy
+        working-directory: apps/web
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

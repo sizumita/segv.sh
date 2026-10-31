@@ -1,0 +1,10 @@
+{
+  // The Worker's code runs on workerd: its globals come from worker-configuration.d.ts (`pnpm run cf-typegen`, from
+  // the test configuration's bindings), not from the DOM.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["es2022"],
+    "types": ["@cloudflare/vitest-plugin/types", "node"]
+  },
+  "include": ["src", "test", "worker-configuration.d.ts", "*.config.ts"]
+}

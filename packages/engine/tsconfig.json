@@ -1,0 +1,9 @@
+{
+  // The engine (browser, its Web Worker and the push Service Worker) and its tests against FakeWorld.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["es2022", "DOM", "WebWorker", "DOM.Iterable"],
+    "types": ["node"]
+  },
+  "include": ["src", "test", "*.config.ts"]
+}

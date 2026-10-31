@@ -3,41 +3,25 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vp dev --mode ssr",
-    "build": "qwik build",
-    "build.client": "vp build",
-    "build.server": "qwik check-client src dist && vp build -c adapters/cloudflare-workers/vite.config.ts",
-    "build.types": "tsc --incremental --noEmit",
-    "lint": "vp lint src",
-    "fmt": "vp fmt",
-    "preview": "qwik build && wrangler dev",
-    "deploy": "qwik build && wrangler deploy",
-    "cf-typegen": "wrangler types",
-    "db:migrate:local": "wrangler d1 migrations apply DB --local",
-    "qwik": "qwik",
-    "test": "vp test run",
+    "dev": "pnpm --filter @segv/web run dev",
+    "build": "pnpm --filter @segv/web run build",
+    "preview": "pnpm --filter @segv/web run preview",
+    "deploy": "pnpm --filter @segv/web run deploy",
+    "db:migrate:local": "pnpm --filter @segv/web run db:migrate:local",
     "check": "vp check",
-    "test:e2e": "node test/e2e/run.mjs"
-  },
-  "dependencies": {
-    "@noble/ciphers": "2.4.0",
-    "@noble/curves": "2.4.0",
-    "@noble/hashes": "2.4.0",
-    "@noble/post-quantum": "0.7.1"
+    "fmt": "vp fmt",
+    "lint": "vp lint",
+    "check:workspace": "node scripts/check-workspace.mjs && pnpm dedupe --check && pnpm peers check -r",
+    "typecheck": "tsc --noEmit -p . && pnpm --recursive run typecheck",
+    "test": "vp test run",
+    "test:e2e": "pnpm --filter @segv/web run test:e2e"
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "1.66.0",
-    "@cloudflare/vitest-plugin": "1.4.9",
-    "@qwik.dev/core": "2.0.0-rc.4",
-    "@qwik.dev/router": "2.0.0-rc.4",
-    "@types/node": "25.6.0",
-    "eslint-plugin-qwik": "2.0.0-rc.4",
-    "playwright": "1.64.1",
-    "typescript": "5.9.3",
-    "vite": "npm:@voidzero-dev/vite-plus-core@1.4.0",
-    "vite-plus": "1.4.0",
-    "vitest": "5.0.5",
-    "wrangler": "4.154.0"
+    "eslint-plugin-qwik": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vite-plus": "catalog:",
+    "vitest": "catalog:"
   },
   "engines": {
     "node": "^22.18.0 || ^24.11.0 || >=26.0.0"

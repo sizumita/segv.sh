@@ -1,8 +1,6 @@
 # Build
-/dist
-/lib
-/lib-types
-/server
+/apps/web/dist
+/apps/web/server
 
 # Development
 node_modules
@@ -47,8 +45,8 @@ lerna-debug.log*
 functions/**/*.js
 .wrangler/
 
-# TypeScript incremental output (tsconfig "outDir": "tmp")
-/tmp
+# TypeScript incremental output (apps/web/tsconfig.json "outDir": "tmp")
+/apps/web/tmp
 
 # Local Worker secrets
 .dev.vars*

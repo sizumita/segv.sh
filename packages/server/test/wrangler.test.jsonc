@@ -1,0 +1,68 @@
+// Workers-runtime test config (../vite.config.ts). Mirrors ../../../apps/web/wrangler.jsonc minus the
+// Qwik bundle / static assets, with a test entry (./entry.ts) and low proof-of-work difficulty.
+{
+  "name": "segv-sh-test",
+  "main": "./entry.ts",
+  "compatibility_date": "2026-10-20",
+  "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "segv-test",
+      "database_id": "00000000-0000-0000-0000-000000000001",
+      "migrations_dir": "../migrations",
+    },
+  ],
+  "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "segv-blobs-test" }],
+  "durable_objects": {
+    "bindings": [
+      { "name": "SHARD", "class_name": "ShardDO" },
+      { "name": "BLOBREG", "class_name": "BlobRegDO" },
+      { "name": "INBOX", "class_name": "InboxDO" },
+      { "name": "RT", "class_name": "RealtimeDO" },
+      { "name": "CKPT", "class_name": "CheckpointDO" },
+      { "name": "PUSH", "class_name": "PushDO" },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ShardDO", "BlobRegDO", "InboxDO", "RealtimeDO", "CheckpointDO"],
+    },
+    { "tag": "v2", "new_sqlite_classes": ["PushDO"] },
+  ],
+  "ratelimits": [
+    { "name": "RL_WRITE", "namespace_id": "1001", "simple": { "limit": 60, "period": 60 } },
+    { "name": "RL_BLOB", "namespace_id": "1002", "simple": { "limit": 20, "period": 60 } },
+    { "name": "RL_READ", "namespace_id": "1003", "simple": { "limit": 600, "period": 60 } },
+    { "name": "RL_INBOX", "namespace_id": "1004", "simple": { "limit": 10, "period": 60 } },
+    { "name": "RL_RING", "namespace_id": "1005", "simple": { "limit": 60, "period": 60 } },
+    // Marks of rows a device in use has shown (§10.10): their own binding, so that they never take the rings' tokens.
+    { "name": "RL_SEEN", "namespace_id": "1006", "simple": { "limit": 60, "period": 60 } },
+  ],
+  // APP_HOSTS: the tests talk to https://segv.test (helpers.ts ORIGIN).
+  "vars": {
+    "POW_REGISTER": "6",
+    "POW_WRAP": "5",
+    "POW_BLOB": "5",
+    "POW_PUT": "4",
+    "POW_INBOX": "4",
+    "POW_PUSH": "4",
+    // v2: Δ = 1 s, SKEW = 0, Δin = 1 s. E_FIRST = 1 (era 0 is "before the
+    // first deploy" for the era-bound tests).
+    "DELTA_S": "1",
+    "SKEW_S": "0",
+    "INBOX_SLOT_S": "1",
+    "E_FIRST": "1",
+    // Fixed test secrets (never used outside tests).
+    "ROUTE_KEY": "dGVzdC1yb3V0ZS1rZXktc2Vndi5zaC12Mi0wMDAwMDA",
+    "SRV_KEY": "dGVzdC1zcnYta2V5LXNlZ3Yuc2gtdjItMDAwMDAwMDA",
+    "APP_HOSTS": "segv.test,localhost",
+    // Web Push on, with fixed test keys. Pushes only ever go to the *.push.test hosts below, which never
+    // resolve: the push tests replace PushDO's fetch.
+    "VAPID_SK": "dGVzdC12YXBpZC1rZXktc2Vndi5zaC12Mi0wMDAwMDA",
+    "PUSH_KEY": "dGVzdC1wdXNoLWtleS1zZWd2LnNoLXYyLTAwMDAwMDA",
+    "VAPID_SUB": "mailto:push@segv.test",
+    "PUSH_HOSTS": "push.test,*.push.test",
+  },
+}

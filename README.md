@@ -203,20 +203,19 @@ Durable Objects (SQLite), D1 and R2. All cryptography comes from the [noble](htt
 
 ### Repository layout
 
-| Path                              | Contents                                                                                                                         |
-| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `src/lib/proto.ts`                | The protocol's cryptographic core and encodings, shared by the browser, the Worker and the Durable Objects; uses only `@noble/*` |
-| `src/lib/wire.ts`                 | Strict encoders and decoders for the binary API formats (put, get, inbox, feed and realtime frames)                              |
-| `src/client/`                     | The browser-only engine: unlock and accounts, conversations, membership, delivery, restore, integrity, passkeys, images          |
-| `src/routes/`, `src/components/`  | The Qwik UI                                                                                                                      |
-| `src/server/`                     | The Worker's API, the Durable Objects and the D1 directory                                                                       |
-| `src/entry.cloudflare-workers.ts` | The Worker entry: `/api/*` goes to the API, everything else to Qwik's server-side rendering                                      |
-| `migrations/`                     | The D1 schema                                                                                                                    |
-| `src/**/*.test.ts`                | Unit tests: the cryptographic core and wire formats (cross-checks, tampering, known-answer vectors, fuzzing) and UI helpers      |
-| `test/worker/`                    | API, Durable Object and directory tests on the Workers runtime                                                                   |
-| `test/engine/`                    | `FakeWorld`, an in-memory server, and tests of the real client engine against it                                                 |
-| `test/e2e/`                       | End-to-end tests with Playwright and virtual passkeys that support PRF                                                           |
-| `docs/`                           | The specification and the design rationale                                                                                       |
+A pnpm workspace: the app that ships lives in `apps/`, the code it is built from in `packages/`.
+
+| Path                 | Contents                                                                                                                                                                                               |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `apps/web/`          | The Worker that serves segv.sh: its entry (`/api/*` goes to the API, everything else to Qwik's server-side rendering), Qwik Router's routes, static files, `wrangler.jsonc` and the end-to-end tests   |
+| `packages/protocol/` | The protocol's cryptographic core and encodings (`proto.ts`) and strict codecs for the binary API formats (`wire.ts`), shared by the browser, the Worker and the Durable Objects; uses only `@noble/*` |
+| `packages/engine/`   | The client engine: unlock and accounts, conversations, membership, delivery, restore, integrity, passkeys, images, notifications; tested against `FakeWorld`, an in-memory server                      |
+| `packages/ui/`       | The Qwik UI, which talks to the engine only through its `Engine` interface                                                                                                                             |
+| `packages/server/`   | The Worker's API, the Durable Objects, the D1 directory and its schema (`migrations/`), tested on the Workers runtime                                                                                  |
+| `docs/`              | The specification and the design rationale                                                                                                                                                             |
+
+Unit tests sit next to the code they test (`*.test.ts`); the engine's and the server's larger tests are in each
+package's `test/`.
 
 ## Getting started
 
@@ -228,7 +227,7 @@ installs it.
 ```bash
 pnpm install
 # Local server secrets: two random 32-byte values in base64url (the file is gitignored).
-node -e 'const k = () => require("node:crypto").randomBytes(32).toString("base64url"); console.log(`ROUTE_KEY=${k()}\nSRV_KEY=${k()}`)' > .dev.vars
+node -e 'const k = () => require("node:crypto").randomBytes(32).toString("base64url"); console.log(`ROUTE_KEY=${k()}\nSRV_KEY=${k()}`)' > apps/web/.dev.vars
 pnpm run db:migrate:local
 pnpm run dev
 ```
@@ -239,18 +238,17 @@ Open the local URL that `pnpm run dev` prints. In development the passkey's rely
 ## Checks and tests
 
 ```bash
-pnpm run check                         # formatting and lint
-pnpm exec tsc --noEmit -p .            # type check: the app
-pnpm exec tsc --noEmit -p test/engine  # type check: the engine tests
-pnpm exec tsc --noEmit -p test/worker  # type check: the Workers-runtime tests
-pnpm test                              # unit, Workers-runtime and engine tests
-pnpm run build                         # production build, including a type check and lint
-pnpm run test:e2e                      # production build + wrangler dev + headless Chromium
+pnpm run check      # formatting and lint
+pnpm run check:workspace  # the workspace's dependency rules
+pnpm run typecheck  # type check: every package
+pnpm test           # every package's tests: unit, engine and Workers-runtime
+pnpm run build      # production build, including a type check of the web app
+pnpm run test:e2e   # production build + wrangler dev + headless Chromium
 ```
 
-The end-to-end tests need Playwright's Chromium (`pnpm exec playwright install chromium`). They run against their own
-local state, with low proof of work and generated secrets, and do not touch your development data. GitHub Actions runs
-all of these, and `pnpm audit`, on every pull request.
+The end-to-end tests need Playwright's Chromium (`pnpm --filter @segv/web exec playwright install chromium`). They run
+against their own local state, with low proof of work and generated secrets, and do not touch your development data.
+GitHub Actions runs all of these, and `pnpm audit`, on every pull request.
 
 ## Deployment
 

@@ -1,0 +1,17 @@
+{
+  // Compiler options shared by every package: each package's tsconfig.json extends this file and adds its own lib,
+  // types and files. Packages import each other by name ("@segv/engine/types"), never by a path alias.
+  "compilerOptions": {
+    "target": "es2020",
+    "module": "esnext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "noEmit": true
+  }
+}
