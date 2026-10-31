@@ -1,10 +1,10 @@
 # segv.sh protocol v2 (stage 1)
 
-This is the normative spec. It replaces protocol v1. Every implementation (the client crypto core `src/lib/proto.ts`, the
-client engine, the Worker and the tests) MUST follow it byte for byte. The rationale lives in `docs/DESIGN.md`.
-"Stage 1" is the first build stage of the Label-Indexed Store (LIS). The identifier of the protocol is `segv.sh/v2/` in
-every stage, and §14 lists what later stages add. v1 wire formats are removed: a v2 implementation does not read,
-write or serve them, and there is no migration (no v1 data exists).
+This is the normative spec. It replaces protocol v1. Every implementation (the client crypto core
+`packages/protocol/src/proto.ts`, the client engine, the Worker and the tests) MUST follow it byte for byte. The
+rationale lives in `docs/DESIGN.md`. "Stage 1" is the first build stage of the Label-Indexed Store (LIS). The identifier
+of the protocol is `segv.sh/v2/` in every stage, and §14 lists what later stages add. v1 wire formats are removed: a v2
+implementation does not read, write or serve them, and there is no migration (no v1 data exists).
 
 Key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 
@@ -27,9 +27,10 @@ texts.
 - The server stores **public** data only, with one exception, below. Anyone may read every other stored byte,
   forever, and the server never sees a secret of an account or a conversation. It has no sessions. Writes are
   anonymous. Abuse control is proof of work plus per-IP rate limits, and no address is stored.
-- **The exception: push registrations.** A deployment MAY offer Web Push notifications (§9.8, §10.10, §11.13). Then one
-  component, PushDO, stores data that is never served: for each device that turned notifications on, its push endpoint
-  (the URL at which its browser's push service accepts messages for it) with that subscription's encryption keys,
+- **The exception: push registrations.** A deployment MAY offer push notifications (§9.8, §10.10, §11.13): Web Push for
+  browsers, and APNs and FCM for its native apps (§11.14). Then one component, PushDO, stores data that is never served:
+  for each device that turned notifications on, its push endpoint (the URL at which its browser's push service accepts
+  messages for it, or the token under which a native app receives them) with the keys to which its pushes are encrypted,
   sealed under a server secret, keyed hashes of the bells it registered (§4.2) and of its account's quiet tag (§4.1),
   and the day of its last registration. It stores no uid, handle, conversation, topic, IP address or sender, and
   nothing about a ring or about a device in use: which devices a message reached, and which rows an account marked
@@ -71,7 +72,7 @@ texts.
 | **P** | Public reader. Reads and archives everything stored, forever, and may later own a quantum computer. **P\*** = P plus active use of every public API (including the WebSocket). |
 | **O** | The operator / platform. Sees every request when it happens (IP, path, timing, WebSocket topics), can run arbitrary server code, and can delay, omit or reorder responses. Cannot break the cryptography. |
 | **M** | A member of a conversation, possibly malicious. M holds the epoch keys of the epochs it belongs to, and may write any row an outsider can write plus rows under labels it can compute. |
-| **N** | A push service, only for a device that turned notifications on (§11.13): Apple's for Safari and for iOS and iPadOS web apps, Google's (FCM) for Chrome and most Chromium browsers, Mozilla's for Firefox, Microsoft's for Edge. It holds the device's push subscription, which it can link to the device and often to an account with the browser's vendor, and it sees every push sent to that subscription: its time and its size. It cannot read a push (RFC 8291), and every push has the same length and the same fixed text; the bells that a push names are encrypted to the device (§9.8). |
+| **N** | A push service, only for a device that turned notifications on (§11.13): Apple's for Safari, for iOS and iPadOS web apps and for the iOS and macOS apps (APNs), Google's (FCM) for Chrome and most Chromium browsers and for the Android app, Mozilla's for Firefox, Microsoft's for Edge. It holds the device's push subscription or token, which it can link to the device and often to an account with the vendor of the browser or of the operating system, and it sees every push sent to it: its time and its size. It cannot read the bells that a push names, which are encrypted to the device (RFC 8291, §9.8), and every push has the same fixed text, and its encrypted part the same length. |
 
 ### 0.3 Guarantees in stage 1
 
@@ -130,24 +131,24 @@ These hold in stage 1. §13 has the full leakage table and the explicit list of 
   (§12.6).
 - No forward secrecy if a passkey PRF output, recovery code or AK leaks. No post-compromise security within an epoch.
 - No deniability among members. No deletion: the archive is public. No censorship resistance.
-- Not defended against: malicious served JavaScript; a malicious member who signs an unusable claim (freezing
-  membership for the whole conversation, attributably, and messaging too when the claim removes someone) or spams;
-  anyone who fills the global inbox day cap (§9.3), which delays first contact and inbox deliveries for everyone, for
-  as long as it keeps refilling the cap every day; where push is offered, anyone who fills PushDO's endpoint cap with
-  registrations (§9.8), which keeps every new device from turning notifications on until they expire, or its cap of
-  registrations changed in a day, which keeps every device from registering a new or changed set until the next day,
-  or who keeps more pushes due than the one PushDO sends, which delays everyone's notifications; and directory key
-  substitution by O (detected only by fingerprint comparison, TOFU pins (CONTACT, MEMBER) and disagreement with the
-  keys in descriptors).
-- **Web Push** (optional; §9.8, §11.13, §13.4):
-  - Delivery is best effort. A push service may drop or delay a push, a browser may revoke a subscription, the
-    pushes to one device are coalesced to at most one per `PUSH_WINDOW` (60 s), except across a restart of PushDO, and
-    a registration expires 30 days after its device last refreshed it. A restart (an eviction or a deploy) loses the
-    pushes then due and the registration changes that PushDO has not yet written, so a device may get the
-    notifications of its earlier set, or none, until it registers again at its next start, or within 24 hours while it
-    runs (§9.8, §11.13). Messages from a client that does not ring (the first release, §7.1) notify nobody, and a
-    contact that the first release recorded when a third member's row accepted a request counts (§7.3): that
-    conversation, and the later ones that user starts, ring although the user never accepted them.
+- Not defended against: malicious served JavaScript (in a browser; a native app runs only the code of its signed
+  package, §11.14); a malicious member who signs an unusable claim (freezing membership for the whole conversation,
+  attributably, and messaging too when the claim removes someone) or spams; anyone who fills the global inbox day cap
+  (§9.3), which delays first contact and inbox deliveries for everyone, for as long as it keeps refilling the cap every
+  day; where push is offered, anyone who fills PushDO's endpoint cap with registrations (§9.8), which keeps every new
+  device from turning notifications on until they expire, or its cap of registrations changed in a day, which keeps
+  every device from registering a new or changed set until the next day, or who keeps more pushes due than the one
+  PushDO sends, which delays everyone's notifications; and directory key substitution by O (detected only by fingerprint
+  comparison, TOFU pins (CONTACT, MEMBER) and disagreement with the keys in descriptors).
+- **Push notifications** (optional; §9.8, §11.13, §13.4):
+  - Delivery is best effort. A push service may drop or delay a push, a browser may revoke a subscription and an
+    operating system a token, the pushes to one device are coalesced to at most one per `PUSH_WINDOW` (60 s), except
+    across a restart of PushDO, and a registration expires 30 days after its device last refreshed it. A restart (an
+    eviction or a deploy) loses the pushes then due and the registration changes that PushDO has not yet written, so a
+    device may get the notifications of its earlier set, or none, until it registers again at its next start, or within
+    24 hours while it runs (§9.8, §11.13). Messages from a client that does not ring (the first release, §7.1) notify
+    nobody, and a contact that the first release recorded when a third member's row accepted a request counts (§7.3):
+    that conversation, and the later ones that user starts, ring although the user never accepted them.
   - A push names at most the `PUSH_BELLS` = 4 bells that rang its device last, and a push that the push service
     replaces with the next one loses its bells (§9.8), so a preview may leave a conversation out. A preview may also
     miss rows, or show a row that the app later drops (§11.13).
@@ -183,6 +184,17 @@ These hold in stage 1. §13 has the full leakage table and the explicit list of 
     sent there and, since a sender never rings its own bell, which of those members sends each, until each of them
     posts in the new epoch or the epoch changes again.
   - Notifications are shown also while the app is open.
+  - **Native apps** (§11.14). A native app's notification code may be unable to read its keys before the device is
+    first unlocked after a restart, and then shows the fixed text. Android may deliver a push late while the device
+    sleeps, and an Android device without Google Play services gets none. A desktop app without a push transport
+    (Windows, Linux) notifies, if at all, only while it runs, and also of rows that another device of the account
+    shows (§11.13).
+  - **Sync notes** (§11.16) are best effort. A device misses those sent while its socket is closed and no quiet push
+    reaches it, and a quiet push may be lost, delayed or replaced (§9.8); the device then learns the change from the
+    self lane when the app next runs, at most `READ_PERSIST` after the sender stopped using the copy. A device that gets
+    no quiet pushes (a browser, or an iOS app without the notification filtering entitlement) keeps the notifications of
+    copies read elsewhere until the app opens. The code of a native app that runs outside its web view gets the time its
+    platform grants, and leaves the rest to the app (§11.14).
 
 ## 1. Primitives and encoding
 
@@ -283,6 +295,7 @@ kS = HKDF(AK, "", "segv.sh/v2/self/aead",   32)       // self lane (§4.1)
 rS = HKDF(AK, "", "segv.sh/v2/self/route",  32)
 nS = HKDF(AK, "", "segv.sh/v2/self/notify", 32)
 qS = HKDF(AK, "", "segv.sh/v2/self/quiet",  16)       // quiet secret (§4.1, §11.13)
+kN = HKDF(AK, "", "segv.sh/v2/self/note",   32)       // sync notes (§11.16)
 ```
 
 - `uid` = 16 random bytes, public.
@@ -310,8 +323,12 @@ bundleSig   = SIG.sign(enc("segv.sh/v2/bundle", bundleBytes), sigSk)
 
 ### 2.3 Unlock secrets
 
-- PRF input: `prf.eval.first = utf8("segv.sh/v2/prf")`. The browser applies the WebAuthn PRF prefix. `prf` is 32
-  bytes and never leaves the client.
+- PRF input: `prf.eval.first = utf8("segv.sh/v2/prf")`. `prf` is the PRF extension's `results.first` for it, 32 bytes,
+  and never leaves the client. The browser applies the WebAuthn PRF prefix. A native app that calls the platform's
+  passkey API instead (§11.14) MUST obtain the same 32 bytes for the same credential: where that API takes the
+  authenticator's `hmac-secret` salt rather than the PRF input, it passes `SHA-256(utf8("WebAuthn PRF") ‖ 0x00 ‖ PRF
+  input)`, the salt that a browser derives. Otherwise one passkey would give different keys on the web and in the app,
+  and the wraps made by one would not open in the other.
 - Passkey unlock key:
 
   ```
@@ -369,7 +386,9 @@ A failed unlock MUST NOT create keys or write anything.
 2. Check that it is free with a handle-prefix query (§10.6), filtering locally.
 3. Generate `AK` and `uid`, then build the bundle.
 4. Call `navigator.credentials.create` with:
-   - `rp.id` = the page hostname, `user.id = uid`;
+   - `rp.id` = the RP ID, `user.id = uid`. The RP ID is the page hostname, which host pinning makes the deployment's
+     canonical host (§9.7); a native app uses the canonical host of the deployment it is built for, never the host of
+     its own origin (§11.14), so the web app and the native apps of a deployment share their passkeys;
    - `residentKey: "required"`, `userVerification: "required"`;
    - algorithms [-8, -7, -257];
    - `extensions.prf.eval.first` = PRF input.
@@ -384,7 +403,7 @@ A failed unlock MUST NOT create keys or write anything.
 
 **Login**:
 
-1. Call discoverable `get()` (empty `allowCredentials`, UV required, PRF).
+1. Call discoverable `get()` (`rpId` = the RP ID, empty `allowCredentials`, UV required, PRF).
 2. `rawId` = credId, and `userHandle` = uid if present.
 3. `GET /api/v2/dir/wraps/{credId}[?uid=]`, then unlock.
 
@@ -563,7 +582,7 @@ Qself       = t16(H(enc("segv.sh/v2/quiet", qS)))                           push
 
 - **Quiet tag.** All devices of an account compute the same `qS` and `Qself`, without any record. `Qself` is a hash of
   `qS`, the account's quiet secret, and only the account's devices know `qS`: no member of a conversation can compute
-  either from that conversation's keys, bells, topics or labels. A device registers `Qself` with its push subscription,
+  either from that conversation's keys, bells, topics or labels. A device registers `Qself` with its push endpoint,
   and a device of the account that is in use sends `qS` to tell the server that the account has seen some rows
   (§10.10, §11.13).
 
@@ -1527,7 +1546,9 @@ body = aeadSeal(kS, pad(S, CLASSES), aad = enc("segv.sh/v2/self", u16 E, label))
 - A known record's content has exactly the length its layout gives and obeys its row in §7.2: CONV_JOIN and REQUEST
   `via ∈ 1..5`; EPOCH `e ≥ 1`, only flag bit1 allowed, `(claimE, claimK)` a position; ENDED `(claimE, claimK)` a
   position other than NONE; LINK only flag bits 0–1; PREFS `len ≥ 1`; the counts of §7.2; DESC and
-  REQUEST `224 ≤ dlen ≤ 2960`; MEMBER's handle; LEFT's `(E, n)` a position; SNAP's `(Eh, nh)` a position.
+  REQUEST `224 ≤ dlen ≤ 2960`; MEMBER's handle; LEFT's `(E, n)` a position; SNAP's `(Eh, nh)` a position; READ
+  `1 ≤ m ≤ 32` and only flag bit0; CONV_PREFS `len ≥ 50`, and for key 1 `len = 53`. A CONV_PREFS with a key that the
+  reader does not know is ignored, not malformed, so later keys never make a row unreadable.
 - A row at `Lself` MUST NOT hold a SNAP. A row at `Lsnap` MUST hold exactly one known record, a SNAP. Writers write
   `count = 1` and prev fields NONE / `ZERO16` there; readers do not use a pointer row's prev fields.
 - S2 (§7.4) is malformed unless, after removing the padmé padding, it is `"SGS2"`, `ver = 1`, `(Eh, nh)` a position,
@@ -1558,6 +1579,8 @@ body = aeadSeal(kS, pad(S, CLASSES), aad = enc("segv.sh/v2/self", u16 E, label))
 | 0x0E | LEFT | `conv[16] | root[32] | u32 e | uid[16] | u32 t | u16 E | u32 n` (78 B). Another member's leave as self recorded it: `uid` is recorded as left in epoch e of the copy (§6.9). `t` is the stored time of the LEAVE row R of the leave's kept source (§6.9), and `(E, n)`, a position field (§3.1), is R's position when e is R's own epoch, or NONE when the leave was carried into e from an earlier epoch. Written as §7.3 says, so a restore does not need R and decides the leave as R would be decided (§6.8). |
 | 0x0F | TREG | `bundleId[32] | u32 t_reg` (36 B). The registration time `t_reg` (seconds since T0, §8.2) of the blob `bundleId`, which for the epoch that bundle defines gives `E_start(e)` (§4.2) and the time of its join line (§11.8). It is a fact about the blob, so it names no copy or epoch. Written in the row of a join's CONV_JOIN (§7.3), and kept by snapshots for the bundle of every CONV_JOIN and EPOCH record they hold (§7.4). No parse rule on `t_reg`. |
 | 0x12 | ENDED | `conv[16] | root[32] | u32 e | u16 claimE | u32 claimK` (58 B). The copy has ended in its epoch e (§6.6 step 3): the final winning claim of e, at `(claimE, claimK)` on `Lctl_e` (a position other than NONE), removed or dropped self. Written with the next HEADS row after that claim is processed, and kept by snapshots (§7.3, §7.4), so a restore neither probes that control lane nor fetches the claim's bundle (§11.4 step 5). The first release skips it (§7.1). |
+| 0x13 | READ | `conv[16] | root[32] | u32 e | u8 flags | u8 m | (u16 E | u32 cnt) × m` (54 + 6m B). The account's read positions in epoch e of the copy: on lane ℓ of `D_e`, every row before `(E, cnt)` has been read on one of its devices (§11.8). `flags` bit0: the user marked the copy unread. The first release skips it (§7.1). |
+| 0x14 | CONV_PREFS | `conv[16] | root[32] | u8 key | value[len − 49]`. A setting of the copy that every device of the account applies. Key 1, mute: `value = u32 until`, the time (seconds since T0) until which the copy is muted, 0 for not muted and `0xFFFFFFFF` for until the user unmutes it (§11.13). The first release skips it (§7.1). |
 | 0x20 | SNAP | `blobId[32] | key[32] | u32 size | u16 Eh | u32 nh` (74 B). Allowed only in rows at `Lsnap`. |
 
 **Why TREG is a record of its own**. Appending `u32 t_reg` to CONV_JOIN and EPOCH would make them 141 and
@@ -1696,6 +1719,8 @@ records are idempotent:
 | LEAVE | `(conv, root, e)` | every record is kept; the copy's *latest* LEAVE record is the one with the highest e (§6.9) |
 | LEFT | `(conv, root, e, uid)` | the record with the least `(t, (E, n))` wins, NONE counting as after every real position (the key of §6.9), so identical records count once and the fold holds at most one record per key; it stands for its LEAVE row and is decided by §6.8 |
 | CONTACT | `uid` | the first one wins (see the pin check below) |
+| READ | `(conv, root)` | per epoch, each lane's position is the maximum over the records, so positions only move forward whichever device wrote them; the copy's read positions are those of the highest epoch named; flag bit0 is that of the copy's latest READ in self-lane order (§11.8). A reader ignores a record whose `m` is not `|D_e|` |
+| CONV_PREFS | `(conv, root, key)` | the latest wins |
 | LINK | `s` | |
 | CONFIRMED | `(conv, root)` | (written for a confirming row or claim, §6.7 step 6); one of a legacy copy's key that the first release wrote after a bit1 record, in a row without a HEADS record, belongs to the copy that §7.2 assigns it to |
 | HEADS | per copy | the latest entry wins (an entry of a legacy copy belongs to the copy that §7.2 assigns its epoch to); `(Ein, relIn)` takes the maximum. A record may hold any subset of copies. A restore also keeps, per epoch of a copy, the furthest control position `(ctlE, ctlCnt)` of the entries it applied, the replaced ones included (§11.4 step 5). |
@@ -1856,6 +1881,8 @@ blob = aeadSeal(skey, padme(S2), aad = utf8("segv.sh/v2/snapshot")); skey = rand
     CONTACT (other MEMBER records are dropped, and looked up again if ever needed);
   - every LINK that has not expired;
   - the latest PREFS per key;
+  - for every copy that the snapshot keeps, its READ (its highest epoch, with the merged positions and the latest
+    flags) and its latest CONV_PREFS per key;
   - a HEADS record with the inbox cursor.
 - **Pointer.** A self row whose only record is `SNAP{blobId, skey, size, Eh, nh}`, with prev fields NONE / `ZERO16`
   (§7.1), is put at `Lsnap(E, j)` with `E = max(E_now, regEra)` (never below `regEra`, as for self rows, §7.3), where
@@ -2133,8 +2160,8 @@ decapsulations). Only a device with no inbox cursor reads that much (§11.5).
 - Storage: a `meta` table holding `ws-tag-key`, 32 random bytes that key the opaque per-client tag.
 - Per socket:
   - tags `[clientTag, "h:" + ⌊acceptMs / 3 600 000⌋]`;
-  - the attachment `{t: acceptMs, topics: Uint8Array(16·n), win, frames, changes}` with at most 256 topics (4 KiB;
-    attachments may hold up to 16 KiB).
+  - the attachment `{t: acceptMs, topics: Uint8Array(16·n), win, frames, changes, notes}` with at most 256 topics (4
+    KiB; attachments may hold up to 16 KiB), `notes` being true once the socket has sent NOTES (§10.8).
 - In memory:
   - `boot` = 8 random bytes chosen at construction, and `seq`, a u64 counter of published rows that starts at 0 per
     boot;
@@ -2175,9 +2202,9 @@ RESUME.
 **`webSocketMessage`:**
 
 - Text `"ping"` is answered `"pong"` (auto-response).
-- Binary SUB, UNSUB and RESUME are handled as in §10.8.
+- Binary SUB, UNSUB, RESUME and NOTES are handled as in §10.8.
 - Anything else closes the socket with 1008: another text, a malformed binary frame, more than 256 topics on the
-  socket, a frame over 8 KiB, a second RESUME, or a control-frame rate above the limits.
+  socket, a frame over 8 KiB, a second RESUME or NOTES, or a control-frame rate above the limits.
 - A SUB that would push the total above 250 000 pairs closes the socket with 1013 (try again later).
 
 **`publish(rows)`** (RPC from the Worker):
@@ -2186,11 +2213,15 @@ RESUME.
 2. For each socket subscribed to a row's topic, send one ROWS frame with the matching rows.
 3. Drop sockets that fail to receive.
 
-**Durability.** Nothing about topics or rows is persisted. After a restart, `boot` changes, so a RESUME gets GAP. A
-hibernatable DO is also evicted after a short time without events (an auto-answered `ping` is not an event): its
-in-memory state, the ring and `boot` included, is reset, and the constructor runs again on the next event. The
-10-minute window is therefore an upper bound, reached only while the DO stays resident; at low traffic most RESUMEs
-after a reconnect get GAP, which costs a catch-up (§11.6), never a lost row.
+**`note(topic, note)`** (RPC from the Worker, §10.11): for each socket subscribed to `topic` whose `notes` is true, send
+one NOTE frame (§10.8), and drop the sockets that fail to receive. A note gets no `seq`, enters no ring and is never
+replayed, so a socket that is not open when it comes never gets it.
+
+**Durability.** Nothing about topics, rows or notes is persisted. After a restart, `boot` changes, so a RESUME gets GAP.
+A hibernatable DO is also evicted after a short time without events (an auto-answered `ping` is not an event): its
+in-memory state, the ring and `boot` included, is reset, and the constructor runs again on the next event. The 10-minute
+window is therefore an upper bound, reached only while the DO stays resident; at low traffic most RESUMEs after a
+reconnect get GAP, which costs a catch-up (§11.6), never a lost row.
 
 ### 9.5 CheckpointDO (`ckpt/v2`, SQLite, one instance)
 
@@ -2352,46 +2383,68 @@ New in stage 1:
   4 MiB (§10.9) is not stored in `caches.default` (copying the stream would buffer the whole batch); it is sent
   without Content-Length and with the same `cache-control` as any other page, and costs one `RL_READ` token per
   started 4 MiB of the page's batches (without the page header), at most 64 (§10.9).
+- **App origins.** `APP_ORIGINS` lists the origins of the deployment's native apps (§11.14), comma-separated, and is
+  empty by default. Each entry is the serialization of an origin whose scheme is `https`, `capacitor` or `tauri`, with
+  no path and no port; for segv.sh they are `capacitor://app.segv.sh`, `https://app.segv.sh`, `tauri://localhost` and
+  `https://tauri.localhost` (§11.14). Pages of these origins may read the API's answers (§10.1, "Cross-origin requests")
+  and open the realtime socket (§10.8); the pages of every other site still may not. The host of an `https` entry is one
+  that the deployment never serves (`app.segv.sh` has no server): a page served there would get the native apps' access.
+  An `APP_ORIGINS` that is not such a list counts as empty, so the native apps are refused and nothing else changes; the
+  Worker logs the reason once per isolate, naming the setting but never its value (as for push, §9.8).
 
 The Worker passes Durable Objects only what they need. Client addresses and headers never reach a DO; the RealtimeDO
 gets the opaque client tag only.
 
 ### 9.8 PushDO (`push/v2`, SQLite, one instance; optional)
 
-A deployment offers Web Push only when the Worker secrets `VAPID_SK` and `PUSH_KEY` are set and the whole push
-configuration below is valid; push is then **on**. The Worker then serves the three endpoints of §10.10 and params `push`
-(§10.9), and PushDO, which the Worker reaches with `getByName("push/v2")`, stores the registrations of the devices that
-turn notifications on (§11.13) and sends their notifications. Otherwise push is **off** and none of this exists: params
-carry no `push`, all three paths are unknown (404), and no PushDO is ever addressed. PushDO is the one component that
-stores data that is not public (§0.1): nothing serves it, and no checkpoint covers it (§9.5). The Worker passes it the
-fields of the three requests only (for `seen`, the quiet tag that it computes from the request's secret, §10.10).
+A push reaches a device through one of three **transports**: **Web Push** (RFC 8030, 8291 and 8292) for browsers, and
+for the native apps (§11.14) **APNs**, Apple's push service, for the iOS and macOS apps, and **FCM**, Firebase Cloud
+Messaging, for the Android app. A transport is on when its secret is set and its settings below are valid: `VAPID_SK`
+for Web Push, `APNS_KEY` for APNs, `FCM_KEY` for FCM. Push is **on** when the Worker secret `PUSH_KEY` is set and valid,
+`APP_HOSTS` is not empty, the other settings below are valid, and at least one transport is on. The Worker then serves
+the three endpoints of §10.10 and params `push` (§10.9), and PushDO, which the Worker reaches with
+`getByName("push/v2")`, stores the registrations of the devices that turn notifications on (§11.13) and sends their
+notifications. Otherwise push is **off** and none of this exists: params carry no `push`, all three paths are unknown
+(404), and no PushDO is ever addressed. PushDO is the one component that stores data that is not public (§0.1): nothing
+serves it, and no checkpoint covers it (§9.5). The Worker passes it the fields of these requests and of `sync` (§10.11)
+only (for `seen` and `sync`, the quiet tag that it computes from the request's secret).
 
-**Configuration** (with `VAPID_SK` set):
+**Configuration:**
 
 | name | kind | meaning |
 | ---- | ---- | ------- |
-| `VAPID_SK` | secret | The VAPID private key (RFC 8292): a P-256 scalar `d`, 32 bytes big-endian, b64u, with `1 ≤ d < n`. The Worker derives its public key `[d]G`, 65 bytes uncompressed (`0x04 ‖ x ‖ y`), from it and reports that key as params `push.vapid`, the key every device subscribes with. |
 | `PUSH_KEY` | secret, required | 32 bytes, b64u: the key under which registrations are stored (below). |
-| `VAPID_SUB` | var or secret, required | The operator's contact, a `mailto:` or `https:` URI, sent as the JWT's `sub` claim. |
-| `PUSH_HOSTS` | var | The hosts that may receive pushes, comma-separated; an entry `*.d` matches every host that ends with `.d`. Default `web.push.apple.com,fcm.googleapis.com,updates.push.services.mozilla.com,*.notify.windows.com`. |
+| `VAPID_SK` | secret | Web Push. The VAPID private key (RFC 8292): a P-256 scalar `d`, 32 bytes big-endian, b64u, with `1 ≤ d < n`. The Worker derives its public key `[d]G`, 65 bytes uncompressed (`0x04 ‖ x ‖ y`), from it and reports that key as params `push.vapid`, the key every browser subscribes with. |
+| `VAPID_SUB` | var or secret, required with `VAPID_SK` | The operator's contact, a `mailto:` or `https:` URI, sent as the JWT's `sub` claim. |
+| `PUSH_HOSTS` | var | The hosts that may receive Web Push messages, comma-separated; an entry `*.d` matches every host that ends with `.d`. Default `web.push.apple.com,fcm.googleapis.com,updates.push.services.mozilla.com,*.notify.windows.com`. |
+| `APNS_KEY` | secret | APNs. An APNs authentication key of the operator's Apple developer team: the P-256 scalar `d` of its `.p8` file, 32 bytes big-endian, b64u, with `1 ≤ d < n`. |
+| `APNS_KEY_ID` | var, required with `APNS_KEY` | The key's identifier, 10 characters of `[0-9A-Z]`. |
+| `APNS_TEAM` | var, required with `APNS_KEY` | The team's identifier, 10 characters of `[0-9A-Z]`. |
+| `APNS_TOPICS` | var, required with `APNS_KEY` | The bundle IDs of the apps that may register (the iOS app's and the macOS app's), comma-separated, each 1 to 155 characters of `[A-Za-z0-9.-]`. Reported as params `push.apns`. |
+| `FCM_KEY` | secret | FCM. The private key of a Google service account that may send messages for the project: an RSA key, PKCS #8 DER, b64u. |
+| `FCM_EMAIL` | var, required with `FCM_KEY` | The service account's e-mail address (its `client_email`). |
+| `FCM_PROJECT` | var, required with `FCM_KEY` | The Firebase project's ID, 6 to 30 characters of `[a-z0-9-]`. Reported as params `push.fcm`. |
 | `POW_PUSH` | var | The PoW base of `push/sub` (§10.2), default 20. |
 | `PUSH_MAX_SUBS` | var | The most endpoints stored, default 100 000. |
 | `PUSH_DAY_SUBS` | var | The most endpoints whose registration may change in one day, default 2 000 ("Memory", below). |
 
 A deployment that offers push MUST also set `APP_HOSTS` (§9.7), whose first host gives the payload's `navigate` URL.
-**An invalid push configuration turns push off, and nothing else.** When `VAPID_SK` is set but the push configuration is
-invalid (`VAPID_SK` not a valid P-256 scalar; `PUSH_KEY` missing or not 32 bytes; `VAPID_SUB` missing, or not a
-`mailto:` or `https:` URI; `PUSH_HOSTS`, `POW_PUSH`, `PUSH_MAX_SUBS` or `PUSH_DAY_SUBS` present but malformed or out of
-range; `APP_HOSTS` empty), push is off exactly as without `VAPID_SK`: params omit `push` and `pow.push` (§10.9), and
-`push/sub`, `ring` and `seen` answer as when push is not configured (§10.10). The Worker logs the reason once per isolate,
-naming the setting but never its value (§9.7), and every other endpoint works as before: push settings never make the
-Worker answer 503 "server misconfigured" (§3.1). While push is off, PushDO sends nothing, and its daily pass deletes
-only the endpoints whose day has expired (below): it never deletes one because its `box` does not open, since
-`PUSH_KEY` may be the setting that is missing or malformed. A new `PUSH_KEY` invalidates every registration (none of
-them matches or opens under it): the next daily pass deletes them, they count toward `PUSH_MAX_SUBS` until then, and
-devices register again at each device's next start (§11.13); so it SHOULD NOT change. A new `VAPID_SK` makes every push
-to an existing subscription fail until its device subscribes again with the new key, at its next start (§11.13), so it
-SHOULD NOT change either.
+**An invalid push setting turns off what it belongs to, and nothing else.** An invalid setting of a transport turns that
+transport off: for Web Push, `VAPID_SK` not a valid P-256 scalar, `VAPID_SUB` missing or not a `mailto:` or `https:`
+URI, or `PUSH_HOSTS` malformed; for APNs, `APNS_KEY` not a valid P-256 scalar, or `APNS_KEY_ID`, `APNS_TEAM` or
+`APNS_TOPICS` missing or malformed; for FCM, `FCM_KEY` not an RSA key in PKCS #8, or `FCM_EMAIL` or `FCM_PROJECT`
+missing or malformed. Push is off, exactly as when no transport's secret is set, when `PUSH_KEY` is missing or not 32
+bytes, when `POW_PUSH`, `PUSH_MAX_SUBS` or `PUSH_DAY_SUBS` is present but malformed or out of range, when `APP_HOSTS` is
+empty, or when no transport is on: params omit `push` and `pow.push` (§10.9), and `push/sub`, `ring` and `seen` answer
+as when push is not configured (§10.10). The Worker logs the reason once per isolate, naming the setting but never its
+value (§9.7), and every other endpoint works as before: push settings never make the Worker answer 503 "server
+misconfigured" (§3.1). While push is off, PushDO sends nothing, and its daily pass deletes only the endpoints whose day
+has expired (below): it never deletes one because its `box` does not open, since `PUSH_KEY` may be the setting that is
+missing or malformed. A new `PUSH_KEY` invalidates every registration (none of them matches or opens under it): the next
+daily pass deletes them, they count toward `PUSH_MAX_SUBS` until then, and devices register again at each device's next
+start (§11.13); so it SHOULD NOT change. A new `VAPID_SK` makes every push to an existing subscription fail until its
+device subscribes again with the new key, at its next start (§11.13), so it SHOULD NOT change either. A new APNs or FCM
+key changes nothing for the devices: their tokens stay valid.
 
 **Storage.** Durable storage holds the registrations as the daily passes wrote them (below), and nothing else:
 
@@ -2402,14 +2455,18 @@ CREATE TABLE tok (tk BLOB NOT NULL CHECK (length(tk) = 16), ep BLOB NOT NULL, PR
 CREATE INDEX tok_ep ON tok (ep);
 ```
 
-- `ep` names an endpoint: `t16(HMAC(PUSH_KEY, enc("segv.sh/v2/push/ep", endpoint)))`.
-- `box` holds the endpoint and the subscription's keys: `aeadSeal(PUSH_KEY, enc(endpoint, p256dh, auth),
-  aad = enc("segv.sh/v2/push/sub", ep))`.
+- `ep` names an endpoint: `t16(HMAC(PUSH_KEY, enc("segv.sh/v2/push/ep", endpoint)))`. An **endpoint** is the address of
+  a device's pushes, as `push/sub` gave it (§10.10): a Web Push subscription's URL, or, for a native app,
+  `apns:<env>:<topic>:<token>` or `fcm:<token>`.
+- `box` holds the endpoint and the keys its pushes are encrypted to (a Web Push subscription's, or a native app's own,
+  §11.13): `aeadSeal(PUSH_KEY, enc(endpoint, p256dh, auth), aad = enc("segv.sh/v2/push/sub", ep))`.
 - `tk` stands for a bell registered for the endpoint: `t16(HMAC(PUSH_KEY, enc("segv.sh/v2/push/bell", bell)))`, or
-  for its account's quiet tag `Q` (§4.1): `t16(HMAC(PUSH_KEY, enc("segv.sh/v2/push/quiet", Q)))`. The two labels
-  differ, so a bell's `tk` never matches a quiet tag's: a ring never reaches an endpoint through its quiet tag, and a
-  `seen` never through a bell. A bell is a capability (whoever holds it can ring it or register under it), so it is
-  never stored in the clear; neither is a quiet tag, although it is none (`seen` takes its preimage, §10.10).
+  for its account's quiet tag `Q` (§4.1): `t16(HMAC(PUSH_KEY, enc("segv.sh/v2/push/quiet", Q)))`, and, for an endpoint
+  that takes notes (§10.10), for the same `Q` once more, as its **note tag**: `t16(HMAC(PUSH_KEY,
+  enc("segv.sh/v2/push/note", Q)))`. The three labels differ, so no `tk` of one kind matches one of another: a ring
+  reaches an endpoint through a bell only, a `seen` through a quiet tag only, and a note through a note tag only. A bell
+  is a capability (whoever holds it can ring it or register under it), so it is never stored in the clear; neither is a
+  quiet tag, although it is none (`seen` and `sync` take its preimage, §10.10, §10.11).
 - `day` is the UTC day of the endpoint's last registration, `⌊Unix ms / 86 400 000⌋`, the only time kept for a
   registration.
 
@@ -2423,13 +2480,13 @@ an accepted request, a leave or an ended copy adds or removes one, and a ring ca
 conversation's members refuse their pushes and be deleted, so on a day with few changes, endpoints whose sets changed,
 or that were deleted, that day may be co-members (§13.4).
 
-**Memory.** The object's memory holds three things:
+**Memory.** The object's memory holds four things:
 
 - **The day's registration changes.** Every `sub` (below), and every deletion at a push, takes effect in memory at
   once, noted with its UTC day, and replaces any earlier change of that endpoint: from then on rings and pushes use the
   stored registrations with the changes in memory applied. Only the daily pass (below) writes them to storage, once
-  their day has ended. A `sub` whose keys, bells and quiet tag equal those **stored** for its endpoint is kept as its
-  day alone (a refresh); any other `sub` is kept whole, also when it repeats a change already in memory.
+  their day has ended. A `sub` whose keys, bells, quiet tag and note tag equal those **stored** for its endpoint is kept
+  as its day alone (a refresh); any other `sub` is kept whole, also when it repeats a change already in memory.
 - **Everything a ring causes**, which is never written: per endpoint with a push in flight, the time of its last push
   (`last`), the time of its next one (`due`) and the attempts made for that one (`tries`), each kept at most
   `PUSH_WINDOW` after the endpoint's last push, the bells that rang it since its last push (`rang`: those of its
@@ -2441,36 +2498,42 @@ or that were deleted, that day may be co-members (§13.4).
 - **The rows that an account marked seen** (`seen`, below), which are never written: per endpoint, a hash of each
   row's `(E, label)` with the time it expires, `SEEN_TTL` = 120 s after its last mark, at most `PUSH_SEEN` = 64 per
   endpoint (a mark beyond them drops the one that expires first).
+- **The notes** (`note`, below), which are never written: per endpoint that takes notes, the last `PUSH_NOTES` = 4 notes
+  that reached it, newest first, each kept `NOTE_TTL` = 600 s after it came, and whether a quiet push to it is due.
 
-A restart of the object (an eviction, or a deploy) loses all three: the pushes then due and the windows, so the limit of
+A restart of the object (an eviction, or a deploy) loses all four: the pushes then due and the windows, so the limit of
 one push per `PUSH_WINDOW` and the dedup of rings hold except across a restart; the rows marked seen, so a push that a
-mark made before the restart would have prevented is sent; and the registration changes not yet written, so the
-registrations are again those that the daily passes wrote. Devices send their sets again at their next
-start and at least once a day while they run (§11.13), and an endpoint whose deletion was lost is deleted again at its
-first push, since a device ends its subscription before it deletes its registration (§11.13) and a refused push is
-refused again. All of this is best effort (§0.4). The object's alarm, which the platform stores, holds only the time of
-its next run, which follows the clock alone (below).
+mark made before the restart would have prevented is sent; the notes, so a quiet push then due is not sent and no later
+push carries them; and the registration changes not yet written, so the registrations are again those that the daily
+passes wrote. Devices send their sets again at their next start and at least once a day while they run (§11.13), and an
+endpoint whose deletion was lost is deleted again at its first push, since a device ends its subscription, or gives up
+its token, before it deletes its registration (§11.13) and a refused push is refused again. All of this is best effort
+(§0.4). The object's alarm, which the platform stores, holds only the time of its next run, which follows the clock
+alone (below).
 
-**Limits.** At most `PUSH_TOKENS` = 256 bells and one quiet tag per endpoint (params `push.maxTokens`, equal to
-`limits.topics`, counts the bells), at most `PUSH_PER_BELL` = 8 endpoints per bell and per quiet tag, at most `PUSH_BELLS` = 4 bells named by one push, at most `PUSH_MAX_SUBS`
-endpoints in all, at most `PUSH_DAY_SUBS` endpoints with changes in memory that register them or change their keys,
-bells or quiet tag (a deletion, or a refresh of the day alone, does not count), and at most `PUSH_ROWS` = 20 000 rows read, written
-or deleted by one alarm run's part of the daily pass.
+**Limits.** At most `PUSH_TOKENS` = 256 bells, one quiet tag and one note tag per endpoint (params `push.maxTokens`,
+equal to `limits.topics`, counts the bells), at most `PUSH_PER_BELL` = 8 endpoints per bell, per quiet tag and per note
+tag, at most `PUSH_BELLS` = 4 bells named by one push, at most `PUSH_MAX_SUBS` endpoints in all, at most `PUSH_DAY_SUBS`
+endpoints with changes in memory that register them or change their keys, bells, quiet tag or note tag (a deletion, or a
+refresh of the day alone, does not count), and at most `PUSH_ROWS` = 20 000 rows read, written or deleted by one alarm
+run's part of the daily pass.
 
-**`sub(endpoint, p256dh, auth, tokens, quiet)`** (from `push/sub`, whose fields the Worker has checked, §10.10;
-`quiet` is the account's quiet tag, or none) changes the registrations in memory, at once:
+**`sub(endpoint, p256dh, auth, tokens, quiet, notes)`** (from `push/sub`, whose fields the Worker has checked, §10.10;
+`quiet` is the account's quiet tag, or none, and `notes` whether the endpoint takes notes) changes the registrations in
+memory, at once:
 
 1. With `tokens` empty, delete the endpoint's registration, its push state and its rows marked seen, and answer OK.
 2. If the endpoint is not registered and `PUSH_MAX_SUBS` endpoints are, answer FULL. If the call registers the
-   endpoint, or changes its keys, bells or quiet tag, while `PUSH_DAY_SUBS` other endpoints have such changes in
-   memory, answer FULL.
-3. Set its registration: the given keys, `day` = today, each distinct bell, and the quiet tag when one is given,
-   except a bell or quiet tag that 8 other endpoints already hold: that one is left out for this endpoint, which takes
-   no other endpoint's place. Answer OK.
+   endpoint, or changes its keys, bells, quiet tag or note tag, while `PUSH_DAY_SUBS` other endpoints have such changes
+   in memory, answer FULL.
+3. Set its registration: the given keys, `day` = today, each distinct bell, the quiet tag when one is given, and the
+   note tag when `notes` is true, except a bell, quiet tag or note tag that 8 other endpoints already hold: that one is
+   left out for this endpoint, which takes no other endpoint's place. Answer OK.
 
 Each call thus replaces an endpoint's registration as a whole and refreshes it; a bell's places go to the endpoints
 that hold them first, for as long as they keep refreshing them. Only an account's own devices know its quiet tag, so
-only they take its places; an endpoint left out of them is notified as if it had registered none.
+only they take its places and those of its note tag; an endpoint left out of them is notified as if it had registered
+none, and gets no notes.
 
 **`ring(E, label, tokens)`** (from `ring`, after the Worker found the row fresh, §10.10):
 
@@ -2507,6 +2570,21 @@ sent changes nothing, and one that comes while it is being sent only keeps it fr
 fails (it is then cancelled instead). A dropped `rows` (more than `PUSH_PENDING` rows) makes the push impossible to
 cancel, and a push to an endpoint that registered no quiet tag never is.
 
+**`note(Q, n)`** (from `sync`, §10.11; `Q` is the quiet tag that the Worker computed from the request's secret, and `n`
+the sealed note, 552 bytes) passes a sync note (§11.16) to the account's endpoints that take notes. For each endpoint
+registered under the note tag of `Q`:
+
+1. put `n` at the front of its notes, dropping those older than `NOTE_TTL` and those beyond the first `PUSH_NOTES`;
+2. unless a quiet push to it is due, make one due.
+
+`note` writes nothing, not even the alarm, and does nothing when no endpoint is registered under the note tag of `Q`. A
+**quiet push** carries the endpoint's notes and no bell. It is not held: the alarm's next run sends it, at most
+`PUSH_TICK` later (below), and it is never retried. Every push to the endpoint, quiet or not, carries the notes that the
+endpoint holds at the time, so a note reaches the device in each push that follows it until `PUSH_NOTES` newer notes
+have come or `NOTE_TTL` has passed: a quiet push that is lost, or that a later one replaces, loses no note that a later
+push still carries. A push that rings made due carries the notes too, and a quiet push due to the same endpoint is then
+no longer due.
+
 **Alarm.** The alarm runs on a fixed cadence that nothing else moves: at every multiple of `PUSH_TICK` = 10 s of Unix
 time, whether push is on or off and whatever is registered or due. Each run first arms the next multiple. When no
 alarm is set, the constructor (inside `blockConcurrencyWhile`) arms it at the next multiple, as CheckpointDO's does
@@ -2515,9 +2593,9 @@ an event; otherwise the stored alarm time follows the clock alone, and neither a
 every alarm handler of §9, it never arms a time in the past. Each run then does, in this order:
 
 1. its part of the daily pass (below), in one transaction;
-2. while push is on, the pushes that are due, earliest `due` first, in batches of at most 50 and at most one batch a
-   second, until none is due or the next run's time has come; the rest wait for the next run. While push is off, it
-   sends nothing and drops what is due.
+2. while push is on, the pushes that are due, those that rings made due earliest `due` first and then the quiet pushes,
+   in batches of at most 50 and at most one batch a second, until none is due or the next run's time has come; the rest
+   wait for the next run. While push is off, it sends nothing and drops what is due.
 
 **The daily pass** is the only writer of `sub` and `tok`. A pass starts at the first run of each UTC day (normally the
 one at 00:00) and at the first run after the object starts, and goes through the stored endpoints and those with a
@@ -2540,9 +2618,17 @@ worst day, on which all `PUSH_MAX_SUBS` endpoints expire with 256 bells each and
 (about 27 million rows), takes about 1 400 runs, some 4 hours.
 
 **Sending a push.** For a due endpoint the alarm takes the endpoint and its keys from its registration, opening `box`
-for a stored one; when the endpoint's host is no longer in `PUSH_HOSTS`, or the `box` does not open, it deletes the
-endpoint instead. Otherwise it sends one Web Push message (RFC 8030), `POST <endpoint>`, never following a redirect
-(`fetch` with `redirect: "manual"`), with:
+for a stored one. When the `box` does not open, when a Web Push endpoint's host is no longer in `PUSH_HOSTS`, or when
+an APNs endpoint's topic is no longer in `APNS_TOPICS`, it deletes the endpoint instead; when the endpoint's transport
+is off, it drops the push (as after a failed retry, below) and keeps the endpoint. Otherwise it sends one request of
+the endpoint's transport, never following a redirect (`fetch` with `redirect: "manual"`). Every push carries the
+endpoint's **bells block**: its `rang` at the time of the attempt, 16 bytes per bell, followed by zero bytes up to
+`16·PUSH_BELLS` = 64 bytes (all zero in a quiet push). A push of a native transport (APNs, FCM) also carries the **notes
+block**: the endpoint's notes at the time of the attempt, newest first, 552 bytes each, followed by zero bytes up to
+`552·PUSH_NOTES` = 2 208 bytes. The two blocks, 2 272 bytes, keep each push within the 4 096 bytes that APNs and FCM
+accept. A Web Push message carries no notes block: a Web Push endpoint never takes notes (§10.10).
+
+**Web Push**: one Web Push message (RFC 8030), `POST <endpoint>`, with:
 
 - `TTL: 86400`, `Urgency: normal` and `Topic: segv`, so that a push that the push service still holds for the device
   is replaced by the next one (whose `rang` does not repeat the replaced push's bells);
@@ -2555,35 +2641,95 @@ endpoint instead. Otherwise it sends one Web Push message (RFC 8030), `POST <end
   (`VAPID_SUB`). A JWT MAY be reused for the same `aud` until one hour before its `exp`.
 
 The **payload** is this UTF-8 text, where `<host>` is the first host of `APP_HOSTS` and `<bells>` is the unpadded
-b64u (86 characters) of the endpoint's `rang` at the time of the attempt, 16 bytes per bell, followed by zero bytes up
-to `16·PUSH_BELLS` = 64 bytes:
+b64u (86 characters) of the bells block:
 
 ```
 {"web_push":8030,"mutable":true,"notification":{"title":"segv.sh","body":"new messages","navigate":"https://<host>/","tag":"segv","data":{"bells":"<bells>"}}}
 ```
 
-Every push of a deployment thus has the same length and the same text, and differs only in `<bells>`. It is a
-declarative push message (W3C Push API). A browser that supports those (Safari on iOS and iPadOS 18.4 and later)
-hands it, since it is `mutable`, to the device's Service Worker as a proposed notification that carries `data`, and
-shows that notification itself when the Service Worker shows none in time; other browsers pass the payload to the
-Service Worker (§11.13). `tag` makes a new notification replace an earlier one that is still shown. The payload holds
-no text of any message and names no sender or count. Its bells tell the device alone, once the browser has decrypted
-the push (RFC 8291), which of its registrations rang: O knows them from the rings, and N cannot read them.
+Every Web Push message of a deployment thus has the same length and the same text, and differs only in `<bells>`. It is
+a declarative push message (W3C Push API). A browser that supports those (Safari on iOS and iPadOS 18.4 and later) hands
+it, since it is `mutable`, to the device's Service Worker as a proposed notification that carries `data`, and shows that
+notification itself when the Service Worker shows none in time; other browsers pass the payload to the Service Worker
+(§11.13). `tag` makes a new notification replace an earlier one that is still shown. The payload holds no text of any
+message and names no sender or count. Its bells tell the device alone, once the browser has decrypted the push (RFC
+8291), which of its registrations rang: O knows them from the rings, and N cannot read them.
 
-The answer decides the rest:
+**APNs**: one request to APNs (over HTTP/2), `POST https://<apns-host>/3/device/<token>`, where `<apns-host>` is
+`api.push.apple.com` for the environment `production` and `api.sandbox.push.apple.com` for `sandbox`, with:
+
+- `apns-push-type: alert`, `apns-priority: 10`, `apns-topic: <topic>`, `apns-expiration: <now + 86 400 s, in seconds
+  since the Unix epoch>` and `apns-collapse-id: segv`, so that a push that APNs still holds for the device is replaced
+  by the next one, as `Topic` does for Web Push;
+- `authorization: bearer <JWT>`: a JWT signed with ES256 under `APNS_KEY`, with the header
+  `{"alg":"ES256","kid":"<APNS_KEY_ID>"}` and the claims `iss` (`APNS_TEAM`) and `iat` (seconds since the Unix epoch).
+  PushDO makes a new JWT at most once every 20 minutes and uses each for at most 50 minutes, the bounds that APNs sets;
+- `content-type: application/json` and this body, where `<c>` is the unpadded b64u (3 167 characters) of the bells block
+  followed by the notes block, encrypted to the endpoint's keys as RFC 8291 says (`aes128gcm`: a fresh P-256 key pair
+  and a random 16-byte salt per push, one record, record size 4096):
+
+  ```
+  {"aps":{"alert":{"title":"segv.sh","body":"new messages"},"sound":"default","mutable-content":1,"thread-id":"segv"},"segv":"<c>"}
+  ```
+
+`mutable-content` hands the push to the app's notification service extension (§11.13), and the system shows the
+alert's fixed text itself when the extension shows nothing else in time.
+
+A **quiet push** to APNs has `apns-expiration: 0` and no `apns-collapse-id`, and this body, without `sound` or
+`thread-id`:
+
+```
+{"aps":{"alert":{"title":"segv.sh","body":"new messages"},"mutable-content":1,"interruption-level":"passive"},"segv":"<c>"}
+```
+
+With an expiration of 0, APNs tries to deliver the push once and stores nothing, so the quiet push never replaces a push
+that APNs holds for a device that is offline (APNs keeps only the newest one per app). It keeps `apns-priority: 10`:
+the extension shows nothing for it but sets the app's badge (§11.13), and should the extension fail, the system shows
+the fixed text, without a sound.
+
+**FCM**: one request to FCM's HTTP v1 API,
+`POST https://fcm.googleapis.com/v1/projects/<FCM_PROJECT>/messages:send`, with `authorization: Bearer <access token>`,
+`content-type: application/json` and this body, `<c>` being as for APNs:
+
+```
+{"message":{"token":"<token>","data":{"segv":"<c>"},"android":{"priority":"HIGH","ttl":"86400s","collapse_key":"segv"}}}
+```
+
+It is a data message: it names no notification, and the app's messaging service shows every notification itself
+(§11.13). The access token comes from Google's OAuth 2.0 token endpoint, `POST https://oauth2.googleapis.com/token`
+with the JWT bearer grant (RFC 7523), for a JWT signed with RS256 under `FCM_KEY` with the claims `iss` (`FCM_EMAIL`),
+`scope` (`https://www.googleapis.com/auth/firebase.messaging`), `aud` (`https://oauth2.googleapis.com/token`), `iat`
+and `exp` (at most one hour after `iat`); PushDO reuses it until five minutes before it expires.
+
+A **quiet push** to FCM has `"priority":"NORMAL"`, `"ttl":"600s"` and `"collapse_key":"segv-note"` in place of the three
+values above. FCM delivers it at once to a device that is awake, and holds it while the device sleeps, keeping only the
+newest quiet push, which carries the notes of those it replaces while they are kept; its collapse key differs from that
+of the other pushes, so it never replaces one of them. The app shows nothing for it (§11.13).
+
+Every push of a transport thus has the same fixed text, every quiet push the same headers, and the encrypted part of
+every push of a transport the same length; no push carries the text of a message, a sender or a count. The answer
+decides the rest:
 
 - a 2xx: the push is sent; `last` = when it was sent, nothing is due, and `rang` and `rows` are emptied;
-- a 429, a 5xx, a network error, or no answer within 10 s: retry once (`tries = 1`), after the answer's `retry-after`
-  when that is at most 60 s, else after 10 s; when the retry fails as well, drop the push (`last` = its first
-  attempt, `rang` and `rows` emptied), and keep the endpoint;
-- anything else, a 3xx or any 4xx other than 429 (404 and 410 for a subscription that expired or was revoked, 400,
-  401, 403, 413): delete the endpoint, so that an endpoint that no push service accepts is gone at its first push.
+- a 429, a 5xx, a network error, no answer within 10 s, or, for FCM, a failed request for its access token: retry once
+  (`tries = 1`), after the answer's `retry-after` when that is at most 60 s, else after 10 s; when the retry fails as
+  well, drop the push (`last` = its first attempt, `rang` and `rows` emptied), and keep the endpoint;
+- an answer that refuses the device: for Web Push anything else, a 3xx or any 4xx other than 429 (404 and 410 for a
+  subscription that expired or was revoked, 400, 401, 403, 413); for APNs a 410, or a 400 whose reason is
+  `BadDeviceToken` or `DeviceTokenNotForTopic`; for FCM a 404 (`UNREGISTERED`), or a 403 whose error code is
+  `SENDER_ID_MISMATCH`: delete the endpoint, so that an endpoint that its push service no longer accepts is gone at
+  its first push;
+- any other answer of APNs or FCM (a 3xx, or a 4xx other than these and 429), which comes from the operator's
+  configuration rather than from the device: drop the push and keep the endpoint.
+
+A quiet push is never retried and changes neither `last` nor what rings made due: after any answer it is no longer due,
+and an answer that refuses the device deletes the endpoint as above.
 
 A dropped push is reported only as a count in the logs (§9.7).
 
 **Capacity.** One PushDO holds every registration in stage 1, within the limits above, and sends at most about 50
-pushes a second; a flood of registrations or rings can fill it or delay everyone's notifications (§0.4). §14 has the
-path beyond it.
+pushes a second, quiet pushes included; a flood of registrations or rings can fill it or delay everyone's notifications
+(§0.4). §14 has the path beyond it.
 
 ## 10. HTTP and WebSocket API
 
@@ -2624,12 +2770,23 @@ path beyond it.
   goes stale.
 - **Hardening.** §9.7 applies to every response (the `101` upgrade only through its exemption), including the era
   bounds and the cache-before-limits rule.
+- **Cross-origin requests.** Only the pages of the deployment's own origin and of its app origins (`APP_ORIGINS`,
+  §9.7) may read the API's answers. A request whose `Origin` header equals an app origin gets, on every `/api/v2/*`
+  answer except the `101` upgrade, `access-control-allow-origin: <that origin>`,
+  `access-control-expose-headers: x-segv-now, retry-after` and `vary: origin`. The Worker sets them on the response
+  object it returns, after any `caches.default` lookup, and never stores them in `caches.default`, as for
+  `x-segv-now`. A preflight (`OPTIONS` with `access-control-request-method`) from an app origin is answered `204` with
+  no body, `access-control-allow-origin: <that origin>`, `access-control-allow-methods: GET, POST, PUT`,
+  `access-control-allow-headers: content-type, x-segv-pow`, `access-control-max-age: 600`, `vary: origin` and
+  `x-segv-now`, in step 3 below (before the rate limit). No answer carries `access-control-allow-credentials`: the
+  API has no credentials. Any other `OPTIONS` request is a wrong method (405), and an answer to any other origin
+  carries none of these headers, so a browser keeps the pages of every other site from reading it, as before.
 
 **Status codes:**
 
 | code | meaning |
 | ---- | ------- |
-| 200 / 201 / 204 | success (put and get carry per-row status inside a 200; `push/sub`, `ring` and `seen` answer 204 with no body, §10.10) |
+| 200 / 201 / 204 | success (put and get carry per-row status inside a 200; `push/sub`, `ring`, `seen` and `sync` answer 204 with no body, §10.10 and §10.11, and so does a preflight from an app origin) |
 | 400 | malformed request (bad layout, length, encoding, class, count, id or handle) |
 | 403 | missing, malformed, stale or insufficient proof of work |
 | 404 | unknown path (the push endpoints while push is off included, §9.8, §10.10), user, uid, blob, era or checkpoint |
@@ -2649,8 +2806,9 @@ path beyond it.
 2. server configuration (secrets, deployment parameters, §3.1): 503 `{error: "server misconfigured"}`, without any DO
    or D1 call (push settings are not part of it: an invalid one only turns push off, §9.8);
 3. path: 404 when no route matches (`/api/v2/push/sub` and `/api/v2/ring` match no route while push is off: not
-   configured, or configured invalidly, §9.8); method: 405 with `allow`; for `/api/v2/rt`: 426 without an upgrade, 403
-   for a foreign Origin;
+   configured, or configured invalidly, §9.8); method: 405 with `allow`, except a preflight from an app origin, which is
+   answered 204 here ("Cross-origin requests", above); for `/api/v2/rt`: 426 without an upgrade, 403 for a foreign
+   Origin (§10.8);
 4. for the cacheable GETs (blob, inbox read, feed page, `/ckpt/{q}`): the path, query and era-bound checks that need
    no storage (§9.7, §10.5, §10.9), then the `caches.default` lookup; a hit is returned here;
 5. the rate limit: 429 with `retry-after`, or 503 when the limiter fails;
@@ -2712,6 +2870,7 @@ never stored.
 | `RL_BLOB` | 20 / 60 s | blob PUT |
 | `RL_RING` | 60 / 60 s | `ring` (§10.10; a binding of its own, so that ringing after each put leaves `RL_WRITE` to the puts) |
 | `RL_SEEN` | 60 / 60 s | `seen` (§10.10; a binding of its own, so that marks never take the tokens of rings) |
+| `RL_SYNC` | 60 / 60 s | `sync` (§10.11; a binding of its own, like `RL_SEEN`) |
 | `RL_READ` | 600 / 60 s | get, inbox read, directory reads, dirlog, blob GET and meta, ckpt, feed (one token per started 4 MiB of the page's batches, without the page header, at least 1 and at most 64, §10.9), era, rt upgrade |
 
 `/api/v2/params` is not rate limited (§9.5: it never reaches the CheckpointDO per request). Responses served from
@@ -2966,7 +3125,8 @@ is the MISS of §6.4(g). It is `no-store`.
 The upgrade is refused:
 
 - with 426 when there is no upgrade header;
-- with 403 when an `Origin` header is present and its host differs from the request host.
+- with 403 when an `Origin` header is present, its host differs from the request host, and it is not an app origin
+  (`APP_ORIGINS`, §9.7).
 
 The Worker forwards only `{upgrade, x-segv-client: hex(HMAC(wsTagKey, "ws|" + clientKey))[0..32]}` to the RealtimeDO.
 
@@ -2977,9 +3137,13 @@ The Worker forwards only `{upgrade, x-segv-client: hex(HMAC(wsTagKey, "ws|" + cl
 SUB     = 0x01 | u16 n (1..256) | topic[16] × n                   add topics (the socket's total must stay ≤ 256)
 UNSUB   = 0x02 | u16 n (1..256) | topic[16] × n                   remove topics
 RESUME  = 0x03 | boot[8] | u64 since_seq | u16 n (0..256) | topic[16] × n
+NOTES   = 0x04                                                    get NOTE frames on this socket from now on
 ```
 
 RESUME is allowed only as the first binary frame. It replaces the topic set.
+
+NOTES is allowed once per socket. From then on the socket gets the NOTE frames of its topics (§9.4). A client of the
+first release never sends it, and so never gets a NOTE frame, which it could not parse.
 
 **Server → client** (binary):
 
@@ -2988,6 +3152,7 @@ HELLO   = 0x80 | boot[8] | u64 now_ms | u64 seq                   sent right aft
 ROWS    = 0x81 | u16 n (1..65535) | (u64 seq | topic[16] | u16 E | label[16] | u32 t | u8 cls | body[CLASSES[cls]+40]) × n
 GAP     = 0x82 | u64 since_seq                                    rows published after since_seq may have been missed
 RESUMED = 0x83                                                    the replay for RESUME is complete
+NOTE    = 0x84 | topic[16] | note[552]                            a sync note for one of the socket's topics (§11.16)
 ```
 
 The server MUST NOT send a ROWS frame with `n = 0`; a client treats one as unparseable (close and reconnect, as for
@@ -3015,6 +3180,8 @@ costs a catch-up (§11.6), never a lost row.
   current epochs of accepted copies by recent activity, followed old epochs (§11.2), then links. Request copies are
   never subscribed (§11.5). Copies beyond the budget are covered by catch-up (§11.6).
 - On reconnect, send RESUME, and SUB any further topics.
+- Send NOTES on every socket: right after its RESUME, or as its first frame when it sends none. On a NOTE frame for
+  `Tself`, apply the note (§11.16); ignore a NOTE frame for any other topic.
 - After GAP, run catch-up (§11.6). After a SUB of a topic that was not subscribed before, run a one-shot probe of that
   topic's expected slots, since rows published before the SUB are not replayed.
 - Reconnect with backoff of 1 s, doubling to 30 s, with jitter; ping every 30 s. After a close with 1008 or 1013, wait
@@ -3036,11 +3203,14 @@ costs a catch-up (§11.6), never a lost row.
 `p` is `P` as §9.6 says; during a D1 outage it may be a stale value or 0, and params never fails because of D1.
 Clients bound it from below by the dirlog size (`P*`, §10.6).
 
-A deployment whose push is on (§9.8) also reports `"push":{"vapid":"<b64u 65-byte P-256 public key>","window":60,
-"maxTokens":256}` and `pow.push`; while push is off (not configured, or configured invalidly) it reports neither.
-`window` is `PUSH_WINDOW` in seconds and `maxTokens` is `PUSH_TOKENS`. A client ignores the keys of params that it does
-not know (the first release does), and takes a `push` whose `vapid` is not 65 bytes starting with `0x04`, whose `window`
-or `maxTokens` is not a positive integer, or that comes without `pow.push`, as no push.
+A deployment whose push is on (§9.8) also reports `"push":{"window":60,"maxTokens":256}` and `pow.push`, and in `push`
+the transports that are on: `"vapid":"<b64u 65-byte P-256 public key>"` while Web Push is on, `"apns":["<topic>", …]`
+(`APNS_TOPICS`) while APNs is on, and `"fcm":"<FCM_PROJECT>"` while FCM is on; while push is off (not configured, or
+configured invalidly) it reports neither `push` nor `pow.push`. `window` is `PUSH_WINDOW` in seconds and `maxTokens` is
+`PUSH_TOKENS`. A client ignores the keys of params that it does not know (the first release does). A browser takes a
+`push` whose `vapid` is missing or is not 65 bytes starting with `0x04`, whose `window` or `maxTokens` is not a positive
+integer, or that comes without `pow.push`, as no push; a native app does the same with its own transport: an `apns` that
+does not list its bundle ID, or an `fcm` that is not its project.
 
 **`GET /api/v2/era/{E}`** (JSON; `RL_READ`) returns `{"era": E, "start": start(E), "end": end(E), "delta": Δ,
 "shards": 1, "kcommit": b64u(kcommit_E), "sealed": bool}`. `start` and `end` (§3.1) are Unix milliseconds, the unit of
@@ -3106,29 +3276,40 @@ is already in the feed; the feed may hold later batches. Auditors check that eac
 occurs in the feed's head chain (not that it is the last head). Clients never use the feed. It exists so that the
 database stays public and mirrors and auditors can verify batch roots and the head chain against checkpoints.
 
-### 10.10 Web Push: `POST /api/v2/push/sub`, `POST /api/v2/ring` and `POST /api/v2/seen`
+### 10.10 Push: `POST /api/v2/push/sub`, `POST /api/v2/ring` and `POST /api/v2/seen`
 
 All three exist only while push is on (§9.8). While it is off, because the deployment does not configure it or
 configures it invalidly, they match no route (404, §10.1 step 3), exactly alike in both cases, and a client never calls
 them, since params carry no `push` (§10.9). The general rules of §10.1 apply to all three, in its order of checks.
 
-**`POST /api/v2/push/sub`** (JSON; PoW `push`; `RL_WRITE`; body ≤ 16 KiB) registers a device's push subscription and
+**`POST /api/v2/push/sub`** (JSON; PoW `push`; `RL_WRITE`; body ≤ 16 KiB) registers a device's push endpoint and
 its bells, replacing everything that endpoint had:
 
 ```json
-{"endpoint": "<https URL>", "p256dh": "<b64u 65 B>", "auth": "<b64u 16 B>", "tokens": ["<b64u 16 B>", …],
- "quiet": "<b64u 16 B>"}
+{"endpoint": "<https URL, apns:… or fcm:…>", "p256dh": "<b64u 65 B>", "auth": "<b64u 16 B>",
+ "tokens": ["<b64u 16 B>", …], "quiet": "<b64u 16 B>", "notes": true}
 ```
 
-- `endpoint` is a string of at most 1024 bytes that parses as an absolute URL whose serialization equals it, with the
-  scheme `https`, no username or password, no port (443 is implied), and a host that `PUSH_HOSTS` lists (§9.8). The
-  list keeps the server from sending requests to arbitrary hosts.
+- `endpoint` is a string of at most 1024 bytes in one of three forms, each only while its transport is on (§9.8):
+  - Web Push: an absolute URL whose serialization equals it, with the scheme `https`, no username or password, no port
+    (443 is implied), and a host that `PUSH_HOSTS` lists. The list keeps the server from sending requests to arbitrary
+    hosts.
+  - APNs: `apns:<env>:<topic>:<token>`, where `<env>` is `production` or `sandbox` (the APNs environment of the app's
+    build), `<topic>` is one of `APNS_TOPICS`, and `<token>` is the device token that the app got from the system, as
+    64 to 200 lowercase hexadecimal digits (an even number of them).
+  - FCM: `fcm:<token>`, where `<token>` is the registration token that the app got from FCM, 1 to 1000 characters of
+    `[A-Za-z0-9_:-]`.
+
+  APNs and FCM are reached at fixed hosts only (§9.8), so neither form lets a client choose where the server sends.
 - `p256dh` is 65 bytes, an uncompressed P-256 point on the curve (`0x04 ‖ x ‖ y`), and `auth` is 16 bytes: the
-  subscription's `getKey("p256dh")` and `getKey("auth")`.
+  subscription's `getKey("p256dh")` and `getKey("auth")`, or a native app's own push keys (§11.13).
 - `tokens` holds 0 to `PUSH_TOKENS` = 256 bells of 16 bytes; a repeated bell counts once. An empty list deletes the
   endpoint's registration.
 - `quiet`, which may be absent, is 16 bytes: the account's quiet tag `Qself` (§4.1). An endpoint registered without
   one gets its pushes whatever its account marks seen (a tab still open on an earlier release sends none).
+- `notes`, which may be absent, is `true` or `false` (absent: `false`): whether the endpoint also takes its account's
+  sync notes, in quiet pushes (§9.8, §11.13). `true` is allowed only with `quiet` and with an APNs or FCM endpoint: a
+  browser must show a notification for every push (`userVisibleOnly`), and a quiet push shows none.
 
 A body that breaks any of these rules, or holds another key, is 400. Otherwise PushDO replaces the endpoint's
 registration as a whole and refreshes it (§9.8), and the answer is 204 with no body, also when a bell whose 8 places
@@ -3186,6 +3367,31 @@ the rows.
   can withhold any push anyway (§13.4).
 - **What a mark can do.** It only cancels or prevents pushes to the account's own endpoints, for the rows it names,
   for `SEEN_TTL`; the Worker checks nothing about the rows, since a mark of a row that never rang changes nothing.
+
+### 10.11 Sync notes: `POST /api/v2/sync`
+
+**`POST /api/v2/sync`** (binary; `RL_SYNC`; no PoW; body = 585 B) passes a sync note (§11.16) from a device to the other
+devices of its account: to the realtime sockets that subscribed to the note's topic and asked for notes (§10.8), and,
+while push is on, to the push endpoints that take notes (§9.8):
+
+```
+request = u8 ver (= 1) | qS[16] | topic[16] | note[552]          585 bytes
+```
+
+A body whose `ver` is not 1 or whose length is not 585 is 400. Once a request has passed steps 1–8 of §10.1, the Worker
+answers **204** with no body, and only then, through `ctx.waitUntil`, calls RealtimeDO's `note(topic, note)` (§9.4) and,
+while push is on, computes `Q = t16(H(enc("segv.sh/v2/quiet", qS)))` and calls PushDO's `note(Q, note)` (§9.8). A
+failure is logged (§9.7) and changes nothing else. The answer never depends on whether a socket or an endpoint gets the
+note.
+
+- **Without push.** Unlike the endpoints of §10.10, `sync` exists whether or not push is on; while it is off, notes
+  reach the sockets only.
+- **Who can send.** A device sends its account's `qS` and `Tself` (§4.1), which only the account's devices know, and O,
+  which sees them in `seen`, `sync` and SUB frames. The note is sealed under `kN` (§11.16), which the server never sees,
+  and a note that does not open is dropped by every device: whoever sends a request with the account's secrets but not
+  its key only wakes the account's devices, within `RL_SYNC` and PushDO's limits.
+- **What it tells.** The server cannot read a note, and every note has the same length. It learns that a device of the
+  account sent one at that moment, from that IP, and that `Tself` and `Qself` belong to one account (§13.4).
 
 ## 11. Client algorithms
 
@@ -3380,7 +3586,8 @@ only when a late row that some member saw is built again (step 8).
 
 ### 11.4 New device / reload (restore)
 
-Every unlock restores. There is no persisted local cache in stage 1.
+Every unlock restores: from the device's local state when it keeps one (§11.15), which makes a restore start where
+the device left off, and otherwise from the server alone, as below.
 
 1. Directory and checkpoints: §11.1.
 2. **Snapshot pointer.** Probe `Lsnap(E_now, 0..15)` and `Lsnap(E_now−1, 0..15)` (body mode).
@@ -3509,7 +3716,10 @@ Every unlock restores. There is no persisted local cache in stage 1.
    ordered by §11.8. The slots and the "fewer than 30 rows" count every row, REACTION rows included (§11.12): the
    initial history is a number of slots, so its cost never depends on what the rows hold, and a lane with many
    reactions shows fewer of its messages until scrollback loads more. A REACTION whose target lies before the slots
-   loaded waits until scrollback loads it.
+   loaded waits until scrollback loads it. **Unread rows**: for every copy whose read positions (§7.2 READ, §11.8) lie
+   before the slots that the restore loaded or processed, also fetch the rows from the read positions on, at most
+   `UNREAD_FETCH` = 256 per copy, in lane order from the earliest (body mode), so that its unread messages, and the
+   first of them, can be shown; a copy with more shows that it has at least that many, and scrollback loads the rest.
 7. **Inbox.** Read from the HEADS cursor (§11.5). Steps 4–5 have applied the self delta and restored every copy,
    a sibling's re-add copies and the copies of legacy skip records included, and settled the control lanes of the
    accepted ones; a request's is settled by step 8's probe, or by §6.7 step 4 when a J of its conversation comes first.
@@ -3699,6 +3909,8 @@ restore (§11.4 cost), again for each such J sent.
 Rows on a slot in the expected map that fail decryption occupy the slot: the client gives the noise warning "ignored
 an undecryptable message" and advances.
 
+**On a NOTE frame** (§10.8) for `Tself`, the client applies the note (§11.16); it ignores one for any other topic.
+
 **Catch-up** runs:
 
 - after GAP;
@@ -3763,9 +3975,21 @@ not stay followed are swept to their heads first (§11.2). Then it polls the inb
 - **`lastTs`** is the maximum clamped `ts` of the copy's TEXT and IMAGE rows and system lines. A REACTION row never
   raises it (§11.12): `lastTs` ranks the copies whose history a restore loads (§11.4 step 6), and a reaction that is
   later removed could not lower it again.
-- **`unread`** counts TEXT and IMAGE rows not signed by self (and epochs committed by others) applied after restore
-  finished, while `live`, never a REACTION row. It is not persisted. `markRead` resets it. A row applied during
-  restore, a row from a sibling device, and a row later dropped by §6.8 never count.
+- **`unread`** counts the copy's unread rows: the TEXT and IMAGE rows of other members' lanes (and the epochs
+  committed by others) that lie at or after their lane's read position in the epoch that the copy's READ names (§7.2),
+  or in a later epoch; never a REACTION row, a row of self's lane (a sibling device's included), or a row later
+  dropped by §6.8. A row counts whether the client applied it live or at a restore, so the messages that arrived while
+  every device of the account was closed stay unread when one opens. A copy without a READ for an epoch that it holds
+  (one that only the first release read, say) counts, until its first READ, the rows applied after its restore
+  finished, while `live`, as the first release did, so its old history never turns unread. A copy whose READ carries
+  the mark (flag bit0) counts as unread, with `unread` at least 1, until it is shown.
+- **Read positions.** While a device in use (§11.13) shows a copy, it moves the copy's read positions in its current
+  epoch to the end of what it shows (each lane's slot after the last row it holds) and clears the mark. The device
+  writes the READ records of the copies whose positions or mark changed in one self row (§7.3): when it stops being in
+  use, at most once per `READ_PERSIST` = 5 minutes while it is in use, with each HEADS row, and in each snapshot, so
+  that the public log holds at most a few such rows per hour of use. The account's other devices learn every change at
+  once from sync notes (§11.16), which the server passes on and cannot read. A device that learns of a read from a sync
+  note or a READ merges it into its own positions (§7.3) and closes that copy's notifications (§11.13).
 - **`MessageView.seq`** is a local, increasing application counter used as a stable tie-breaker. It is not a server
   sequence.
 
@@ -3854,10 +4078,12 @@ counted as unread.
 | `createConversation(handles, name)` | §6.1, by handle. It resolves after step 5, with the new copy in `conversations`; steps 6–9 run in the background. |
 | `sendText` / `sendImage` / `leave` | §11.3. An image is uploaded first (§8.1); the echo shows a local preview. |
 | `react(convId, messageKey, emoji, on)` | §11.3 and §11.12: one REACTION row for the TEXT or IMAGE row of that message, with `op` 1 for `on` and 0 otherwise. It resolves when the row counts as delivered (§11.3 step 8) and fails with §11.3's errors; there is no echo. Each `MessageView` carries `reactions: {emoji, count, mine}[]`. |
-| the notification setting of the device | §11.13: turning it on subscribes the browser and registers the set; turning it off unsubscribes, then deletes the registration and the notification cache. The preview (`none`, `name`, `message`) decides what notifications show. The names of these calls are implementation-defined. |
+| the notification setting of the device | §11.13: turning it on subscribes the browser (a native app: gets its token and push keys) and registers the set; turning it off unsubscribes (a native app: gives up its token and deletes its push keys), then deletes the registration and the notification cache. The preview (`none`, `name`, `message`) decides what notifications show. The names of these calls are implementation-defined. |
 | `addMembers` | Drop leavers (a separate commit first if a requested user is a listed leaver), then §6.3 with the added uids. Resolves after the switch and the first delivery attempt. |
 | `removeMember` | §6.3 without that uid and without leavers. Removing self is refused ("use “leave” to leave a conversation"). |
-| `markRead(convId)` | Resets `unread` and starts scrollback once (§11.10). It only reports that the conversation's pane is open: it accepts no copy and writes no CONTACT, whatever the copy (§11.5). |
+| `markRead(convId)` | Reports that the conversation's pane is open: it moves the copy's read positions and clears its mark (§11.8), and starts scrollback once (§11.10). It accepts no copy and writes no CONTACT, whatever the copy (§11.5). |
+| `markUnread(convId)` / `markAllRead()` | Set the copy's mark, or move every copy's read positions to the rows the client holds and clear every mark (§11.8). Both are written like other read positions. |
+| `setMuted(convId, until)` | Writes a CONV_PREFS mute for the copy (§7.2): every device of the account drops its bell from its registration set until `until` (§11.13). |
 | `accept(convId)` | The user's acceptance, from the accept control (§11.5). For a live copy whose `rootBy` is neither self nor a contact it writes, at once, in a self row that also holds a HEADS record (§7.3): for a request, unless §11.5 lets nothing accept it, the CONV_JOIN with `via = 5` and the CONTACT for `D.by`; for another such copy, the CONTACT for its `rootBy`. For any other copy, an ended one included, it does nothing. When `rootBy` has no MEMBER record (§7.3), which only a copy that is not a request can lack, `accept` first looks it up by uid as §10.6 does and writes the MEMBER in the CONTACT's row; when the lookup fails or finds no verified bundle for `rootBy`, `accept` fails with "could not verify who started this conversation; try again" and writes nothing. It resolves when that row is written and fails with the write's error. Each `ConversationView` carries `byContact`, false when the copy's `rootBy` is neither self nor a contact; while it is false and the copy has not ended, the UI shows the copy as a request's read-only preview, with the accept control, which calls `accept`. |
 | `loadImage` | §8.1, cached by `id.k`. |
 
@@ -3923,7 +4149,7 @@ lane's `prev` chain (§12.2). It writes no self record of its own.
   that it can read, and a row whose `prev` lies in the same era ends the lane for it; so when a member's first rows of
   an era are REACTION rows, that client loads none of the member's rows of earlier eras on that lane.
 
-### 11.13 Notifications (Web Push)
+### 11.13 Notifications
 
 Notifications are optional (§9.8). A client offers them only when params carry `push` (§10.9), and calls no endpoint
 of §10.10 otherwise. They are off by default and chosen per device, the pushes carry no content (§9.8), invites never
@@ -3933,39 +4159,53 @@ decrypts itself.
 
 - **The setting** belongs to the device, is off by default and is never synced: it is no PREFS key (§7.2), and the
   device keeps it in its own storage, with the endpoint it last registered. A client shows it only when params carry
-  `push` and the browser supports Web Push (on iOS and iPadOS, only in a web app opened from the Home Screen).
-  Turning it on, in a user gesture: request the notification permission, register the Service Worker (below), call
-  `pushManager.subscribe({userVisibleOnly: true, applicationServerKey: <push.vapid>})`, and register the set. Turning
-  it off, and `logout`: `unsubscribe()` first, then send the endpoint with an empty set, and delete the notification
-  cache (below); `logout` also turns the setting off, so the next account that signs in on that browser starts with
-  notifications off. In this order, a tab closed between the two steps, or a deletion that a restart of PushDO loses
-  (§9.8), leaves registered only a subscription that has ended, which PushDO deletes at its first push; in the other
-  order it would leave a live subscription registered, and the next account on that browser would get the previous
-  one's notifications for up to 30 days.
-- **The preview** belongs to the device like the setting, is never synced, and is one of `none` (the default: the
-  fixed text of §9.8), `name` (the conversation's name) and `message` (its name and newest message). A device offers
-  `name` and `message` only while it keeps its session across restarts (the remembered session, §11.11), since the
-  Service Worker needs the notification cache, which is kept only then; when the device stops keeping its session, its
-  preview becomes `none`.
+  `push` and the browser supports Web Push (on iOS and iPadOS, only in a web app opened from the Home Screen). Turning
+  it on, in a user gesture: request the notification permission, register the Service Worker (below), call
+  `pushManager.subscribe({userVisibleOnly: true, applicationServerKey: <push.vapid>})`, and register the set. A native
+  app (§11.14) shows it when params carry its transport (§10.9); turning it on, it asks the system for the notification
+  permission, gets its token (from the system for APNs, from FCM for FCM), makes its push keys (below) unless it holds
+  them, and registers the set under its native endpoint (§10.10). Turning it off, and `logout`: `unsubscribe()` first (a
+  native app deletes its push keys and gives up its token, with `unregisterForRemoteNotifications()` for APNs and
+  `deleteToken()` for FCM, so that the push service refuses later pushes), then send the endpoint with an empty set, and
+  delete the notification cache (below); `logout` also turns the setting off, so the next account that signs in on that
+  browser or app starts with notifications off. In this order, a tab closed between the two steps, or a deletion that a
+  restart of PushDO loses (§9.8), leaves registered only a subscription or token that has ended, which PushDO deletes at
+  its first push; in the other order it would leave a live one registered, and the next account on that browser or app
+  would get the previous one's notifications for up to 30 days.
+- **A native app's push keys** stand for a Web Push subscription's: a P-256 key pair and 16 random bytes that the
+  app makes on the device, registered as `p256dh` (the public key, uncompressed) and `auth` (§10.10), with which its
+  notification handler decrypts the bells block of each push (RFC 8291, §9.8). They are kept beside the notification
+  cache (below), leave the device only in `push/sub`, and are made anew whenever notifications are turned on.
+- **The preview** belongs to the device like the setting, is never synced, and is one of `none` (the default: the fixed
+  text of §9.8), `name` (the conversation's name) and `message` (its name and newest message). A device offers `name`
+  and `message` only while it keeps its session across restarts (the remembered session, §11.11), since the notification
+  handler needs the notification cache, which is kept only then; when the device stops keeping its session, its preview
+  becomes `none`.
 - **The registration set** of a device holds, for each copy that is not a request, has not ended, whose leave is not
-  current (§6.9), whose `rootBy` is self or a contact (§7.3), and that the user has not muted on this device (a local
-  choice, not synced), the bell `B_c(ℓ)` of self's lane ℓ in the copy's current epoch c; frozen copies are included. It
+  current (§6.9), whose `rootBy` is self or a contact (§7.3), and that the account has not muted (CONV_PREFS, §7.2; a
+  mute ends at its `until`, and the device then registers again), the bell `B_c(ℓ)` of self's lane ℓ in the copy's
+  current epoch c; frozen copies are included. It
   holds no bell of an earlier epoch (senders ring those, below), none of a request, and none of another live copy whose
   `rootBy` is neither self nor a contact (§11.5), so a conversation started by someone who is not a contact never rings
   before the user accepts it or self sends a TEXT, IMAGE or REACTION in it (either makes `rootBy` a contact, §11.5).
   When the set has more than `push.maxTokens` bells, it holds those of the copies with the newest `lastTs`.
 - **Registering.** `POST /api/v2/push/sub` (§10.10) with the whole set, and with `quiet` = `Qself` (§4.1), replaces
-  the endpoint's registration. A device
-  sends it when the set changes (an epoch switch, a join, an accepted request, a new contact, a leave, an ended copy, a
-  mute), at most once per Δ (changes within Δ go together); after each restore (§11.4 step 11); and at least once per
-  24 hours while the session runs, so that a registration in use never reaches its expiry, and one that a restart of
-  PushDO lost or reverted (§9.8) comes back within a day. Each time, it first reads
-  `pushManager.getSubscription()`: when the endpoint differs from the one it last registered, it sends the old
-  endpoint with an empty set before the new one; when the subscription is gone, or was made with another
-  `applicationServerKey` than `push.vapid`, it sends the old endpoint with an empty set and subscribes again (or,
-  where the browser needs a user gesture for that, shows the setting as off). A failed request is retried with backoff
-  (1 s, doubling to 10 minutes), never sooner than its `retry-after` (an hour after "push full"); a 404 means that the
-  deployment no longer offers push: the device calls `unsubscribe()` and shows the setting as off.
+  the endpoint's registration. A native app also sets `notes` when its preview is `name` or `message` and its handler
+  can show nothing for a push: on iOS and macOS only with the notification filtering entitlement
+  (`com.apple.developer.usernotifications.filtering`), on Android always, since a quiet push is a data message of normal
+  priority. Its handler then gets the account's sync notes (§11.16) while the app is closed. A device sends it when the
+  set changes (an epoch switch, a join, an accepted request, a new contact, a leave, an ended copy, a mute, or a preview
+  change that turns `notes` on or off), at most once per Δ (changes within Δ go together); after each restore (§11.4
+  step 11); and at least once per 24 hours while the session runs, so that a registration in use never reaches its
+  expiry, and one that a restart of PushDO lost or reverted (§9.8) comes back within a day. Each time, it first reads
+  `pushManager.getSubscription()`: when the endpoint differs from the one it last registered, it sends the old endpoint
+  with an empty set before the new one; when the subscription is gone, or was made with another `applicationServerKey`
+  than `push.vapid`, it sends the old endpoint with an empty set and subscribes again (or, where the browser needs a
+  user gesture for that, shows the setting as off). A native app reads its current token instead, and when the token,
+  and so the endpoint, changed, it sends the old endpoint with an empty set before the new one. A failed request is
+  retried with backoff (1 s, doubling to 10 minutes), never sooner than its `retry-after` (an hour after "push full"); a
+  404 means that the deployment no longer offers push: the device calls `unsubscribe()` (a native app gives up its token
+  and deletes its push keys) and shows the setting as off.
 - **Ringing.** After each successful put of a TEXT or IMAGE row (§11.3 step 6: an OK with a verified receipt, a
   CONFLICT with its own body, or a probe that finds its own body), also a late one (§11.3 step 8), the sender sends
   one `POST /api/v2/ring` (§10.10) for the row's `(E, label)` with these bells, e being the send's epoch: `B_e(ℓ)` for
@@ -3981,51 +4221,95 @@ decrypts itself.
   removed at the change knows the old bells and can watch them for as long as any continuing member stays silent,
   learning when messages are sent and by which of the silent members (§13.4).
 - **The notification cache.** While notifications are on, the preview is `name` or `message` and the device keeps its
-  session, the client keeps a cache for the Service Worker in the origin's storage, sealed with AEAD under a device key
-  that the browser cannot export (a non-extractable WebCrypto key kept beside it), and never sends it anywhere. For each
-  copy whose bell is in the registration set it holds that bell, the copy's `ref` (below) and the name that the client
-  shows for it. With `message` it also holds the copy's current epoch c, `conv`, `mk_c`, `rk_c`, self's lane index, the
-  `sigPk` of each member of `D_c` and the handle that the client shows for it, and for each lane of c its **next slot**:
-  the slot after the lane's head as the client last knew it, or `(E_start(c), 0)`. The client writes the cache whenever
-  it sends the registration set, when a copy's name changes, when the page is hidden, and at least every 5 minutes while
-  the session runs, each lane's next slot as the later of the stored one and its own. It deletes the cache whenever the
-  preview changes, before the change takes effect (and then writes it again for a preview other than `none`), when
-  notifications are turned off, and at `logout`, so that no name or key of a `message` cache outlives a downgrade. No
-  write brings back a cache that was deleted, or one decided under an earlier preview, from any tab: the cache keeps a
-  generation, which every deletion moves on; a client reads it before it decides to write, and its write is stored only
-  while the generation is unchanged; the Service Worker's write is stored only while the cache it read is still the one
-  stored; and only a client creates the device key, together with the cache. The cache holds no key that the kept
-  session does not already give (AK derives every key of every held epoch with the server's help, §11.4), but it holds
-  names and handles, which the device keeps nowhere else.
-- **The Service Worker** is registered at scope `/`, without a `fetch` handler and without caching, so it never serves
-  the app's pages or scripts; its registration takes a Trusted Types policy in the app's CSP. A browser that supports
-  declarative push messages hands it the proposed notification of the payload (§9.8), and other browsers the payload
-  itself; either way it gets the payload's `title`, `body`, `navigate`, `tag` and `bells`. For every push it shows at
-  least one notification, within 8 s of the push event (a browser may revoke a subscription whose pushes show nothing:
-  `userVisibleOnly`):
-  1. When it has no cache, the preview is `none`, or no bell of `bells` other than the zero padding is in the cache: one
+  session, the client keeps a cache for the notification handler (below), sealed with AEAD under a device key that
+  cannot be exported, and never sends it anywhere. A browser keeps it in the origin's storage, under a non-extractable
+  WebCrypto key kept beside it. A native app keeps it, with its push keys, where its handler can read them while the
+  app is closed (on iOS and macOS in the app group that the app shares with its extension, on Android in the app's own
+  storage), under a device key that the system's key store holds (the Keychain, shared with the extension and
+  readable once the device has been unlocked after a restart; the Android Keystore). For each
+  copy whose bell is in the registration set it holds that bell, the copy's `ref` (below), the name that the client
+  shows for it, its mute (CONV_PREFS, §7.2), whether the client counts it as unread (§11.8) and the time of its newest
+  notification; and it holds `kN` (§11.16). With `message` it also holds the copy's current epoch c, `conv`, `mk_c`,
+  `rk_c`, self's lane index, the `sigPk` of each member of `D_c` and the handle that the client shows for it, and for
+  each lane of c its **next slot**: the slot after the lane's head as the client last knew it, or `(E_start(c), 0)`; the
+  copy's `root` and its read positions in c; and `qS` and `Tself`, which the actions need (below). The client writes the
+  cache whenever it sends the registration set, when a copy's name changes, when the page is hidden, and at least every
+  5 minutes while the session runs, each lane's next slot as the later of the stored one and its own, and each copy's
+  read positions as the merge of the stored ones and its own (§7.3). It merges the cache's read positions into its own
+  (an action's, below) when it starts and whenever it writes the cache. It deletes the cache whenever the preview
+  changes, before the change takes effect (and then writes it again for a preview other than `none`), when notifications
+  are turned off, and at `logout`, so that no name or key of a `message` cache outlives a downgrade. No write brings
+  back a cache that was deleted, or one decided under an earlier preview, from any tab: the cache keeps a generation,
+  which every deletion moves on; a client reads it before it decides to write, and its write is stored only while the
+  generation is unchanged; the handler's write is stored only while the cache it read is still the one stored; and only
+  a client creates the device key, together with the cache. The cache holds no key that the kept session does not
+  already give (AK derives every key of every held epoch with the server's help, §11.4), but it holds names and handles,
+  which a device without local state (§11.15) keeps nowhere else.
+- **The notification handler** shows the notifications of each push.
+  - In a browser it is the **Service Worker**, registered at scope `/`, without a `fetch` handler and without caching,
+    so it never serves the app's pages or scripts; its registration takes a Trusted Types policy in the app's CSP. A
+    browser that supports declarative push messages hands it the proposed notification of the payload (§9.8), and
+    other browsers the payload itself; either way it gets the payload's `title`, `body`, `navigate`, `tag` and `bells`.
+  - In a native app it is the code that the system runs for a push, also while the app is closed: on iOS and macOS a
+    notification service extension, which gets the alert and `segv` of the APNs push, and whose alert the system shows
+    itself when the extension shows nothing else in time; on Android the app's FCM messaging service, which gets
+    `data.segv` and shows every notification itself. It decrypts `segv` with the device's push keys (RFC 8291) to the
+    bells block and the notes block (§9.8), and uses the fixed `title` and `body` of §9.8, the `tag` `"segv"`, and the
+    app's start page as `navigate`.
+
+  A handler whose cache holds `kN` first applies the push's notes (§11.16). A quiet push, whose bells block is all zero
+  (§9.8), ends there: it reaches only a native handler whose endpoint takes notes, which shows nothing for it. For every
+  other push the handler shows at least one notification, within 8 s of the push (a browser may revoke a subscription
+  whose pushes show nothing: `userVisibleOnly`; Android expects a notification for every high-priority message), except
+  as step 4 says:
+  1. When it has no cache or cannot read it (a native handler before the device is first unlocked after a restart),
+     the preview is `none`, or no bell of `bells` other than the zero padding is in the cache: one
      notification with the payload's `title`, `body` and `tag` that opens `navigate`, or with the same fixed values
      when the payload is not that JSON. It does nothing else.
-  2. Otherwise one notification per distinct copy that the bells name, in their order. With `name` its title is the
-     copy's name and its body the payload's `body`; its `tag` is the copy's `ref`, and it opens the copy's URL (below).
+  2. Otherwise one notification per distinct copy that the bells name and that is not muted in the cache, in their
+     order. With `name` its title is the copy's name and its body the payload's `body`; its `tag` is the copy's `ref`,
+     and it opens the copy's URL (below).
   3. With `message` it first makes one `POST /api/v2/get` (§10.4) for those copies: for each lane of each copy's cached
      epoch other than self's, the slot before the lane's next slot when it is in the same era, and the slots from the
      next slot on, at most `W` of those per lane and at most 256 keys in all, with slot 0 of `E_now` in place of the
      last of them when the next slot's era is below `E_now`. It keeps a row only when it opens under the cached `mk_c`
      and parses (§3.3), its label recomputes as `Lmsg_c(from, E, n)` with `from` its lane, its signature verifies under
-     the cached `sigPk`, and it is a TEXT or IMAGE; a row in the slot before the next slot, which the client has already
-     read (as it does when it is open while the push comes), only when it was stored in the last 5 minutes. A copy's
-     notification is then that of step 2 with, as its body, the copy's newest such row by clamped `ts` (§11.8):
-     `@handle: ` and its text, cut to 200 characters, or `@handle sent an image`, followed by ` (+k)` when it found k
-     more. A copy without such a row, or whose answer has not come 8 s after the push event, gets the notification of
-     step 2 as it is. Then it moves each lane's next slot past the dense prefix it found from that slot on, keeping the
-     later of the stored one and its own.
+     the cached `sigPk`, and it is a TEXT or IMAGE that lies at or after its lane's read position in the cache; a row in
+     the slot before the next slot, which the client has already read (as it does when it is open while the push comes),
+     only when it was stored in the last 5 minutes. A copy's notification is then that of step 2 with, as its body, the
+     copy's newest such row by clamped `ts` (§11.8): `@handle: ` and its text, cut to 200 characters, or `@handle sent
+     an image`, followed by ` (+k)` when it found k more. A copy whose answer has not come 8 s after the push event gets
+     the notification of step 2 as it is, and so does a copy without such a row, unless every row found lies before its
+     read positions: that copy gets none. Then it moves each lane's next slot past the dense prefix
+     it found from that slot on, keeping the later of the stored one and its own.
+  4. When steps 2 and 3 leave no notification (every copy muted, or read according to the notes), the notification of
+     step 1, or none from a handler whose endpoint takes notes.
 
   It takes the text of these notifications from the cache and from rows that verify only, never from the payload,
-  which O composes. It reads no key but the cache's device key, makes no request but that `get`, and stores nothing
-  but the next slots. It checks no checkpoint, receipt or `prev` chain (§12) and reads no control lane, so a preview
-  may miss rows, or show a row that the app later drops (§6.8). Its `notificationclick` handler focuses an open window
-  of the app and moves it to the notification's URL, or opens that URL.
+  which O composes. It reads no key but the cache's device key (and a native app's push keys), makes no request but that
+  `get`, and stores nothing but the next slots and what notes change in the cache. It checks no checkpoint, receipt or
+  `prev` chain (§12) and reads no control lane, so a preview may miss rows, or show a row that the app later drops
+  (§6.8). A tap on a notification opens its URL: the Service Worker's `notificationclick` handler focuses an open window
+  of the app and moves it to that URL, or opens it; a native app opens itself at that URL.
+- **Closing and the badge.** A device closes a copy's notifications once its read positions cover them: when it shows
+  the copy (above), when a READ reaches it in a sync note (§11.16) or in the self lane, and, in the handler, when a
+  note's READ covers every row that the copy's notifications showed (with `name`, when the note is later than the copy's
+  newest notification). A native app, and a web app where the browser offers the Badging API, MAY show as its badge the
+  number of copies that count as unread (§11.8) and are not muted. The client sets it whenever that number changes, and
+  the handler after each push, from its cache: the copies that the client last counted as unread, and those that the
+  handler has notified since, without those that notes have marked read. No push carries a count.
+- **Actions** (native apps whose preview is `message`). A notification of a copy MAY offer two actions:
+  - **Mark read** moves the copy's read positions in the cache to the slots after the rows that the copy's notifications
+    showed, closes them, sets the badge and sends a sync note with the copy's READ (§11.16). It writes no row: the
+    client takes the positions from the cache when it next starts (above), and writes their READ then (§11.8).
+    - **Reply** sends a TEXT in the copy as §11.3 says, and then marks the copy read as above. It needs the device to be
+    unlocked and the app's screen lock (§11.14) to be off, and is offered only where the app can send outside its web
+    view (§11.14); elsewhere the action opens the app at the copy with the text, and the app sends it.
+- **Presentation** (native apps). The handler groups a copy's notifications under its `ref` (the thread identifier on
+  iOS and macOS, the group key on Android) and MAY show them as conversations: on iOS and macOS as communication
+  notifications, on Android in the messaging style with a conversation shortcut, with the copy's `ref` as the
+  conversation's identifier, its name as the conversation's name and the row's `@handle` as the sender. It hands the
+  system nothing else (§13.5).
 - **Conversation URLs** (informative). The client names a copy in its page URL by
   `ref = b64u(HMAC(HKDF(AK, "", "segv.sh/ui/ref"), utf8(key))[0..9])` (12 characters), where `key` is the copy key
   (§7.3): the same on every device of the account, except where §7.3 lets copy keys differ, another value for any
@@ -4053,9 +4337,160 @@ decrypts itself.
   carry `push`, also while the device's own notifications are off: a device without notifications still keeps the
   account's other devices quiet while it is in use. While it is off the device sends no `seen`, not even the retry of
   one sent before; neither does it after `logout`, or for another session than the one that showed the rows.
-- **While the app is open**, the Service Worker still shows a notification for every push it gets (above). In place
-  of the steps above, it MAY show none while a window of the app has focus, where the browser allows that; a push that
-  the server held back for a row marked seen never reaches it.
+- **While the app is open**, the notification handler still shows a notification for every push it gets (above). In
+  place of the steps above, it MAY show none while a window of the app has focus, where the browser allows that, and a
+  native app MAY show none while it is in the foreground and in use; a push that the server held back for a row marked
+  seen never reaches it.
+- **Apps without push.** A native app without a push transport (a desktop app on Windows or Linux, or one on macOS
+  that does not use APNs, §11.14) registers no endpoint and gets no push. It MAY still notify while it runs, also with
+  its window closed: for each TEXT or IMAGE row of another member that reaches it (§11.6) while it is not in use, in a
+  copy whose bell its registration set would hold, it shows the notification that the handler would show for that copy
+  with the device's preview (step 2, with step 3's text when the preview is `message`), at most one per copy per
+  `PUSH_WINDOW`. It sends nothing for this, and learns nothing of its account's marks, so it notifies also of rows that
+  another device of the account shows (§0.4), and closes those notifications when a sync note says that the copy was
+  read (§11.16); its own marks while it is in use, and its rings, are those of any client.
+
+### 11.14 Native apps
+
+A deployment MAY offer native apps: the client of this section, packaged with a web view for an operating system (for
+segv.sh, with Capacitor for iOS and Android and with Tauri for macOS, Windows and Linux). A native app follows §11 as a
+browser client does, with these differences:
+
+- **Origin.** The app's pages have one fixed origin per platform, which the deployment lists in `APP_ORIGINS` (§9.7).
+  For segv.sh these are `capacitor://app.segv.sh` (iOS), `https://app.segv.sh` (Android, whose web view answers that
+  host itself; the deployment never serves it), `tauri://localhost` (macOS and Linux) and `https://tauri.localhost`
+  (Windows). The desktop app's two are the fixed origins of Tauri's own asset protocol, the Windows one with its
+  `https` scheme from the first release on; every Tauri app shares them, which is harmless: each app keeps its storage
+  apart, a page of another app gains nothing that the app's native code could not do without CORS, and no web page can
+  have either origin. An installed app never changes its origin: the web view keeps the remembered session (§11.11) and
+  every other stored value per origin, so a new origin would lose them. A desktop app never loads the deployment's
+  pages instead of its own, which would let the server choose its code again (below).
+- **API.** The app calls the API of the deployment it is built for at that deployment's canonical origin (for segv.sh
+  `https://segv.sh/api/v2/…` and `wss://segv.sh/api/v2/rt`), never at its own origin. Its requests are cross-origin
+  (§10.1, "Cross-origin requests"), and its realtime socket's `Origin` is an app origin (§10.8).
+- **Code.** The app runs only the code of its signed package. Its pages load no script, style, font or worker from the
+  network, and their Content Security Policy, which the app sets itself (a `<meta>` element that comes first in
+  `<head>`, or the shell's own setting), allows scripts only from the app's origin and connections only to the
+  deployment's origin and to what the shell's own bridge needs, with the web app's other restrictions. The server thus
+  never chooses the code that a native app runs: new code comes only in a new package, which the platform verifies.
+- **Passkeys.** The RP ID is the deployment's canonical host (§2.5), never the host of the app's origin, so the web
+  app and the native apps share their passkeys. The app gets the PRF result (§2.3) from its web view's WebAuthn where
+  the platform lets the web view of an app associated with that host use it (iOS: Associated Domains with
+  `webcredentials:<host>`; Android: the web view's WebAuthn support for apps, with a Digital Asset Links statement
+  `delegate_permission/common.get_login_creds`), or else from the platform's passkey API (AuthenticationServices on
+  iOS and macOS, Credential Manager on Android, the WebAuthn API of Windows). Either way it MUST obtain the same 32
+  bytes as a browser (§2.3), which it SHOULD check once against a browser for each platform API it supports. On a
+  platform that offers neither (Linux has no platform passkeys), the app offers no passkey sign-in, and the recovery
+  code still unlocks (§2.5). The server still never sees WebAuthn data.
+- **Association files.** A deployment with native apps serves, at its canonical host,
+  `/.well-known/apple-app-site-association`, whose `webcredentials.apps` lists the app IDs of its Apple apps and whose
+  `applinks` names them for the path `/`, and `/.well-known/assetlinks.json`, with the statements
+  `delegate_permission/common.get_login_creds` and `delegate_permission/common.handle_all_urls` for its Android app's
+  package name and signing certificate, both as `application/json` and without a redirect. They name the apps and
+  nothing else.
+- **Storage.** The app keeps the remembered session (§11.11), its local state (§11.15), the notification cache and the
+  push keys (§11.13) in its own files, sealed under device keys that the system's key store holds, never only in the web
+  view's storage, which the system may clear when the device runs short of space and which some of its modes turn off:
+  the web view holds at most a copy that it can lose. On iOS and macOS the files lie in the app group that the app
+  shares with its extensions, and the keys in a Keychain access group that they share, readable from the first unlock
+  after a restart on (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`); on Android in the app's own storage, under
+  keys of the Android Keystore. No key that the notification handler needs is bound to the user's authentication
+  (biometrics or the passcode), since the handler runs while the device is locked.
+- **Code outside the web view.** The notification handler, the actions of notifications (§11.13) and a share target run
+  where the web view's code does not (a notification service extension, a messaging service, a launch in the
+  background), so they are native code of the app that implements the parts of §11 they need: the handler and the
+  actions, sync notes (§11.16), and, for a reply or a share, the send of §11.3. That code uses the primitives of §1.1
+  exactly, the verification rule of SIG included, and agrees with the engine on every value that both compute, which
+  shared test vectors check. The app and its other processes take one lock across processes (a file lock in the app
+  group, say) around every change of the shared files and around each put, and take the positions they write from the
+  files under that lock; a write that still collides with another device's is a CONFLICT, handled as §11.7 says. Each
+  finishes within the time its platform grants (about 30 s for an iOS extension or background launch, 10 s for an
+  Android messaging service), and leaves the rest to the app.
+- **Screen lock.** An app MAY offer a screen lock, which asks for the device owner's authentication (biometrics or the
+  passcode) before it shows anything once it has been in the background for a time that the user chooses, and which
+  hides its content in the system's app switcher. It is a gate in the app's interface, not a key: the files and keys
+  above stay readable to the notification handler, whose notifications follow the device's preview (§11.13).
+- **Desktop.** The desktop app keeps running when its window is closed, with an icon in the menu bar or the system tray,
+  and MAY start hidden when the user signs in to the system. While it runs it keeps its realtime socket, reconnects when
+  the system wakes, notifies as §11.13 says ("Apps without push"), and shows the badge where the system has one (the
+  Dock on macOS, the taskbar button's overlay on Windows).
+- **Notifications** come through APNs (iOS, macOS) or FCM (Android), with push keys and a notification handler of the
+  app's own (§9.8, §11.13). A desktop app on Windows or Linux has no push transport in stage 1 (§11.13, "Apps without
+  push").
+- **Links.** The mobile apps open the deployment's links to the path `/`, which conversation URLs (§11.13) use, as the
+  association files declare; the fragment reaches the app unchanged. A desktop app registers a URL scheme of its own,
+  and a page of the web app MAY offer to open a conversation URL in it, with the fragment carried over. A conversation
+  URL that the app opens shows that copy as in a browser, and a notification of the app opens its copy's URL in the app.
+
+The server answers a native app as it answers a browser. Its requests differ only in their `Origin` header, which,
+like the User-Agent that every client already sends, tells O which kind of app sent them (§13.5).
+
+### 11.15 Local state
+
+A device that keeps its session (§11.11) SHOULD keep its **local state** across restarts, so that the app shows its
+conversations and their recent messages as soon as it starts, also offline, and catches up from where it stopped
+rather than restoring from scratch:
+
+- **What it holds**: the fold of the self lane as the device applied it (§7.3) with the device's self position; for
+  each copy its state of §11.2 (epochs, keys, descriptors, members, claims and cuts, lane positions, the followed lanes,
+  read positions and settings) and its messages: at least those of the initial history (§11.4 step 6), every unread
+  one, and those the user has scrolled back to, up to an implementation-defined bound; the inbox cursor and parked
+  joins (§11.5); the receipts, checkpoint references and row memory that §12 keeps; and the notification cache's
+  inputs (§11.13). Images are not part of it: a device fetches an image again when it shows it (§8.1), unless it chose
+  to keep the image, sealed like the rest.
+- **How**: sealed with AEAD under a device key that cannot be exported and that never leaves the device: in a browser
+  a non-extractable WebCrypto key in the origin's storage; in a native app a key that the system's key store holds and
+  keeps out of backups and moves to another device, the state lying in the app's own files (§11.14). It is written as
+  the state changes, at least when the device stops being in use, and never sent anywhere.
+- **Unlock**: the client opens the local state after the unlock (§11.1) and shows it at once. It then restores as §11.4
+  says, with the state's positions in place of a snapshot's and a HEADS record's: the self delta from the state's self
+  position, and each copy's lanes and control lane from the state's positions, which are at least as far as anything
+  the device wrote to its self lane. Rows already held are not fetched again. The state holds only what the device has
+  itself verified, so the restore that follows reaches the same verdicts as a restore from the server alone would for
+  every row; a local state that is missing, does not open, fails to parse, belongs to another account or another
+  deployment, or names a protocol version that the client does not support is deleted, and the device restores from the
+  server alone.
+- **Integrity** (§12) is unchanged: the state only lets the device keep more of what it saw, which gives the
+  immutability check of §12.1 more rows to compare.
+- **Deletion**: at `logout`, when the device stops keeping its session, and when another account signs in on it.
+
+The local state adds no request and nothing that the server stores. What it adds on the device is the history that it
+holds at rest, sealed under a key of the device (§13.5).
+
+### 11.16 Sync notes
+
+A **sync note** tells the other devices of the account, at once, what a device has changed in the state that the self
+lane records only later, or that a closed device would otherwise learn only at its next start: read positions and marks
+(§11.8), and the settings of copies (CONV_PREFS, §7.2). The server passes notes on and can read none (§10.11); a lost
+note costs only time, since the self lane carries the same records (§7.3).
+
+```
+note        = u8 ver (= 1) | u64 ts | u8 count | record × count
+sealed note = aeadSeal(kN, pad(note, [512]), aad = enc("segv.sh/v2/note"))          552 bytes
+```
+
+- **Content.** `ts` is the sender's estimate of the server's time when it made the note, in Unix ms. Each `record` is a
+  self-lane record, `u8 rtype | u16 len | content[len]` (§7.1): a READ or a CONV_PREFS. A note holds as many as fit in
+  511 bytes. It is malformed unless `ver = 1`, `ts ≤ 2^53 − 1`, `count ≥ 1`, exactly `count` records follow, and each
+  known record obeys the parse rules of §7.1; a reader skips a record of another `rtype` by its `len`. A note that does
+  not open under `kN` (§2.1), or is malformed, is dropped whole.
+- **Sending.** A device sends notes when its read positions or marks change (§11.8, `markRead`, `markUnread`,
+  `markAllRead`, a notification's Mark read), with a READ for each copy whose positions or mark changed, in its current
+  epoch, and when it writes a CONV_PREFS, with that record. It gathers the changes of up to 2 s, puts them in as few
+  notes as hold them, and sends each in a `POST /api/v2/sync` (§10.11) with `qS` and `Tself`. It does not wait for the
+  answer; after a network error, a timeout or a 5xx it sends the same request once more, after 2 s, and never otherwise.
+  It sends nothing after `logout`, or for another session than the one that made the change.
+- **Receiving.** A device gets notes as NOTE frames on its realtime sockets (§10.8) and, when its endpoint takes notes,
+  in its pushes (§9.8). It applies the records of a note to the copies that it holds, and ignores the rest:
+  - a READ is merged into the copy's read positions as §7.3 merges one of the self lane, and its mark is taken when `ts`
+    is later than the last change of the device's own mark. The device then closes the notifications that the positions
+    cover (§11.13) and counts `unread` again (§11.8). It writes nothing for the note: the device that sent it writes the
+    READ (§11.8);
+  - a CONV_PREFS is applied by the notification handler to its cache when `ts` is later than that of the copy's setting
+    there. A client applies the record when the self row that holds it arrives (§7.3), and ignores the note's copy.
+
+A note may come more than once, in several pushes or both on a socket and in a push, and in any order; applying it again
+changes nothing.
 
 ## 12. Integrity (replacing the v1 global hash chain)
 
@@ -4167,7 +4602,7 @@ are kept. Critical warnings are kept until sign-out.
 | message ↔ message (same conversation) | No identifiers. Rows in the same Δ batch and rare classes are visible. With S = 1 and low traffic, timing correlation is strong. | Exactly: same topic, same IP. | Everything. | — |
 | user ↔ conversation | None. The directory reveals that the account exists and when it registered (the client's `ts`, and the minute through the dirlog head in checkpoints). | The topic set and fetch pattern per socket / IP, linked to the uid at unlock. | Co-members of shared conversations. | — |
 | user ↔ user | None. Global inbox counts per slot are public. | The whole social graph, including a p-bit prefix of every handle and co-member lookup (§13.2 item 10). | Co-members only. | — |
-| activity of a user | Directory events (registration, wrap additions); the size of the global inbox; self rows (one after each own creation, commit, join or leave, and at most one HEADS row per 30 minutes while active), which P cannot tell from other rows except by timing. Per-user send volume is not visible. | Per-IP read and write volume and times; online time; topic sets; with a `message` preview, when each such device receives a push, also while the app is closed (§13.4). | Send times in shared conversations. | When each of its devices that turned notifications on is notified (§11.13). |
+| activity of a user | Directory events (registration, wrap additions); the size of the global inbox; self rows (one after each own creation, commit, join or leave, and at most one HEADS row per 30 minutes while active), which P cannot tell from other rows except by timing. Per-user send volume is not visible. | Per-IP read and write volume and times; online time; topic sets; with a `message` preview, when each such device receives a push, also while the app is closed (§13.4); from sync notes, when a device of the account changes its read state or a setting (§13.4). | Send times in shared conversations. | When each of its devices that turned notifications on is notified (§11.13), and when a native device that takes notes gets a quiet push, that is, when another device of its account changed its read state. |
 | activity of a conversation | Not directly: rows have uniform labels. | Exact per-topic volume and times. | Everything. After removal: only that a claim happened, its `rm` bits and its cuts; with push, also, through the old bells, when messages are sent in the new epoch and which of the members silent there sends them, until they all post there or the epoch changes again (§13.4). | — |
 | membership changes and creations | Both show the same row pattern: a class-1 self row, one class-1 row at least Δ+SKEW later (claim or decoy, which P cannot tell from a medium text), then J deliveries and one class-1 self row (DELIVERED, padded for any number of recipients, §6.12); at most hourly, that some blob was registered. Members who receive J by inbox add that many inbox rows within seconds, while a removal or rotation adds none, so P can tell "someone was invited by inbox" from "nobody was" (§13.2 item 12). Not the member count, not who. No self rows follow a claim observed by other members, and a freeze writes nothing. | Which IPs fetch the bundle blob, so the members. | The members of e+1 see D′. Every member of e, removed ones included, sees `rm` (who of the old members was dropped). | — |
 | content | The size class only (a reaction is a class-0 row, like a short text). Safe against a quantum P. | Same, plus blob fetches per IP (image recipients); with push, which puts are texts or images, since a ring follows them (§13.4). | Everything in epochs held. | Nothing: every push has the same length and fixed text, and the bells in it are encrypted to the device (§9.8). |
@@ -4355,7 +4790,7 @@ Each item is a deliberate trade-off that stage 2 or 3 addresses. None is silent.
   subgroup and pins the cofactored equation (§1.1).
 - **Batching is no longer observable.** P cannot see global seq order, batches or arrival order. Times are Δ-rounded.
 
-### 13.4 Web Push (optional)
+### 13.4 Push notifications (optional)
 
 Notifications add one observer (N, §0.2) and the only data the server stores that is not public (§0.1, §9.8). The
 user-facing rules are fixed: off by default, per device and never synced; pushes that carry no content, whose
@@ -4365,22 +4800,24 @@ with one exception: a contact that the first release recorded when a third membe
 (§7.3), so that conversation, and the later ones that user starts, ring although the user never accepted them. While a
 device of the account is in use, the rows it shows notify none of the account's devices (§11.13).
 
-- **Stored.** Per endpoint: the endpoint and its subscription keys, sealed under `PUSH_KEY`; keyed hashes of its bells
-  and of its account's quiet tag (`tk`); and the day of its last registration. Nothing about a ring or a mark is
-  stored: which endpoints a message reached, and which rows an account marked seen, live in PushDO's memory only, for
-  at most a few minutes (§9.8). Bells are PRF outputs under keys that only members hold (§4.2), and their stored
-  hashes are keyed under `PUSH_KEY`, so the stored data links no conversation or account to another, except that the
-  devices of one account hold the same bells and the same quiet tag, and the number of an endpoint's bells tells about
-  how many conversations it is notified for. Bells change at every epoch change; the quiet tag never does, so its
-  stored hash links the endpoints of one account also when they never shared a bell (an old phone and its
-  replacement, say) for as long as both are stored. The platform keeps a point-in-time history of this storage for 30 days, so
-  a registration, its changes and its deletion stay recoverable from that history for up to 30 days. PushDO writes a
-  change only after the UTC day in which it was made has ended (§9.8), so the history shows, per day, which endpoints
-  were registered, which changed their bell sets and which were deleted, and nothing finer than a day. That still tells
-  something: an epoch change makes the open devices of every member replace one bell, a creation, an accepted request, a
-  leave or an ended copy adds or removes one, and one ring can get several stale endpoints of members of one
-  conversation deleted, so on a day with few changes, endpoints whose sets changed, or that were deleted, that day may
-  be co-members. The day's changes themselves live in PushDO's memory until then.
+- **Stored.** Per endpoint: the endpoint (a Web Push URL, or a native app's token with its APNs environment and app,
+  §10.10) and the keys its pushes are encrypted to, sealed under `PUSH_KEY`; keyed hashes of its bells
+  and of its account's quiet tag, the latter twice for an endpoint that takes notes (`tk`); and the day of its last
+  registration. Nothing about a ring, a mark or a note is stored: which endpoints a message reached, and which rows an
+  account marked seen, live in PushDO's memory only, for at most a few minutes (§9.8). Bells are PRF outputs under keys
+  that only members hold (§4.2), and their stored hashes are keyed under `PUSH_KEY`, so the stored data links no
+  conversation or account to another, except that the devices of one account hold the same bells and the same quiet tag,
+  and the number of an endpoint's bells tells about how many conversations it is notified for. Bells change at every
+  epoch change; the quiet tag never does, so its stored hash links the endpoints of one account also when they never
+  shared a bell (an old phone and its replacement, say) for as long as both are stored. The platform keeps a
+  point-in-time history of this storage for 30 days, so a registration, its changes and its deletion stay recoverable
+  from that history for up to 30 days. PushDO writes a change only after the UTC day in which it was made has ended
+  (§9.8), so the history shows, per day, which endpoints were registered, which changed their bell sets and which were
+  deleted, and nothing finer than a day. That still tells something: an epoch change makes the open devices of every
+  member replace one bell, a creation, an accepted request, a leave or an ended copy adds or removes one, and one ring
+  can get several stale endpoints of members of one conversation deleted, so on a day with few changes, endpoints whose
+  sets changed, or that were deleted, that day may be co-members. The day's changes themselves live in PushDO's memory
+  until then.
 - **O** (live, not stored) sees, at each `push/sub`, an IP with an endpoint and its bells, and at each ring the
   writer's IP, the row, the other lanes' bells and every endpoint registered under them, devices that are offline
   included. With the row's topic, which the put carries, that links each such device to the conversation. Topics
@@ -4394,7 +4831,12 @@ device of the account is in use, the rows it shows notify none of the account's 
   every push. Pushes to the devices of one conversation follow the same rings, so N can guess from their times which
   of its subscriptions share a conversation; the jitter only blurs this. The bells in a push are encrypted to the
   device, and do not change its size. N sees no rings, so a push held back for a row marked seen looks to it like no
-  message at all; every push comes at least `PUSH_HOLD` = 5 s after its ring.
+  message at all; every push comes at least `PUSH_HOLD` = 5 s after its ring. For the native apps N is Apple (APNs) or
+  Google (FCM). It sees the same, under the app's token, which identifies the app's installation to it; an APNs push
+  also names the app (its topic). The bells block is encrypted to the device's push keys (§9.8), so N reads no more of a
+  native push than of a Web Push message: the fixed text, which the system shows when the app's handler does not
+  replace it, and a ciphertext of fixed length. The FCM message is a data message, so the text that an Android device
+  shows never comes from Google.
 - **M** can ring the bells of its conversations with any fresh row (one ring per row and set of bells), which makes the
   other members' devices show the notification at most once per `PUSH_WINDOW` (a restart of PushDO aside). It can
   register its own endpoints under their bells: a bell's 8 places go to the endpoints that take them first (§9.8), so M
@@ -4424,6 +4866,13 @@ device of the account is in use, the rows it shows notify none of the account's 
   for `SEEN_TTL`. Whoever holds `AK` (a device that is still signed in) can mark rows for the account, and can read
   them anyway. A device whose quiet setting is off sends no mark, and the account's other devices then get their
   pushes for the rows it shows.
+- **Sync notes** (§11.16) pass through the server whether or not push is on. O sees at each `sync` an IP with the
+  account's `qS` and `Tself`, which links that topic to the account's quiet tag and endpoints, and learns when a device
+  of the account changed its read state or a setting, which is when its user read, marked or muted a conversation; not
+  which, since the note is sealed under `kN` and every note has the same length. A note stays in PushDO's memory for at
+  most `NOTE_TTL` and is never stored. A quiet push tells N the same moment, for each device that takes notes. O cannot
+  forge a note, which would not open; it can withhold or delay notes, as it can any push. Whoever holds `AK` can send
+  notes for the account, and can read its conversations anyway.
 - **Previews** (§11.13) are a choice of each device's user; they add nothing to a push and nothing to what the server
   stores. With `name` the device makes no request: the bells in the push and its cache name the conversation. With
   `message`, every push makes the device read the new rows of the conversations it names, wherever the device is and
@@ -4436,7 +4885,8 @@ device of the account is in use, the rows it shows notify none of the account's 
   forensic tools have recovered messages of other messengers; and paired devices. A device's notification history
   holds the times of its notifications and what they showed. The device keeps the names and handles of its
   conversations, and with `message` the keys of their current epochs, in the notification cache, sealed under a device
-  key beside the kept session.
+  key beside the kept session. In a native app the handler reads the rows in the same way, while the app is closed; the
+  cache, its device key and the push keys stay in the system's key store and the app's own storage (§11.13).
 - **Others.** A third party who reads a fresh row's `(E, label)` in the public feed knows no bell, so its rings reach
   no device, and the dedup is keyed by the row and the bells together, so they never suppress the writer's ring
   (§9.8). Anyone can fill PushDO's endpoint cap with registrations, or its cap of registrations changed in a day, or
@@ -4445,6 +4895,32 @@ device of the account is in use, the rows it shows notify none of the account's 
   every other guarantee of §0.3. A deployment whose push is off (not configured, or configured invalidly, §9.8)
   behaves as if this section did not exist, apart from the registrations that PushDO may still hold from before, until
   they expire.
+
+### 13.5 Native apps (optional)
+
+A native app (§11.14) changes whom a user trusts for the client's code, and adds little to what the server learns.
+
+- **Code.** A browser runs the code that the server sends with each page, so a server that turns malicious can serve
+  code that reads the keys (§0.4). A native app runs only the code of its signed package: the server cannot change it,
+  a new version reaches a device only through the developer's signing key, the store and the operating system's
+  checks, and every device that installs a version gets that same package. Whoever holds the signing key, and the
+  store, thus decide which code a device runs.
+- **O** learns from the `Origin` header of a native app's requests, as from the User-Agent that every client sends,
+  which kind of app sent them; everything else is as for a browser. The association files (§11.14) are public and
+  name the apps only, and the platforms fetch them through their own servers, not once per device.
+- **Passkeys.** The web app and the native apps use the same passkeys (§2.5). A platform's passkey API, like a
+  browser, sends nothing to the server, which still never sees WebAuthn data.
+- **The device** keeps, beyond what a browser keeps, the push keys and, with a preview, the notification cache, in the
+  app's own files under keys of the system's key store (§11.13, §11.14), where forensic tools may reach them as they
+  reach other apps' data; the keys never leave the device in a backup or a move to another device. Its local state
+  (§11.15), which a browser may keep too, holds the history that it shows, sealed in the same way. A screen lock
+  (§11.14) protects none of this from whoever can read those files: the notification handler reads them while the device
+  is locked.
+- **Apps without push** (§11.13) send nothing for their notifications, and notify also of rows that another device of
+  the account shows.
+- **Conversation notifications** (§11.13) give the system each notified copy's name and `ref` and the senders' handles,
+  which it may keep on the device beyond the notification, for instance to suggest conversations when the user shares
+  something.
 
 ## 14. Deferred to stage 2 / 3
 
@@ -4460,9 +4936,9 @@ device of the account is in use, the rows it shows notify none of the account's 
 
 - anonymous write tokens (VOPRF, NullDO) and refunds;
 - OHTTP (O1) and quiet mode (O2);
-- Web Push beyond one PushDO (§9.8): bells sharded by prefix over several PushDOs, with the coalescing window kept
+- push beyond one PushDO (§9.8): bells sharded by prefix over several PushDOs, with the coalescing window kept
   per endpoint by one shard that owns it; bells chosen by their owner (a secret whose hash the members learn through a
-  new record per epoch), so that members can no longer register under others' bells; unread badges;
+  new record per epoch), so that members can no longer register under others' bells;
 - separate FeedDO / ConnDO / `segv-rt` Worker, and Bloom-filtered fan-out.
 
 **Inbox:** β > 0 buckets aligned to handle prefixes, dynamic inbox pricing, and the link-only flag (`flags.bit0`).
@@ -4488,11 +4964,11 @@ device of the account is in use, the rows it shows notify none of the account's 
 **Clients:**
 
 - a link-sharing UI and the `Engine` methods for links (the engine implements links internally in stage 1, §11.11);
-- read cursors in PREFS;
-- a persisted local cache;
 - a "load older" UI beyond 500 messages;
 - the late-row check of §11.3 step 8 after every put, not only after slow ones, with the sender's own next slot in
-  the following epoch (closes §13.2 item 15 at one more `get` per send).
+  the following epoch (closes §13.2 item 15 at one more `get` per send);
+- push for the desktop apps on Windows and Linux (WNS, UnifiedPush), and for Android devices without Google Play
+  services (UnifiedPush); the account's marks for the notifications of apps without push (§11.13).
 
 ---
 
@@ -4502,7 +4978,7 @@ device of the account is in use, the rows it shows notify none of the account's 
 | ---- | -- | ---------- |
 | Storage | one global hash-chained log (LogDO), kinds 1–4, `UNIQUE(tag)` | per-era ShardDO rows `(E, label) → (t, cls, body)`, create-only; D1 directory; BlobRegDO; InboxDO; CheckpointDO |
 | Reading | download every row since the cursor | point lookups of expected labels (`/get`), topic WebSocket, snapshot + self lane |
-| Realtime | `/api/ws` broadcasts every row to everyone; ping only | `/api/v2/rt`: SUB, UNSUB, RESUME (by per-boot `seq`) / HELLO, ROWS, GAP, RESUMED, per-topic delivery, ≤ 256 topics per socket |
+| Realtime | `/api/ws` broadcasts every row to everyone; ping only | `/api/v2/rt`: SUB, UNSUB, RESUME (by per-boot `seq`), NOTES / HELLO, ROWS, GAP, RESUMED, NOTE, per-topic delivery, ≤ 256 topics per socket |
 | Labels | `segv.sh/v1/*` | `segv.sh/v2/*` everywhere (no compatibility) |
 | Bundle | JSON v1 with `scan` | JSON v2 without `scan`; fingerprint over `(uid, sigPk, kemPk)`; `sigPk` must lie in the prime-order subgroup, and every signature uses the pinned cofactored check (§1.1) |
 | Directory | kind-1/2 log rows; D1 as a derived index; exact handle lookup | D1 authoritative with a dirlog chain; prefix lookups; exact wrap-id and own-uid lookups |
@@ -4517,7 +4993,7 @@ device of the account is in use, the rows it shows notify none of the account's 
 | Multi-device | own invite per epoch; counters by log scan | self lane (records + snapshots + trusted HEADS positions), CAS on shared counters, CONFLICT returns the occupant, resumable J delivery |
 | Re-add after a removal | the skip rule: the removed copy continues at the re-add's epoch | a separate copy, rooted at the re-add's descriptor, as a first contact; the removed copy has ended and keeps its history (§6.6 step 3, §6.7 step 6, §13.2 item 16) |
 | Reactions | none | REACTION rows (type 3) on the sender's lane, bound to the target row's label and body; per member and emoji the latest row decides, at most 8 emoji per member and message; no unread count, no `lastTs`, no line (§11.12) |
-| Notifications | none | optional Web Push: devices register bells derived from the epoch key, a sender rings the other lanes' bells after a text or image, and one PushDO sends a contentless push, coalesced per device; it stores no uid, conversation or IP; a device may show a preview that it decrypts itself; a device in use marks the rows it shows seen, and the account's devices get no push for them (§9.8, §10.10, §11.13, §13.4) |
+| Notifications | none | optional push (Web Push, and APNs and FCM for native apps): devices register bells derived from the epoch key, a sender rings the other lanes' bells after a text or image, and one PushDO sends a contentless push, coalesced per device; it stores no uid, conversation or IP; a device may show a preview that it decrypts itself; a device in use marks the rows it shows seen, and the account's devices get no push for them (§9.8, §10.10, §11.13, §13.4) |
 | Integrity | client-verified global chain (fatal on gaps); `head` in messages; local checkpoint | signed checkpoint chain (local persistence, range verification), `ck` in messages, `prevh`, immutability, receipts, public feed for auditors |
 | Abuse | PoW `register/wrap/append/blob`; RL write/blob/read | PoW `register/wrap/put/inbox/blob` (and `push`); RL write/inbox/blob/read (and ring) |
 | Blobs | `/api/blob`; D1 ledger (day precision, private) | `/api/v2/blob` + `meta`; BlobRegDO create-only with Δ-precise `t_reg`, readable by id only; its head enters checkpoints hourly |
