@@ -997,13 +997,30 @@ export function ringEraOk(E: number, nowMs: number, p: Pick<V2Params, "delta" | 
 /** §10.10 step 2: `t` is rounded down to Δ, so a row stored RING_FRESH seconds ago may carry a t up to Δ older. */
 export const ringRowFresh = (t: number, nowMs: number, delta: number): boolean => t + delta >= secOf(nowMs) - RING_FRESH;
 
+const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+let ringSleep = realSleep;
+
+/** Test hook: how the Worker waits for the push that a ring made due (null: a real timer). */
+export function _setRingSleepForTests(f: ((ms: number) => Promise<void>) | null): void {
+  ringSleep = f ?? realSleep;
+}
+
+/**
+ * §10.10 steps 1–4. The wait happens here, where it costs nothing, rather than in PushDO: PushDO answers how long
+ * until the push it made due, and `flush` then sends it on time (§9.8). A wait cut short (the Worker stopped) only
+ * leaves the push to PushDO's next alarm run.
+ */
 async function ringAfter(c: Ctx, E: number, label: Bytes, tokens: Bytes[]): Promise<void> {
   try {
     if (!ringEraOk(E, c.now, c.params)) return;
     const v = routeV(krouteFor(c.keys, E), label);
     const [r] = (await shardStub(c.env, E, 0).get(E, 0, [{ v, label, mode: 1 } as ShardGetKey])) as ShardGetResult[];
     if (!r || r.s !== "hit" || !ringRowFresh(r.t, c.now, c.params.delta)) return;
-    await pushStub(c.env).ring(E, label, tokens);
+    const push = pushStub(c.env);
+    const wait = await push.ring(E, label, tokens);
+    if (wait === null) return;
+    await ringSleep(wait);
+    await push.flush();
   } catch (e) {
     console.error(JSON.stringify({ msg: "ring failed", error: logErr(e) }));
   }
