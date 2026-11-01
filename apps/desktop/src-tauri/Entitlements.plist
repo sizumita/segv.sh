@@ -3,7 +3,8 @@
 <plist version="1.0">
 <dict>
 	<!-- Passkeys of the canonical host (docs/PROTOCOL.md §2.5, §11.14): the RP ID segv.sh, which the deployment's
-	     apple-app-site-association names this app for. Needs a provisioning profile of a paid team. -->
+	     apple-app-site-association names this app for. Needs a provisioning profile of a paid team. A build with
+	     scripts/bundle.mjs writes its own entitlements, with the host of the deployment it calls and the team. -->
 	<key>com.apple.developer.associated-domains</key>
 	<array>
 		<string>webcredentials:segv.sh</string>

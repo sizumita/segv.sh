@@ -11,8 +11,10 @@
 //                                (macOS): passkeys need it (§11.14 "Passkeys"); without one the app is signed ad hoc
 //                                and offers the recovery code only
 //
-// The entitlements of a signed app name its team: the application identifier, which the data protection keychain
-// and the deployment's apple-app-site-association need, is added here to src-tauri/Entitlements.plist.
+// The entitlements are written here: a signed app names its team (the application identifier, which the data
+// protection keychain and the deployment's apple-app-site-association need) and the deployment's host as its
+// associated domain (webcredentials:<host>); src-tauri/Entitlements.plist shows segv.sh's. An app signed ad hoc gets
+// none of them.
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -36,25 +38,47 @@ if (origin !== "https://segv.sh") {
   );
 }
 
+/** An entitlements plist of these entries, each a key and its XML value. */
+const plist = (entries) =>
+  [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+    '<plist version="1.0">',
+    "<dict>",
+    ...entries.map(([k, v]) => `\t<key>${k}</key>\n\t${v}`),
+    "</dict>",
+    "</plist>",
+    "",
+  ].join("\n");
+
 const team = process.env.APPLE_TEAM_ID;
 const identity = process.env.APPLE_SIGNING_IDENTITY;
 const profile = process.env.APPLE_PROVISIONING_PROFILE;
 if (process.platform === "darwin") {
+  const path = join(OUT, "Entitlements.plist");
+  mkdirSync(dirname(path), { recursive: true });
   if (identity && profile && team) {
     if (!/^[A-Z0-9]{10}$/.test(team))
       throw new Error("APPLE_TEAM_ID must be 10 characters A-Z, 0-9");
-    const plist = readFileSync(join(TAURI, "Entitlements.plist"), "utf8");
-    const extra = [
-      ["com.apple.application-identifier", `<string>${team}.${conf.identifier}</string>`],
-      ["com.apple.developer.team-identifier", `<string>${team}</string>`],
-      ["keychain-access-groups", `<array><string>${team}.${conf.identifier}</string></array>`],
-    ]
-      .map(([k, v]) => `\t<key>${k}</key>\n\t${v}\n`)
-      .join("");
-    const merged = plist.replace(/<\/dict>\s*<\/plist>\s*$/, `${extra}</dict>\n</plist>\n`);
-    const path = join(OUT, "Entitlements.plist");
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, merged);
+    const appId = `${team}.${conf.identifier}`;
+    writeFileSync(
+      path,
+      plist([
+        ["com.apple.application-identifier", `<string>${appId}</string>`],
+        ["com.apple.developer.team-identifier", `<string>${team}</string>`],
+        ["keychain-access-groups", `<array><string>${appId}</string></array>`],
+        // The passkeys of the deployment that the app calls: their RP ID is its host (§2.5), whose association file
+        // names the app. A deployment without https has none.
+        ...(u.protocol === "https:"
+          ? [
+              [
+                "com.apple.developer.associated-domains",
+                `<array><string>webcredentials:${u.hostname}</string></array>`,
+              ],
+            ]
+          : []),
+      ]),
+    );
     Object.assign(overlay.bundle.macOS, {
       signingIdentity: identity,
       entitlements: path,
@@ -65,7 +89,9 @@ if (process.platform === "darwin") {
     console.warn(
       "bundle: APPLE_TEAM_ID, APPLE_SIGNING_IDENTITY or APPLE_PROVISIONING_PROFILE unset: signing ad hoc, without passkeys",
     );
-    overlay.bundle.macOS.signingIdentity = "-";
+    // No restricted entitlement: without a profile that allows it, the system refuses to launch the app.
+    writeFileSync(path, plist([]));
+    Object.assign(overlay.bundle.macOS, { signingIdentity: "-", entitlements: path });
   }
 }
 
