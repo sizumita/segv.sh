@@ -105,10 +105,14 @@ export interface LocalNotifyOptions {
 export class LocalNotify {
   private readonly o: LocalNotifyOptions;
   private enabled: boolean;
-  /** per tag: when its last notification was shown (monotonic), and the one waiting for the window to end */
+  /**
+   * per tag: when its last notification was shown (monotonic), and the row waiting for the window to end. The row, not
+   * its notification, waits: the notification is made when it is shown, with the preview in effect then, so a
+   * preview turned down meanwhile never shows a message's text.
+   */
   private readonly tags = new Map<
     string,
-    { last: number; next: LocalNotification | null; timer: EngineTimer | null }
+    { last: number; next: Arrival | null; timer: EngineTimer | null }
   >();
   private lastBadge = -1;
 
@@ -159,14 +163,14 @@ export class LocalNotify {
       return;
     }
     // Within the window: the newest row waits for its end, and replaces the notification then.
-    t.next = note;
+    t.next = a;
     t.timer ??= this.o.clock.setTimer(() => {
       t.timer = null;
-      const n = t.next;
+      const next = t.next;
       t.next = null;
-      if (!n || !this.enabled) return;
+      if (!next || !this.enabled) return;
       t.last = this.o.clock.mono();
-      this.o.notifier.show(n);
+      this.o.notifier.show(noteFor(next, this.o.preview()));
     }, due - now);
   }
 

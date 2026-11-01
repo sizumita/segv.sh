@@ -125,6 +125,16 @@ describe("LocalNotify", () => {
     expect(notifier.shown).toHaveLength(3);
   });
 
+  it("makes a waiting notification with the preview in effect when it is shown", () => {
+    const { n, clock, notifier, st } = setup();
+    n.arrived(arrival({ text: "one" }));
+    n.arrived(arrival({ text: "a secret", unread: 2 }));
+    st.preview = "name";
+    clock.advance(DEFAULT_WINDOW_MS);
+    expect(notifier.shown.map((x) => x.body)).toEqual(["@bob: one", "new messages"]);
+    expect(notifier.shown.some((x) => x.body.includes("secret"))).toBe(false);
+  });
+
   it("notifies nothing while the device is in use, or while notifications are off", () => {
     const a = setup();
     a.st.inUse = true;
