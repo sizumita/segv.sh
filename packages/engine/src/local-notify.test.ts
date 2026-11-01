@@ -155,6 +155,28 @@ describe("LocalNotify", () => {
     expect(notifier.shown).toHaveLength(1);
   });
 
+  it("drops a waiting row when its conversation is shown, also with the fixed text", () => {
+    const { n, clock, notifier } = setup({ preview: "none" });
+    n.arrived(arrival({ text: "one" }));
+    n.arrived(arrival({ text: "two", unread: 2 }));
+    n.shown(REF);
+    clock.advance(DEFAULT_WINDOW_MS);
+    expect(notifier.shown).toHaveLength(1);
+    expect(notifier.closed).toEqual([REF, "segv"]);
+  });
+
+  it("closes the fixed notification once every conversation it tells of is shown", () => {
+    const { n, notifier } = setup({ preview: "none" });
+    const OTHER = "ZZZZZZZZZZZZ";
+    n.arrived(arrival());
+    n.arrived(arrival({ ref: OTHER, name: "@carol", handle: "carol" }));
+    expect(notifier.shown.map((x) => x.tag)).toEqual(["segv", "segv"]);
+    n.shown(REF);
+    expect(notifier.closed).toEqual([REF]);
+    n.shown(OTHER);
+    expect(notifier.closed).toEqual([REF, OTHER, "segv"]);
+  });
+
   it("sets the badge only when the count changes", () => {
     const { n, notifier } = setup();
     n.badge(0);

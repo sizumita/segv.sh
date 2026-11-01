@@ -106,14 +106,16 @@ export class LocalNotify {
   private readonly o: LocalNotifyOptions;
   private enabled: boolean;
   /**
-   * per tag: when its last notification was shown (monotonic), and the row waiting for the window to end. The row, not
-   * its notification, waits: the notification is made when it is shown, with the preview in effect then, so a
-   * preview turned down meanwhile never shows a message's text.
+   * per conversation (its ref): when its last notification was shown (monotonic), and the row waiting for the window
+   * to end. The row, not its notification, waits: the notification is made when it is shown, with the preview in
+   * effect then, so a preview turned down meanwhile never shows a message's text.
    */
-  private readonly tags = new Map<
+  private readonly convs = new Map<
     string,
     { last: number; next: Arrival | null; timer: EngineTimer | null }
   >();
+  /** the conversations that the fixed notification (one tag for all, preview `none`) tells of and that are unread */
+  private readonly fixedFor = new Set<string>();
   private lastBadge = -1;
 
   constructor(o: LocalNotifyOptions) {
@@ -149,17 +151,19 @@ export class LocalNotify {
     this.clearAll();
   }
 
-  /** A row reached the device (§11.6): notify unless the device is in use, at most once per tag per PUSH_WINDOW. */
+  /**
+   * A row reached the device (§11.6): notify unless the device is in use, at most once per conversation per
+   * PUSH_WINDOW.
+   */
   arrived(a: Arrival): void {
     if (!this.enabled || this.o.inUse()) return;
-    const note = noteFor(a, this.o.preview());
     const now = this.o.clock.mono();
-    const t = this.tags.get(note.tag) ?? { last: -Infinity, next: null, timer: null };
-    this.tags.set(note.tag, t);
+    const t = this.convs.get(a.ref) ?? { last: -Infinity, next: null, timer: null };
+    this.convs.set(a.ref, t);
     const due = t.last + this.o.windowMs();
     if (now >= due) {
       t.last = now;
-      this.o.notifier.show(note);
+      this.show(a);
       return;
     }
     // Within the window: the newest row waits for its end, and replaces the notification then.
@@ -170,19 +174,29 @@ export class LocalNotify {
       t.next = null;
       if (!next || !this.enabled) return;
       t.last = this.o.clock.mono();
-      this.o.notifier.show(noteFor(next, this.o.preview()));
+      this.show(next);
     }, due - now);
   }
 
-  /** The copy is shown on this device: its notifications close (§11.13 "Closing and the badge"). */
+  private show(a: Arrival): void {
+    const n = noteFor(a, this.o.preview());
+    if (n.tag === FIXED.tag) this.fixedFor.add(a.ref);
+    this.o.notifier.show(n);
+  }
+
+  /**
+   * The copy is shown on this device: its notifications close, and the row waiting for it is dropped (§11.13 "Closing
+   * and the badge"). The fixed notification closes once every conversation that it tells of is shown.
+   */
   shown(ref: string): void {
-    const t = this.tags.get(ref);
+    const t = this.convs.get(ref);
     if (t) {
       t.timer?.cancel();
       t.timer = null;
       t.next = null;
     }
     this.o.notifier.close(ref);
+    if (this.fixedFor.delete(ref) && this.fixedFor.size === 0) this.o.notifier.close(FIXED.tag);
   }
 
   /** The number of copies that count as unread (§11.13): set whenever it changes. */
@@ -194,8 +208,9 @@ export class LocalNotify {
 
   /** `logout`, or notifications turned off: nothing waits, nothing stays on screen, no badge. */
   clearAll(): void {
-    for (const t of this.tags.values()) t.timer?.cancel();
-    this.tags.clear();
+    for (const t of this.convs.values()) t.timer?.cancel();
+    this.convs.clear();
+    this.fixedFor.clear();
     this.o.notifier.closeAll();
   }
 
