@@ -4,6 +4,24 @@
 // (src-tauri/tauri.windows.conf.json), which leaves the page nothing to do.
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
+declare global {
+  interface Window {
+    /** What the native code tells the page about its window before the page loads (src-tauri/src/lib.rs, Windows). */
+    readonly __SEGV_WINDOW__?: { readonly os?: string; readonly backdrop?: string };
+  }
+}
+
+/**
+ * Marks the root element with the window's system and backdrop (data-os, data-backdrop), which desktop.css styles: on
+ * Windows the system's title bar, and Mica or an opaque window. Called first, before anything reads them.
+ */
+export function markWindow(): void {
+  const w = window.__SEGV_WINDOW__;
+  const root = document.documentElement;
+  if (w?.os) root.dataset.os = w.os;
+  if (w?.backdrop) root.dataset.backdrop = w.backdrop;
+}
+
 /** The height of the strip that acts as the title bar, in CSS pixels (desktop.css: --titlebar). */
 const TITLEBAR = 44;
 

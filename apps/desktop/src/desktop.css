@@ -113,7 +113,8 @@ html[data-shell="desktop"] body {
 }
 
 /* ---- Windows: the system's title bar is above the page, and the window is Mica on Windows 11
-   (data-backdrop="mica") or opaque before it ("none"); src-tauri/src/lib.rs sets both attributes ---- */
+   (data-backdrop="mica") or opaque before it ("none"); chrome.ts sets both attributes from what
+   src-tauri/src/lib.rs tells the page ---- */
 :root[data-shell="desktop"][data-os="windows"] {
   --lights: 14px;
 }

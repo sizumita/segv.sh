@@ -108,8 +108,9 @@ fn tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
 }
 
 /// The main window on Windows, which tauri.windows.conf.json leaves to this function: Mica behind the page on Windows 11,
-/// and an opaque window before it, where a transparent one would show the desktop through the page. The page learns
-/// which from the attributes that the script sets on its root element before any of its own code runs (desktop.css).
+/// and an opaque window before it, where a transparent one would show the desktop through the page. The script tells
+/// the page which, in a global that it reads before anything else (chrome.ts): it runs before the document is parsed,
+/// when the document may not have its root element yet.
 #[cfg(windows)]
 fn main_window(app: &AppHandle<Wry>) -> tauri::Result<()> {
     use tauri::utils::config::WindowEffectsConfig;
@@ -121,7 +122,7 @@ fn main_window(app: &AppHandle<Wry>) -> tauri::Result<()> {
     let backdrop = if mica { "mica" } else { "none" };
     let mut window = tauri::WebviewWindowBuilder::from_config(app, &conf)?
         .initialization_script(format!(
-            "document.documentElement.dataset.os=\"windows\";document.documentElement.dataset.backdrop=\"{backdrop}\";"
+            "Object.defineProperty(window,\"__SEGV_WINDOW__\",{{value:Object.freeze({{os:\"windows\",backdrop:\"{backdrop}\"}})}});"
         ))
         .transparent(mica);
     if mica {
