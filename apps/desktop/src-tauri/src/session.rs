@@ -45,8 +45,14 @@ fn aad(uid: &str) -> Vec<u8> {
     format!("segv.sh/v2/session/{uid}").into_bytes()
 }
 
+/// One load, save or clear at a time, each from start to end: a sign-out that comes while a save still waits for the
+/// key store (a TPM may take seconds) runs after it, and removes what it wrote, instead of finishing first and being
+/// undone. The lock is fair, so they run in the order in which they came.
+static SESSION: tauri::async_runtime::Mutex<()> = tauri::async_runtime::Mutex::const_new(());
+
 #[tauri::command]
 pub async fn session_load<R: Runtime>(app: AppHandle<R>) -> Result<Option<Loaded>, String> {
+    let _held = SESSION.lock().await;
     let Ok(text) = fs::read_to_string(path(&app)?) else {
         return Ok(None);
     };
@@ -85,6 +91,7 @@ pub async fn session_load<R: Runtime>(app: AppHandle<R>) -> Result<Option<Loaded
 
 #[tauri::command]
 pub async fn session_save<R: Runtime>(app: AppHandle<R>, uid: String, ak: String) -> Result<(), String> {
+    let _held = SESSION.lock().await;
     let ak = B64.decode(ak).map_err(|_| "invalid key".to_string())?;
     if ak.len() != 32 || uid.is_empty() || uid.len() > 64 {
         return Err("invalid session".into());
@@ -125,6 +132,7 @@ pub async fn session_save<R: Runtime>(app: AppHandle<R>, uid: String, ak: String
 
 #[tauri::command]
 pub async fn session_clear<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    let _held = SESSION.lock().await;
     match fs::remove_file(path(&app)?) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
