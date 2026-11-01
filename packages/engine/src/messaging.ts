@@ -93,6 +93,9 @@ type Bytes = Uint8Array;
 /** Topics per realtime socket (§10.8). */
 const RT_TOPICS = 256;
 
+/** Catch-up runs this often while realtime is connected (§11.6); otherwise every `delays.catchUpInterval`. */
+const CONNECTED_CATCH_UP_MS = 300_000;
+
 /** A self row holds at most this many bytes of records (cls 3 minus the S header and a margin, §7.1, §7.3). */
 const ROW_BUDGET = 16_384 - 32 - 64;
 
@@ -184,6 +187,8 @@ export class Messaging {
   private readonly topics = new Map<string, { c: Copy; ep: Epoch }>();
   /** at most 2 realtime sockets of at most 256 topics each (§10.8) */
   private readonly rts: Realtime[] = [];
+  /** monotonic time of the last periodic catch-up */
+  private lastPeriodic = -Infinity;
   private WS: WebSocketCtor | null = null;
   private seqCounter = 0;
   private localCounter = 0;
@@ -307,9 +312,17 @@ export class Messaging {
       () => Math.max(this.params().inboxSlot, 2) * 1000,
       () => this.h.enqueue(() => this.pollInbox()),
     );
+    // The loop ticks at the short interval, so a socket that drops gets the short cadence at once, not after the
+    // long wait that was scheduled while it was connected.
     this.every(
-      () => (this.rts[0]?.connected ? 300_000 : this.h.delays.catchUpInterval),
-      () => this.catchUp(),
+      () => this.h.delays.catchUpInterval,
+      () => {
+        const now = this.h.clock.mono();
+        if (this.rts[0]?.connected && now - this.lastPeriodic < CONNECTED_CATCH_UP_MS)
+          return Promise.resolve();
+        this.lastPeriodic = now;
+        return this.catchUp();
+      },
     );
   }
 

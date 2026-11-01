@@ -159,7 +159,9 @@ bell up in a cache sealed on the device and, for the message, fetches and decryp
 - The server stores, per device, its push endpoint and keys sealed under a server key, keyed hashes of its bells, and
   the day of its last registration: no account, conversation, topic or address, and nothing about which devices a
   message reached. It writes registration changes only once a day, because the platform keeps a 30-day history of the
-  storage; that history can still suggest, on a quiet day, which devices changed together.
+  storage; that history can still suggest, on a quiet day, which devices changed together. Until then it keeps them in
+  a sealed journal that gets one row of the same size every minute whether or not anything changed, so a restart of
+  the server loses at most the last minute's changes.
 - The browser's push service (Apple for every iPhone and iPad web app, Google, Mozilla or Microsoft) learns that the
   device uses segv.sh and when it is notified, and can guess from the timing which of its devices share a
   conversation.
@@ -190,7 +192,7 @@ The app is a Qwik v2 site with a client engine that runs entirely in the browser
 | `BlobRegDO`             | Registers uploads to R2 and their times, which membership changes depend on                                                                                                                       |
 | `RealtimeDO`            | Hibernatable WebSockets that push new rows to the topics each client subscribed to                                                                                                                |
 | `CheckpointDO`          | Every 60 seconds, signs the heads of the shard, inbox, upload registry and directory into a checkpoint chain                                                                                      |
-| `PushDO` (optional)     | The sealed notification registrations of the devices that turned notifications on, and the notifications; written once a day                                                                      |
+| `PushDO` (optional)     | The sealed notification registrations of the devices that turned notifications on, and the notifications; written once a day, with a sealed journal of fixed size written once a minute           |
 | D1                      | The directory (handle ↔ account id ↔ public keys, key wraps) and its public, hash-chained log                                                                                                     |
 | R2                      | Encrypted images and key bundles, content-addressed and immutable                                                                                                                                 |
 

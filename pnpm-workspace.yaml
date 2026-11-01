@@ -52,6 +52,13 @@ overrides:
   "@azure/functions@3.5.1>uuid": 11.1.1 # GHSA-w5hq-g745-h8pq
   "@qwik.dev/router@2.0.0-rc.4>zod": 4.6.6 # GHSA-mrhx-c7xc-m3w5
   vite-imagetools@10.0.0>sharp: 0.35.5 # GHSA-f88m-g3jw-g9cj, GHSA-rgj7-g3m4-5g8c, GHSA-wq5f-xc86-pv6w
+  # eslint-plugin-qwik 2.0.0-rc.4 brings in eslint and typescript-eslint, whose minimatch 10 has an advisory that
+  # only minimatch 11 fixes. These parents call only minimatch(), new Minimatch() and match(), which 11 keeps, and
+  # none of them reaches the Worker or the app. Delete these once the parents depend on minimatch 11, and run
+  # `pnpm audit`.
+  eslint@10.13.0>minimatch: 11.0.3 # GHSA-g3hv-75wg-m249
+  "@eslint/config-array@0.23.5>minimatch": 11.0.3 # GHSA-g3hv-75wg-m249
+  "@typescript-eslint/typescript-estree@8.72.1>minimatch": 11.0.3 # GHSA-g3hv-75wg-m249
 
 # vite resolves to @voidzero-dev/vite-plus-core, whose version (1.x) is outside the vite ranges that plugins declare.
 peerDependencyRules:

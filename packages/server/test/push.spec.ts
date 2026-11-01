@@ -1,6 +1,6 @@
 /**
  * Web Push (docs/PROTOCOL.md §9.8, §10.10): the configuration, both endpoints, and PushDO's registrations, pushes,
- * daily pass and alarm.
+ * journal, daily pass and alarm.
  *
  * PushDO is one instance ("push/v2"). Each test that drives it starts from empty tables and a new instance (reset()),
  * whose clock, randomness, sleep and fetch are replaced: its clock runs days ahead of real time, so the alarm it arms
@@ -10,17 +10,21 @@ import { gcm } from "@noble/ciphers/aes.js";
 import { p256 } from "@noble/curves/nist.js";
 import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as P from "@segv/protocol/proto";
 import * as W from "@segv/protocol/wire";
-import { MAX_RING_BODY, MAX_SEEN_BODY, RING_FRESH, ringEraOk, ringRowFresh } from "../src/api";
+import { MAX_RING_BODY, MAX_SEEN_BODY, RING_FRESH, _setRingSleepForTests, ringEraOk, ringRowFresh } from "../src/api";
 import { _resetPushConfigForTests } from "../src/env";
 import {
+  JR_BYTES,
+  JR_SLOTS,
   PUSH_HOLD,
+  PUSH_JOURNAL,
   PUSH_PENDING,
   PUSH_SEEN,
   PUSH_TICK,
   PUSH_WINDOW,
+  RING_WAIT,
   SEEN_TTL,
   dayOf,
   nextTick,
@@ -141,11 +145,13 @@ async function install(): Promise<void> {
   });
 }
 
-/** Empty tables, a new instance (empty memory), fresh fakes. */
+/** Empty tables (the journal and the pass's day included), a new instance (empty memory), fresh fakes. */
 async function reset(now: number | null = BASE): Promise<void> {
   await inDO(async (_h, state) => {
     state.storage.sql.exec("DELETE FROM tok");
     state.storage.sql.exec("DELETE FROM sub");
+    state.storage.sql.exec("DELETE FROM jr");
+    state.storage.sql.exec("DELETE FROM meta");
     await state.storage.deleteAlarm();
   });
   await evictDurableObject(DO());
@@ -172,6 +178,20 @@ async function run(at?: number): Promise<void> {
   if (at !== undefined) fake.now = at;
   await DO().run();
 }
+/**
+ * `sub` as a device sends it: while the journal's next row is full (BUSY), the next minute's run, which writes that
+ * row, and `sub` again. Many registrations at once thus spread over minutes.
+ */
+async function subRetrying(d: Dev, bs: Bytes[], quiet: Bytes | null = null): Promise<void> {
+  for (;;) {
+    const r = await sub(d, bs, quiet);
+    if (r !== "busy") return void expect(r).toBe("ok");
+    await run((Math.floor(nowOf() / 60_000) + 1) * 60_000);
+  }
+}
+/** The day of the last completed pass that `meta` holds. */
+const passDay = (): Promise<number | null> =>
+  inDO((_h, state) => state.storage.sql.exec<{ v: number }>("SELECT v FROM meta WHERE k = 'pass'").toArray()[0]?.v ?? null);
 const dueOf = (d: Dev): Promise<number | null> => inDO((h) => h.pushes.get(P.hex(d.ep))?.due ?? null);
 const stateOf = (d: Dev): Promise<PushState> => inDO((h) => ({ ...(h.pushes.get(P.hex(d.ep)) ?? { due: null, last: null, tries: 0 }) }));
 const callsTo = (d: Dev): Call[] => fake.calls.filter((c) => c.url === d.endpoint);
@@ -364,6 +384,15 @@ describe("POST /api/v2/push/sub (§10.10)", () => {
     expect((await post(body())).status).toBe(204);
   });
 
+  it('503 "push busy" with retry-after 60 for a change the journal\'s next row cannot hold', async () => {
+    const big = (endpoint: string) => body({ endpoint, tokens: bells(256).map(P.b64u) });
+    expect((await post(big("https://fcm.googleapis.com/fcm/send/a1"))).status).toBe(204);
+    const r = await post(big("https://fcm.googleapis.com/fcm/send/a2"));
+    expect(r.status).toBe(503);
+    expect(r.headers.get("retry-after")).toBe("60");
+    expect(await r.json()).toEqual({ error: "push busy" });
+  });
+
   it("a repeated token counts once; 256 distinct ones are accepted", async () => {
     const t = P.b64u(P.random(16));
     expect((await post(body({ tokens: [t, t, t] }))).status).toBe(204);
@@ -481,7 +510,12 @@ describe("PushDO limits (§9.8)", () => {
 describe("POST /api/v2/ring (§10.10)", () => {
   beforeEach(async () => {
     _resetPushConfigForTests();
+    // The Worker's wait for the push it rang ends at once (the flush then finds nothing due yet), unless a test says so.
+    _setRingSleepForTests(async () => {});
     await reset(null);
+  });
+  afterEach(() => {
+    _setRingSleepForTests(null);
   });
   const ringBody = (E: number, label: Bytes, tokens: Bytes[], ver = 1): Bytes =>
     P.concat(Uint8Array.of(ver), P.u16(E), label, Uint8Array.of(tokens.length), ...tokens);
@@ -507,6 +541,35 @@ describe("POST /api/v2/ring (§10.10)", () => {
     }
     expect(new Set(answers)).toEqual(new Set(["204||null"]));
     expect(await dueOf(d)).not.toBeNull();
+  });
+
+  it("after the answer, the Worker waits as long as PushDO says and flushes: the push goes out at its due time", async () => {
+    const slept: number[] = [];
+    _setRingSleepForTests(async (ms) => {
+      slept.push(ms);
+      fake.now! += ms;
+    });
+    fake.now = Date.now();
+    fake.rand = 0.5;
+    const d = dev();
+    const b = P.random(16);
+    await sub(d, [b]);
+    const row = makeRow();
+    await putOk([row]);
+    const t0 = fake.now;
+    expect((await post(ringBody(row.E, row.label, [b]))).status).toBe(204);
+    expect(slept).toHaveLength(1);
+    expect(slept[0]).toBeGreaterThanOrEqual(HOLD);
+    expect(slept[0]).toBeLessThanOrEqual(HOLD + DELTA * 1000);
+    expect(callsTo(d).map((c) => c.at)).toEqual([t0 + slept[0]]);
+    // The next push waits for the end of PUSH_WINDOW, beyond RING_WAIT: the Worker does not wait, the alarm sends it.
+    const row2 = makeRow();
+    await putOk([row2]);
+    slept.length = 0;
+    expect((await post(ringBody(row2.E, row2.label, [b]))).status).toBe(204);
+    expect(slept).toEqual([]);
+    expect((await dueOf(d))! - fake.now!).toBeGreaterThan(RING_WAIT);
+    expect(callsTo(d)).toHaveLength(1);
   });
 
   it("400 for ver 2, n 0, n 65 or a length mismatch; 413 above 1044 bytes; 429 from RL_RING; no proof of work", async () => {
@@ -619,7 +682,7 @@ describe("the push request (§9.8)", () => {
     expect(c.init.method).toBe("POST");
     expect(c.init.redirect).toBe("manual");
     expect(c.headers.get("ttl")).toBe("86400");
-    expect(c.headers.get("urgency")).toBe("normal");
+    expect(c.headers.get("urgency")).toBe("high");
     expect(c.headers.get("topic")).toBe("segv");
     expect(c.headers.get("content-encoding")).toBe("aes128gcm");
     expect(c.headers.get("content-type")).toBe("application/octet-stream");
@@ -812,7 +875,7 @@ describe("expiry and what is stored (§9.8)", () => {
     expect(await sub(dev(), bells(1))).toBe("ok");
   });
 
-  it("stores only sub and tok: keyed hashes, a sealed box, no bell in the clear, nothing per ring, and logs nothing identifying", async () => {
+  it("stores sub, tok, the journal and the pass's day: keyed hashes, sealed boxes, no bell in the clear, nothing per ring, and logs nothing identifying", async () => {
     const log = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       await reset(BASE);
@@ -824,7 +887,7 @@ describe("expiry and what is stored (§9.8)", () => {
       await ring(bs);
       await run(BASE + DAY + 2000);
       await run(BASE + DAY + 20_000);
-      const { names, kv, sub: subs, tok } = await inDO(async (_h, state) => ({
+      const { names, kv, sub: subs, tok, jr, meta } = await inDO(async (_h, state) => ({
         names: state.storage.sql
           .exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\' AND name NOT LIKE 'sqlite_%'")
           .toArray()
@@ -833,9 +896,14 @@ describe("expiry and what is stored (§9.8)", () => {
         kv: (await state.storage.list()).size,
         sub: state.storage.sql.exec<{ ep: ArrayBuffer; box: ArrayBuffer; day: number }>("SELECT ep, box, day FROM sub").toArray(),
         tok: state.storage.sql.exec<{ tk: ArrayBuffer; ep: ArrayBuffer }>("SELECT tk, ep FROM tok").toArray(),
+        jr: state.storage.sql.exec<{ box: ArrayBuffer }>("SELECT box FROM jr").toArray(),
+        meta: state.storage.sql.exec<{ k: string; v: number }>("SELECT k, v FROM meta").toArray(),
       }));
-      expect(names).toEqual(["sub", "tok"]);
+      expect(names).toEqual(["jr", "meta", "sub", "tok"]);
       expect(kv).toBe(0);
+      // One journal row for the one minute the runs fell in, however much happened in it; the day of the pass.
+      expect(jr.map((r) => r.box.byteLength)).toEqual([24 + JR_BYTES + 16]);
+      expect(meta).toEqual([{ k: "pass", v: dayOf(BASE) + 1 }]);
       expect(subs).toHaveLength(1);
       expect(P.hex(new Uint8Array(subs[0].ep))).toBe(P.hex(d.ep));
       const [e, k, a] = P.dec(P.aeadOpen(PUSH_KEY, new Uint8Array(subs[0].box), P.enc("segv.sh/v2/push/sub", d.ep)), 3);
@@ -844,7 +912,13 @@ describe("expiry and what is stored (§9.8)", () => {
       expect(P.hex(a)).toBe(P.hex(d.auth));
       expect(() => P.aeadOpen(P.random(32), new Uint8Array(subs[0].box), P.enc("segv.sh/v2/push/sub", d.ep))).toThrow();
       expect(tok.map((r) => P.hex(new Uint8Array(r.tk))).sort()).toEqual(bs.map((x) => P.hex(tkOf(x))).sort());
-      const all = P.hex(P.concat(...subs.flatMap((r) => [new Uint8Array(r.ep), new Uint8Array(r.box)]), ...tok.flatMap((r) => [new Uint8Array(r.tk), new Uint8Array(r.ep)])));
+      const all = P.hex(
+        P.concat(
+          ...subs.flatMap((r) => [new Uint8Array(r.ep), new Uint8Array(r.box)]),
+          ...tok.flatMap((r) => [new Uint8Array(r.tk), new Uint8Array(r.ep)]),
+          ...jr.map((r) => new Uint8Array(r.box)),
+        ),
+      );
       for (const x of bs) expect(all).not.toContain(P.hex(x));
       const lines = log.mock.calls.map((c) => c.map(String).join(" ")).join("\n");
       expect(lines).toContain("push results");
@@ -909,19 +983,30 @@ describe("only the daily pass writes, and the alarm follows the clock (§9.8)", 
     expect(t.tok.map((r) => r.tk).sort()).toEqual([P.hex(tkOf(x.a2)), P.hex(tkOf(x.b1))].sort());
   });
 
-  it("(b) a restart before the pass brings back the stored registrations; the device's next sub restores its own", async () => {
+  it("(b) a restart brings back the changes that the journal holds; one of the last minute comes back with the device's next sub", async () => {
+    // The run that took D's refusal wrote the journal's row first: A, B and C's changes are in it, D's deletion is not.
     const x = await dayOfChanges();
     await restart();
-    expect(await reaches(x.A, [x.a1])).toBe(true);
-    expect(await reaches(x.D, [x.d1])).toBe(true);
-    expect(await reaches(x.B, [x.b1])).toBe(false);
-    await sub(x.B, [x.b1]);
+    expect(await reaches(x.A, [x.a2])).toBe(true);
+    expect(await reaches(x.A, [x.a1])).toBe(false);
     expect(await reaches(x.B, [x.b1])).toBe(true);
-    // The next pass writes B's re-sent registration; a restart after it keeps everything.
+    expect(await reaches(x.C, [x.c1])).toBe(false);
+    expect(await reaches(x.D, [x.d1])).toBe(true); // deleted again at its next push (§9.8)
+    // A change after the minute's row is lost with a restart in that minute; the device's next sub restores it.
+    const E = dev();
+    const e1 = P.random(16);
+    await sub(E, [e1]);
+    await restart();
+    expect(await reaches(E, [e1])).toBe(false);
+    await sub(E, [e1]);
+    expect(await reaches(E, [e1])).toBe(true);
+    // The next pass writes what memory holds; a restart after it keeps everything.
     await run(BASE + 2 * DAY);
     await restart();
+    expect(await reaches(x.A, [x.a2])).toBe(true);
     expect(await reaches(x.B, [x.b1])).toBe(true);
-    expect(await reaches(x.A, [x.a1])).toBe(true);
+    expect(await reaches(E, [e1])).toBe(true);
+    expect(await reaches(x.C, [x.c1])).toBe(false);
   });
 
   it("(c) rings write nothing: not the alarm, not the tables; the alarm keeps the PUSH_TICK grid", async () => {
@@ -963,14 +1048,34 @@ describe("only the daily pass writes, and the alarm follows the clock (§9.8)", 
     await reset(BASE);
     const devs = Array.from({ length: 120 }, () => dev());
     const bs = devs.map(() => P.random(16));
-    for (let i = 0; i < devs.length; i++) await sub(devs[i], [bs[i]]);
+    for (let i = 0; i < devs.length; i++) await subRetrying(devs[i], [bs[i]]); // over a few minutes
+    const t = nowOf();
     await ring(bs.slice(0, 60));
     await ring(bs.slice(60));
-    await run(BASE + HOLD);
+    await run(t + HOLD);
     expect(fake.calls).toHaveLength(120);
     const at = [...new Set(fake.calls.map((c) => c.at))].sort((p, q) => p - q);
-    expect(at).toEqual([BASE + HOLD, BASE + HOLD + 1000, BASE + HOLD + 2000]);
-    expect(fake.calls.filter((c) => c.at === BASE + HOLD)).toHaveLength(50);
+    expect(at).toEqual([t + HOLD, t + HOLD + 1000, t + HOLD + 2000]);
+    expect(fake.calls.filter((c) => c.at === t + HOLD)).toHaveLength(50);
+  });
+
+  it("(c2) flushes close together share the limit of one batch a second", async () => {
+    await reset(BASE);
+    const devs = Array.from({ length: 100 }, () => dev());
+    const bs = devs.map(() => P.random(16));
+    for (let i = 0; i < devs.length; i++) await subRetrying(devs[i], [bs[i]]);
+    const t = nowOf();
+    await ring(bs.slice(0, 50));
+    fake.now = t + 200;
+    await ring(bs.slice(50));
+    fake.now = t + HOLD;
+    await DO().flush(); // the first 50
+    fake.now = t + HOLD + 200;
+    await DO().flush(); // the other 50, due now, wait for the next second
+    const at = fake.calls.map((c) => c.at);
+    expect(at).toHaveLength(100);
+    expect(at.filter((x) => x === t + HOLD)).toHaveLength(50);
+    expect(at.filter((x) => x === t + HOLD + 1000)).toHaveLength(50);
   });
 
   it("(d) after a restart at noon the first pass writes nothing; a change at 23:59:59 is written at 00:00, never earlier", async () => {
@@ -1073,6 +1178,211 @@ describe("only the daily pass writes, and the alarm follows the clock (§9.8)", 
     expect(await runDurableObjectAlarm(DO())).toBe(true);
     expect(await inDO((_h, state) => state.storage.getAlarm())).toBe(later + PUSH_TICK * 1000);
   });
+
+  it("(g) ring answers the wait until its push is due; flush sends what is due then, and nothing before", async () => {
+    await reset(BASE);
+    const d = dev();
+    const b = P.random(16);
+    await sub(d, [b]);
+    fake.rand = 0.7;
+    const wait = await ring([b]);
+    const due = (await dueOf(d))!;
+    expect(wait).toBe(due - BASE);
+    await DO().flush();
+    expect(callsTo(d)).toHaveLength(0);
+    fake.now = due;
+    await DO().flush();
+    expect(callsTo(d).map((c) => c.at)).toEqual([due]);
+    // The next push waits for the end of PUSH_WINDOW: beyond RING_WAIT, no wait is answered, and a run sends it.
+    fake.now = due + 1000;
+    expect(await ring([b])).toBeNull();
+    const due2 = (await dueOf(d))!;
+    expect(due2 - fake.now).toBeGreaterThan(RING_WAIT);
+    // A ring that joins a waiting push answers that push's wait once it is near.
+    fake.now = due2 - 3000;
+    expect(await ring([b])).toBe(3000);
+    await run(nextTick(due2));
+    expect(callsTo(d)).toHaveLength(2);
+    // A marked row's push is cancelled: the flush at its time finds nothing.
+    const e = dev();
+    const q = P.random(16);
+    const eb = P.random(16);
+    await sub(e, [eb], q);
+    const label = P.random(16);
+    const w = (await ring([eb], label))!;
+    await DO().seen(q, [{ E: 1, label }]); // the quiet tag, as the Worker passes it
+    fake.now! += w;
+    await DO().flush();
+    expect(callsTo(e)).toHaveLength(0);
+  });
+});
+
+// ───────────── 11b. the journal ─────────────
+
+describe("the journal keeps the day's changes across a restart (§9.8)", () => {
+  const jrRows = (): Promise<{ slot: number; box: string }[]> =>
+    inDO((_h, state) =>
+      state.storage.sql
+        .exec<{ slot: number; box: ArrayBuffer }>("SELECT slot, box FROM jr ORDER BY slot")
+        .toArray()
+        .map((r) => ({ slot: r.slot, box: P.hex(new Uint8Array(r.box)) })),
+    );
+  const minute = (ms: number): number => Math.floor(ms / (PUSH_JOURNAL * 1000));
+  const openRow = async (ms: number, key = PUSH_KEY): Promise<Bytes> => {
+    const box = await inDO(
+      (_h, state) =>
+        new Uint8Array(state.storage.sql.exec<{ box: ArrayBuffer }>("SELECT box FROM jr WHERE slot = ?", minute(ms) % JR_SLOTS).one().box),
+    );
+    return P.aeadOpen(key, box, P.enc("segv.sh/v2/push/jr", P.u32(minute(ms))));
+  };
+  const regCount = (): Promise<number> => inDO((h) => (h as unknown as { regCount: number }).regCount);
+
+  it("(a) one row of one length at the first run of each minute while push is on, whatever changed; nothing else writes it", async () => {
+    await reset(BASE);
+    await run(BASE);
+    let rows = await jrRows();
+    expect(rows.map((r) => r.slot)).toEqual([minute(BASE) % JR_SLOTS]);
+    const len = rows[0].box.length;
+    expect(len / 2).toBe(24 + JR_BYTES + 16);
+    const d = dev();
+    const b = P.random(16);
+    fake.now = BASE + 1000;
+    await sub(d, [b]);
+    await ring([b]);
+    await DO().flush();
+    expect(await jrRows()).toEqual(rows);
+    await run(BASE + 10_000); // the same minute: no second row, the change waits
+    expect(await jrRows()).toEqual(rows);
+    await run(BASE + 60_000);
+    rows = await jrRows();
+    expect(rows).toHaveLength(2);
+    // The row holds the change, sealed under PUSH_KEY and bound to its minute; bells only as keyed hashes.
+    const p = await openRow(BASE + 60_000);
+    expect(p).toHaveLength(JR_BYTES);
+    expect(P.hex(p)).toContain(P.hex(d.ep));
+    expect(P.hex(p)).toContain(P.hex(tkOf(b)));
+    expect(P.hex(p)).not.toContain(P.hex(b));
+    await expect(openRow(BASE + 60_000, P.random(32))).rejects.toThrow();
+    // Nothing waits: the next minute's row is as long.
+    await run(BASE + 120_000);
+    rows = await jrRows();
+    expect(rows).toHaveLength(3);
+    for (const r of rows) expect(r.box.length).toBe(len);
+    // While push is off, none.
+    await setEnv({ VAPID_SK: undefined });
+    await run(BASE + 180_000);
+    expect(await jrRows()).toHaveLength(3);
+  });
+
+  it("(b) a restart reads the changes back in order, across empty minutes, a deletion at a push included", async () => {
+    await reset(BASE);
+    await run(BASE);
+    const [A, B, C] = [dev(), dev(), dev()];
+    const [a1, a2, b1, c1] = bells(4);
+    fake.now = BASE + 1000;
+    await sub(A, [a1]);
+    await sub(B, [b1]);
+    await sub(C, [c1]);
+    await run(BASE + 60_000);
+    fake.now = BASE + 61_000;
+    await sub(A, [a2]);
+    await sub(B, []);
+    fake.respond = (c) => new Response(null, { status: c.url === C.endpoint ? 410 : 201 });
+    await ring([c1]);
+    await run(BASE + 61_000 + HOLD); // the same minute: C's push is refused, and its deletion waits for the next row
+    for (let m = 2; m <= 30; m++) await run(BASE + m * 60_000);
+    await restart();
+    fake.respond = () => new Response(null, { status: 201 });
+    expect(await reaches(A, [a2])).toBe(true);
+    expect(await reaches(A, [a1])).toBe(false);
+    expect(await reaches(B, [b1])).toBe(false);
+    expect(await reaches(C, [c1])).toBe(false);
+    expect((await tables()).sub).toEqual([]);
+    await run(BASE + DAY);
+    expect((await tables()).sub.map((r) => r.ep)).toEqual([P.hex(A.ep)]);
+  });
+
+  it("(c) what a completed pass wrote is not read back; a restart in the minute of a row leaves that row as it was", async () => {
+    await reset(BASE);
+    const d = dev();
+    await sub(d, bells(1));
+    await run(BASE + 60_000); // journaled on day D
+    await run(BASE + DAY); // the pass of D+1 writes it and records that it is complete
+    await restart();
+    await run(BASE + DAY + 10_000);
+    expect(await regCount()).toBe(0); // stored, not a change of the day
+    const e = dev();
+    const eb = bells(1);
+    fake.now = BASE + DAY + 70_000;
+    await sub(e, eb);
+    await run(BASE + DAY + 120_000); // e's row
+    const before = await jrRows();
+    await restart();
+    await run(BASE + DAY + 130_000); // the same minute, after the restart: no new row over it
+    expect(await jrRows()).toEqual(before);
+    expect(await reaches(e, eb)).toBe(true);
+    expect(await regCount()).toBe(1);
+  });
+
+  it("(d) a row that does not open ends the walk: under a new PUSH_KEY nothing is read back", async () => {
+    await reset(BASE);
+    await run(BASE);
+    const d = dev();
+    fake.now = BASE + 1000;
+    await sub(d, bells(1));
+    await run(BASE + 60_000);
+    await restart();
+    await setEnv({ PUSH_KEY: P.b64u(P.random(32)) });
+    await run(BASE + 70_000);
+    expect(await regCount()).toBe(0);
+  });
+
+  it("(e) sub answers BUSY to a change the next row cannot hold with those waiting; each change it took survives", async () => {
+    await reset(BASE);
+    await run(BASE);
+    const [a, b, c] = [dev(), dev(), dev()];
+    const [a1, a2, bb, cb] = [bells(256), bells(256), bells(256), bells(1)];
+    fake.now = BASE + 1000;
+    expect(await sub(a, a1)).toBe("ok");
+    expect(await sub(b, bb)).toBe("busy"); // a's change takes most of the next row
+    expect(await reaches(b, bb)).toBe(false); // and nothing of b changed
+    expect(await sub(c, cb)).toBe("ok"); // a small change still fits
+    expect(await sub(a, a2)).toBe("ok"); // a's next change takes the place of the one waiting
+    expect(await sub(b, [])).toBe("ok"); // so does a deletion, of nothing
+    await run(BASE + 60_000); // the row of minute 1 holds a and c
+    expect(await sub(b, bb)).toBe("ok");
+    await run(BASE + 120_000); // and that of minute 2, b
+    await restart();
+    for (const [d, bs] of [
+      [a, a2],
+      [b, bb],
+      [c, cb],
+    ] as const)
+      expect(await reaches(d, bs)).toBe(true);
+    expect(await reaches(a, a1)).toBe(false);
+    expect(await regCount()).toBe(3);
+  });
+
+  it("(f) a pass while push is off leaves the day in meta, so the journal's changes come back with push", async () => {
+    await reset(BASE);
+    const d = dev();
+    const b = bells(1);
+    fake.now = BASE + 1000;
+    await sub(d, b);
+    await run(BASE + 60_000); // its row; the day's pass has nothing to write yet
+    expect(await passDay()).toBe(dayOf(BASE));
+    await restart();
+    await setEnv({ PUSH_KEY: undefined }); // the object starts with push off: it cannot read the journal
+    await run(BASE + DAY + 1000); // the next day's pass goes through, by day only
+    await run(BASE + DAY + 11_000);
+    expect(await passDay()).toBe(dayOf(BASE));
+    expect(await storedDay(d)).toBeNull();
+    await restart(); // push is on again (a deploy restarts the object)
+    await run(BASE + DAY + 21_000);
+    expect(await storedDay(d)).toBe(dayOf(BASE));
+    expect(await passDay()).toBe(dayOf(BASE) + 1);
+    expect(await reaches(d, b)).toBe(true);
+  });
 });
 
 // ───────────── 12. the pass in parts ─────────────
@@ -1081,7 +1391,7 @@ describe("the daily pass works in bounded parts (§9.8)", () => {
   it("never reads, writes or deletes more than PUSH_ROWS rows in a run, never splits an endpoint, goes in ep order, resumes and retries", async () => {
     await reset(BASE);
     const old = Array.from({ length: 40 }, () => dev());
-    for (const d of old) await sub(d, bells(256));
+    for (const d of old) await subRetrying(d, bells(256)); // one a minute: each fills a journal row
     const sender = dev();
     const sb = P.random(16);
     fake.now = BASE + 29 * DAY;
@@ -1130,9 +1440,9 @@ describe("the daily pass works in bounded parts (§9.8)", () => {
     });
     for (let at = BASE + 31 * DAY + 100_000; runs < 40; at += 10_000, runs++) await run(at);
     const end = await tables();
-    // The 40 expired. Of the 10 changes, those that parts before the restart reached were written; the rest were lost.
-    const written = changed.map((d) => P.hex(d.ep)).filter((h) => h <= firstPass[firstPass.length - 1].last!);
-    expect(end.sub.map((r) => r.ep).sort()).toEqual([P.hex(sender.ep), ...written].sort());
+    // The 40 expired. The 10 changes are all written: the journal brought back those the parts before the restart had
+    // not reached (and those they had, which the second pass writes again).
+    expect(end.sub.map((r) => r.ep).sort()).toEqual([P.hex(sender.ep), ...changed.map((d) => P.hex(d.ep))].sort());
     const secondPass = (await inDO((h) => h.parts)) as PassPart[];
     expect(firstPass).toHaveLength(4);
     expect(secondPass.length).toBeGreaterThan(5);
@@ -1141,22 +1451,23 @@ describe("the daily pass works in bounded parts (§9.8)", () => {
       // Each pass goes through the endpoints in ascending ep order.
       for (let i = 1; i < pass.length; i++) expect(pass[i].first! > pass[i - 1].last!).toBe(true);
     }
-    // After the restart the pass started again from the lowest ep stored.
-    expect(secondPass[0].first).toBe(mid.sub[0].ep);
+    // After the restart the pass started again from the lowest ep, stored or read back from the journal.
+    expect(secondPass[0].first).toBe([...mid.sub.map((r) => r.ep), ...changed.map((d) => P.hex(d.ep))].sort()[0]);
   });
 
   it("writes the day's changes in parts too, in ascending ep whatever the order of the changes", async () => {
     await reset(BASE);
     const devs = Array.from({ length: 12 }, () => dev());
-    for (const d of devs) await sub(d, bells(100));
+    for (const d of devs) await subRetrying(d, bells(100)); // three a minute
     await inDO((h) => {
       h.pushRows = 300;
     });
+    const partsAt = (await inDO((h) => h.parts.length)) as number; // the parts of the first day's pass come before
     for (let i = 0; i < 12; i++) await run(BASE + DAY + i * 10_000);
     const t = await tables();
     expect(t.sub).toHaveLength(12);
     expect(t.tok).toHaveLength(1200);
-    const parts = (await inDO((h) => h.parts)) as PassPart[];
+    const parts = ((await inDO((h) => h.parts)) as PassPart[]).slice(partsAt);
     expect(parts.length).toBeGreaterThanOrEqual(6);
     for (const p of parts) expect(p.rows).toBeLessThanOrEqual(300);
     for (let i = 1; i < parts.length; i++) expect(parts[i].first! > parts[i - 1].last!).toBe(true);
