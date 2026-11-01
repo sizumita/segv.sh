@@ -89,6 +89,15 @@
     // 308 to https://<first><path> (pages) or 421 (/api/*). "" disables the check. localhost = local dev
     // (vp dev, wrangler dev, test/e2e). packages/server/src/hosts.ts.
     "APP_HOSTS": "segv.sh,localhost",
+    // Origins of the native apps (docs/PROTOCOL.md §9.7, §11.14; comma-separated https:, capacitor: or tauri:
+    // origins without a path or port): their pages may read API answers (CORS) and open the realtime socket. Unset
+    // or invalid = none (an invalid value is logged by name). iOS, Android, macOS/Linux, Windows.
+    // packages/server/src/origins.ts.
+    "APP_ORIGINS": "capacitor://app.segv.sh,https://app.segv.sh,tauri://localhost,https://tauri.localhost",
+    // App IDs (<Team ID>.<bundle id>, comma-separated) named by /.well-known/apple-app-site-association for passkeys
+    // (webcredentials) and links (applinks). ANDROID_APPS (<package>@<SHA-256 cert fingerprint>, comma-separated)
+    // fills /.well-known/assetlinks.json the same way. Unset = that file is a 404. packages/server/src/well-known.ts.
+    "APPLE_APP_IDS": "NBDP5VK335.sh.segv.desktop",
   },
   // Workers Logs: keep only our own console.error lines (they never contain addresses, ids or bodies).
   // Invocation logs would retain every request's URL (handles, credential / blob ids) and request

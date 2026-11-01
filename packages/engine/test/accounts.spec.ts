@@ -29,9 +29,9 @@ const wa = vi.hoisted(() => {
     hex,
     creds,
     forgotten: [] as Uint8Array[],
-    /** The credential the next signInWithPasskey() picks (and whether it returns its user handle). */
+    /** The credential the next signIn() picks (and whether it returns its user handle). */
     pick: null as null | { credId: Uint8Array; withUserHandle: boolean },
-    /** Runs inside createPasskey(), i.e. after the handle check and before POST /api/v2/register. */
+    /** Runs inside create(), i.e. after the handle check and before POST /api/v2/register. */
     onCreate: null as null | (() => void),
     prfAtCreate: true,
   };
@@ -39,22 +39,25 @@ const wa = vi.hoisted(() => {
 
 vi.mock("../src/webauthn", () => ({
   PasskeyError: class PasskeyError extends Error {},
-  prfCapability: async () => true,
-  createPasskey: async (uid: Uint8Array) => {
-    wa.onCreate?.();
-    const credId = wa.rnd(16);
-    const prf = wa.rnd(32);
-    wa.creds.set(wa.hex(credId), { credId, uid: uid.slice(), prf });
-    return { credId, prf: wa.prfAtCreate ? prf : null };
-  },
-  prfForCredential: async (credId: Uint8Array) => wa.creds.get(wa.hex(credId))?.prf ?? null,
-  signInWithPasskey: async () => {
-    const p = wa.pick!;
-    const c = wa.creds.get(wa.hex(p.credId))!;
-    return { credId: c.credId, uid: p.withUserHandle ? c.uid : null, prf: c.prf };
-  },
-  forgetCredential: async (credId: Uint8Array) => {
-    wa.forgotten.push(credId);
+  prfInput: () => new TextEncoder().encode("segv.sh/v2/prf"),
+  browserPasskeys: {
+    capability: async () => true,
+    create: async (_rpId: string, uid: Uint8Array) => {
+      wa.onCreate?.();
+      const credId = wa.rnd(16);
+      const prf = wa.rnd(32);
+      wa.creds.set(wa.hex(credId), { credId, uid: uid.slice(), prf });
+      return { credId, prf: wa.prfAtCreate ? prf : null };
+    },
+    prfFor: async (_rpId: string, credId: Uint8Array) => wa.creds.get(wa.hex(credId))?.prf ?? null,
+    signIn: async () => {
+      const p = wa.pick!;
+      const c = wa.creds.get(wa.hex(p.credId))!;
+      return { credId: c.credId, uid: p.withUserHandle ? c.uid : null, prf: c.prf };
+    },
+    forget: async (_rpId: string, credId: Uint8Array) => {
+      wa.forgotten.push(credId);
+    },
   },
 }));
 

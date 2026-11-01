@@ -45,6 +45,7 @@ export const initialEngineState = (): EngineState => ({
   warnings: [],
   prfSupported: null,
   notifications: "unavailable",
+  localNotify: false,
   preview: "unavailable",
   quiet: "unavailable",
 });

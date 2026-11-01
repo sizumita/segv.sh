@@ -120,6 +120,11 @@ export interface EngineState {
    */
   notifications: "unavailable" | "off" | "on";
   /**
+   * The notifications come from the app itself while it runs, from the rows that reach it, also with its window
+   * closed (an app without push, §11.13): no push service is involved, and none comes while the app is not running.
+   */
+  localNotify: boolean;
+  /**
    * What notifications show on this device (§11.13): "unavailable" while notifications are unavailable or the session
    * is not kept on this device (the Service Worker needs the notification cache, which is kept only then).
    */

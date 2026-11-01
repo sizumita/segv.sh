@@ -1,0 +1,11 @@
+{
+  // The page and its build config. Type-checking them also checks @segv/ui and @segv/engine, which the page bundles.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["es2022", "DOM", "WebWorker", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "jsxImportSource": "@qwik.dev/core",
+    "types": ["vite/client", "node"]
+  },
+  "include": ["src", "*.config.ts"]
+}

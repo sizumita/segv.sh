@@ -65,6 +65,7 @@ import { SNAP_RECORDS, firstFreePointer, writeSnapshot } from "./snapshot";
 import { MAX_REACTIONS, reactionSets, refreshReactions } from "./reactions";
 import { lanesEnd, olderInitialHistory, scrollback } from "./history";
 import { prepareImage } from "./image";
+import type { Arrival } from "./local-notify";
 import type { CacheCopy } from "./notify-cache";
 import {
   claimRead,
@@ -166,6 +167,8 @@ export interface MessagingHost {
   ring(E: number, label: Bytes, bells: Bytes[]): void;
   /** a TEXT or IMAGE of another member was shown as it arrived: marked seen while in use (§11.13); never waits */
   shown(E: number, label: Bytes, t: number): void;
+  /** the same row, in a copy whose bell the registration set holds: an app without push may notify (§11.13) */
+  arrived?(a: Arrival): void;
 }
 
 export class Messaging {
@@ -754,6 +757,16 @@ export class Messaging {
 
   private catchUpSoon(): Promise<void> {
     return this.h.track(this.catchUp()).catch(() => {});
+  }
+
+  /**
+   * The system woke from sleep (§11.14 "Desktop"): an open socket that no longer answers is replaced at once, a closed
+   * one reconnects without waiting for its back-off, and the rows stored meanwhile are fetched.
+   */
+  wake(): void {
+    if (!this.live || this.stopped) return;
+    for (const rt of this.rts) rt.wake();
+    void this.catchUpSoon();
   }
 
   /**
@@ -1431,8 +1444,13 @@ export class Messaging {
         this.markHeads();
         this.h.changed();
       },
-      shown: (E, label, t) => {
-        if (!quiet) this.h.shown(E, label, t);
+      shown: (E, label, t, c, m) => {
+        if (quiet) return;
+        this.h.shown(E, label, t);
+        if (this.h.arrived) {
+          const a = this.arrival(c, m);
+          if (a) this.h.arrived(a);
+        }
       },
       handleOf: (c, ep, j) => this.handleOf(c, ep, j),
       onWelcome: (c, ep, j, at, J) => {
@@ -1820,13 +1838,18 @@ export class Messaging {
   }
 
   private newSocket(WS: WebSocketCtor): Realtime {
-    const rt = new Realtime(WS, this.h.clock, {
-      onRows: (rows) => this.onRows(rows),
-      onMissed: () => void this.catchUpSoon(),
-      onSubscribed: () => void this.catchUpSoon(),
-      onHello: (s, sent, recv) => this.h.api.time.add(s, sent, recv),
-      onState: () => this.h.setConnected(this.rts.some((x) => x.connected)),
-    });
+    const rt = new Realtime(
+      WS,
+      this.h.clock,
+      {
+        onRows: (rows) => this.onRows(rows),
+        onMissed: () => void this.catchUpSoon(),
+        onSubscribed: () => void this.catchUpSoon(),
+        onHello: (s, sent, recv) => this.h.api.time.add(s, sent, recv),
+        onState: () => this.h.setConnected(this.rts.some((x) => x.connected)),
+      },
+      this.h.api.origin,
+    );
     rt.start();
     return rt;
   }
@@ -2442,7 +2465,11 @@ export class Messaging {
       ]);
     });
     this.subscribe();
-    const host = typeof location === "undefined" ? "segv.sh" : location.host;
+    const host = this.h.api.origin
+      ? new URL(this.h.api.origin).host
+      : typeof location === "undefined"
+        ? "segv.sh"
+        : location.host;
     return P.encodeLink(host, s, this.h.acc.uid);
   }
 
@@ -2935,12 +2962,41 @@ export class Messaging {
   private notifiable(): { c: Copy; ep: Epoch; bell: Bytes }[] {
     const out: { c: Copy; ep: Epoch; bell: Bytes }[] = [];
     for (const c of this.copies.values()) {
-      if (c.probe || c.request || c.left || this.endOf(c) !== null || !this.byContact(c)) continue;
-      const ep = c.epochs.get(c.current);
-      if (!ep || ep.myIndex < 0) continue;
-      out.push({ c, ep, bell: P.bell(ep.keys.nk, ep.myIndex) });
+      const ep = this.bellEpoch(c);
+      if (ep) out.push({ c, ep, bell: P.bell(ep.keys.nk, ep.myIndex) });
     }
     return out.sort((a, b) => b.c.lastTs - a.c.lastTs);
+  }
+
+  /** The current epoch of a copy whose bell the registration set holds (§11.13), or null. */
+  private bellEpoch(c: Copy): Epoch | null {
+    if (c.probe || c.request || c.left || this.endOf(c) !== null || !this.byContact(c)) return null;
+    const ep = c.epochs.get(c.current);
+    return ep && ep.myIndex >= 0 ? ep : null;
+  }
+
+  /**
+   * A TEXT or IMAGE row of another member reached the device live (§11.13 "Apps without push"): what its notification
+   * needs, when the copy is one whose bell the registration set would hold.
+   */
+  private arrival(c: Copy, m: MessageView): Arrival | null {
+    if (!this.bellEpoch(c) || m.mine || (m.kind !== "text" && m.kind !== "image")) return null;
+    const v = this.viewOfCopy(c);
+    if (!v) return null;
+    return {
+      ref: v.ref,
+      name: v.name,
+      handle: m.fromHandle,
+      text: m.kind === "text" ? (m.text ?? "") : null,
+      unread: c.unread,
+    };
+  }
+
+  /** The copies the badge counts (§11.13): those of the registration set that count as unread. */
+  unreadCount(): number {
+    let n = 0;
+    for (const c of this.copies.values()) if (c.unread > 0 && this.bellEpoch(c)) n++;
+    return n;
   }
 
   /**
@@ -3463,7 +3519,23 @@ export class Messaging {
   // ───────────────────────── views ─────────────────────────
 
   views(): ConversationView[] {
-    const x = {
+    const x = this.viewCtx();
+    const out: ConversationView[] = [];
+    for (const c of this.copies.values()) {
+      if (c.reactionsDirty) refreshReactions(c, this.h.acc.uidB);
+      const v = viewOf(c, x);
+      if (v) out.push(v);
+    }
+    return out.sort((a, b) => b.lastTs - a.lastTs);
+  }
+
+  /** The view of one copy (null for a copy the UI does not show). */
+  viewOfCopy(c: Copy): ConversationView | null {
+    return viewOf(c, this.viewCtx());
+  }
+
+  private viewCtx() {
+    return {
       selfUid: this.h.acc.uid,
       selfHandle: this.h.acc.handle,
       user: (uidB: string) => this.knownUser(uidB),
@@ -3472,18 +3544,14 @@ export class Messaging {
       byContact: (c: Copy) => this.byContact(c),
       mono: this.h.clock.mono(),
       processingWait: this.h.delays.processingWait,
-      ref: (key: string) => {
-        let r = this.refs.get(key);
-        if (r === undefined) this.refs.set(key, (r = refOf(this.h.acc.refKey, key)));
-        return r;
-      },
+      ref: (key: string) => this.refOfKey(key),
     };
-    const out: ConversationView[] = [];
-    for (const c of this.copies.values()) {
-      if (c.reactionsDirty) refreshReactions(c, this.h.acc.uidB);
-      const v = viewOf(c, x);
-      if (v) out.push(v);
-    }
-    return out.sort((a, b) => b.lastTs - a.lastTs);
+  }
+
+  /** The ref of a copy's view key (`ConversationView.ref`, §11.13 "Conversation URLs"). */
+  refOfKey(key: string): string {
+    let r = this.refs.get(key);
+    if (r === undefined) this.refs.set(key, (r = refOf(this.h.acc.refKey, key)));
+    return r;
   }
 }

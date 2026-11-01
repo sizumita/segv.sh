@@ -1,0 +1,16 @@
+# The native code of the apps (one Cargo workspace, one Cargo.lock): the desktop app's Tauri shell.
+[workspace]
+resolver = "3"
+members = ["apps/desktop/src-tauri"]
+
+[workspace.package]
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

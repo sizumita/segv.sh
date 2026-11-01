@@ -6,13 +6,15 @@ import { act } from "./util";
 type Preview = "none" | "name" | "message";
 
 /** What notifications show on this device (docs/PROTOCOL.md §11.13). */
-const PREVIEWS: { id: Preview; label: string; hint: string }[] = [
+const PREVIEWS: { id: Preview; label: string; hint: string; local?: string }[] = [
   { id: "none", label: "“new messages”", hint: "the same text for every notification" },
   { id: "name", label: "the conversation's name", hint: "decrypted on this device" },
   {
     id: "message",
     label: "the name and the newest message",
     hint: "this device fetches and decrypts it after each notification, also while the app is closed",
+    // An app without push shows only the messages that reach it while it runs (§11.13).
+    local: "decrypted on this device",
   },
 ];
 
@@ -105,7 +107,11 @@ export const Settings = component$(() => {
             {state.notifications === "unavailable" ? (
               <p class="dim small">this browser cannot show notifications.</p>
             ) : (
-              <p class="dim small">on this device only. invites and requests never notify.</p>
+              <p class="dim small">
+                on this device only. invites and requests never notify.
+                {state.localNotify &&
+                  " segv.sh notifies while it runs, also with its window closed: keep it in the menu bar or the system tray."}
+              </p>
             )}
             {state.notifications !== "unavailable" && (
               <p class="row">
@@ -147,7 +153,10 @@ export const Settings = component$(() => {
                           previewBusy.value = false;
                         }}
                       />
-                      {p.label} <span class="dim small">— {p.hint}</span>
+                      {p.label}{" "}
+                      <span class="dim small">
+                        — {state.localNotify && p.local ? p.local : p.hint}
+                      </span>
                     </label>
                   ))}
                   {state.preview !== "none" && (

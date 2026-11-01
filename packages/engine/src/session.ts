@@ -1,7 +1,15 @@
-// "Remember this device": keeps the account key (AK) in IndexedDB, encrypted under a
+// "Remember this device" (docs/PROTOCOL.md §11.11): keeps the account key (AK) in IndexedDB, encrypted under a
 // non-extractable WebCrypto AES-GCM key that is stored next to it. Script running on this origin
 // can still use the key (as it could use an unlocked session anyway), but the raw AK never sits in
-// storage in the clear and cannot be copied out of the browser profile as bytes.
+// storage in the clear and cannot be copied out of the browser profile as bytes. A native app supplies
+// its own store instead (EngineOptions.session; §11.14 "Storage").
+
+/** Where a device keeps its remembered session. `load` answers null for nothing stored or anything unreadable. */
+export interface SessionStore {
+  load(): Promise<{ uid: string; AK: Uint8Array } | null>;
+  save(uid: string, AK: Uint8Array): Promise<void>;
+  clear(): Promise<void>;
+}
 const DB = "segv";
 const STORE = "session";
 const KEY = "current";
@@ -82,3 +90,10 @@ export async function clearSession(): Promise<void> {
     /* nothing stored */
   }
 }
+
+/** The browser's store: IndexedDB, under a non-extractable key kept beside the session. */
+export const idbSessionStore: SessionStore = {
+  load: loadSession,
+  save: saveSession,
+  clear: clearSession,
+};

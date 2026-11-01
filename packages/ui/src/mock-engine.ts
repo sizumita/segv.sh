@@ -112,6 +112,7 @@ class MockEngine implements Engine {
     warnings: [],
     prfSupported: null,
     notifications: "unavailable",
+    localNotify: false,
     preview: "unavailable",
     quiet: "unavailable",
   };

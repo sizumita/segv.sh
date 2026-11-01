@@ -1,8 +1,35 @@
-// Passkeys with the WebAuthn PRF extension (docs/PROTOCOL.md §2.3–2.5). Browser only.
+// Passkeys with the WebAuthn PRF extension (docs/PROTOCOL.md §2.3–2.5): the browser's WebAuthn, behind the
+// PasskeyPlatform interface that a native app implements with the platform's own passkey API (§11.14).
 // The PRF output never leaves this module's callers; nothing here talks to the server.
 import * as P from "@segv/protocol/proto";
 
-const prfInput = () => P.utf8(P.PRF_INPUT);
+/**
+ * A passkey API. `rpId` is the RP ID (§2.5) and `prfInput` the PRF input of §2.3, which the platform evaluates as a
+ * browser's `prf.eval.first`: the 32-byte result MUST equal a browser's for the same credential (§2.3).
+ */
+export interface PasskeyPlatform {
+  /** true/false when the platform can tell whether it supports PRF, null when unknown */
+  capability(): Promise<boolean | null>;
+  /** Creates a discoverable passkey bound to `uid`, with the PRF result if the authenticator gives it at creation. */
+  create(
+    rpId: string,
+    uid: Uint8Array,
+    handle: string,
+    prfInput: Uint8Array,
+  ): Promise<{ credId: Uint8Array; prf: Uint8Array | null }>;
+  /** Evaluates the PRF for one credential (the second ceremony after a registration without PRF). */
+  prfFor(rpId: string, credId: Uint8Array, prfInput: Uint8Array): Promise<Uint8Array | null>;
+  /** Discoverable sign-in: the user picks a passkey; its id, user handle (= uid) and PRF result. */
+  signIn(
+    rpId: string,
+    prfInput: Uint8Array,
+  ): Promise<{ credId: Uint8Array; uid: Uint8Array | null; prf: Uint8Array | null }>;
+  /** Best effort: tells the passkey provider that a credential is useless. */
+  forget(rpId: string, credId: Uint8Array): Promise<void>;
+}
+
+/** The PRF input of §2.3. */
+export const prfInput = (): Uint8Array => P.utf8(P.PRF_INPUT);
 
 /** Normalises the PRF result (ArrayBuffer, typed array, or the plain Array some extensions return). */
 function toBytes(x: unknown): Uint8Array | null {
@@ -21,7 +48,7 @@ function prfFirst(cred: PublicKeyCredential): Uint8Array | null {
 }
 
 /** true/false when the browser can tell, null when unknown. Only says the *browser* supports PRF. */
-export async function prfCapability(): Promise<boolean | null> {
+async function prfCapability(): Promise<boolean | null> {
   try {
     if (typeof PublicKeyCredential === "undefined") return false;
     const get = (
@@ -36,8 +63,6 @@ export async function prfCapability(): Promise<boolean | null> {
     return null;
   }
 }
-
-const rpId = () => location.hostname;
 
 export class PasskeyError extends Error {}
 
@@ -55,15 +80,17 @@ function explain(e: unknown): Error {
 }
 
 /** Creates a discoverable passkey bound to `uid`. Returns the PRF output if the authenticator gave it at creation. */
-export async function createPasskey(
+async function createPasskey(
+  rpId: string,
   uid: Uint8Array,
   handle: string,
+  input: Uint8Array,
 ): Promise<{ credId: Uint8Array; prf: Uint8Array | null }> {
   let cred: PublicKeyCredential;
   try {
     cred = (await navigator.credentials.create({
       publicKey: {
-        rp: { id: rpId(), name: "segv.sh" },
+        rp: { id: rpId, name: "segv.sh" },
         user: { id: uid as BufferSource, name: handle, displayName: handle },
         challenge: P.random(32) as BufferSource,
         pubKeyCredParams: [
@@ -79,7 +106,7 @@ export async function createPasskey(
         attestation: "none",
         timeout: 180_000,
         extensions: {
-          prf: { eval: { first: prfInput() as BufferSource } },
+          prf: { eval: { first: input as BufferSource } },
         } as AuthenticationExtensionsClientInputs,
       },
     })) as PublicKeyCredential;
@@ -91,18 +118,22 @@ export async function createPasskey(
 }
 
 /** Evaluates the PRF for a specific credential (second ceremony after registration). */
-export async function prfForCredential(credId: Uint8Array): Promise<Uint8Array | null> {
+async function prfForCredential(
+  rpId: string,
+  credId: Uint8Array,
+  input: Uint8Array,
+): Promise<Uint8Array | null> {
   let cred: PublicKeyCredential;
   try {
     cred = (await navigator.credentials.get({
       publicKey: {
-        rpId: rpId(),
+        rpId,
         challenge: P.random(32) as BufferSource,
         allowCredentials: [{ type: "public-key", id: credId as BufferSource }],
         userVerification: "required",
         timeout: 180_000,
         extensions: {
-          prf: { eval: { first: prfInput() as BufferSource } },
+          prf: { eval: { first: input as BufferSource } },
         } as AuthenticationExtensionsClientInputs,
       },
     })) as PublicKeyCredential;
@@ -113,7 +144,10 @@ export async function prfForCredential(credId: Uint8Array): Promise<Uint8Array |
 }
 
 /** Discoverable sign-in: the user picks a passkey; returns its id, user handle (= uid) and PRF output. */
-export async function signInWithPasskey(): Promise<{
+async function signInWithPasskey(
+  rpId: string,
+  input: Uint8Array,
+): Promise<{
   credId: Uint8Array;
   uid: Uint8Array | null;
   prf: Uint8Array | null;
@@ -122,13 +156,13 @@ export async function signInWithPasskey(): Promise<{
   try {
     cred = (await navigator.credentials.get({
       publicKey: {
-        rpId: rpId(),
+        rpId,
         challenge: P.random(32) as BufferSource,
         allowCredentials: [],
         userVerification: "required",
         timeout: 180_000,
         extensions: {
-          prf: { eval: { first: prfInput() as BufferSource } },
+          prf: { eval: { first: input as BufferSource } },
         } as AuthenticationExtensionsClientInputs,
       },
     })) as PublicKeyCredential;
@@ -142,15 +176,24 @@ export async function signInWithPasskey(): Promise<{
 }
 
 /** Best effort: tell the passkey provider a credential is useless (e.g. registration failed after creating it). */
-export async function forgetCredential(credId: Uint8Array): Promise<void> {
+async function forgetCredential(rpId: string, credId: Uint8Array): Promise<void> {
   try {
     const signal = (
       PublicKeyCredential as unknown as {
         signalUnknownCredential?: (o: { rpId: string; credentialId: string }) => Promise<void>;
       }
     ).signalUnknownCredential;
-    await signal?.call(PublicKeyCredential, { rpId: rpId(), credentialId: P.b64u(credId) });
+    await signal?.call(PublicKeyCredential, { rpId, credentialId: P.b64u(credId) });
   } catch {
     /* unsupported */
   }
 }
+
+/** The browser's WebAuthn. */
+export const browserPasskeys: PasskeyPlatform = {
+  capability: prfCapability,
+  create: createPasskey,
+  prfFor: prfForCredential,
+  signIn: signInWithPasskey,
+  forget: forgetCredential,
+};

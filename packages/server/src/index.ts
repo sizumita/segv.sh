@@ -1,10 +1,11 @@
 /*
  * The Worker's API and its Durable Objects (docs/PROTOCOL.md §9, §10). A Worker that serves them answers a request
- * on a non-canonical host with `pinHost`, sends every /api/* request to `handleApi`, and exports each Durable Object
- * class below from its main module.
+ * on a non-canonical host with `pinHost`, answers the native apps' association files with `wellKnown` (§11.14),
+ * sends every /api/* request to `handleApi`, and exports each Durable Object class below from its main module.
  */
 export { handleApi, stampResponse } from "./api";
 export { pinHost } from "./hosts";
+export { wellKnown } from "./well-known";
 export { ShardDO } from "./shard-do";
 export { BlobRegDO } from "./blobreg-do";
 export { InboxDO } from "./inbox-do";

@@ -1,0 +1,26 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "The app's own pages in its main window: the platform commands of src/lib.rs, the events they listen to, and moving the window by its title bar.",
+  "windows": ["main"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:window:allow-start-dragging",
+    "core:window:allow-toggle-maximize",
+    "allow-session-load",
+    "allow-session-save",
+    "allow-session-clear",
+    "allow-notify-permission",
+    "allow-notify-request",
+    "allow-notify-show",
+    "allow-notify-close",
+    "allow-notify-close-all",
+    "allow-badge",
+    "allow-page-ready",
+    "allow-passkey-capability",
+    "allow-passkey-create",
+    "allow-passkey-prf",
+    "allow-passkey-sign-in"
+  ]
+}

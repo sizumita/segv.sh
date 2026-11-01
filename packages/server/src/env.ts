@@ -287,6 +287,34 @@ export function _resetPushConfigForTests(): void {
   pushLogged.clear();
 }
 
+// ───────────── optional list settings (§9.7, §11.14) ─────────────
+
+/**
+ * The entries of a comma-separated setting, each trimmed and kept once: [] when it is unset or empty, null when it is
+ * not a string or an entry fails `ok`.
+ */
+export function listVar(raw: unknown, ok: (entry: string) => boolean): string[] | null {
+  if (raw === undefined || raw === null) return [];
+  if (typeof raw !== "string") return null;
+  if (raw.trim() === "") return [];
+  const list = raw.split(",").map((e) => e.trim());
+  return list.every(ok) ? [...new Set(list)] : null;
+}
+
+const settingLogged = new Set<string>();
+
+/** Logs that an optional setting is invalid, once per isolate, by name and never by value (as for push, §9.8). */
+export function logSettingOnce(msg: string, setting: string): void {
+  if (settingLogged.has(setting)) return;
+  settingLogged.add(setting);
+  console.error(JSON.stringify({ msg, setting }));
+}
+
+/** Test hook: forget which optional settings were logged. */
+export function _resetSettingLogsForTests(): void {
+  settingLogged.clear();
+}
+
 /** True when `host` (lowercase) is listed in PUSH_HOSTS: exactly, or under a `*.d` entry. */
 export function pushHostAllowed(cfg: PushConfig, host: string): boolean {
   const h = host.toLowerCase();

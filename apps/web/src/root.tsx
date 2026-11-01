@@ -1,7 +1,7 @@
 import { component$ } from "@qwik.dev/core";
 import { DocumentHeadTags, RouterOutlet, useQwikRouter } from "@qwik.dev/router";
 
-// The stylesheet is a plain static file (public/global.css), linked explicitly. Importing CSS
+// The stylesheet is @segv/ui's global.css, served as a plain static file (vite.config.ts), linked explicitly. Importing CSS
 // from src/ would make Qwik inline it as a <style> tag in production (blocked by our CSP, which
 // has no 'unsafe-inline' for styles) and would not load it at all under `vp dev` (SSR in workerd).
 const STYLESHEET = "/global.css";

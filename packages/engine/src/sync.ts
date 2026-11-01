@@ -35,8 +35,11 @@ export interface SyncCtx {
   warn(text: string, critical?: boolean): void;
   /** a row or line was applied */
   changed(): void;
-  /** a TEXT or IMAGE row of another member was shown and counted unread: marked seen while in use (§11.13) */
-  shown?(E: number, label: Bytes, t: number): void;
+  /**
+   * a TEXT or IMAGE row of another member was shown and counted unread: marked seen while in use, and notified by an
+   * app without push (§11.13)
+   */
+  shown?(E: number, label: Bytes, t: number, c: Copy, view: MessageView): void;
   /** the displayed handle of member j of an epoch */
   handleOf(c: Copy, ep: Epoch, j: number): string;
   /** a WELCOME's J, found on lane j at `at` (§5.2: accepted whenever the row is processed) */
@@ -405,7 +408,7 @@ export function applyLaneRow(
   const unread = !mine && !quiet && ctx.live();
   if (unread) c.unread++;
   ep.rows.set(key, { j, E: r.E, n: r.n, t: r.t, unread, shown: true, th });
-  if (unread) ctx.shown?.(r.E, r.label, r.t);
+  if (unread) ctx.shown?.(r.E, r.label, r.t, c, view);
   ctx.changed();
 }
 
