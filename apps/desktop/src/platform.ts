@@ -94,12 +94,14 @@ const CHAT = /^#c\/[A-Za-z0-9_-]{12}$/;
 
 /**
  * A clicked notification or an opened `segv:` link (src-tauri/src/notify.rs): the native code has shown the window,
- * and the page moves to the conversation it names, as a link would (packages/ui/src/route.ts). Once the page listens,
- * it asks for the one that launched the app, which came before the page did.
+ * and the page moves to the conversation it names, or to the start page for "" (the fixed notification, §11.13), as
+ * a link would (packages/ui/src/route.ts follows the fragment). Once the page listens, it asks for the one that
+ * launched the app, which came before the page did (null: none).
  */
 export async function followOpens(): Promise<void> {
   const open = (to: string | null) => {
-    if (to && CHAT.test(to) && location.hash !== to) location.hash = to;
+    if (to === null || (to !== "" && !CHAT.test(to)) || location.hash === to) return;
+    location.hash = to;
   };
   await listen<string>("segv:open", (e) => open(e.payload));
   open(await call<string | null>("page_ready"));
