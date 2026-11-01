@@ -178,6 +178,20 @@ async function run(at?: number): Promise<void> {
   if (at !== undefined) fake.now = at;
   await DO().run();
 }
+/**
+ * `sub` as a device sends it: while the journal's next row is full (BUSY), the next minute's run, which writes that
+ * row, and `sub` again. Many registrations at once thus spread over minutes.
+ */
+async function subRetrying(d: Dev, bs: Bytes[], quiet: Bytes | null = null): Promise<void> {
+  for (;;) {
+    const r = await sub(d, bs, quiet);
+    if (r !== "busy") return void expect(r).toBe("ok");
+    await run((Math.floor(nowOf() / 60_000) + 1) * 60_000);
+  }
+}
+/** The day of the last completed pass that `meta` holds. */
+const passDay = (): Promise<number | null> =>
+  inDO((_h, state) => state.storage.sql.exec<{ v: number }>("SELECT v FROM meta WHERE k = 'pass'").toArray()[0]?.v ?? null);
 const dueOf = (d: Dev): Promise<number | null> => inDO((h) => h.pushes.get(P.hex(d.ep))?.due ?? null);
 const stateOf = (d: Dev): Promise<PushState> => inDO((h) => ({ ...(h.pushes.get(P.hex(d.ep)) ?? { due: null, last: null, tries: 0 }) }));
 const callsTo = (d: Dev): Call[] => fake.calls.filter((c) => c.url === d.endpoint);
@@ -368,6 +382,15 @@ describe("POST /api/v2/push/sub (§10.10)", () => {
   it("takes the account's quiet tag, or none", async () => {
     expect((await post(body({ quiet: P.b64u(P.random(16)) }))).status).toBe(204);
     expect((await post(body())).status).toBe(204);
+  });
+
+  it('503 "push busy" with retry-after 60 for a change the journal\'s next row cannot hold', async () => {
+    const big = (endpoint: string) => body({ endpoint, tokens: bells(256).map(P.b64u) });
+    expect((await post(big("https://fcm.googleapis.com/fcm/send/a1"))).status).toBe(204);
+    const r = await post(big("https://fcm.googleapis.com/fcm/send/a2"));
+    expect(r.status).toBe(503);
+    expect(r.headers.get("retry-after")).toBe("60");
+    expect(await r.json()).toEqual({ error: "push busy" });
   });
 
   it("a repeated token counts once; 256 distinct ones are accepted", async () => {
@@ -1025,14 +1048,15 @@ describe("only the daily pass writes, and the alarm follows the clock (§9.8)", 
     await reset(BASE);
     const devs = Array.from({ length: 120 }, () => dev());
     const bs = devs.map(() => P.random(16));
-    for (let i = 0; i < devs.length; i++) await sub(devs[i], [bs[i]]);
+    for (let i = 0; i < devs.length; i++) await subRetrying(devs[i], [bs[i]]); // over a few minutes
+    const t = nowOf();
     await ring(bs.slice(0, 60));
     await ring(bs.slice(60));
-    await run(BASE + HOLD);
+    await run(t + HOLD);
     expect(fake.calls).toHaveLength(120);
     const at = [...new Set(fake.calls.map((c) => c.at))].sort((p, q) => p - q);
-    expect(at).toEqual([BASE + HOLD, BASE + HOLD + 1000, BASE + HOLD + 2000]);
-    expect(fake.calls.filter((c) => c.at === BASE + HOLD)).toHaveLength(50);
+    expect(at).toEqual([t + HOLD, t + HOLD + 1000, t + HOLD + 2000]);
+    expect(fake.calls.filter((c) => c.at === t + HOLD)).toHaveLength(50);
   });
 
   it("(d) after a restart at noon the first pass writes nothing; a change at 23:59:59 is written at 00:00, never earlier", async () => {
@@ -1293,6 +1317,53 @@ describe("the journal keeps the day's changes across a restart (§9.8)", () => {
     await run(BASE + 70_000);
     expect(await regCount()).toBe(0);
   });
+
+  it("(e) sub answers BUSY to a change the next row cannot hold with those waiting; each change it took survives", async () => {
+    await reset(BASE);
+    await run(BASE);
+    const [a, b, c] = [dev(), dev(), dev()];
+    const [a1, a2, bb, cb] = [bells(256), bells(256), bells(256), bells(1)];
+    fake.now = BASE + 1000;
+    expect(await sub(a, a1)).toBe("ok");
+    expect(await sub(b, bb)).toBe("busy"); // a's change takes most of the next row
+    expect(await reaches(b, bb)).toBe(false); // and nothing of b changed
+    expect(await sub(c, cb)).toBe("ok"); // a small change still fits
+    expect(await sub(a, a2)).toBe("ok"); // a's next change takes the place of the one waiting
+    expect(await sub(b, [])).toBe("ok"); // so does a deletion, of nothing
+    await run(BASE + 60_000); // the row of minute 1 holds a and c
+    expect(await sub(b, bb)).toBe("ok");
+    await run(BASE + 120_000); // and that of minute 2, b
+    await restart();
+    for (const [d, bs] of [
+      [a, a2],
+      [b, bb],
+      [c, cb],
+    ] as const)
+      expect(await reaches(d, bs)).toBe(true);
+    expect(await reaches(a, a1)).toBe(false);
+    expect(await regCount()).toBe(3);
+  });
+
+  it("(f) a pass while push is off leaves the day in meta, so the journal's changes come back with push", async () => {
+    await reset(BASE);
+    const d = dev();
+    const b = bells(1);
+    fake.now = BASE + 1000;
+    await sub(d, b);
+    await run(BASE + 60_000); // its row; the day's pass has nothing to write yet
+    expect(await passDay()).toBe(dayOf(BASE));
+    await restart();
+    await setEnv({ PUSH_KEY: undefined }); // the object starts with push off: it cannot read the journal
+    await run(BASE + DAY + 1000); // the next day's pass goes through, by day only
+    await run(BASE + DAY + 11_000);
+    expect(await passDay()).toBe(dayOf(BASE));
+    expect(await storedDay(d)).toBeNull();
+    await restart(); // push is on again (a deploy restarts the object)
+    await run(BASE + DAY + 21_000);
+    expect(await storedDay(d)).toBe(dayOf(BASE));
+    expect(await passDay()).toBe(dayOf(BASE) + 1);
+    expect(await reaches(d, b)).toBe(true);
+  });
 });
 
 // ───────────── 12. the pass in parts ─────────────
@@ -1301,7 +1372,7 @@ describe("the daily pass works in bounded parts (§9.8)", () => {
   it("never reads, writes or deletes more than PUSH_ROWS rows in a run, never splits an endpoint, goes in ep order, resumes and retries", async () => {
     await reset(BASE);
     const old = Array.from({ length: 40 }, () => dev());
-    for (const d of old) await sub(d, bells(256));
+    for (const d of old) await subRetrying(d, bells(256)); // one a minute: each fills a journal row
     const sender = dev();
     const sb = P.random(16);
     fake.now = BASE + 29 * DAY;
@@ -1368,15 +1439,16 @@ describe("the daily pass works in bounded parts (§9.8)", () => {
   it("writes the day's changes in parts too, in ascending ep whatever the order of the changes", async () => {
     await reset(BASE);
     const devs = Array.from({ length: 12 }, () => dev());
-    for (const d of devs) await sub(d, bells(100));
+    for (const d of devs) await subRetrying(d, bells(100)); // three a minute
     await inDO((h) => {
       h.pushRows = 300;
     });
+    const partsAt = (await inDO((h) => h.parts.length)) as number; // the parts of the first day's pass come before
     for (let i = 0; i < 12; i++) await run(BASE + DAY + i * 10_000);
     const t = await tables();
     expect(t.sub).toHaveLength(12);
     expect(t.tok).toHaveLength(1200);
-    const parts = (await inDO((h) => h.parts)) as PassPart[];
+    const parts = ((await inDO((h) => h.parts)) as PassPart[]).slice(partsAt);
     expect(parts.length).toBeGreaterThanOrEqual(6);
     for (const p of parts) expect(p.rows).toBeLessThanOrEqual(300);
     for (let i = 1; i < parts.length; i++) expect(parts[i].first! > parts[i - 1].last!).toBe(true);

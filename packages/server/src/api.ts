@@ -964,6 +964,8 @@ async function pushSub(c: Ctx, cfg: PushConfig): Promise<Response> {
     throw new HttpError(503, "storage unavailable", { "retry-after": "5" });
   }
   if (r === "full") throw new HttpError(503, "push full", { "retry-after": "3600" });
+  // The journal's next row is full (§9.8): the change is refused rather than kept where a restart would lose it.
+  if (r === "busy") throw new HttpError(503, "push busy", { "retry-after": "60" });
   return noContent();
 }
 

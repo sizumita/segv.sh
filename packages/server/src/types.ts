@@ -158,7 +158,7 @@ export interface CkptRange {
 // ───────────── PushDO (§9.8) ─────────────
 
 /** PushDO.sub: "full" when PUSH_MAX_SUBS endpoints are stored, or PUSH_DAY_SUBS others changed today. */
-export type PushSubResult = "ok" | "full";
+export type PushSubResult = "ok" | "full" | "busy";
 
 // ───────────── stubs ─────────────
 

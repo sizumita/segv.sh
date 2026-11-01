@@ -2554,6 +2554,12 @@ memory, at once:
    note tag when `notes` is true, except a bell, quiet tag or note tag that 8 other endpoints already hold: that one is
    left out for this endpoint, which takes no other endpoint's place. Answer OK.
 
+When step 1 or 3 would make a change wait for the journal (below), and the journal's next row could not hold it along
+with the changes already waiting, the call answers BUSY instead and changes nothing. So every change that `sub` accepts
+is in the journal's next row, however many come at once; a burst is spread over the following minutes, as devices send
+again what was refused (§11.13). With a typical endpoint, a row holds about 15 registrations of a few bells each, or
+one of 256.
+
 Each call thus replaces an endpoint's registration as a whole and refreshes it; a bell's places go to the endpoints
 that hold them first, for as long as they keep refreshing them. Only an account's own devices know its quiet tag, so
 only they take its places and those of its note tag; an endpoint left out of them is notified as if it had registered
@@ -2638,7 +2644,8 @@ it at minute `m = ⌊Unix ms / 60 000⌋` sets row `slot = m mod JR_SLOTS` to `b
 aad = enc("segv.sh/v2/push/jr", u32(m)))`, where `payload` has exactly `JR_BYTES` = 5 376 bytes:
 `u32 prev ‖ (u16 len ‖ record)* ‖ zero bytes`. `prev` is the minute of the latest earlier row that holds a record
 (0 when there is none), and the records are the changes waiting for the journal, oldest first, as many as fit; the
-others wait for the next row. A **record** is `u8 kind ‖ u32 day ‖ ep`, `day` being the UTC day of the change:
+others wait for the next row. Only deletions at a push can be left waiting so: `sub` refuses a change that would not
+fit (BUSY, above). A **record** is `u8 kind ‖ u32 day ‖ ep`, `day` being the UTC day of the change:
 kind 1, a registration, followed by `enc(endpoint, p256dh, auth, tks)`, `tks` being the `tk` that it keeps, in
 ascending order, one after another; kind 2, a refresh; kind 3, a deletion. `JR_BYTES` leaves room for the largest
 registration (an endpoint of 1024 bytes, 256 bells, a quiet tag and a note tag). A change waits for the journal from the
@@ -2657,7 +2664,10 @@ minute that no run wrote, a row of two days before, or one sealed under an earli
 **The daily pass** is the only writer of `sub` and `tok`. A pass starts at the first run of each UTC day (normally the
 one at 00:00), and at the first run after the object starts unless `meta` holds that day, and goes through the stored
 endpoints and those with a change in memory in ascending order of `ep`, a part at each run, until it has gone through
-all of them; the part that goes through the last of them also sets `meta` to the day, in its transaction:
+all of them; the part that goes through the last of them also sets `meta` to the day, in its transaction, when push is
+on and the object read the journal back in full at its start. A pass that could not (push off, or a read-back that
+failed) leaves `meta` as it is: the next start then reads back the records that this pass never saw, which a later day
+in `meta` would make it skip.
 
 - It deletes every endpoint whose day lies more than `PUSH_EXPIRY` = 30 days before today, its day being that of its
   change in memory when it has one (today's included), else its stored `day`; so a refresh in memory always keeps its
@@ -3383,7 +3393,8 @@ A body that breaks any of these rules, or holds another key, is 400. Otherwise P
 registration as a whole and refreshes it (§9.8), and the answer is 204 with no body, also when a bell whose 8 places
 other endpoints hold was left out. For a new endpoint while PushDO holds `PUSH_MAX_SUBS` endpoints, and for a new
 or changed registration while it holds the day's changes of `PUSH_DAY_SUBS` other endpoints (§9.8), the answer is 503
-`{error: "push full"}` with `retry-after: 3600`, and for a failed PushDO call 503 `{error: "storage unavailable"}` with
+`{error: "push full"}` with `retry-after: 3600`; for a change that the journal's next row cannot hold (BUSY, §9.8), 503
+`{error: "push busy"}` with `retry-after: 60`; and for a failed PushDO call 503 `{error: "storage unavailable"}` with
 `retry-after: 5`. Knowing an endpoint is what allows replacing or deleting its registration: only the device, its push
 service and the operator know it (§13.4).
 
@@ -4273,9 +4284,9 @@ decrypts itself.
   than `push.vapid`, it sends the old endpoint with an empty set and subscribes again (or, where the browser needs a
   user gesture for that, shows the setting as off). A native app reads its current token instead, and when the token,
   and so the endpoint, changed, it sends the old endpoint with an empty set before the new one. A failed request is
-  retried with backoff (1 s, doubling to 10 minutes), never sooner than its `retry-after` (an hour after "push full"); a
-  404 means that the deployment no longer offers push: the device calls `unsubscribe()` (a native app gives up its token
-  and deletes its push keys) and shows the setting as off.
+  retried with backoff (1 s, doubling to 10 minutes), never sooner than its `retry-after` (a minute after "push busy",
+  an hour after "push full"); a 404 means that the deployment no longer offers push: the device calls `unsubscribe()`
+  (a native app gives up its token and deletes its push keys) and shows the setting as off.
 - **Ringing.** After each successful put of a TEXT or IMAGE row (§11.3 step 6: an OK with a verified receipt, a
   CONFLICT with its own body, or a probe that finds its own body), also a late one (§11.3 step 8), the sender sends
   one `POST /api/v2/ring` (§10.10) for the row's `(E, label)` with these bells, e being the send's epoch: `B_e(ℓ)` for

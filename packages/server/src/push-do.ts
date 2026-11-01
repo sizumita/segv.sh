@@ -11,7 +11,11 @@
  * - Memory holds the day's registration changes (in effect at once), everything a ring causes (due pushes, windows,
  *   the dedup of rings) and the rows each account marked seen. A restart loses the last two; the first call or run
  *   after it reads the changes back from the journal, all but those of the last minute, which devices send again at
- *   their next start (§11.13). A push that a lost mark would have prevented is sent.
+ *   their next start (§11.13). `sub` answers BUSY to a change that the journal's next row could not hold with those
+ *   already waiting, so that bound holds however many changes come at once. A push that a lost mark would have
+ *   prevented is sent.
+ * - Only a pass that ran with push on, after the journal was read back, records its day in `meta`: a later start reads
+ *   back the records of that day and after, so a day recorded without them would lose them.
  * - Every push waits at least PUSH_HOLD after its ring, so that a device of the account in use can mark its row seen
  *   first (`seen`, §9.8): a push whose rows were all marked is cancelled.
  * - `ring` answers how long until the push it made due; the Worker waits that long, where waiting costs nothing, and
@@ -470,10 +474,14 @@ export class PushDO extends DurableObject<Env> {
   // The journal: the changes waiting for its next row (by ep, oldest first, each an encoded record), the minute of the
   // latest row written (by this start of the object or an earlier one) and that of the latest row holding a record.
   private readonly jq = new Map<string, Bytes>();
+  /** What the waiting changes take in a row: 2 + length each. */
+  private jqBytes = 0;
   private jLast = 0;
   private jHead = 0;
-  /** The journal and the pass's state have been read back since the object started. */
+  /** The journal and the pass's state have been read back since the object started (tried, at least). */
   private rebuilt = false;
+  /** The journal was read back in full, with push on: only then may a completed pass record its day in `meta`. */
+  private recovered = false;
 
   private signer: { cfg: PushConfig; s: VapidSigner } | null = null;
   private running: Promise<void> | null = null;
@@ -576,17 +584,40 @@ export class PushDO extends DurableObject<Env> {
   }
 
   /** Queues a change for the journal's next row, in place of one of the same endpoint still waiting. */
-  private journalLater(ep: Bytes, kind: number, day: number, rec?: RegRecord): void {
+  private journalLater(ep: Bytes, record: Bytes): void {
     const k = hex(ep);
+    this.unqueue(k);
+    this.jq.set(k, record);
+    this.jqBytes += 2 + record.length;
+  }
+
+  /** Takes an endpoint's change off the journal's queue: a row or the daily pass holds it now. */
+  private unqueue(k: string): void {
+    const r = this.jq.get(k);
+    if (r === undefined) return;
     this.jq.delete(k);
-    this.jq.set(k, jrRecord(kind, ep, day, rec));
+    this.jqBytes -= 2 + r.length;
+  }
+
+  /**
+   * Whether `record`, queued for `ep`, would go into the journal's next row along with every change waiting (§9.8
+   * `sub`, BUSY), so that a change `sub` accepts is in the next row.
+   */
+  private fitsNext(ep: Bytes, record: Bytes): boolean {
+    const old = this.jq.get(hex(ep));
+    return 4 + this.jqBytes - (old ? 2 + old.length : 0) + 2 + record.length <= JR_BYTES;
+  }
+
+  /** The record that deleting ep now queues: null when there is nothing to delete, or the deletion already waits. */
+  private delRecord(ep: Bytes, ch: Change | undefined, stored: boolean, day: number): Bytes | null {
+    return (stored || ch) && !(ch?.kind === "del" && ch.day === day) ? jrRecord(JR_DEL, ep, day) : null;
   }
 
   /** Deletes ep's registration in memory, at once (§9.8), and queues the deletion for the journal. */
   private deleteNow(ep: Bytes, day: number): void {
-    const ch = this.changeOf(ep);
     const stored = this.hasStored(ep);
-    if ((stored || ch) && !(ch?.kind === "del" && ch.day === day)) this.journalLater(ep, JR_DEL, day);
+    const r = this.delRecord(ep, this.changeOf(ep), stored, day);
+    if (r) this.journalLater(ep, r);
     this.setChange(ep, stored ? { kind: "del", day } : null);
   }
 
@@ -632,7 +663,10 @@ export class PushDO extends DurableObject<Env> {
       row = open(latest);
       if (row) break;
     }
-    if (!row) return;
+    if (!row) {
+      this.recovered = true;
+      return;
+    }
     this.jLast = latest;
     this.jHead = row.recs.length > 0 ? latest : row.prev;
     const chain: Bytes[][] = row.recs.length > 0 ? [row.recs] : [];
@@ -644,6 +678,7 @@ export class PushDO extends DurableObject<Env> {
       p = x.prev;
     }
     for (let i = chain.length - 1; i >= 0; i--) for (const r of chain[i]) this.replay(r, done);
+    this.recovered = true;
   }
 
   /** One record read back: applied as `sub` or a deletion applied it, unless a completed pass has written it. */
@@ -665,7 +700,8 @@ export class PushDO extends DurableObject<Env> {
   /**
    * Replaces an endpoint's registration as a whole, in memory, at once (§9.8 `sub`). The Worker has checked every
    * field (§10.10); `tokens` are bells, `quiet` the account's quiet tag (or null). Empty `tokens` delete the
-   * registration.
+   * registration. A change that the journal's next row could not hold, with the changes already waiting for it, is
+   * refused ("busy") and changes nothing: the device sends it again later (§11.13).
    */
   async sub(endpoint: string, p256dh: Bytes, auth: Bytes, tokens: Bytes[], quiet: Bytes | null = null): Promise<PushSubResult> {
     this.ready();
@@ -677,6 +713,8 @@ export class PushDO extends DurableObject<Env> {
     const ch = this.changeOf(ep);
     const row = this.storedRow(ep);
     if (tokens.length === 0) {
+      const r = this.delRecord(ep, ch, row !== null, day);
+      if (r && !this.fitsNext(ep, r)) return "busy";
       this.pushes.delete(hex(ep));
       this.marks.delete(hex(ep));
       this.deleteNow(ep, day);
@@ -691,14 +729,22 @@ export class PushDO extends DurableObject<Env> {
     if (row) {
       const o = openBox(cfg.pushKey, ep, row.box);
       if (o && o.endpoint === endpoint && same(o.p256dh, p256dh) && same(o.auth, auth) && same(this.storedTks(ep), tks)) {
-        if (!(ch?.kind === "refresh" && ch.day === day)) this.journalLater(ep, JR_REFRESH, day);
+        if (!(ch?.kind === "refresh" && ch.day === day)) {
+          const r = jrRecord(JR_REFRESH, ep, day);
+          if (!this.fitsNext(ep, r)) return "busy";
+          this.journalLater(ep, r);
+        }
         this.setChange(ep, { kind: "refresh", day });
         return "ok";
       }
     }
     if (this.regCount - (ch?.kind === "reg" ? 1 : 0) >= cfg.daySubs) return "full";
     const rec: RegRecord = { ep, day, endpoint, p256dh: p256dh.slice(), auth: auth.slice(), tks, stored: row !== null };
-    if (!(ch?.kind === "reg" && sameReg(ch.rec, rec))) this.journalLater(ep, JR_REG, day, rec);
+    if (!(ch?.kind === "reg" && sameReg(ch.rec, rec))) {
+      const r = jrRecord(JR_REG, ep, day, rec);
+      if (!this.fitsNext(ep, r)) return "busy";
+      this.journalLater(ep, r);
+    }
     this.setChange(ep, { kind: "reg", rec });
     return "ok";
   }
@@ -857,7 +903,7 @@ export class PushDO extends DurableObject<Env> {
     for (const [k, r] of this.jq) {
       if (6 + r.length > JR_BYTES) {
         // Larger than any row (not possible for a change that the Worker checked): it would hold up the rest.
-        this.jq.delete(k);
+        this.unqueue(k);
         console.error(JSON.stringify({ msg: "push journal dropped a change" }));
         continue;
       }
@@ -870,7 +916,7 @@ export class PushDO extends DurableObject<Env> {
     this.sql.exec("INSERT INTO jr (slot, box) VALUES (?, ?) ON CONFLICT (slot) DO UPDATE SET box = excluded.box", m % JR_SLOTS, box);
     this.jLast = m;
     if (recs.length > 0) this.jHead = m;
-    for (const k of taken) this.jq.delete(k);
+    for (const k of taken) this.unqueue(k);
   }
 
   private cleanup(now: number): void {
@@ -974,7 +1020,10 @@ export class PushDO extends DurableObject<Env> {
     }
 
     const completes = !stopped && !storedMore;
-    if (ops.length > 0 || completes) {
+    // A pass that could not see the journal's changes (push off, or the journal not read back) leaves `meta` as it
+    // is: the day it would record would make a later start skip the records of the days before, which it never wrote.
+    const mark = completes && cfg !== null && this.recovered;
+    if (ops.length > 0 || mark) {
       try {
         this.ctx.storage.transactionSync(() => {
           this.beforeCommit?.();
@@ -997,7 +1046,7 @@ export class PushDO extends DurableObject<Env> {
             }
           }
           // The day whose pass is complete: a restart then neither starts it again nor reads back what it wrote.
-          if (completes) this.sql.exec("INSERT INTO meta (k, v) VALUES ('pass', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", today);
+          if (mark) this.sql.exec("INSERT INTO meta (k, v) VALUES ('pass', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", today);
         });
       } catch (e) {
         console.error(JSON.stringify({ msg: "push pass part failed", error: logErr(e) }));
@@ -1006,7 +1055,7 @@ export class PushDO extends DurableObject<Env> {
     }
     for (const op of ops) {
       // Written: it no longer waits for the journal.
-      this.jq.delete(hex(op.ep));
+      this.unqueue(hex(op.ep));
       if (op.k === "delete") {
         this.storedCount--;
         this.pushes.delete(hex(op.ep));
