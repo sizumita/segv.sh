@@ -4,8 +4,10 @@
  * or rows is ever persisted (§13.1).
  *
  *  - fetch(): upgrade from the Worker. The only client-derived input is `x-segv-client`, an opaque tag. Sockets
- *    carry the tags [clientTag, "h:" + accept hour] and the attachment {t, topics, win, frames, changes}; caps
- *    are counted with getWebSockets(tag) only (attachments are never deserialised to count).
+ *    carry the tags [clientTag, "h:" + accept hour, "t:" + accept ms] and the attachment {t, topics, win, frames,
+ *    changes}; caps are counted with getWebSockets(tag) only (attachments are never deserialised to count). A client
+ *    at its cap first loses the sockets that showed no sign of life for 90 s: neither accepted nor had a "ping"
+ *    auto-answered since (the runtime keeps the time of the last auto-answer), closed with 4001.
  *  - In memory: `boot` (8 random bytes per construction) and `seq` (u64 per boot); a mirror of the attachments
  *    with an index 8-byte topic prefix → sockets (full 16-byte compare on delivery), rebuilt lazily after a wake;
  *    the (topic, socket) pair count; a ring of the last 10 min / 8192 rows / 16 MiB of published rows for RESUME.
@@ -36,6 +38,11 @@ const ROWS_FRAME_MAX_ROWS = 0xffff;
 export interface RtLimits {
   /** live sockets per client tag */
   perClient: number;
+  /**
+   * a client at its cap first loses (4001) the sockets neither accepted nor auto-answered a "ping" within this long:
+   * three ping periods, so a client that vanished without a close frame does not hold its places for an hour
+   */
+  staleMs: number;
   /** live sockets in total (the runtime allows 32 768 hibernatable sockets per object) */
   total: number;
   /** sockets older than this are closed with 4000 */
@@ -62,6 +69,7 @@ export interface RtLimits {
 
 const RT_LIMITS: Readonly<RtLimits> = {
   perClient: 8,
+  staleMs: 90_000,
   total: 20_000,
   maxAgeMs: HOUR_MS,
   topics: RT_MAX_TOPICS,
@@ -148,6 +156,16 @@ function openCount(sockets: WebSocket[]): number {
   let n = 0;
   for (const ws of sockets) if (ws.readyState === WebSocket.OPEN) n++;
   return n;
+}
+
+/** Accept time from a socket's "t:" tag; 0 for a socket accepted before the tag existed (judged by its pings alone). */
+function acceptedAt(tags: string[]): number {
+  for (const tag of tags) {
+    if (!tag.startsWith("t:")) continue;
+    const t = Number(tag.slice(2));
+    return Number.isFinite(t) ? t : 0;
+  }
+  return 0;
 }
 
 function refuse(status: 429 | 503, error: string): Response {
@@ -241,8 +259,10 @@ export class RealtimeDO extends DurableObject<Env> {
     const clientTag = CLIENT_TAG_RE.test(raw) ? raw : "none";
     const now = this.clock();
     this.sweep(now);
-    if (openCount(this.ctx.getWebSockets(clientTag)) >= this.limits.perClient) {
-      return refuse(429, "too many connections from this client");
+    const mine = this.ctx.getWebSockets(clientTag);
+    if (openCount(mine) >= this.limits.perClient) {
+      this.dropStale(mine, now);
+      if (openCount(mine) >= this.limits.perClient) return refuse(429, "too many connections from this client");
     }
     if (openCount(this.ctx.getWebSockets()) >= this.limits.total) return refuse(503, "too many connections");
 
@@ -250,7 +270,7 @@ export class RealtimeDO extends DurableObject<Env> {
     const [client, server] = Object.values(new WebSocketPair());
     const att: Att = { t: now, topics: new Uint8Array(0), win: 0, frames: 0, changes: 0 };
     try {
-      this.ctx.acceptWebSocket(server, [clientTag, `h:${hour}`]);
+      this.ctx.acceptWebSocket(server, [clientTag, `h:${hour}`, `t:${now}`]);
       server.serializeAttachment(att);
       server.send(encodeServerFrame({ f: "hello", boot: this.boot, now, seq: this.seq }));
     } catch (e) {
@@ -434,6 +454,20 @@ export class RealtimeDO extends DurableObject<Env> {
       if (x >= h - 1) continue;
       for (const ws of this.ctx.getWebSockets(`h:${x}`)) this.drop(ws, 4000, "max age");
       this.hours.delete(x);
+    }
+  }
+
+  /**
+   * Closes with 4001 the open sockets of `list` that showed no sign of life within `staleMs` (§9.4): neither accepted
+   * (the "t:" tag) nor had a "ping" auto-answered since. Clients ping every 30 s, so these are almost always sockets
+   * whose client vanished without a close frame. Reads only tags and the runtime's auto-answer time.
+   */
+  private dropStale(list: WebSocket[], now: number): void {
+    for (const ws of list) {
+      if (ws.readyState !== WebSocket.OPEN) continue;
+      const pinged = this.ctx.getWebSocketAutoResponseTimestamp(ws)?.getTime() ?? 0;
+      if (Math.max(acceptedAt(this.ctx.getTags(ws)), pinged) >= now - this.limits.staleMs) continue;
+      this.drop(ws, 4001, "no ping");
     }
   }
 

@@ -2162,7 +2162,7 @@ decapsulations). Only a device with no inbox cursor reads that much (§11.5).
 
 - Storage: a `meta` table holding `ws-tag-key`, 32 random bytes that key the opaque per-client tag.
 - Per socket:
-  - tags `[clientTag, "h:" + ⌊acceptMs / 3 600 000⌋]`;
+  - tags `[clientTag, "h:" + ⌊acceptMs / 3 600 000⌋, "t:" + acceptMs]`;
   - the attachment `{t: acceptMs, topics: Uint8Array(16·n), win, frames, changes, notes}` with at most 256 topics (4
     KiB; attachments may hold up to 16 KiB), `notes` being true once the socket has sent NOTES (§10.8).
 - In memory:
@@ -2194,9 +2194,16 @@ isolate.
 
 1. Take the client tag from `x-segv-client` if it matches `^[0-9a-f]{32}$` (the Worker sends lowercase hex), else
    "none".
-2. Refuse if the client already has 8 live sockets: 429, `retry-after: 60`.
+2. If the client already has 8 live sockets, close with 4001 those of them that are **silent**: neither accepted nor
+   had a `ping` auto-answered in the last 90 s (three ping periods). Then refuse if it still has 8: 429,
+   `retry-after: 60`.
 3. Refuse if there are 20 000 live sockets in total, or if accepting fails: 503, `retry-after: 60`.
 4. Otherwise accept with the tags, set the attachment, send HELLO, and return 101.
+
+A client that vanishes without a close frame (a device that sleeps, a network that changes) leaves its sockets open
+here, and step 2 keeps them from holding its places. The check reads the `t:` tag and the time of the socket's last
+auto-answer, which the runtime keeps (`getWebSocketAutoResponseTimestamp`): it deserialises no attachment, and pings
+never wake the object. A socket without a `t:` tag (one accepted by an earlier version) is judged by its pings alone.
 
 Sockets older than 1 h are closed with 4000. Whenever sockets are counted or sent to, every socket under an hour tag
 older than the previous hour is closed, and a socket's exact age is checked before sending to it. Clients reconnect and
@@ -3240,8 +3247,13 @@ costs a catch-up (§11.6), never a lost row.
   `Tself`, apply the note (§11.16); ignore a NOTE frame for any other topic.
 - After GAP, run catch-up (§11.6). After a SUB of a topic that was not subscribed before, run a one-shot probe of that
   topic's expected slots, since rows published before the SUB are not replayed.
-- Reconnect with backoff of 1 s, doubling to 30 s, with jitter; ping every 30 s. After a close with 1008 or 1013, wait
-  at least 60 s and do not resend the same frame or topic set; never send a frame or topic set above the limits.
+- Reconnect with backoff of 1 s, doubling to 30 s, with jitter. After a close with 1008 or 1013, wait at least 60 s and
+  do not resend the same frame or topic set; never send a frame or topic set above the limits.
+- Ping every 30 s. When no frame (the `pong` or any other) arrives within 10 s of a ping, give the socket up and
+  reconnect at once: a socket can die without a close event, and the server answers every ping while the socket lives.
+  Give up a connection attempt that has not opened within 15 s, and retry it with the backoff.
+- In a browser, when the page is shown again or the network comes back, ping an open socket at once (as above), or
+  connect at once without waiting for the backoff (but not during the 60 s wait after a 1008 or 1013).
 - On any frame the client cannot parse, close and reconnect.
 
 ### 10.9 Params, eras, checkpoints, feed

@@ -672,6 +672,45 @@ describe("RealtimeDO caps and age", () => {
     for (const s of open.slice(8)) s.ws.close(1000);
   });
 
+  it("a client at its cap first loses (4001) the sockets silent for 90 s; those that pinged or were just accepted stay", async () => {
+    const stub = fresh();
+    const A = clientTag();
+    // The runtime stamps auto-answers with the real time; the object's clock is moved around it.
+    const T = Date.now();
+    await setClock(stub, T - 200_000);
+    const old: Sock[] = [];
+    for (let i = 0; i < 6; i++) old.push(await connect(stub, A));
+    const otherClient = await connect(stub); // silent as long, but not at its cap
+    await setClock(stub, T - 30_000);
+    const recent = [await connect(stub, A), await connect(stub, A)];
+    const pinged = old.slice(0, 3);
+    const silent = old.slice(3);
+    for (const s of pinged) {
+      s.ws.send("ping");
+      await s.until(() => s.frames.some((f) => f.f === "text" && f.text === "pong"), "pong");
+    }
+    // The tags and the time of the last auto-answer outlive the object's eviction.
+    await evictDurableObject(stub);
+    await setClock(stub, T + 1_000);
+
+    const ninth = await connect(stub, A);
+    for (const s of silent) await s.closedWith(4001);
+    expect(silent[0].closed()!.reason).toBe("no ping");
+    const more = [await connect(stub, A), await connect(stub, A)]; // 3 pinged + 2 recent + 3 new = 8
+    const full = await upgrade(stub, A);
+    expect(full.status).toBe(429);
+    await full.text();
+    for (const s of [...pinged, ...recent, ninth, ...more, otherClient]) expect(s.closed()).toBeNull();
+
+    // The kept sockets still receive.
+    const Tp = topic();
+    pinged[0].send({ f: "sub", topics: [Tp] });
+    await pairsAre(stub, 1);
+    await stub.publish([row(Tp)]);
+    await pinged[0].rowsAre(1);
+    for (const s of [...pinged, ...recent, ninth, ...more, otherClient]) s.ws.close(1000);
+  });
+
   it("503 when accepting fails", async () => {
     const stub = fresh();
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});

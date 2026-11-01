@@ -1,8 +1,11 @@
 // The realtime socket (docs/PROTOCOL.md §10.8, §11.6): SUB / UNSUB / RESUME by seq, HELLO (a clock sample),
-// ROWS, GAP and RESUMED; ping every 30 s; reconnect with back-off and jitter, at least 60 s after a 1008 or 1013.
+// ROWS, GAP and RESUMED; reconnect with back-off and jitter, at least 60 s after a 1008 or 1013.
 // One socket of up to 256 topics (the session opens a second one for more than 256 topics, §10.8).
-// In a browser, a page shown again or a network that comes back skips the back-off: phones stop a hidden page's
-// socket, and the app should be online as soon as it is opened.
+// Liveness: a ping every 30 s, and a socket that answers nothing within 10 s of a ping is replaced at once (a socket
+// can die without a close event: a laptop that slept, a network that changed, a NAT that forgot it); an attempt that
+// has not opened within 15 s is given up and retried with the back-off.
+// In a browser, a page shown again or a network that comes back skips the back-off, or pings an open socket at once:
+// phones stop a hidden page's socket, and the app should be online as soon as it is opened.
 import * as P from "@segv/protocol/proto";
 import * as W from "@segv/protocol/wire";
 import type { EngineClock, EngineTimer, WebSocketCtor } from "./options";
@@ -25,8 +28,10 @@ const PING_MS = 30_000;
 const BACKOFF_MIN = 1000;
 const BACKOFF_MAX = 30_000;
 const POLICY_WAIT = 60_000;
-/** After a wake, an open socket that answers nothing (not even the "pong") within this long is replaced. */
-const WAKE_PROBE_MS = 10_000;
+/** An open socket that answers nothing (not even the "pong") within this long after a ping is replaced. */
+const PROBE_MS = 10_000;
+/** A socket still connecting after this long is given up (and retried with the back-off). */
+const CONNECT_MS = 15_000;
 
 export class Realtime {
   private ws: WebSocket | null = null;
@@ -41,6 +46,8 @@ export class Realtime {
   private openedAt = 0;
   private backoff = BACKOFF_MIN;
   private timer: EngineTimer | null = null;
+  /** gives up the connecting socket after CONNECT_MS */
+  private dial: EngineTimer | null = null;
   private ping: EngineTimer | null = null;
   private probe: EngineTimer | null = null;
   /** monotonic time of the last frame received on the open socket */
@@ -68,9 +75,8 @@ export class Realtime {
     this.unlisten?.();
     this.unlisten = null;
     this.timer?.cancel();
-    this.ping?.cancel();
-    this.probe?.cancel();
-    this.timer = this.ping = this.probe = null;
+    this.timer = null;
+    this.idle();
     const ws = this.ws;
     this.ws = null;
     if (ws) {
@@ -133,7 +139,10 @@ export class Realtime {
     };
   }
 
-  /** Pings an open socket at once; without any answer within WAKE_PROBE_MS, replaces it. */
+  /**
+   * Pings an open socket now; when no frame at all (the "pong" or any other) arrives within PROBE_MS, replaces it at
+   * once. Any frame counts, so a late timer (a throttled background tab) cannot replace a socket that answered.
+   */
   private probeNow(ws: WebSocket): void {
     if (this.probe) return;
     const sent = this.clock.mono();
@@ -148,7 +157,15 @@ export class Realtime {
       this.abandon(ws);
       this.backoff = BACKOFF_MIN;
       this.connect();
-    }, WAKE_PROBE_MS);
+    }, PROBE_MS);
+  }
+
+  /** Cancels the timers that belong to the current socket. */
+  private idle(): void {
+    this.dial?.cancel();
+    this.ping?.cancel();
+    this.probe?.cancel();
+    this.dial = this.ping = this.probe = null;
   }
 
   /** Forgets a socket without waiting for its close event. */
@@ -161,9 +178,7 @@ export class Realtime {
     }
     if (this.ws !== ws) return;
     this.ws = null;
-    this.ping?.cancel();
-    this.probe?.cancel();
-    this.ping = this.probe = null;
+    this.idle();
     this.h.onState(false);
   }
 
@@ -184,8 +199,18 @@ export class Realtime {
     this.sent.clear();
     this.resumed = false;
     this.openedAt = this.clock.mono();
+    this.lastRx = -Infinity;
     ws.binaryType = "arraybuffer";
+    // A handshake can hang without ever failing (a network that drops packets, a captive portal).
+    this.dial = this.clock.setTimer(() => {
+      this.dial = null;
+      if (this.stopped || this.ws !== ws || ws.readyState !== 0) return;
+      this.abandon(ws);
+      this.retry(false);
+    }, CONNECT_MS);
     ws.onopen = () => {
+      this.dial?.cancel();
+      this.dial = null;
       this.backoff = BACKOFF_MIN;
       const topics = [...this.want.values()];
       if (this.boot) {
@@ -203,9 +228,7 @@ export class Realtime {
     ws.onclose = (ev) => {
       if (this.ws !== ws) return;
       this.ws = null;
-      this.ping?.cancel();
-      this.probe?.cancel();
-      this.ping = this.probe = null;
+      this.idle();
       this.h.onState(false);
       this.retry(ev.code === 1008 || ev.code === 1013);
     };
@@ -224,15 +247,20 @@ export class Realtime {
     const wait = policy ? POLICY_WAIT + jitter : this.backoff + jitter;
     this.backoff = Math.min(this.backoff * 2, BACKOFF_MAX);
     this.notBefore = policy ? this.clock.mono() + wait : 0;
+    this.timer?.cancel();
     this.timer = this.clock.setTimer(() => {
       this.timer = null;
       this.connect();
     }, wait);
   }
 
+  /** The ping every PING_MS on the open socket; each one is a probe. */
   private pingNow(): void {
-    if (this.ws?.readyState === 1) this.ws.send("ping");
-    if (!this.stopped) this.ping = this.clock.setTimer(() => this.pingNow(), PING_MS);
+    this.ping = null;
+    const ws = this.ws;
+    if (this.stopped || !ws || ws.readyState !== 1) return;
+    this.probeNow(ws);
+    this.ping = this.clock.setTimer(() => this.pingNow(), PING_MS);
   }
 
   /** Sends SUB for wanted topics the server lacks and UNSUB for the others. */
