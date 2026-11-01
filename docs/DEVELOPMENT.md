@@ -55,6 +55,38 @@ also reads `apps/web/.dev.vars`.
 The root scripts (`dev`, `build`, `preview`, `deploy`, `db:migrate:local`, `test:e2e`) run the web app's scripts. Run
 other Wrangler commands in `apps/web`, where `wrangler.jsonc` is.
 
+## Desktop app
+
+`apps/desktop` is the desktop app (docs/PROTOCOL.md §11.14), built with [Tauri 2](https://tauri.app): the UI of
+`packages/ui`, rendered in the client only (Qwik's CSR mode) into one static page that the app carries in its package
+and shows at `tauri://localhost`. The engine gets the app's platform through `EngineOptions` (`apps/desktop/src/platform.ts`):
+the deployment's canonical origin for every API call and the realtime socket, passkeys through AuthenticationServices
+(the RP ID stays the canonical host), the remembered session in a file of the app's data directory sealed under a key
+of the data protection keychain, and notifications that the app shows itself while it runs, also with its window
+closed (§11.13, "Apps without push"). Their native side is in `apps/desktop/src-tauri/src`; the commands that the page
+may call are listed in `build.rs` and granted in `capabilities/main.json`. The window is Liquid Glass on macOS 26 and
+later (`windowEffects` in `tauri.conf.json`), and `apps/desktop/src/desktop.css` lets it show through the page's chrome.
+
+Requirements: Rust (the workspace's `Cargo.toml` is at the root), and on macOS Xcode. macOS 15 or later runs the app.
+
+- `pnpm --filter @segv/desktop run dev` runs `tauri dev`: the page comes from a Vite server at `http://localhost:1420`,
+  which passes `/api/*` on to `SEGV_DEV_API` (default `http://localhost:5173`, the local `pnpm run dev`). A binary run
+  outside an app bundle has no notification center and no associated domains, so notifications and passkeys only
+  work in a bundle.
+- `pnpm --filter @segv/desktop run bundle -- --debug --bundles app` builds `target/debug/bundle/macos/segv.sh.app`
+  (`scripts/bundle.mjs`). It calls `SEGV_ORIGIN` (default `https://segv.sh`); a local server needs
+  `SEGV_ORIGIN=http://localhost:5173`, and `APP_ORIGINS` in `apps/web/wrangler.jsonc` already lets
+  `tauri://localhost` call it. To sign the app with passkeys, set `APPLE_TEAM_ID`, `APPLE_SIGNING_IDENTITY` (the
+  identity's name or SHA-1) and `APPLE_PROVISIONING_PROFILE` (a macOS profile of `sh.segv.desktop` with the
+  Associated Domains capability, which needs a paid Apple Developer Program team; a development profile lists the
+  Macs it runs on). Without them the app is signed ad hoc and signs in with the recovery code only. Passkeys of a
+  deployment also need its `/.well-known/apple-app-site-association` to name the app (`APPLE_APP_IDS`, see
+  [DEPLOYMENT.md](DEPLOYMENT.md)).
+- `cargo clippy -p segv-desktop` and `cargo fmt --all` check and format the native code.
+
+Windows and Linux builds compile, but neither keeps the session nor shows notifications yet: their key stores and
+notification centers are not wired up.
+
 ## Tests
 
 `pnpm test` runs `vp test run`, which runs the Vitest project of each package (`packages/*/vite.config.ts`):
@@ -105,9 +137,10 @@ code that apps are built from. Nothing is published: a package exports its TypeS
 imports it compiles them (Vite and Qwik's optimizer, or Node's type stripping in the end-to-end test).
 
 ```text
-apps/web ──▶ packages/ui ──▶ packages/engine ──▶ packages/protocol
-   │                                                  ▲
-   └──────────▶ packages/server ──────────────────────┘
+apps/desktop ──▶ packages/ui ──▶ packages/engine ──▶ packages/protocol
+                   ▲                                      ▲
+apps/web ──────────┘                                      │
+   └──────────▶ packages/server ──────────────────────────┘
 ```
 
 - Dependencies point one way. An app may import any package; `ui` imports `engine`; `engine` and `server` import
@@ -123,9 +156,9 @@ apps/web ──▶ packages/ui ──▶ packages/engine ──▶ packages/prot
   The one exception is the workspace's own `devDependencies`, which Node finds from every directory below the root:
   declare them in each package that imports them all the same.
 - `@segv/ui` takes `@qwik.dev/core` as a peer dependency: the app provides the one copy of Qwik.
-- Code that needs one platform belongs to the app that ships on that platform. A native shell would be an app of its
-  own that builds `@segv/ui` and gives the engine its platform (`EngineOptions`); `packages/` never import a platform's
-  SDK.
+- Code that needs one platform belongs to the app that ships on that platform. A native shell is an app of its own
+  that builds `@segv/ui` and gives the engine its platform (`EngineOptions`), as `apps/desktop` does; `packages/` never
+  import a platform's SDK.
 - `pnpm run check:workspace` checks these rules, which pnpm does not enforce by itself
   (`scripts/check-workspace.mjs`): versions only from the catalog or the workspace, the allowed dependencies between
   packages (`ALLOWED` in the script), no platform SDK under `packages/`, and every import declared by the package that

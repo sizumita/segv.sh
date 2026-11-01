@@ -1,0 +1,112 @@
+/*
+ * The desktop app's window, over @segv/ui's global.css. The window itself is Liquid Glass (macOS 26 and later; the
+ * sidebar material before that: windowEffects in src-tauri/tauri.conf.json), and the page leaves it showing through
+ * its chrome: the title bar strip and the conversation list. The open conversation, dialogs and the image viewer stay
+ * opaque, so that messages read as they do on the web app. The page fills the window under the system's buttons, and
+ * its top strip is the title bar (chrome.ts).
+ */
+:root[data-shell="desktop"] {
+  --titlebar: 44px;
+  /* the system's window buttons, from the left edge (trafficLightPosition, plus the three buttons), centred in the
+     title bar */
+  --lights: 84px;
+  --glass: color-mix(in srgb, var(--bg) 55%, transparent);
+  --glass-hi: color-mix(in srgb, var(--fg) 9%, transparent);
+  --rule: color-mix(in srgb, var(--fg) 22%, transparent);
+  --radius: 12px;
+}
+html[data-shell="desktop"],
+html[data-shell="desktop"] body {
+  background: transparent;
+}
+[data-shell="desktop"] body {
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+/* Text that people read or write stays selectable. */
+[data-shell="desktop"]
+  :is(.msgs, .composer, input, textarea, .recovery .code, .fp, .settings, .errors, .warnings) {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* ---- signed out, loading, recovery: the page sits on the glass, below the title bar ---- */
+[data-shell="desktop"] :is(.boot, .page) {
+  padding-top: calc(var(--titlebar) + 32px);
+}
+[data-shell="desktop"]
+  :is(.page, .boot)
+  :is(button:not(.link), .btn, input[type="text"], textarea, .progress, .recovery .code) {
+  background: var(--glass);
+}
+[data-shell="desktop"] :is(.page, .boot) :is(button:not(.link), .btn):hover:not(:disabled) {
+  background: var(--fg);
+}
+
+/* ---- signed in ---- */
+[data-shell="desktop"] .chat {
+  padding: 0;
+}
+/* The status bar is the title bar: after the window buttons, on the glass. */
+[data-shell="desktop"] .bar {
+  min-height: var(--titlebar);
+  align-items: center;
+  padding: 0 14px 0 var(--lights);
+  border-bottom: 0;
+}
+[data-shell="desktop"] .bar button:not(.link) {
+  background: var(--glass);
+}
+[data-shell="desktop"] :is(.warnings, .chat > .errors) {
+  margin: 0 8px 8px;
+  background: var(--bg);
+  border: 1px solid var(--fg);
+  border-radius: var(--radius);
+}
+[data-shell="desktop"] .chat > .errors .error {
+  border: 0;
+}
+/* The list is the sidebar: on the glass, with lighter rules. */
+[data-shell="desktop"] .left {
+  border-right: 0;
+  background: transparent;
+}
+[data-shell="desktop"] .left :is(.me, .newconv, .lists) {
+  border-bottom-color: var(--rule);
+}
+[data-shell="desktop"] .left :is(button:not(.conv, .link), .btn, input[type="text"], textarea) {
+  background: var(--glass);
+}
+[data-shell="desktop"] .left :is(button:not(.conv, .link), .btn):hover:not(:disabled) {
+  background: var(--fg);
+}
+[data-shell="desktop"] .conv {
+  border-radius: 8px;
+  margin: 1px 6px;
+  width: calc(100% - 12px);
+}
+[data-shell="desktop"] .conv:hover:not(:disabled) {
+  background: var(--glass-hi);
+}
+[data-shell="desktop"] .conv.on,
+[data-shell="desktop"] .conv.on:hover:not(:disabled) {
+  background: var(--fg);
+}
+/* The conversation is a sheet inset in the glass. */
+[data-shell="desktop"] .right {
+  margin: 0 8px 8px 0;
+  background: var(--bg);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+@media (max-width: 720px) {
+  [data-shell="desktop"] .right {
+    margin-left: 8px;
+  }
+}
+[data-shell="desktop"] .settings,
+[data-shell="desktop"] .leave {
+  border-radius: var(--radius);
+}

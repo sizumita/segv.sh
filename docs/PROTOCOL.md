@@ -4474,9 +4474,10 @@ browser client does, with these differences:
 - **Storage.** The app keeps the remembered session (§11.11), its local state (§11.15), the notification cache and the
   push keys (§11.13) in its own files, sealed under device keys that the system's key store holds, never only in the web
   view's storage, which the system may clear when the device runs short of space and which some of its modes turn off:
-  the web view holds at most a copy that it can lose. On iOS and macOS the files lie in the app group that the app
-  shares with its extensions, and the keys in a Keychain access group that they share, readable from the first unlock
-  after a restart on (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`); on Android in the app's own storage, under
+  the web view holds at most a copy that it can lose. On iOS and macOS the files lie where the app's extensions can read
+  them (the app group that the app shares with its extensions, when it has any), and the keys in the data protection
+  keychain, in a Keychain access group that they share, readable from the first unlock after a restart on
+  (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`) and never synced; on Android in the app's own storage, under
   keys of the Android Keystore. No key that the notification handler needs is bound to the user's authentication
   (biometrics or the passcode), since the handler runs while the device is locked.
 - **Code outside the web view.** The notification handler, the actions of notifications (§11.13) and a share target run
@@ -4497,12 +4498,13 @@ browser client does, with these differences:
   and MAY start hidden when the user signs in to the system. While it runs it keeps its realtime socket, reconnects when
   the system wakes, notifies as §11.13 says ("Apps without push"), and shows the badge where the system has one (the
   Dock on macOS, the taskbar button's overlay on Windows).
-- **Notifications** come through APNs (iOS, macOS) or FCM (Android), with push keys and a notification handler of the
-  app's own (§9.8, §11.13). A desktop app on Windows or Linux has no push transport in stage 1 (§11.13, "Apps without
-  push").
+- **Notifications** come through APNs (iOS, and macOS when the desktop app uses it) or FCM (Android), with push keys
+  and a notification handler of the app's own (§9.8, §11.13). A desktop app on Windows or Linux has no push transport in
+  stage 1, nor has one on macOS that does not use APNs (§11.13, "Apps without push").
 - **Links.** The mobile apps open the deployment's links to the path `/`, which conversation URLs (§11.13) use, as the
-  association files declare; the fragment reaches the app unchanged. A desktop app registers a URL scheme of its own,
-  and a page of the web app MAY offer to open a conversation URL in it, with the fragment carried over. A conversation
+  association files declare; the fragment reaches the app unchanged. A desktop app registers a URL scheme of its own
+  (for segv.sh `segv:`, whose `segv://open#c/<ref>` names a conversation), and a page of the web app MAY offer to open
+  a conversation URL in it, with the fragment carried over. A conversation
   URL that the app opens shows that copy as in a browser, and a notification of the app opens its copy's URL in the app.
 
 The server answers a native app as it answers a browser. Its requests differ only in their `Origin` header, which,

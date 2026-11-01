@@ -34,6 +34,7 @@ export default defineConfig({
       "**/worker-configuration.d.ts",
       "**/dist/**",
       "apps/web/server/**",
+      "apps/desktop/src-tauri/gen/**",
       "docs/PROTOCOL.md",
       "packages/protocol/src/**",
       "packages/server/src/**",

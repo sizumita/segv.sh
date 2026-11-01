@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- macOS app icon grid: an 824 px squircle-ish rounded square centred on a 1024 px canvas -->
+  <rect x="100" y="100" width="824" height="824" rx="185" ry="185" fill="#000"/>
+  <!-- the favicon's cursor: x 4/16, y 10/16, 8/16 wide, 2/16 high of the square -->
+  <rect x="306" y="615" width="412" height="103" fill="#fff"/>
+</svg>

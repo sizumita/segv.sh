@@ -1,10 +1,11 @@
 {
   "name": "@segv/ui",
   "private": true,
-  "description": "The Qwik UI. It renders the engine's state and calls the Engine interface; each app mounts <App /> and supplies the platform.",
+  "description": "The Qwik UI and its stylesheet (global.css). It renders the engine's state and calls the Engine interface; each app mounts <App /> and supplies the platform.",
   "type": "module",
   "exports": {
-    ".": "./src/app.tsx"
+    ".": "./src/app.tsx",
+    "./global.css": "./global.css"
   },
   "scripts": {
     "test": "vp test run",

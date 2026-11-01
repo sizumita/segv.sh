@@ -5,15 +5,20 @@
  *  - `vp build`: plain Qwik client build; adapters/cloudflare-workers/vite.config.ts extends this
  *                for the server bundle that wrangler deploys.
  */
+import { copyFile, readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { join } from "node:path";
 import { cloudflare } from "@cloudflare/vite-plugin";
 import { qwikVite } from "@qwik.dev/core/optimizer";
 import { qwikRouter } from "@qwik.dev/router/vite";
 import type { Plugin } from "vite";
 import { defineConfig, lazyPlugins } from "vite-plus";
 
+const require = createRequire(import.meta.url);
 /** The push Service Worker's entry, in @segv/engine (packages/engine/src/sw-main.ts). */
-const SW_ENTRY = createRequire(import.meta.url).resolve("@segv/engine/sw-main");
+const SW_ENTRY = require.resolve("@segv/engine/sw-main");
+/** The stylesheet of @segv/ui, which every app serves as one static file. */
+const STYLESHEET = require.resolve("@segv/ui/global.css");
 /** The push Service Worker's own CSP: it loads nothing, and reads rows from this origin's API only (§11.13). */
 const SW_CSP = "default-src 'none'; connect-src 'self'";
 
@@ -61,6 +66,35 @@ function swPlugin(): Plugin {
   };
 }
 
+/**
+ * Serves /global.css in dev and copies it to the root of the client build. It stays a plain static file: imported from
+ * src/, or emitted into the bundle, Qwik would inline it as a <style> tag in production (blocked by the CSP, which has
+ * no 'unsafe-inline' for styles), and `vp dev` would not load it at all (SSR in workerd). So it is written after the
+ * bundle, where Qwik's manifest never sees it.
+ */
+function stylesheetPlugin(): Plugin {
+  return {
+    name: "segv:css",
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        if (req.url?.split("?")[0] !== "/global.css") return next();
+        readFile(STYLESHEET, "utf8").then(
+          (css) => {
+            res.setHeader("Content-Type", "text/css; charset=utf-8");
+            res.setHeader("Cache-Control", "no-store");
+            res.end(css);
+          },
+          (e: unknown) => next(e),
+        );
+      });
+    },
+    async writeBundle(options) {
+      if (this.environment?.config.consumer !== "client" || !options.dir) return;
+      await copyFile(STYLESHEET, join(options.dir, "global.css"));
+    },
+  };
+}
+
 // In workerd dev, Qwik libs must be transformed by the Qwik optimizer instead of being
 // pre-bundled by Vite's dep optimizer, otherwise their QRL segments 404 in the browser.
 const QWIK_LIBS = [
@@ -82,6 +116,7 @@ export default defineConfig(({ command, mode }) => {
     // lazyPlugins: factories are skipped by `vp lint` / `vp fmt` / `vp check`.
     plugins: lazyPlugins(() => mode === "test" ? [] : [
       swPlugin(),
+      stylesheetPlugin(),
       qwikRouter(dev ? { devSsrServer: false } : {}),
       qwikVite(),
       ...(dev
@@ -94,7 +129,9 @@ export default defineConfig(({ command, mode }) => {
           ]
         : []),
     ]),
-    server: { headers: { "Cache-Control": "public, max-age=0" } },
+    // cors: false: the Worker answers cross-origin requests and preflights itself (APP_ORIGINS, docs/PROTOCOL.md §10.1),
+    // as in production; Vite's own CORS handling would answer the native apps' preflights first.
+    server: { cors: false, headers: { "Cache-Control": "public, max-age=0" } },
     preview: { headers: { "Cache-Control": "public, max-age=600" } },
   };
 });
