@@ -1,8 +1,7 @@
 # Checks every pull request: formatting, lint, type checks, tests, the production build, the Wrangler configuration,
-# the end-to-end test, the desktop app's native code, the dependencies' advisories and registry signatures, and the
-# format of the lockfile. The audit
-# also runs every week, since advisories are published against versions that are already locked. Pushes to main are
-# checked by the Deploy workflow.
+# the end-to-end test, the desktop app's native code on macOS and Windows, the dependencies' advisories and registry
+# signatures, and the format of the lockfile. The audit also runs every week, since advisories are published against
+# versions that are already locked. Pushes to main are checked by the Deploy workflow.
 #
 # - No job has secrets, and the GITHUB_TOKEN can only read the repository.
 # - Dependencies come from pnpm-lock.yaml, without install scripts and without a cache.
@@ -130,12 +129,20 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # The desktop app's native code (apps/desktop/src-tauri), on macOS, where its platform code compiles. Its pages are
-  # built first: the Tauri context embeds them. Cargo takes the versions of Cargo.lock.
+  # The desktop app's native code (apps/desktop/src-tauri), on macOS and on Windows, where each system's platform code
+  # compiles. Its pages are built first: the Tauri context embeds them. Cargo takes the versions of Cargo.lock.
   desktop:
-    name: Desktop app
+    name: Desktop app (${{ matrix.system }})
     if: github.event_name != 'schedule'
-    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: macOS
+            runner: macos-15
+          - system: Windows
+            runner: windows-2025
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
       contents: read

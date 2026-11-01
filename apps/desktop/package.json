@@ -1,7 +1,7 @@
 {
   "name": "@segv/desktop",
   "private": true,
-  "description": "The desktop app (Tauri 2, docs/PROTOCOL.md §11.14): @segv/ui rendered in the client only, in a web view at tauri://localhost, with passkeys, storage and notifications in native code (src-tauri).",
+  "description": "The desktop app for macOS and Windows (Tauri 2, docs/PROTOCOL.md §11.14): @segv/ui rendered in the client only, in a web view at tauri://localhost (https://tauri.localhost on Windows), with passkeys, storage and notifications in native code (src-tauri).",
   "type": "module",
   "scripts": {
     "dev": "tauri dev",

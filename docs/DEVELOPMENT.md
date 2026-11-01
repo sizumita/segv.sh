@@ -57,35 +57,59 @@ other Wrangler commands in `apps/web`, where `wrangler.jsonc` is.
 
 ## Desktop app
 
-`apps/desktop` is the desktop app (docs/PROTOCOL.md §11.14), built with [Tauri 2](https://tauri.app): the UI of
-`packages/ui`, rendered in the client only (Qwik's CSR mode) into one static page that the app carries in its package
-and shows at `tauri://localhost`. The engine gets the app's platform through `EngineOptions` (`apps/desktop/src/platform.ts`):
-the deployment's canonical origin for every API call and the realtime socket, passkeys through AuthenticationServices
-(the RP ID stays the canonical host), the remembered session in a file of the app's data directory sealed under a key
-of the data protection keychain, and notifications that the app shows itself while it runs, also with its window
-closed (§11.13, "Apps without push"). Their native side is in `apps/desktop/src-tauri/src`; the commands that the page
-may call are listed in `build.rs` and granted in `capabilities/main.json`. The window is Liquid Glass on macOS 26 and
-later (`windowEffects` in `tauri.conf.json`), and `apps/desktop/src/desktop.css` lets it show through the page's chrome.
+`apps/desktop` is the desktop app (docs/PROTOCOL.md §11.14), built with [Tauri 2](https://tauri.app) for macOS and
+Windows: the UI of `packages/ui`, rendered in the client only (Qwik's CSR mode) into one static page that the app
+carries in its package and shows at `tauri://localhost` (`https://tauri.localhost` on Windows). The engine gets the
+app's platform through `EngineOptions` (`apps/desktop/src/platform.ts`): the deployment's canonical origin for every API
+call and the realtime socket, passkeys through the system's own API (AuthenticationServices on macOS, the WebAuthn API
+of Windows; the RP ID stays the canonical host), the remembered session in a file of the app's local data directory
+sealed under a key of the system's key store (the data protection keychain on macOS; on Windows a key of the TPM, or
+DPAPI on a device without one), and notifications that the app shows itself while it runs, also with its window closed
+(§11.13, "Apps without push"). Their native side is in `apps/desktop/src-tauri/src`; the commands that the page may call
+are listed in `build.rs` and granted in `capabilities/main.json`. The window is Liquid Glass on macOS 26 and later and
+Mica on Windows 11 (`windowEffects` in `tauri.conf.json`; on Windows `src/lib.rs` makes the window), and
+`apps/desktop/src/desktop.css` lets it show through the page's chrome. `tauri.windows.conf.json` holds what differs on
+Windows: a window with the system's title bar, the page's CSP (Tauri's bridge answers at `https://ipc.localhost` there),
+WebView2's switches that keep the page's timers running while the window is closed, and the installer.
 
-Requirements: Rust (the workspace's `Cargo.toml` is at the root), and on macOS Xcode. macOS 15 or later runs the app.
+Requirements: Rust (the workspace's `Cargo.toml` is at the root); on macOS Xcode, on Windows the MSVC build tools
+(Visual Studio Build Tools with "Desktop development with C++") and WebView2, which Windows 11 includes. The app runs
+on macOS 15 or later, and on Windows 10 22H2 or Windows 11.
 
 - `pnpm --filter @segv/desktop run dev` runs `tauri dev`: the page comes from a Vite server at `http://localhost:1420`,
-  which passes `/api/*` on to `SEGV_DEV_API` (default `http://localhost:5173`, the local `pnpm run dev`). A binary run
-  outside an app bundle has no notification center and no associated domains, so notifications and passkeys only
-  work in a bundle.
+  which passes `/api/*` on to `SEGV_DEV_API` (default `http://localhost:5173`, the local `pnpm run dev`). On macOS a
+  binary run outside an app bundle has no notification center and no associated domains, so notifications and passkeys
+  only work in a bundle.
 - `pnpm --filter @segv/desktop run bundle -- --debug --bundles app` builds `target/debug/bundle/macos/segv.sh.app`
   (`scripts/bundle.mjs`). It calls `SEGV_ORIGIN` (default `https://segv.sh`); a local server needs
   `SEGV_ORIGIN=http://localhost:5173`, and `APP_ORIGINS` in `apps/web/wrangler.jsonc` already lets
-  `tauri://localhost` call it. To sign the app with passkeys, set `APPLE_TEAM_ID`, `APPLE_SIGNING_IDENTITY` (the
-  identity's name or SHA-1) and `APPLE_PROVISIONING_PROFILE` (a macOS profile of `sh.segv.desktop` with the
-  Associated Domains capability, which needs a paid Apple Developer Program team; a development profile lists the
-  Macs it runs on). Without them the app is signed ad hoc and signs in with the recovery code only. Passkeys of a
-  deployment also need its `/.well-known/apple-app-site-association` to name the app (`APPLE_APP_IDS`, see
-  [DEPLOYMENT.md](DEPLOYMENT.md)).
+  `tauri://localhost` and `https://tauri.localhost` call it. To sign the app with passkeys, set `APPLE_TEAM_ID`,
+  `APPLE_SIGNING_IDENTITY` (the identity's name or SHA-1) and `APPLE_PROVISIONING_PROFILE` (a macOS profile of
+  `sh.segv.desktop` with the Associated Domains capability, which needs a paid Apple Developer Program team; a
+  development profile lists the Macs it runs on). Without them the app is signed ad hoc and signs in with the
+  recovery code only. Passkeys of a deployment also need its `/.well-known/apple-app-site-association` to name the app
+  (`APPLE_APP_IDS`, see [DEPLOYMENT.md](DEPLOYMENT.md)), and macOS reads it only for an app in `/Applications`.
+- On Windows, `pnpm --filter @segv/desktop run bundle -- --debug --bundles nsis` builds
+  `target/debug/bundle/nsis/segv.sh_0.1.0_x64-setup.exe`, an installer for the current user that needs no administrator.
+  It makes the Start menu shortcut with the app's AppUserModelID (`sh.segv.desktop`), under which the app registers
+  itself for notifications at every launch (`src/notify.rs`), and registers the `segv:` scheme that a click on a
+  notification opens. A development build registers the scheme itself, to its own binary, until the app is installed
+  again. To get the installers without building on Windows, use the workflow "Desktop app for Windows"
+  (`.github/workflows/desktop-windows.yml`): it builds unsigned installers for x64 and ARM64 for every pull request that
+  changes the desktop app, or when started from the Actions tab, and keeps them as the run's artifacts for 14 days.
+  Passkeys need no signing and no association file: the WebAuthn API of Windows takes the RP ID from the app. It reaches
+  the passkeys of Windows Hello, security keys, phones and the passkey managers that Windows lists, but not those that a
+  browser keeps itself (Chrome's in Google Password Manager, say). Windows Hello evaluates the PRF extension from the
+  February 2026 updates of Windows 11 24H2 and 25H2 on (KB5077181); security keys with hmac-secret do on earlier
+  versions too. Windows 11 24H2 and later ask once whether the app may use passkeys (Settings > Privacy & security >
+  Passkey access). Set `WINDOWS_SIGN_COMMAND` to sign the binaries and the installer (Tauri's
+  `bundle.windows.signCommand`, with `%1` for the file); unsigned, SmartScreen warns when the installer runs.
 - `cargo clippy -p segv-desktop` and `cargo fmt --all` check and format the native code.
+  `cargo clippy -p segv-desktop --target x86_64-pc-windows-msvc` checks the Windows code from macOS too (after
+  `rustup target add x86_64-pc-windows-msvc`); CI runs the check on macOS and on Windows.
 
-Windows and Linux builds compile, but neither keeps the session nor shows notifications yet: their key stores and
-notification centers are not wired up.
+Linux builds compile, but they neither keep the session nor show notifications yet: the key store and the
+notifications of Linux are not wired up.
 
 ## Tests
 

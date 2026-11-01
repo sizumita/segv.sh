@@ -13,6 +13,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2.7.4", features = [] }
 
+[dev-dependencies]
+# The PRF salt of the Windows passkeys, tested on every system (src/passkey.rs).
+sha2 = "0.10.9"
+
 [dependencies]
 aes-gcm = "0.11.1"
 base64 = "0.23.1"
@@ -32,3 +36,18 @@ objc2-authentication-services = "0.3.2"
 objc2-foundation = "0.3.2"
 objc2-user-notifications = "0.3.2"
 security-framework = { version = "3.7.0", features = ["OSX_10_15"] }
+
+[target.'cfg(windows)'.dependencies]
+sha2 = "0.10.9"
+windows = { version = "0.62.2", features = [
+  "Data_Xml_Dom",
+  "UI_Notifications",
+  "Win32_Foundation",
+  "Win32_Networking_WindowsWebServices",
+  "Win32_Security_Cryptography",
+  "Win32_System_Power",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
+windows-registry = "0.6.1"
+windows-version = "0.1.7"

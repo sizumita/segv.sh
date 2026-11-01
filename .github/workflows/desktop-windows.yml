@@ -1,0 +1,94 @@
+# Builds the desktop app's Windows installers (docs/DEVELOPMENT.md, "Desktop app"): an NSIS installer for x64 and one
+# for ARM64, kept as the run's artifacts for 14 days. It runs for a pull request that changes the desktop app, and when
+# started by hand from the Actions tab (GitHub offers that once this file is on the default branch). It is for trying
+# a branch on Windows, not a release: nothing is signed, so SmartScreen warns, and nothing is published.
+#
+# - No job has secrets, and the GITHUB_TOKEN can only read the repository.
+# - Dependencies come from pnpm-lock.yaml, without install scripts and without a cache. Cargo takes the versions of
+#   Cargo.lock. Tauri's CLI fetches NSIS and checks the files' hashes.
+# - pnpm is the release that "packageManager" in package.json pins, installed by pnpm/action-setup.
+# - Every action is pinned to a full commit SHA.
+
+name: Desktop app for Windows
+
+on:
+  pull_request:
+    paths:
+      - apps/desktop/**
+      - packages/engine/**
+      - packages/ui/**
+      - packages/protocol/**
+      - Cargo.lock
+      - Cargo.toml
+      - pnpm-lock.yaml
+      - .github/workflows/desktop-windows.yml
+  workflow_dispatch:
+    inputs:
+      origin:
+        description: The deployment that the app calls (SEGV_ORIGIN, an origin without a path)
+        required: true
+        default: https://segv.sh
+
+permissions: {}
+
+# A newer push to a pull request cancels the run that is still building the previous one.
+concurrency:
+  group: desktop-windows-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  installer:
+    name: Installer (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+    runs-on: windows-2025
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The version comes from "packageManager" in package.json.
+      - name: Set up pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Add the Rust target
+        run: rustup target add "${{ matrix.target }}"
+
+      # tauri build makes the pages first (beforeBuildCommand). The origin reaches the build through the environment,
+      # never through the script's text, and scripts/bundle.mjs refuses anything but an origin.
+      - name: Build the installer
+        env:
+          # A pull request's run has no inputs: it builds for segv.sh.
+          SEGV_ORIGIN: ${{ inputs.origin || 'https://segv.sh' }}
+        run: pnpm --filter @segv/desktop run bundle -- --ci --target "${{ matrix.target }}" --bundles nsis
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: segv.sh-windows-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 14

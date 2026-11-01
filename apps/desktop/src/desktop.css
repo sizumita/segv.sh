@@ -1,9 +1,10 @@
 /*
  * The desktop app's window, over @segv/ui's global.css. The window itself is Liquid Glass (macOS 26 and later; the
- * sidebar material before that: windowEffects in src-tauri/tauri.conf.json), and the page leaves it showing through
- * its chrome: the title bar strip and the conversation list. The open conversation, dialogs and the image viewer stay
- * opaque, so that messages read as they do on the web app. The page fills the window under the system's buttons, and
- * its top strip is the title bar (chrome.ts).
+ * sidebar material before that: windowEffects in src-tauri/tauri.conf.json), or Mica on Windows 11, and the page
+ * leaves it showing through its chrome: the title bar strip and the conversation list. The open conversation, dialogs
+ * and the image viewer stay opaque, so that messages read as they do on the web app. On macOS the page fills the
+ * window under the system's buttons, and its top strip is the title bar (chrome.ts); on Windows the system draws the
+ * title bar above the page (the end of this file).
  */
 :root[data-shell="desktop"] {
   --titlebar: 44px;
@@ -109,4 +110,18 @@ html[data-shell="desktop"] body {
 [data-shell="desktop"] .settings,
 [data-shell="desktop"] .leave {
   border-radius: var(--radius);
+}
+
+/* ---- Windows: the system's title bar is above the page, and the window is Mica on Windows 11
+   (data-backdrop="mica") or opaque before it ("none"); chrome.ts sets both attributes from what
+   src-tauri/src/lib.rs tells the page ---- */
+:root[data-shell="desktop"][data-os="windows"] {
+  --lights: 14px;
+}
+[data-shell="desktop"][data-os="windows"] :is(.boot, .page) {
+  padding-top: 32px;
+}
+html[data-shell="desktop"][data-backdrop="none"],
+html[data-shell="desktop"][data-backdrop="none"] body {
+  background: var(--bg);
 }

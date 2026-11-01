@@ -56,7 +56,8 @@ export default defineConfig(({ command, mode }) => ({
     proxy: { "/api": { target: DEV_API, changeOrigin: true, ws: true } },
   },
   build: {
-    // WKWebView of macOS 15, the oldest system the app supports (src-tauri/tauri.conf.json).
+    // WKWebView of macOS 15, the oldest system the app supports (src-tauri/tauri.conf.json). WebView2 on Windows is an
+    // evergreen Chromium, which reads whatever this one does.
     target: "safari18",
     outDir: "dist",
     emptyOutDir: true,
