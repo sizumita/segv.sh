@@ -5,8 +5,9 @@
 //! click finds what to open from the identifier alone: nothing else is handed to the system.
 
 use serde::Deserialize;
-use std::sync::OnceLock;
-use tauri::{AppHandle, Emitter, Manager, Runtime, Wry};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State, Wry};
 
 /// One notification, as the engine's LocalNotification.
 #[derive(Deserialize)]
@@ -35,6 +36,14 @@ pub fn open_of(tag: &str) -> String {
 
 static APP: OnceLock<AppHandle<Wry>> = OnceLock::new();
 
+/// What the page is asked to open before it listens: a link or a notification click that launched the app arrives
+/// before the page has loaded, so the newest one waits here until the page says that it is ready (`page_ready`).
+#[derive(Default)]
+pub struct Opens {
+    ready: AtomicBool,
+    pending: Mutex<Option<String>>,
+}
+
 /// Shows the main window and asks the page to open `open` (a conversation's fragment, or "" for the start page).
 pub fn open_in_app<R: Runtime>(app: &AppHandle<R>, open: &str) {
     if let Some(w) = app.get_webview_window("main") {
@@ -42,7 +51,20 @@ pub fn open_in_app<R: Runtime>(app: &AppHandle<R>, open: &str) {
         let _ = w.show();
         let _ = w.set_focus();
     }
-    let _ = app.emit_to("main", "segv:open", open.to_string());
+    let opens = app.state::<Opens>();
+    if opens.ready.load(Ordering::SeqCst) {
+        let _ = app.emit_to("main", "segv:open", open.to_string());
+    } else if let Ok(mut p) = opens.pending.lock() {
+        *p = Some(open.to_string());
+    }
+}
+
+/// The page listens for `segv:open` from now on; it gets what was asked of it before, if anything.
+#[tauri::command]
+pub fn page_ready(opens: State<'_, Opens>) -> Option<String> {
+    let mut p = opens.pending.lock().ok()?;
+    opens.ready.store(true, Ordering::SeqCst);
+    p.take()
 }
 
 /// Called once at launch, before the system can deliver a click that launched the app.

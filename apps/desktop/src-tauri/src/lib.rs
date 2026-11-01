@@ -79,6 +79,7 @@ fn tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
 
 pub fn run() {
     let app = tauri::Builder::default()
+        .manage(notify::Opens::default())
         // A second launch (or a link opened on Windows and Linux) goes to the running app.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| show_main(app)))
         .plugin(tauri_plugin_deep_link::init())
@@ -96,6 +97,7 @@ pub fn run() {
             notify::notify_close,
             notify::notify_close_all,
             notify::badge,
+            notify::page_ready,
             passkey::passkey_capability,
             passkey::passkey_create,
             passkey::passkey_prf,

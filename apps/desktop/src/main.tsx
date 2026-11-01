@@ -9,7 +9,7 @@ import { moveByTitleBar } from "./chrome";
 import { followOpens, platform } from "./platform";
 
 configureEngine(platform());
-followOpens();
+followOpens().catch((e: unknown) => console.error("segv: could not follow links", e));
 moveByTitleBar();
 // Not `void render(…)`: Qwik's optimizer drops a `void` statement whose operand holds a pure JSX node.
 render(document.body, <App />).catch((e: unknown) => console.error("segv: could not render", e));

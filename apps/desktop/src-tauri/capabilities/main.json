@@ -17,6 +17,7 @@
     "allow-notify-close",
     "allow-notify-close-all",
     "allow-badge",
+    "allow-page-ready",
     "allow-passkey-capability",
     "allow-passkey-create",
     "allow-passkey-prf",

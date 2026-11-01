@@ -10,6 +10,7 @@ const COMMANDS: &[&str] = &[
     "notify_close",
     "notify_close_all",
     "badge",
+    "page_ready",
     "passkey_capability",
     "passkey_create",
     "passkey_prf",
