@@ -2,15 +2,15 @@
  * Cloudflare Worker entry (production). Built by Vite (Qwik SSR build) -> server/entry.cloudflare-workers.js,
  * which wrangler.jsonc "main" points to. The API and the Durable Objects come from @segv/server (packages/server).
  *
- * Order: host pinning (APP_HOSTS), then API routes (plain fetch, incl. WebSocket upgrade -> Durable Object),
- * then Qwik Router SSR. Everything under /api/ is answered by handleApi (packages/server/src/api.ts) and never
- * reaches Qwik.
+ * Order: host pinning (APP_HOSTS), then the native apps' association files under /.well-known/, then API routes
+ * (plain fetch, incl. WebSocket upgrade -> Durable Object), then Qwik Router SSR. Everything under /api/ is answered
+ * by handleApi (packages/server/src/api.ts) and never reaches Qwik.
  */
 import {
   createQwikRouter,
   type PlatformCloudflarePages,
 } from "@qwik.dev/router/middleware/cloudflare-pages";
-import { handleApi, pinHost, stampResponse } from "@segv/server";
+import { handleApi, pinHost, stampResponse, wellKnown } from "@segv/server";
 import render from "./entry.ssr";
 
 // Durable Object classes must be exported from the Worker's main module (docs/PROTOCOL.md §9): per-era
@@ -36,10 +36,15 @@ export default {
     const url = new URL(request.url);
     // The passkey RP ID is the hostname: never serve the app (or the log) on a non-canonical host.
     const pinned = pinHost(env, url);
-    // §10.1: the 421 on /api/* carries x-segv-now (and HSTS) like every other API response.
-    if (pinned) return url.pathname.startsWith("/api/") ? stampResponse(pinned, url) : pinned;
+    const isApi = url.pathname.startsWith("/api/");
+    // §10.1: the 421 on /api/* carries x-segv-now (and HSTS, and the CORS headers for an app
+    // origin) like every other API response.
+    if (pinned) return isApi ? stampResponse(pinned, request, env, url) : pinned;
+    // §11.14: the native apps' association files, at the canonical host and without a redirect.
+    const wellKnownFile = wellKnown(request, env, url);
+    if (wellKnownFile) return wellKnownFile;
     // Every endpoint is under /api/v2/; any other /api/* path is a 404 from the same router (§10.1).
-    if (url.pathname.startsWith("/api/")) return handleApi(request, env, ctx, url);
+    if (isApi) return handleApi(request, env, ctx, url);
     return qwikRouter(request, env as unknown as QwikEnv, ctx);
   },
 } satisfies ExportedHandler<Env>;

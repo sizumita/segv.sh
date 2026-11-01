@@ -104,25 +104,51 @@ device ([PROTOCOL.md §9.8](PROTOCOL.md)).
    push setting that is missing or invalid (never its value); an invalid push setting turns push off and changes
    nothing else.
 
+### Native apps (optional)
+
+The native apps ([PROTOCOL.md §11.14](PROTOCOL.md)) run their pages at origins of their own, call the API of the
+deployment they are built for, and sign in with its passkeys. Three variables in `wrangler.jsonc` let them:
+
+- `APP_ORIGINS`: the origins of the apps' pages, comma-separated. Each one is `https://`, `capacitor://` or `tauri://`
+  followed by a host name in lowercase, with no port and no path. Pages of these origins may read the API's answers
+  and open the realtime socket; the pages of every other site still may not. segv.sh lists `capacitor://app.segv.sh`
+  (iOS), `https://app.segv.sh` (Android), `tauri://localhost` (macOS and Linux) and `https://tauri.localhost`
+  (Windows). The host of an `https://` entry must be one that no server answers on (`app.segv.sh` has none): a page
+  served there would get the apps' access.
+- `APPLE_APP_IDS`: the app IDs of the Apple apps, each `<Team ID>.<bundle ID>`, comma-separated. They fill
+  `/.well-known/apple-app-site-association`, which lets the apps use the deployment's passkeys and open its links.
+- `ANDROID_APPS`: the Android apps, each `<package name>@<fingerprint>`, comma-separated, where the fingerprint is the
+  SHA-256 of the app's signing certificate as 32 colon-separated pairs of uppercase hex digits (as `keytool -list -v`
+  prints it). They fill `/.well-known/assetlinks.json`.
+
+While a variable is unset or empty, no app origin is allowed (`APP_ORIGINS`) or its file answers 404. An invalid value
+counts as unset, and the Worker's logs name the variable (never its value); nothing else changes. Apple and Google
+fetch the two files from the canonical host, which answers them without a redirect; check them at
+`https://<your domain>/.well-known/apple-app-site-association` and `https://<your domain>/.well-known/assetlinks.json`.
+
 ## Configuration reference
 
 ### Variables
 
-| Name           | Value at segv.sh    | Meaning                                                                                                                                                                                      |
-| -------------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `POW_REGISTER` | 20                  | Proof-of-work difficulty (leading zero bits) for registration                                                                                                                                |
-| `POW_WRAP`     | 18                  | Difficulty for adding a key wrap (a passkey or the recovery code)                                                                                                                            |
-| `POW_PUT`      | 16                  | Base difficulty for writing rows; larger bodies need more                                                                                                                                    |
-| `POW_INBOX`    | 18                  | Base difficulty for posting inbox invites; larger bodies need more                                                                                                                           |
-| `POW_BLOB`     | 18                  | Base difficulty for uploading an image or a key bundle; larger uploads need more                                                                                                             |
-| `DELTA_S`      | 10                  | Δ in seconds, 1–3600: the granularity of row times. It must divide 604 800 (one week). Constant for the deployment                                                                           |
-| `SKEW_S`       | 2                   | SKEW in seconds, 0–60: the bound on clock differences between server components. Constant within an era                                                                                      |
-| `INBOX_SLOT_S` | 10                  | Δin in seconds, 1–3600: the length of an inbox slot. Constant for the deployment                                                                                                             |
-| `E_FIRST`      | 42                  | The era of the first deployment                                                                                                                                                              |
-| `APP_HOSTS`    | `segv.sh,localhost` | The host names the Worker answers on, comma-separated; the first is canonical. Pages on other hosts are redirected to it (308), and API requests are refused (421). Empty disables the check |
+| Name            | Value at segv.sh             | Meaning                                                                                                                                                                                      |
+| --------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POW_REGISTER`  | 20                           | Proof-of-work difficulty (leading zero bits) for registration                                                                                                                                |
+| `POW_WRAP`      | 18                           | Difficulty for adding a key wrap (a passkey or the recovery code)                                                                                                                            |
+| `POW_PUT`       | 16                           | Base difficulty for writing rows; larger bodies need more                                                                                                                                    |
+| `POW_INBOX`     | 18                           | Base difficulty for posting inbox invites; larger bodies need more                                                                                                                           |
+| `POW_BLOB`      | 18                           | Base difficulty for uploading an image or a key bundle; larger uploads need more                                                                                                             |
+| `DELTA_S`       | 10                           | Δ in seconds, 1–3600: the granularity of row times. It must divide 604 800 (one week). Constant for the deployment                                                                           |
+| `SKEW_S`        | 2                            | SKEW in seconds, 0–60: the bound on clock differences between server components. Constant within an era                                                                                      |
+| `INBOX_SLOT_S`  | 10                           | Δin in seconds, 1–3600: the length of an inbox slot. Constant for the deployment                                                                                                             |
+| `E_FIRST`       | 42                           | The era of the first deployment                                                                                                                                                              |
+| `APP_HOSTS`     | `segv.sh,localhost`          | The host names the Worker answers on, comma-separated; the first is canonical. Pages on other hosts are redirected to it (308), and API requests are refused (421). Empty disables the check |
+| `APP_ORIGINS`   | four origins (above)         | The origins of the native apps' pages, comma-separated, which may read API answers and open the realtime socket. Empty by default                                                            |
+| `APPLE_APP_IDS` | `NBDP5VK335.sh.segv.desktop` | The Apple apps' app IDs, comma-separated, for `/.well-known/apple-app-site-association` (404 while unset)                                                                                    |
+| `ANDROID_APPS`  | unset                        | The Android apps' package names and certificate fingerprints, comma-separated, for `/.well-known/assetlinks.json` (404 while unset)                                                          |
 
 A variable that is present but invalid (not a decimal number, out of range, or a `DELTA_S` that does not divide 604 800)
-makes every `/api/v2/*` request answer 503 `server misconfigured`. Clients refuse a proof-of-work base above 26.
+makes every `/api/v2/*` request answer 503 `server misconfigured`. Clients refuse a proof-of-work base above 26. The
+native apps' variables are the exception: an invalid one counts as unset and changes nothing else.
 
 ### Secrets
 

@@ -58,6 +58,10 @@
     "ROUTE_KEY": "dGVzdC1yb3V0ZS1rZXktc2Vndi5zaC12Mi0wMDAwMDA",
     "SRV_KEY": "dGVzdC1zcnYta2V5LXNlZ3Yuc2gtdjItMDAwMDAwMDA",
     "APP_HOSTS": "segv.test,localhost",
+    // Native apps (§9.7, §11.14): the desktop app's two fixed origins and two test origins; the association files.
+    "APP_ORIGINS": "tauri://localhost,https://tauri.localhost,capacitor://app.segv.test,https://app.segv.test",
+    "APPLE_APP_IDS": "ABCDE12345.test.segv.desktop,ABCDE12345.test.segv.ios",
+    "ANDROID_APPS": "test.segv.app@14:6D:E9:83:C5:73:06:50:D8:EE:B9:95:2F:34:FC:64:16:A0:83:42:E6:1D:BE:A8:8A:04:96:B2:3F:CF:44:E5",
     // Web Push on, with fixed test keys. Pushes only ever go to the *.push.test hosts below, which never
     // resolve: the push tests replace PushDO's fetch.
     "VAPID_SK": "dGVzdC12YXBpZC1rZXktc2Vndi5zaC12Mi0wMDAwMDA",

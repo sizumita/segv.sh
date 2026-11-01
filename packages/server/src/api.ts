@@ -10,7 +10,10 @@
  *  - immutable responses and the short-lived inbox tail are served from caches.default before the rate
  *    limiter; a feed page takes one RL_READ token per started 4 MiB;
  *  - every response except the 101 WebSocket upgrade carries a fresh `x-segv-now` (never stored in
- *    caches.default, §10.1), nosniff, no-referrer and HSTS (https), stamped on the object actually returned.
+ *    caches.default, §10.1), nosniff, no-referrer and HSTS (https), stamped on the object actually returned;
+ *  - only the deployment's own origin and its app origins (APP_ORIGINS, packages/server/src/origins.ts) may read the
+ *    answers: an answer to an app origin carries the CORS headers, stamped like `x-segv-now`, and a preflight from
+ *    one is answered 204 at the method check (§10.1).
  */
 import {
   BLOB_MAX,
@@ -94,6 +97,7 @@ import {
   type ServerKeys,
   type V2Params,
 } from "./env";
+import { CORS_HEADERS, appOriginOf, isPreflight, preflightResponse, setCorsHeaders } from "./origins";
 import { PUSH_TOKENS, PUSH_WINDOW } from "./push-do";
 import {
   blobRegStub,
@@ -167,10 +171,13 @@ const rl = (env: Env, name: "RL_WRITE" | "RL_BLOB" | "RL_READ" | "RL_INBOX" | "R
 const readLimit = (c: Ctx) => rateLimit(rl(c.env, "RL_READ"), "read", c.request);
 const writeLimit = (c: Ctx) => rateLimit(rl(c.env, "RL_WRITE"), "write", c.request);
 
+/** Thrown by methods() for a preflight from an app origin, which handleApi answers 204 (§10.1 step 3). */
+class Preflight extends Error {}
+
 function methods(c: Ctx, allowed: string[]): void {
-  if (!allowed.includes(c.request.method)) {
-    throw new HttpError(405, "method not allowed", { allow: allowed.join(", ") });
-  }
+  if (allowed.includes(c.request.method)) return;
+  if (isPreflight(c.request) && appOriginOf(c.env, c.request) !== null) throw new Preflight();
+  throw new HttpError(405, "method not allowed", { allow: allowed.join(", ") });
 }
 
 function binary(body: Bytes, cacheControl = "no-store"): Response {
@@ -205,12 +212,13 @@ async function cacheGet(key: string): Promise<Response | null> {
   return res;
 }
 
-/** Stores a copy (without x-segv-now: it is stamped later, on the returned object only). */
+/** Stores a copy (without x-segv-now and the CORS headers: they are stamped later, on the returned object only). */
 function cachePut(c: Ctx, key: string, res: Response): void {
   const cache = edgeCache();
   if (!cache || res.status !== 200) return;
   const copy = res.clone();
   copy.headers.delete("x-segv-now");
+  for (const h of CORS_HEADERS) copy.headers.delete(h);
   const cc = res.headers.get("cache-control");
   if (cc) copy.headers.set(STORED_CC, cc);
   c.ctx.waitUntil(
@@ -644,9 +652,9 @@ let wsKey: Bytes | null = null;
 
 async function rt(c: Ctx): Promise<Response> {
   if (c.request.headers.get("upgrade")?.toLowerCase() !== "websocket") throw new HttpError(426, "expected websocket");
-  // Browsers always send Origin on WebSocket handshakes: refuse pages on other sites.
+  // Browsers always send Origin on WebSocket handshakes: refuse pages on other sites, except the native apps (§10.8).
   const origin = c.request.headers.get("origin");
-  if (origin !== null) {
+  if (origin !== null && appOriginOf(c.env, c.request) === null) {
     let host: string | null = null;
     try {
       host = new URL(origin).host;
@@ -1185,20 +1193,22 @@ export function routeLabel(path: string): string {
 }
 
 /**
- * Stamps `x-segv-now`, `nosniff`, `no-referrer` and HSTS (https only) on the response actually returned (after any
- * cache lookup), whoever built it: JSON, binary, streamed, or a caches.default entry (whose stored headers are not
- * trusted to carry them). Responses from caches.default have immutable headers, so they are copied. The 101
- * WebSocket upgrade gets none of these headers: it is returned exactly as the RealtimeDO built it (its headers are
- * immutable, and its HELLO frame carries the server time; §9.7, §10.1). The Worker entries also apply it to the 421
- * of host pinning on /api/v2/* paths, which never reaches handleApi (§10.1: every /api/v2/* response carries
- * x-segv-now).
+ * Stamps `x-segv-now`, `nosniff`, `no-referrer`, HSTS (https only) and, for a request from an app origin, the CORS
+ * headers on the response actually returned (after any cache lookup), whoever built it: JSON, binary, streamed, or a
+ * caches.default entry (whose stored headers are not trusted to carry them). Responses from caches.default have
+ * immutable headers, so they are copied. The 101 WebSocket upgrade gets none of these headers: it is returned exactly
+ * as the RealtimeDO built it (its headers are immutable, and its HELLO frame carries the server time; §9.7, §10.1).
+ * The Worker entries also apply it to the 421 of host pinning on /api/v2/* paths, which never reaches handleApi
+ * (§10.1: every /api/v2/* response carries x-segv-now, and an app origin can read it).
  */
-export function stampResponse(res: Response, url: URL, now = Date.now()): Response {
+export function stampResponse(res: Response, request: Request, env: Env, url: URL, now = Date.now()): Response {
   if (res.status === 101) return res;
+  const cors = appOriginOf(env, request);
   const stamp = (r: Response): Response => {
     r.headers.set("x-segv-now", String(now));
     for (const [k, v] of Object.entries(SECURITY_HEADERS)) r.headers.set(k, v);
     if (url.protocol === "https:") r.headers.set("strict-transport-security", HSTS);
+    if (cors !== null) setCorsHeaders(r.headers, cors);
     return r;
   };
   try {
@@ -1223,7 +1233,8 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
     if (!keys || !v2ParamsValid(env)) throw new HttpError(503, "server misconfigured");
     res = await route({ request, env, ctx, url, now, params: v2Params(env), keys });
   } catch (e) {
-    if (e instanceof HttpError) {
+    if (e instanceof Preflight) res = preflightResponse();
+    else if (e instanceof HttpError) {
       // Any HttpError with an object `extra` (ApiError here, PrefixBitsError in the directory) answers
       // {error, ...extra}, e.g. {error, era} or {error, p}.
       const extra = errorExtra(e);
@@ -1238,7 +1249,7 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
       res = errorResponse(500, "internal error");
     }
   }
-  return stampResponse(res, url, now);
+  return stampResponse(res, request, env, url, now);
 }
 
 /** Test hook: forget the per-isolate caches (ckpt ensure flag, client-tag key, the directory's cached P). */
