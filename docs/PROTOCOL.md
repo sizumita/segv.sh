@@ -2590,8 +2590,10 @@ up to `PUSH_JITTER` = Δ seconds, and, when no `flush` sends it, until the alarm
 
 **`flush()`** (from `ring`, §10.10, once the time that `ring` answered has passed) sends the pushes then due, as step 3
 of an alarm run does (below), until none is due or `FLUSH` = 5 s have passed; the next run sends the rest. The object
-sends in one loop at a time: a `flush` during a run, or a run during a `flush`, waits for the loop under way. `flush`
-writes nothing.
+sends in one loop at a time: a `flush` during a run, or a run during a `flush`, waits for the loop under way. The limit
+of one batch a second holds across the loops: a loop that starts less than a second after the last batch began, in
+that loop or an earlier one, waits for the second to end, or leaves the pushes to the next run or `flush` when its own
+time would end first. `flush` writes nothing.
 
 **`seen(Q, rows)`** (from `seen`, §10.10; `Q` is the quiet tag that the Worker computed from the request's secret, and
 `rows` are 1 to 16 distinct `(E, label)`) records that a device of the account that registered `Q` has shown these

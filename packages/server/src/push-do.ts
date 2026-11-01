@@ -486,6 +486,8 @@ export class PushDO extends DurableObject<Env> {
   private signer: { cfg: PushConfig; s: VapidSigner } | null = null;
   private running: Promise<void> | null = null;
   private sending: Promise<void> | null = null;
+  /** No batch of pushes begins before this time: a second after the last one began, whichever loop sent it. */
+  private nextBatch = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -1075,7 +1077,10 @@ export class PushDO extends DurableObject<Env> {
 
   // ───────────── sending ─────────────
 
-  /** Sends the due pushes, earliest first, 50 at a time and at most 50 a second, until none is due or `deadline`. */
+  /**
+   * Sends the due pushes, earliest first, 50 at a time and at most one batch a second, until none is due or
+   * `deadline`. The second is kept across loops (`nextBatch`), so that runs and flushes close together share it.
+   */
   private async sendDue(deadline: number): Promise<void> {
     const cfg = this.config();
     if (!cfg) {
@@ -1084,14 +1089,24 @@ export class PushDO extends DurableObject<Env> {
       return;
     }
     const tally = { sent: 0, retried: 0, dropped: 0, deleted: 0 };
+    const isDue = (s: PushState, at: number): boolean => s.due !== null && s.due <= at;
     for (;;) {
-      const start = this.clock();
+      let start = this.clock();
       if (start >= deadline) break;
+      if (start < this.nextBatch) {
+        // The last batch, of this loop or an earlier one, began less than a second ago. Past the deadline the next
+        // run or flush sends what is due.
+        if (this.nextBatch >= deadline || ![...this.pushes.values()].some((s) => isDue(s, start))) break;
+        await this.sleep(this.nextBatch - start);
+        start = this.clock();
+      }
+      // Each turn of the loop sends a batch or ends it.
       const due = [...this.pushes.values()]
-        .filter((s) => s.due !== null && s.due <= start)
+        .filter((s) => isDue(s, start))
         .sort((a, b) => (a.due as number) - (b.due as number))
         .slice(0, PUSH_BATCH);
       if (due.length === 0) break;
+      this.nextBatch = start + 1000;
       // Their `due` stays set while they are sent: a ring meanwhile coalesces into them (§9.8 `ring` step 2), and a
       // mark no longer cancels them.
       const results = await Promise.all(
@@ -1105,9 +1120,6 @@ export class PushDO extends DurableObject<Env> {
         }),
       );
       for (const r of results) if (r) tally[r]++;
-      const more = [...this.pushes.values()].some((s) => s.due !== null && s.due <= this.clock());
-      const wait = start + 1000 - this.clock();
-      if (more && wait > 0) await this.sleep(Math.min(wait, Math.max(0, deadline - this.clock())));
     }
     if (tally.dropped + tally.deleted + tally.retried > 0) console.error(JSON.stringify({ msg: "push results", ...tally }));
   }

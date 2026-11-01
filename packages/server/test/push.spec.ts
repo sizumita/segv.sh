@@ -1059,6 +1059,25 @@ describe("only the daily pass writes, and the alarm follows the clock (§9.8)", 
     expect(fake.calls.filter((c) => c.at === t + HOLD)).toHaveLength(50);
   });
 
+  it("(c2) flushes close together share the limit of one batch a second", async () => {
+    await reset(BASE);
+    const devs = Array.from({ length: 100 }, () => dev());
+    const bs = devs.map(() => P.random(16));
+    for (let i = 0; i < devs.length; i++) await subRetrying(devs[i], [bs[i]]);
+    const t = nowOf();
+    await ring(bs.slice(0, 50));
+    fake.now = t + 200;
+    await ring(bs.slice(50));
+    fake.now = t + HOLD;
+    await DO().flush(); // the first 50
+    fake.now = t + HOLD + 200;
+    await DO().flush(); // the other 50, due now, wait for the next second
+    const at = fake.calls.map((c) => c.at);
+    expect(at).toHaveLength(100);
+    expect(at.filter((x) => x === t + HOLD)).toHaveLength(50);
+    expect(at.filter((x) => x === t + HOLD + 1000)).toHaveLength(50);
+  });
+
   it("(d) after a restart at noon the first pass writes nothing; a change at 23:59:59 is written at 00:00, never earlier", async () => {
     await reset(BASE);
     const d = dev();
