@@ -1,7 +1,8 @@
 // The platform that the desktop app gives the engine (docs/PROTOCOL.md §11.14; EngineOptions): the deployment's
-// canonical origin, passkeys through AuthenticationServices, the remembered session in the app's own files under a key of
-// the system's key store, and notifications that the app shows itself while it runs (§11.13 "Apps without push"). Each
-// one is a command of the app's native code (src-tauri/src).
+// canonical origin, passkeys through the system's own API (AuthenticationServices on macOS, the WebAuthn API of
+// Windows), the remembered session in the app's own files under a key of the system's key store, and notifications that
+// the app shows itself while it runs (§11.13 "Apps without push"). Each one is a command of the app's native code
+// (src-tauri/src).
 import type {
   EngineOptions,
   LocalNotification,
@@ -63,7 +64,8 @@ const passkeys: PasskeyPlatform = {
       prf: r.prf ? fromB64u(r.prf) : null,
     };
   },
-  // AuthenticationServices has no call that tells the provider a credential is useless.
+  // Neither AuthenticationServices nor the WebAuthn API of Windows can tell a provider that a credential is useless
+  // (Windows can only delete a passkey of Windows Hello, which the app leaves to the user).
   forget: async () => {},
 };
 

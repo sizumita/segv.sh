@@ -3257,11 +3257,15 @@ dependencies = [
  "security-framework",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
  "tauri-plugin-deep-link",
  "tauri-plugin-single-instance",
+ "windows",
+ "windows-registry",
+ "windows-version",
 ]
 
 [[package]]

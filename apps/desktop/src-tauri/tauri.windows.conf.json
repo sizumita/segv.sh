@@ -1,0 +1,42 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "create": false,
+        "title": "segv.sh",
+        "width": 1100,
+        "height": 760,
+        "minWidth": 560,
+        "minHeight": 420,
+        "visible": false,
+        "backgroundThrottling": "disabled",
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,IntensiveWakeUpThrottling --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows",
+        "scrollBarStyle": "fluentOverlay",
+        "useHttpsScheme": true,
+        "dragDropEnabled": false
+      }
+    ],
+    "security": {
+      "csp": {
+        "connect-src": "'self' https://segv.sh wss://segv.sh https://ipc.localhost blob:"
+      },
+      "devCsp": {
+        "connect-src": "'self' ws://localhost:1420 https://ipc.localhost blob:"
+      }
+    }
+  },
+  "bundle": {
+    "targets": ["nsis"],
+    "resources": {
+      "icons/128x128.png": "notification.png"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerHooks": "windows/hooks.nsh"
+      }
+    }
+  }
+}

@@ -10,32 +10,57 @@
 //   APPLE_PROVISIONING_PROFILE   a provisioning profile of the app's bundle id with the Associated Domains capability
 //                                (macOS): passkeys need it (§11.14 "Passkeys"); without one the app is signed ad hoc
 //                                and offers the recovery code only
+//   WINDOWS_SIGN_COMMAND         the command that signs each Windows binary and the installer, with %1 for the file
+//                                (Tauri's bundle.windows.signCommand); without one they are not signed
 //
-// The entitlements are written here: a signed app names its team (the application identifier, which the data
+// The macOS entitlements are written here: a signed app names its team (the application identifier, which the data
 // protection keychain and the deployment's apple-app-site-association need) and the deployment's host as its
 // associated domain (webcredentials:<host>); src-tauri/Entitlements.plist shows segv.sh's. An app signed ad hoc gets
-// none of them.
+// none of them. A Windows app needs neither: the WebAuthn API of Windows takes the RP ID from the app.
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 
 const APP = join(import.meta.dirname, "..");
 const TAURI = join(APP, "src-tauri");
 const OUT = join(APP, "..", "..", "target", "segv-desktop");
-const conf = JSON.parse(readFileSync(join(TAURI, "tauri.conf.json"), "utf8"));
+const read = (name) => JSON.parse(readFileSync(join(TAURI, name), "utf8"));
+// `pnpm run bundle -- …` passes its `--` on, which Tauri would take as the start of cargo's arguments.
+const args = process.argv.slice(2);
+if (args[0] === "--") args.shift();
+
+/** The system that the build is for: the one of `--target <triple>` (a cross build), or else this one. */
+const target = (() => {
+  const i = args.findIndex((a) => a === "--target" || a === "-t");
+  const triple = i >= 0 ? args[i + 1] : args.find((a) => a.startsWith("--target="))?.slice(9);
+  if (triple?.includes("windows")) return "windows";
+  if (triple?.includes("apple-darwin")) return "macos";
+  if (triple?.includes("linux")) return "linux";
+  return { darwin: "macos", win32: "windows" }[process.platform] ?? "linux";
+})();
+
+/** The page's CSP for that system: tauri.conf.json's, with what tauri.<system>.conf.json changes. */
+const csp = (() => {
+  const base = read("tauri.conf.json").app.security.csp;
+  try {
+    return { ...base, ...read(`tauri.${target}.conf.json`).app?.security?.csp };
+  } catch {
+    return base;
+  }
+})();
 
 const origin = process.env.SEGV_ORIGIN ?? "https://segv.sh";
 const u = new URL(origin);
 if (u.origin !== origin)
   throw new Error(`SEGV_ORIGIN must be an origin, without a path: ${origin}`);
-const overlay = { bundle: { macOS: {} }, app: { security: { csp: { ...conf.app.security.csp } } } };
+const overlay = { bundle: { macOS: {}, windows: {} }, app: { security: {} } };
 if (origin !== "https://segv.sh") {
   const ws = `${u.protocol === "https:" ? "wss:" : "ws:"}//${u.host}`;
-  const csp = overlay.app.security.csp;
-  csp["connect-src"] = csp["connect-src"].replace(
-    "https://segv.sh wss://segv.sh",
-    `${origin} ${ws}`,
-  );
+  overlay.app.security.csp = {
+    ...csp,
+    "connect-src": csp["connect-src"].replace("https://segv.sh wss://segv.sh", `${origin} ${ws}`),
+  };
 }
 
 /** An entitlements plist of these entries, each a key and its XML value. */
@@ -54,7 +79,7 @@ const plist = (entries) =>
 const team = process.env.APPLE_TEAM_ID;
 const identity = process.env.APPLE_SIGNING_IDENTITY;
 const profile = process.env.APPLE_PROVISIONING_PROFILE;
-if (process.platform === "darwin") {
+if (target === "macos") {
   const path = join(OUT, "Entitlements.plist");
   mkdirSync(dirname(path), { recursive: true });
   if (identity && profile && team) {
@@ -95,16 +120,20 @@ if (process.platform === "darwin") {
   }
 }
 
+if (target === "windows") {
+  const sign = process.env.WINDOWS_SIGN_COMMAND;
+  if (sign) overlay.bundle.windows.signCommand = sign;
+  else console.warn("bundle: WINDOWS_SIGN_COMMAND unset: the app and its installer are not signed");
+}
+
 const configPath = join(OUT, "tauri.overlay.json");
 mkdirSync(OUT, { recursive: true });
 writeFileSync(configPath, JSON.stringify(overlay, null, 2));
-const r = spawnSync(
-  "pnpm",
-  ["exec", "tauri", "build", "--config", configPath, ...process.argv.slice(2)],
-  {
-    cwd: APP,
-    stdio: "inherit",
-    env: { ...process.env, SEGV_ORIGIN: origin },
-  },
-);
+// Tauri's CLI through this Node, without a shell, which Windows would need for pnpm's .cmd shim.
+const cli = createRequire(import.meta.url).resolve("@tauri-apps/cli/tauri.js");
+const r = spawnSync(process.execPath, [cli, "build", "--config", configPath, ...args], {
+  cwd: APP,
+  stdio: "inherit",
+  env: { ...process.env, SEGV_ORIGIN: origin },
+});
 process.exit(r.status ?? 1);

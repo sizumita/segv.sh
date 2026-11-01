@@ -4478,8 +4478,10 @@ browser client does, with these differences:
   them (the app group that the app shares with its extensions, when it has any), and the keys in the data protection
   keychain, in a Keychain access group that they share, readable from the first unlock after a restart on
   (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`) and never synced; on Android in the app's own storage, under
-  keys of the Android Keystore. No key that the notification handler needs is bound to the user's authentication
-  (biometrics or the passcode), since the handler runs while the device is locked.
+  keys of the Android Keystore; on Windows in the app's local data folder, which a roaming profile does not carry,
+  under keys wrapped by a key of the TPM that cannot be exported (the Platform Crypto Provider), or, on a device
+  without a usable TPM, sealed with DPAPI for the user. No key that the notification handler needs is bound to the
+  user's authentication (biometrics or the passcode), since the handler runs while the device is locked.
 - **Code outside the web view.** The notification handler, the actions of notifications (§11.13) and a share target run
   where the web view's code does not (a notification service extension, a messaging service, a launch in the
   background), so they are native code of the app that implements the parts of §11 they need: the handler and the
@@ -4524,9 +4526,10 @@ rather than restoring from scratch:
   inputs (§11.13). Images are not part of it: a device fetches an image again when it shows it (§8.1), unless it chose
   to keep the image, sealed like the rest.
 - **How**: sealed with AEAD under a device key that cannot be exported and that never leaves the device: in a browser
-  a non-extractable WebCrypto key in the origin's storage; in a native app a key that the system's key store holds and
-  keeps out of backups and moves to another device, the state lying in the app's own files (§11.14). It is written as
-  the state changes, at least when the device stops being in use, and never sent anywhere.
+  a non-extractable WebCrypto key in the origin's storage; in a native app a key that the system's key store holds and,
+  as far as the system can (§11.14), keeps out of backups and moves to another device, the state lying in the app's
+  own files (§11.14). It is written as the state changes, at least when the device stops being in use, and never sent
+  anywhere.
 - **Unlock**: the client opens the local state after the unlock (§11.1) and shows it at once. It then restores as §11.4
   says, with the state's positions in place of a snapshot's and a HEADS record's: the self delta from the state's self
   position, and each copy's lanes and control lane from the state's positions, which are at least as far as anything
@@ -4996,13 +4999,17 @@ A native app (§11.14) changes whom a user trusts for the client's code, and add
   which kind of app sent them; everything else is as for a browser. The association files (§11.14) are public and
   name the apps only, and the platforms fetch them through their own servers, not once per device.
 - **Passkeys.** The web app and the native apps use the same passkeys (§2.5). A platform's passkey API, like a
-  browser, sends nothing to the server, which still never sees WebAuthn data.
+  browser, sends nothing to the server, which still never sees WebAuthn data. On Windows any program that the user
+  runs may ask for the passkeys of any RP ID, as the browsers there do, and so for the PRF result that unlocks the
+  account (§2.3): the system's prompt names the RP ID, and Windows 11 24H2 and later ask once for each program whether
+  it may use passkeys at all.
 - **The device** keeps, beyond what a browser keeps, the push keys and, with a preview, the notification cache, in the
   app's own files under keys of the system's key store (§11.13, §11.14), where forensic tools may reach them as they
-  reach other apps' data; the keys never leave the device in a backup or a move to another device. Its local state
-  (§11.15), which a browser may keep too, holds the history that it shows, sealed in the same way. A screen lock
-  (§11.14) protects none of this from whoever can read those files: the notification handler reads them while the device
-  is locked.
+  reach other apps' data; the keys never leave the device in a backup or a move to another device, except on a Windows
+  device without a usable TPM, where DPAPI lets the user's Windows credentials open them, and with them a roaming
+  profile or a domain's backup key, together with a copy of the app's files. Its local state (§11.15), which a
+  browser may keep too, holds the history that it shows, sealed in the same way. A screen lock (§11.14) protects none
+  of this from whoever can read those files: the notification handler reads them while the device is locked.
 - **Apps without push** (§11.13) send nothing for their notifications, and notify also of rows that another device of
   the account shows.
 - **Conversation notifications** (§11.13) give the system each notified copy's name and `ref` and the senders' handles,
