@@ -109,6 +109,9 @@ importers:
       '@tauri-apps/cli':
         specifier: 'catalog:'
         version: 2.12.4
+      '@types/node':
+        specifier: 'catalog:'
+        version: 25.6.0
       typescript:
         specifier: 'catalog:'
         version: 5.9.3
