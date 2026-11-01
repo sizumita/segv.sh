@@ -9,13 +9,19 @@ import { I, P, freshWorldPerTest, newEngine, server, settle, waitFor, type W } f
 
 vi.mock("../src/webauthn", () => ({
   PasskeyError: class PasskeyError extends Error {},
-  prfCapability: async () => true,
-  createPasskey: async () => ({ credId: crypto.getRandomValues(new Uint8Array(16)), prf: crypto.getRandomValues(new Uint8Array(32)) }),
-  prfForCredential: async () => null,
-  signInWithPasskey: async () => {
-    throw new Error("not used");
+  prfInput: () => new TextEncoder().encode("segv.sh/v2/prf"),
+  browserPasskeys: {
+    capability: async () => true,
+    create: async () => ({
+      credId: crypto.getRandomValues(new Uint8Array(16)),
+      prf: crypto.getRandomValues(new Uint8Array(32)),
+    }),
+    prfFor: async () => null,
+    signIn: async () => {
+      throw new Error("not used");
+    },
+    forget: async () => {},
   },
-  forgetCredential: async () => {},
 }));
 
 freshWorldPerTest({ skew: 2 });

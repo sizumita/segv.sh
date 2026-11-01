@@ -3,7 +3,13 @@
 import * as P from "@segv/protocol/proto";
 import { ApiError, isTransient, type Api, type DirWrapJson, type Progress } from "./api";
 import { UserError, message } from "./errors";
-import { createPasskey, forgetCredential, prfForCredential, signInWithPasskey } from "./webauthn";
+import { prfInput, type PasskeyPlatform } from "./webauthn";
+
+/** The passkey API and the RP ID (§2.5): the page's host in a browser, the canonical host in a native app. */
+export interface Passkeys {
+  platform: PasskeyPlatform;
+  rpId: string;
+}
 
 /** What a successful unlock yields. */
 export interface Unlocked {
@@ -22,19 +28,20 @@ export function normaliseHandle(handleIn: string): string {
 
 /** Creates a passkey for `uid` and returns its id and PRF secret, asking a second time when needed (§2.5 step 5). */
 async function newPasskey(
+  pk: Passkeys,
   uid: Uint8Array,
   name: string,
   progress: Progress,
 ): Promise<{ credId: Uint8Array; prf: Uint8Array }> {
   progress("creating passkey…");
-  const { credId, prf: prf0 } = await createPasskey(uid, name);
+  const { credId, prf: prf0 } = await pk.platform.create(pk.rpId, uid, name, prfInput());
   let prf = prf0;
   if (!prf) {
     progress("confirm the passkey once more to derive your keys…");
-    prf = await prfForCredential(credId);
+    prf = await pk.platform.prfFor(pk.rpId, credId, prfInput());
   }
   if (!prf) {
-    await forgetCredential(credId);
+    await pk.platform.forget(pk.rpId, credId);
     throw new UserError(NO_PRF);
   }
   return { credId, prf };
@@ -46,6 +53,7 @@ async function newPasskey(
  */
 export async function registerAccount(
   api: Api,
+  pk: Passkeys,
   handleIn: string,
   progress: Progress,
 ): Promise<Unlocked & { handle: string; recoveryCode: string; regNow: number | null }> {
@@ -57,7 +65,7 @@ export async function registerAccount(
   const uid = P.random(16);
   const id = P.deriveIdentity(AK);
   const { bundle, sig } = P.makeBundle(uid, handle, id, Date.now());
-  const { credId, prf } = await newPasskey(uid, handle, progress);
+  const { credId, prf } = await newPasskey(pk, uid, handle, progress);
   const code = P.newRecoveryCode();
   const rk = P.recoveryKem(code);
   const now = Date.now();
@@ -72,7 +80,7 @@ export async function registerAccount(
   } catch (e) {
     // A definitive rejection (4xx): the account does not exist, so the new passkey is useless (§2.5 step 7).
     if (e instanceof ApiError && !e.transient) {
-      await forgetCredential(credId);
+      await pk.platform.forget(pk.rpId, credId);
       if (e.status === 409) throw new UserError(`@${handle} is taken`);
       throw e;
     }
@@ -86,7 +94,7 @@ export async function registerAccount(
       throw e;
     }
     if (!landed || landed.bundle !== bundle) {
-      if (landed) await forgetCredential(credId);
+      if (landed) await pk.platform.forget(pk.rpId, credId);
       throw e;
     }
   }
@@ -94,9 +102,13 @@ export async function registerAccount(
 }
 
 /** Discoverable passkey login (§2.5): the wraps filed under the credential id (and the user handle, if any). */
-export async function loginWithPasskey(api: Api, progress: Progress): Promise<Unlocked> {
+export async function loginWithPasskey(
+  api: Api,
+  pk: Passkeys,
+  progress: Progress,
+): Promise<Unlocked> {
   progress("waiting for passkey…");
-  const { credId, uid, prf } = await signInWithPasskey();
+  const { credId, uid, prf } = await pk.platform.signIn(pk.rpId, prfInput());
   if (!prf)
     throw new UserError(
       "this passkey did not return a PRF secret (unsupported provider or browser). use your recovery code instead.",
@@ -139,11 +151,12 @@ export async function loginWithCode(
  */
 export async function addPasskeyTo(
   api: Api,
+  pk: Passkeys,
   acc: { uid: Uint8Array; AK: Uint8Array; id: P.Identity; handle: string },
   progress: Progress,
   stillSignedIn: () => void,
 ): Promise<void> {
-  const { credId, prf } = await newPasskey(acc.uid, acc.handle || "segv", progress);
+  const { credId, prf } = await newPasskey(pk, acc.uid, acc.handle || "segv", progress);
   stillSignedIn();
   const wrap = P.makeWrap(
     acc.uid,
@@ -158,7 +171,7 @@ export async function addPasskeyTo(
     await api.postWrap(wrap, progress);
   } catch (e) {
     if (!isTransient(e)) {
-      await forgetCredential(credId);
+      await pk.platform.forget(pk.rpId, credId);
       throw e;
     }
     let listed = false;

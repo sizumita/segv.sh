@@ -44,7 +44,7 @@ export const SignedOut = component$(() => {
         <h1>segv.sh</h1>
         <p class="dim">
           end-to-end encrypted messenger. the server is a public log of ciphertext; your keys never
-          leave this browser.
+          leave this device.
         </p>
       </header>
 

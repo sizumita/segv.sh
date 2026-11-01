@@ -61,6 +61,8 @@ export class Realtime {
     private readonly WS: WebSocketCtor,
     private readonly clock: EngineClock,
     private readonly h: RealtimeHandlers,
+    /** the deployment's canonical origin of a native app (§11.14); absent: the page's own */
+    private readonly origin?: string,
   ) {}
 
   start(): void {
@@ -186,7 +188,7 @@ export class Realtime {
     if (this.stopped) return;
     const url = new URL(
       "/api/v2/rt",
-      typeof location === "undefined" ? "http://localhost/" : location.href,
+      this.origin ?? (typeof location === "undefined" ? "http://localhost/" : location.href),
     );
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     let ws: WebSocket;

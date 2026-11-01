@@ -288,6 +288,8 @@ export const FEW_USERS_WARNING = "the directory answered fewer accounts than exp
 export interface ApiOptions {
   fetch: typeof fetch;
   clock: EngineClock;
+  /** the deployment's canonical origin for a native app (§11.14); absent: the page's own origin */
+  origin?: string;
   /** noise warnings (the directory's short answers) */
   warn?: (text: string) => void;
   /** critical warnings (a changed stored row, an invalid receipt, §12.1, §12.5) */
@@ -315,6 +317,10 @@ export class Api {
   /** every row this session fetched, received or wrote (§12.1) */
   readonly rows: RowMemory;
   private readonly fetchFn: typeof fetch;
+  /** "" (the page's origin), or the deployment's canonical origin that every path is resolved against */
+  private readonly base: string;
+  /** the deployment's canonical origin of a native app (§11.14), or undefined for the page's own */
+  readonly origin: string | undefined;
   private readonly clock: EngineClock;
   private readonly warn: (text: string) => void;
   private readonly critical: (text: string) => void;
@@ -330,6 +336,8 @@ export class Api {
 
   constructor(opts: ApiOptions) {
     this.fetchFn = opts.fetch;
+    this.origin = opts.origin;
+    this.base = opts.origin ?? "";
     this.clock = opts.clock;
     this.time = new ServerClock(opts.clock);
     this.warn = opts.warn ?? (() => {});
@@ -350,7 +358,7 @@ export class Api {
     const sent = this.clock.mono();
     let res: Response;
     try {
-      res = await this.fetchFn(path, init);
+      res = await this.fetchFn(this.base + path, init);
     } catch (e) {
       throw new ApiError(0, `network error: ${e instanceof Error ? e.message : String(e)}`);
     }

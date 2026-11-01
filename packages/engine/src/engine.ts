@@ -10,6 +10,7 @@ import {
   loginWithCode,
   loginWithPasskey,
   registerAccount,
+  type Passkeys,
   type Unlocked,
 } from "./accounts";
 import { Api, isTransient, pushParams } from "./api";
@@ -24,6 +25,7 @@ import {
 } from "./options";
 import { refKeyOf } from "./conv";
 import { cursorAt, type InboxCursor } from "./inbox";
+import { DEFAULT_WINDOW_MS, LocalNotify, localSettingStore } from "./local-notify";
 import { Messaging, type MessagingHost } from "./messaging";
 import {
   cacheGen,
@@ -39,11 +41,14 @@ import { PushClient, browserPushPlatform, localPushStore } from "./push";
 import { QuietClient, localQuietStore, pageInUse } from "./quiet";
 import { SelfLane } from "./selflane";
 import { readSnapshot } from "./snapshot";
-import { clearSession, loadSession, saveSession } from "./session";
+import { idbSessionStore, type SessionStore } from "./session";
 import type { ConversationView, Engine, EngineState, ImageRef } from "./types";
-import { prfCapability } from "./webauthn";
+import { browserPasskeys } from "./webauthn";
 
 export type { EngineOptions } from "./options";
+export type { LocalNotification, LocalNotifier, LocalPermission, LocalStore } from "./local-notify";
+export type { SessionStore } from "./session";
+export type { PasskeyPlatform } from "./webauthn";
 
 /** Messages per conversation handed to the UI (§11). */
 export const VIEW_MESSAGES = 500;
@@ -83,6 +88,7 @@ const emptyState = (): EngineState => ({
   warnings: [],
   prfSupported: null,
   notifications: "unavailable",
+  localNotify: false,
   preview: "unavailable",
   quiet: "unavailable",
 });
@@ -116,6 +122,12 @@ export class SegvEngine implements Engine {
   private cacheOps: Promise<void> = Promise.resolve();
   /** the session is kept on this device (loaded at boot, or saved at sign-in) */
   private remembered = false;
+  /** where the remembered session is kept (§11.11, §11.14) */
+  private readonly sessionStore: SessionStore;
+  /** the passkey API and the RP ID (§2.5, §11.14) */
+  private readonly passkeys: Passkeys;
+  /** the notifications of an app without push (§11.13), or null where pushes notify */
+  private readonly local: LocalNotify | null;
 
   private account: Account | null = null;
   private self: SelfLane | null = null;
@@ -145,7 +157,18 @@ export class SegvEngine implements Engine {
     this.clock = opts.clock ?? systemClock;
     this.delays = { ...DEFAULT_DELAYS, ...opts.delays };
     this.fetchFn = opts.fetch ?? ((input, init) => fetch(input, init));
+    this.sessionStore = opts.session ?? idbSessionStore;
+    this.passkeys = {
+      platform: opts.passkeys ?? browserPasskeys,
+      // The canonical host, never the host of a native app's own origin (§2.5, §11.14).
+      rpId: opts.origin
+        ? new URL(opts.origin).hostname
+        : typeof location === "undefined"
+          ? "localhost"
+          : location.hostname,
+    };
     this.api = this.newApi();
+    const inUse = opts.quiet?.inUse ?? pageInUse();
     this.push = new PushClient({
       transport: {
         pushSub: (b) => this.api.pushSub(b),
@@ -170,7 +193,7 @@ export class SegvEngine implements Engine {
       transport: { seen: (qS, rows) => this.api.seen(qS, rows) },
       store: opts.quiet?.store ?? localQuietStore(),
       clock: this.clock,
-      inUse: opts.quiet?.inUse ?? pageInUse(),
+      inUse,
       offered: () => {
         const p = this.api.cachedParams;
         return !!p && pushParams(p) !== null;
@@ -179,8 +202,26 @@ export class SegvEngine implements Engine {
       delta: () => this.api.cachedParams?.delta ?? 10,
       serverNow: () => this.api.serverNow(),
     });
-    this.cacheStore = opts.notify ? opts.notify.store : idbCacheStore();
+    // An app without push keeps no notification cache: only a push's handler reads one (§11.13).
+    this.cacheStore = opts.local ? null : opts.notify ? opts.notify.store : idbCacheStore();
     this.previewStore = opts.notify?.preview ?? localPreviewStore();
+    this.local = opts.local
+      ? new LocalNotify({
+          notifier: opts.local.notifier,
+          store: opts.local.store ?? localSettingStore(),
+          clock: this.clock,
+          preview: () => this.preview(),
+          windowMs: () => {
+            const p = this.api.cachedParams;
+            const push = p ? pushParams(p) : null;
+            return push ? push.window * 1000 : DEFAULT_WINDOW_MS;
+          },
+          inUse,
+        })
+      : null;
+    opts.onWake?.(() => {
+      if (this.live) this.msg?.wake();
+    });
     if (typeof document !== "undefined")
       document.addEventListener("visibilitychange", () => {
         if (document.visibilityState === "hidden") this.scheduleCache(0);
@@ -188,18 +229,30 @@ export class SegvEngine implements Engine {
   }
 
   private notificationState(): EngineState["notifications"] {
+    if (this.local) return this.local.on ? "on" : "off";
     if (!this.push.available) return "unavailable";
     return this.push.on ? "on" : "off";
   }
 
+  /** Whether this device's notifications are on, through push or as an app without push. */
+  private notifying(): boolean {
+    return this.local ? this.local.on : this.push.on;
+  }
+
   private previewState(): EngineState["preview"] {
+    // An app without push shows its notifications from what it holds while it runs: it needs no cache (§11.13).
+    if (this.local) return this.previewStore.load();
     if (!this.push.available || !this.remembered || this.cacheStore === null) return "unavailable";
     return this.previewStore.load();
   }
 
-  private notificationPatch(): Pick<EngineState, "notifications" | "preview" | "quiet"> {
+  private notificationPatch(): Pick<
+    EngineState,
+    "notifications" | "localNotify" | "preview" | "quiet"
+  > {
     return {
       notifications: this.notificationState(),
+      localNotify: this.local !== null,
       preview: this.previewState(),
       quiet: this.quiet.available ? (this.quiet.on ? "on" : "off") : "unavailable",
     };
@@ -219,7 +272,7 @@ export class SegvEngine implements Engine {
   /** The preview in effect: `none` unless notifications are on and the session is kept (§11.13). */
   private preview(): Preview {
     const p = this.previewState();
-    return p === "unavailable" || !this.push.on ? "none" : p;
+    return p === "unavailable" || !this.notifying() ? "none" : p;
   }
 
   /**
@@ -227,7 +280,8 @@ export class SegvEngine implements Engine {
    * changed, when the page is hidden, and every 5 minutes while the session runs.
    */
   private scheduleCache(ms: number): void {
-    if (!this.live || this.preview() === "none") return;
+    // Only a push's notification handler reads the cache; an app without push keeps none.
+    if (this.local || !this.live || this.preview() === "none") return;
     const now = this.clock.mono();
     if (now + ms >= this.cacheDue) return;
     this.cacheTimer?.cancel();
@@ -286,6 +340,7 @@ export class SegvEngine implements Engine {
   private newApi(): Api {
     return new Api({
       fetch: this.fetchFn,
+      origin: this.opts.origin,
       clock: this.clock,
       warn: (t) => this.warn(t),
       critical: (t) => this.warn(t, true),
@@ -306,14 +361,18 @@ export class SegvEngine implements Engine {
 
   /** Loads a remembered session, if any (the app calls this once). */
   async boot(): Promise<void> {
-    this.patch({ prfSupported: await prfCapability() });
-    const s = await loadSession();
+    this.patch({
+      prfSupported: await this.passkeys.platform.capability().catch(() => null),
+    });
+    await this.local?.check();
+    this.patch(this.notificationPatch());
+    const s = await this.sessionStore.load().catch(() => null);
     if (!s) return this.patch({ phase: "signed-out" });
     this.remembered = true;
     try {
       await this.unlock(s.AK, P.fromB64u(s.uid), "");
     } catch (e) {
-      await clearSession();
+      await this.sessionStore.clear().catch(() => {});
       this.remembered = false;
       this.patch({ phase: "signed-out", error: `could not restore session: ${message(e)}` });
     }
@@ -321,7 +380,7 @@ export class SegvEngine implements Engine {
 
   register(handleIn: string, remember = false): Promise<{ recoveryCode: string }> {
     return this.authFlow(async () => {
-      const r = await registerAccount(this.api, handleIn, (m) => this.progress(m));
+      const r = await registerAccount(this.api, this.passkeys, handleIn, (m) => this.progress(m));
       await this.unlock(r.AK, r.uid, r.handle, { now: r.regNow });
       if (remember) await this.remember(r);
       return { recoveryCode: r.recoveryCode };
@@ -330,7 +389,7 @@ export class SegvEngine implements Engine {
 
   login(remember: boolean): Promise<void> {
     return this.authFlow(async () => {
-      const found = await loginWithPasskey(this.api, (m) => this.progress(m));
+      const found = await loginWithPasskey(this.api, this.passkeys, (m) => this.progress(m));
       await this.unlock(found.AK, found.uid, "");
       if (remember) await this.remember(found);
     });
@@ -350,6 +409,7 @@ export class SegvEngine implements Engine {
     await this.action(() =>
       addPasskeyTo(
         this.api,
+        this.passkeys,
         acc,
         (m) => this.progress(m),
         () => this.assertSession(acc, gen),
@@ -362,11 +422,14 @@ export class SegvEngine implements Engine {
     this.stopTimers();
     // The next account on this browser starts with notifications off, and gets none of this one's (§11.13).
     await this.push.logout().catch(() => {});
+    // An app without push turns its notifications off too, and leaves none on screen (§11.13).
+    this.local?.disable();
+    this.local?.stop();
     this.quiet.stop();
     await this.dropCache();
     this.previewStore.save("none");
     this.remembered = false;
-    await clearSession();
+    await this.sessionStore.clear().catch(() => {});
     for (const p of this.imageCache.values()) p.then((u) => URL.revokeObjectURL(u)).catch(() => {});
     this.resetData();
     this.account = null;
@@ -378,6 +441,20 @@ export class SegvEngine implements Engine {
   }
 
   async setNotifications(on: boolean): Promise<void> {
+    if (this.local) {
+      try {
+        if (!on) this.local.disable();
+        else if (!(await this.local.enable()))
+          this.patch({
+            error: "notifications are not allowed for segv.sh: allow them in the system's settings",
+          });
+      } catch (e) {
+        this.patch({ error: message(e) });
+      } finally {
+        this.patch(this.notificationPatch());
+      }
+      return;
+    }
     try {
       if (on) await this.push.enable();
       else {
@@ -479,6 +556,8 @@ export class SegvEngine implements Engine {
 
   markRead(convId: string): void {
     this.msg?.markRead(convId);
+    // Shown: its notifications close (§11.13 "Closing and the badge").
+    if (this.local && this.msg?.copies.has(convId)) this.local.shown(this.msg.refOfKey(convId));
   }
 
   clearError(): void {
@@ -670,6 +749,11 @@ export class SegvEngine implements Engine {
       shown: (E, label, t) => {
         if (this.live && gen === this.generation) this.quiet.shown(E, label, t);
       },
+      arrived: this.local
+        ? (a) => {
+            if (this.live && gen === this.generation) this.local?.arrived(a);
+          }
+        : undefined,
     };
   }
 
@@ -749,7 +833,7 @@ export class SegvEngine implements Engine {
   /** "Remember this device" is a convenience: failing to store the session must not fail the sign-in. */
   private async remember(u: Unlocked): Promise<void> {
     try {
-      await saveSession(P.b64u(u.uid), u.AK);
+      await this.sessionStore.save(P.b64u(u.uid), u.AK);
       this.remembered = true;
       this.patch(this.notificationPatch());
     } catch (e) {
@@ -865,6 +949,7 @@ export class SegvEngine implements Engine {
     if (this.emitTimer) clearTimeout(this.emitTimer);
     this.emitTimer = null;
     if (this.account) this.state = { ...this.state, conversations: this.views() };
+    if (this.local) this.local.badge(this.account && this.msg ? this.msg.unreadCount() : 0);
     for (const fn of this.listeners) {
       try {
         fn(this.state);
@@ -877,10 +962,21 @@ export class SegvEngine implements Engine {
 
 let instance: SegvEngine | undefined;
 
+let configured: EngineOptions | undefined;
+
+/**
+ * The platform of a native app (§11.14), given once before the UI first asks for the engine: its canonical origin, its
+ * passkeys, storage and notifications. A browser never calls it.
+ */
+export function configureEngine(opts: EngineOptions): void {
+  if (instance) throw new Error("the engine has already started");
+  configured = opts;
+}
+
 /** The browser-wide engine singleton (booted on first use). */
 export function getEngine(): Engine {
   if (!instance) {
-    instance = new SegvEngine();
+    instance = new SegvEngine(configured);
     void instance.boot();
   }
   return instance;

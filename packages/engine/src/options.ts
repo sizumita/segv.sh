@@ -1,8 +1,11 @@
 // Engine options (docs/PROTOCOL.md §11): the transport, the clocks, and every protocol delay, so tests can inject
 // them. The app constructs the engine without options.
+import type { LocalNotifier, LocalStore } from "./local-notify";
 import type { CacheStore, PreviewStore } from "./notify-cache";
 import type { PushPlatform, PushStore } from "./push";
 import type { QuietStore } from "./quiet";
+import type { SessionStore } from "./session";
+import type { PasskeyPlatform } from "./webauthn";
 
 /** A scheduled callback; `cancel()` is idempotent. */
 export interface EngineTimer {
@@ -68,6 +71,12 @@ export const DEFAULT_DELAYS: EngineDelays = {
 export type WebSocketCtor = new (url: string | URL, protocols?: string | string[]) => WebSocket;
 
 export interface EngineOptions {
+  /**
+   * The canonical origin of the deployment, for a native app (§11.14): every API call and the realtime socket go there
+   * (`https://segv.sh/api/v2/…`, `wss://segv.sh/api/v2/rt`), and the passkeys' RP ID is its host (§2.5). Absent: the
+   * page's own origin, as in a browser.
+   */
+  origin?: string;
   /** HTTP transport (default: the global fetch) */
   fetch?: typeof fetch;
   /** realtime transport (default: the global WebSocket) */
@@ -94,4 +103,24 @@ export interface EngineOptions {
    * in use (default: the page's visibility, focus and input; never without a page).
    */
   quiet?: { store?: QuietStore; inUse?: () => boolean };
+  /**
+   * Passkeys through the platform's own API (AuthenticationServices on macOS, §2.3, §11.14) instead of the web view's
+   * WebAuthn, which cannot use the canonical host as RP ID from an app origin. Default: the browser's WebAuthn.
+   */
+  passkeys?: PasskeyPlatform;
+  /**
+   * Where the remembered session is kept (§11.11). Default: IndexedDB, under a non-extractable WebCrypto key. A native
+   * app keeps it in its own files, under a key of the system's key store (§11.14 "Storage").
+   */
+  session?: SessionStore;
+  /**
+   * Notifications of an app without push (§11.13 "Apps without push"): shown by the app itself while it runs, from the
+   * rows that reach it while it is not in use. With it, `push.platform` should be null.
+   */
+  local?: { notifier: LocalNotifier; store?: LocalStore };
+  /**
+   * Registers a listener for the system waking from sleep (§11.14 "Desktop"): the engine then replaces its realtime
+   * sockets at once and catches up, instead of waiting for a probe to time out.
+   */
+  onWake?: (listener: () => void) => void;
 }
