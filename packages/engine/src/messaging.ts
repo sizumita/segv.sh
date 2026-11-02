@@ -125,6 +125,9 @@ const before = (at: { E: number; rel: number }): InboxCursor => ({
 
 /** `accept`, or a post that accepts, could not verify the inviter's directory bundle (§11.11). */
 export const NOT_VERIFIED = "could not verify who started this conversation; try again";
+export const FILE_TOO_LARGE = "the file is too large";
+/** A file's bytes are only ever saved, never shown: its object URL has no type a browser renders (§8.3). */
+const FILE_TYPE = "application/octet-stream";
 
 /** The account of the session, as the engine holds it. */
 export interface SessionAccount {
@@ -163,9 +166,9 @@ export interface MessagingHost {
   setConnected(on: boolean): void;
   /** the latest verified checkpoint (EngineState.head, §12.3) */
   setHead(q: number, C: Bytes): void;
-  /** a TEXT or IMAGE was stored: ask the server to ring these bells (§11.13); never waits */
+  /** a TEXT, IMAGE or FILE was stored: ask the server to ring these bells (§11.13); never waits */
   ring(E: number, label: Bytes, bells: Bytes[]): void;
-  /** a TEXT or IMAGE of another member was shown as it arrived: marked seen while in use (§11.13); never waits */
+  /** a TEXT, IMAGE or FILE of another member was shown as it arrived: marked seen while in use (§11.13); never waits */
   shown(E: number, label: Bytes, t: number): void;
   /** the same row, in a copy whose bell the registration set holds: an app without push may notify (§11.13) */
   arrived?(a: Arrival): void;
@@ -209,6 +212,8 @@ export class Messaging {
   private readonly ownPending = new Set<string>();
   /** decrypted images by `id.k` (never by id alone, §8.1) */
   readonly imageCache = new Map<string, Promise<string>>();
+  /** decrypted files by `id.k` (never by id alone, §8.3): an object URL and the file's length */
+  readonly fileCache = new Map<string, Promise<{ url: string; size: number }>>();
   /** copies with a scheduled re-evaluation of their control lane (an undecided row, or finality, §6.4–§6.5) */
   private readonly settleTimers = new Set<string>();
   /** LEAVE records being written, by copy key and epoch (one write per session, §6.9) */
@@ -2245,7 +2250,7 @@ export class Messaging {
   }
 
   /**
-   * Before self's TEXT, IMAGE or REACTION: in a live copy whose `rootBy` is neither self nor a contact, the post is the
+   * Before self's TEXT, IMAGE, FILE or REACTION: in a live copy whose `rootBy` is neither self nor a contact, the post is the
    * user's acceptance (§11.5): it writes the same records as `accept`, before the put.
    */
   private async acceptForPost(c: Copy): Promise<void> {
@@ -2881,9 +2886,85 @@ export class Messaging {
     return p;
   }
 
+  // ───────────────────────── files (§8.3) ─────────────────────────
+
+  /** Encrypts and uploads a file as it is, then sends its FILE row (§8.3, §11.3). */
+  sendFile(convId: string, file: File): Promise<void> {
+    const c = this.copy(convId);
+    const name = P.safeFileName(file.name);
+    const echo = this.addEcho(c, "file", name, { id: "", k: "", name, size: file.size });
+    const run = async () => {
+      try {
+        if (file.size > P.FILE_MAX) throw new UserError(FILE_TOO_LARGE);
+        this.h.progress("encrypting file…");
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        this.h.check();
+        if (bytes.length > P.FILE_MAX) throw new UserError(FILE_TOO_LARGE);
+        const { blob, id, key } = P.encryptBlob(bytes);
+        await this.h.api.putBlob(P.fromB64u(id), blob, (m) => this.h.progress(m));
+        this.h.check();
+        const k = P.b64u(key);
+        const url = URL.createObjectURL(new Blob([bytes as BlobPart], { type: FILE_TYPE }));
+        this.fileCache.set(`${id}.${k}`, Promise.resolve({ url, size: bytes.length }));
+        await this.acceptForPost(c);
+        await sendRow(this.sendCtx(c, echo.key), c, {
+          type: P.MT.FILE,
+          file: { id: P.fromB64u(id), k: key, size: bytes.length, name },
+        });
+        if (c.messages.some((m) => m.key === echo.key)) this.markEcho(c, echo.key, "sent");
+      } catch (e) {
+        for (const [kk, x] of this.echoes) if (x.echoKey === echo.key) this.echoes.delete(kk);
+        this.markEcho(c, echo.key, "failed");
+        if (!(e instanceof SessionEnded)) this.h.error(message(e));
+      } finally {
+        this.h.progress("");
+      }
+    };
+    const prev = this.sendChains.get(convId) ?? Promise.resolve();
+    const next = prev.then(run, run);
+    this.sendChains.set(convId, next);
+    return this.h.track(next);
+  }
+
+  /**
+   * Downloads, checks and decrypts a file, when the user asks for it (§8.3); cached by `id.k`. Resolves with an object
+   * URL of its bytes as `application/octet-stream`, which nothing in the app opens or renders.
+   */
+  loadFile(f: { id: string; k: string; size: number }): Promise<string> {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(f.id) || !/^[A-Za-z0-9_-]{43}$/.test(f.k))
+      return Promise.reject(new Error("bad file reference"));
+    if (!Number.isSafeInteger(f.size) || f.size < 0 || f.size > 0xffffffff)
+      return Promise.reject(new Error("bad file size"));
+    const len = P.fileBlobLen(f.size);
+    if (len > P.BLOB_MAX) return Promise.reject(new UserError(FILE_TOO_LARGE));
+    const cacheKey = `${f.id}.${f.k}`;
+    let p = this.fileCache.get(cacheKey);
+    if (!p) {
+      p = (async () => {
+        const got = await this.h.api.getBlobUpTo(P.fromB64u(f.id), len);
+        if (!got) throw new Error("file not found");
+        const data = P.decryptBlob(got, f.id, P.fromB64u(f.k));
+        const url = URL.createObjectURL(new Blob([data as BlobPart], { type: FILE_TYPE }));
+        return { url, size: data.length };
+      })();
+      this.fileCache.set(cacheKey, p);
+      p.catch(() => this.fileCache.delete(cacheKey));
+    }
+    // Two rows may name one blob and key with different sizes: each is checked against what the blob holds.
+    return p.then((x) => {
+      if (x.size !== f.size) throw new Error("the file does not match its message");
+      return x.url;
+    });
+  }
+
   // ───────────────────────── sending (§11.3) ─────────────────────────
 
-  private addEcho(c: Copy, kind: "text" | "image", text: string): MessageView {
+  private addEcho(
+    c: Copy,
+    kind: "text" | "image" | "file",
+    text: string,
+    file?: MessageView["file"],
+  ): MessageView {
     const m: MessageView = {
       key: `local:${++this.localCounter}`,
       seq: 0,
@@ -2893,6 +2974,7 @@ export class Messaging {
       ts: Math.floor(this.h.clock.wall()),
       kind,
       text,
+      ...(file ? { file } : {}),
       status: "sending",
       reactions: [],
     };
@@ -2932,7 +3014,7 @@ export class Messaging {
   }
 
   /**
-   * The bells a TEXT or IMAGE stored in `ep` rings (§11.13): every other lane of `ep`, and, when the copy holds
+   * The bells a TEXT, IMAGE or FILE stored in `ep` rings (§11.13): every other lane of `ep`, and, when the copy holds
    * `ep.e − 1`, the bell there of each member of both epochs, other than self, of whom no valid row in `ep` was seen
    * (a device that has not processed the epoch change still has that bell registered).
    */
@@ -2976,18 +3058,20 @@ export class Messaging {
   }
 
   /**
-   * A TEXT or IMAGE row of another member reached the device live (§11.13 "Apps without push"): what its notification
-   * needs, when the copy is one whose bell the registration set would hold.
+   * A TEXT, IMAGE or FILE row of another member reached the device live (§11.13 "Apps without push"): what its
+   * notification needs, when the copy is one whose bell the registration set would hold.
    */
   private arrival(c: Copy, m: MessageView): Arrival | null {
-    if (!this.bellEpoch(c) || m.mine || (m.kind !== "text" && m.kind !== "image")) return null;
+    if (!this.bellEpoch(c) || m.mine) return null;
+    if (m.kind !== "text" && m.kind !== "image" && m.kind !== "file") return null;
     const v = this.viewOfCopy(c);
     if (!v) return null;
     return {
       ref: v.ref,
       name: v.name,
       handle: m.fromHandle,
-      text: m.kind === "text" ? (m.text ?? "") : null,
+      kind: m.kind,
+      text: m.kind === "text" ? (m.text ?? "") : "",
       unread: c.unread,
     };
   }
@@ -3211,7 +3295,7 @@ export class Messaging {
   // ───────────────────────── reactions (§11.12) ─────────────────────────
 
   /**
-   * §11.12: one REACTION row for the TEXT or IMAGE message `messageKey`, sent as a text is (§11.3) but without an echo,
+   * §11.12: one REACTION row for the TEXT, IMAGE or FILE message `messageKey`, sent as a text is (§11.3) but without an echo,
    * after the user's acceptance that a post makes (§11.5). A reaction that changes nothing by the state this device
    * holds (an add of an emoji that is on, a remove of one that is off, an add beyond 8) resolves without a row.
    */

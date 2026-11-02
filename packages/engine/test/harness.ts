@@ -301,7 +301,7 @@ export const chat = (e: Engine, convId: string): string[] =>
     .filter((m) => m.kind !== "system")
     .map(
       (m) =>
-        `${m.fromHandle}: ${m.kind === "image" ? "[image]" : m.text}${m.status === "sent" ? "" : ` (${m.status})`}`,
+        `${m.fromHandle}: ${m.kind === "image" ? "[image]" : m.kind === "file" ? `[file ${m.file?.name}]` : m.text}${m.status === "sent" ? "" : ` (${m.status})`}`,
     );
 
 export const systemLines = (e: Engine, convId: string): string[] =>

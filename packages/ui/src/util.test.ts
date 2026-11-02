@@ -2,14 +2,17 @@ import { describe, expect, it } from "vite-plus/test";
 import * as proto from "@segv/protocol/proto";
 import {
   HANDLE_RE,
+  MAX_FILE_BYTES,
   MAX_MEMBERS,
   MAX_NAME,
   dayKey,
   fitBox,
+  fmtBytes,
   inviterOf,
   listOf,
   parseHandles,
   relTime,
+  shortName,
   textTooLong,
 } from "./util";
 
@@ -19,6 +22,29 @@ describe("ui constants mirror proto.ts", () => {
     expect(HANDLE_RE.flags).toBe(proto.HANDLE_RE.flags);
     expect(MAX_MEMBERS).toBe(proto.MAX_MEMBERS);
     expect(MAX_NAME).toBe(proto.MAX_NAME);
+    expect(MAX_FILE_BYTES).toBe(proto.FILE_MAX);
+  });
+});
+
+describe("fmtBytes", () => {
+  it("reads like a size: no trailing .0, whole megabytes from 10 MB", () => {
+    expect(
+      [0, 1023, 1024, 2_345_678, 2 * 1024 * 1024, 10 * 1024 * 1024, 12_345_678].map(fmtBytes),
+    ).toEqual(["0 B", "1023 B", "1 KB", "2.2 MB", "2 MB", "10 MB", "12 MB"]);
+  });
+});
+
+describe("shortName", () => {
+  it("keeps a short name, and elides the middle of a long one so that its extension stays", () => {
+    expect(shortName("report.pdf")).toBe("report.pdf");
+    const long = `${"a".repeat(80)}.pdf`;
+    const s = shortName(long);
+    expect(Array.from(s)).toHaveLength(48);
+    expect(s.endsWith("aaaaaa.pdf")).toBe(true);
+    expect(s).toContain("…");
+    // a spoofed extension far into the name is still followed by the real one
+    expect(shortName(`invoice.pdf${" ".repeat(60)}.exe`).endsWith(".exe")).toBe(true);
+    expect(Array.from(shortName("あ".repeat(60)))).toHaveLength(48);
   });
 });
 

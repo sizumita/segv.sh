@@ -1,5 +1,5 @@
 // Notifications of an app without push (docs/PROTOCOL.md §11.13 "Apps without push", §11.14 "Desktop"): while the app
-// runs, also with its window closed, each TEXT or IMAGE row of another member that reaches it while it is not in use, in
+// runs, also with its window closed, each TEXT, IMAGE or FILE row of another member that reaches it while it is not in use, in
 // a copy whose bell its registration set would hold, gets the notification that the push handler would show for that
 // copy with the device's preview, at most one per copy per PUSH_WINDOW. The app sends nothing for them. The system's
 // notifications themselves are the app's (LocalNotifier); this module decides what they say and when.
@@ -66,8 +66,9 @@ export interface Arrival {
   ref: string;
   name: string;
   handle: string;
-  /** the TEXT's text, or null for an IMAGE */
-  text: string | null;
+  kind: "text" | "image" | "file";
+  /** the TEXT's text; "" for an IMAGE or FILE */
+  text: string;
   unread: number;
 }
 
@@ -83,7 +84,12 @@ export function noteFor(a: Arrival, preview: Preview): LocalNotification {
   if (preview === "name") return { tag: a.ref, title: a.name, body: FIXED.body, open };
   // As plain text: a notification can neither style nor hide, and a spoiler must not reach the lock screen.
   const who = `@${a.handle}`;
-  const text = a.text === null ? `${who} sent an image` : `${who}: ${plainText(a.text)}`;
+  const text =
+    a.kind === "image"
+      ? `${who} sent an image`
+      : a.kind === "file"
+        ? `${who} sent a file`
+        : `${who}: ${plainText(a.text)}`;
   const chars = Array.from(text);
   const cut = chars.length > MAX_BODY ? `${chars.slice(0, MAX_BODY - 1).join("")}…` : text;
   const more = Math.max(0, a.unread - 1);

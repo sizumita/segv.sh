@@ -148,7 +148,7 @@ interface Found {
   text: string;
 }
 
-/** The newest verified TEXT or IMAGE of each copy, and how far each lane's dense prefix reaches. */
+/** The newest verified TEXT, IMAGE or FILE of each copy, and how far each lane's dense prefix reaches. */
 async function readNewest(
   copies: { copy: CacheCopy; ep: CacheEpoch }[],
   d: SwDeps,
@@ -217,6 +217,7 @@ async function readNewest(
       // As plain text: a notification can neither style nor hide, and a spoiler must not reach the lock screen.
       if (v.msg.type === P.MT.TEXT) text = `${who}: ${plainText(v.msg.text)}`;
       else if (v.msg.type === P.MT.IMAGE) text = `${who} sent an image`;
+      else if (v.msg.type === P.MT.FILE) text = `${who} sent a file`;
       else return;
       const lo = P.T0_MS + r.t * 1000 - TS_SLACK_MS;
       const hi = P.T0_MS + (r.t + deltaS) * 1000 + TS_SLACK_MS;

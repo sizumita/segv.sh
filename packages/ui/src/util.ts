@@ -17,6 +17,8 @@ export const MAX_NAME = 64;
 export const MAX_TEXT_JSON_BYTES = 15_000;
 /** Refuse to even try decoding absurdly large picks (the engine re-encodes to ≤ 8 MiB). */
 export const MAX_IMAGE_INPUT_BYTES = 50 * 1024 * 1024;
+/** Mirror of FILE_MAX (packages/protocol/src/proto.ts, §8.3): the largest file the engine sends. */
+export const MAX_FILE_BYTES = 10 * 1024 * 1024;
 
 export function errMsg(e: unknown): string {
   let s = "";
@@ -164,7 +166,21 @@ export function fitBox(w: number, h: number, max: number): { w: number; h: numbe
 export function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
-  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  const mb = n / 1024 / 1024;
+  return mb < 10 ? `${mb.toFixed(1).replace(/\.0$/, "")} MB` : `${Math.round(mb)} MB`;
+}
+
+/**
+ * A file's name cut to `max` characters by eliding its middle, so that its end, where the extension is, stays visible
+ * (§8.3). The name is already a safe name (the engine's `safeFileName`).
+ */
+export function shortName(name: string, max = 48): string {
+  const chars = Array.from(name);
+  if (chars.length <= max) return name;
+  const dot = name.lastIndexOf(".");
+  const ext = dot > 0 ? Array.from(name.slice(dot)).length : 0;
+  const tail = Math.min(Math.max(ext + 6, 12), Math.floor(max / 2));
+  return `${chars.slice(0, max - tail - 1).join("")}…${chars.slice(-tail).join("")}`;
 }
 
 export function extFor(mime: string): string {

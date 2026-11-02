@@ -1,6 +1,7 @@
 import { $, component$, useContext, useSignal, useVisibleTask$ } from "@qwik.dev/core";
 import type { ConversationView, MessageView } from "@segv/engine/types";
 import { loadEngine } from "./engine-loader";
+import { MsgFile } from "./msg-file";
 import { MsgImage } from "./msg-image";
 import { MsgText } from "./msg-text";
 import { UiCtx } from "./state";
@@ -86,6 +87,8 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
                   )}
                   {m.kind === "image" && m.image ? (
                     <MsgImage img={m.image} hold={props.conv.request} />
+                  ) : m.kind === "file" && m.file ? (
+                    <MsgFile file={m.file} />
                   ) : (
                     <MsgText text={m.text ?? ""} />
                   )}

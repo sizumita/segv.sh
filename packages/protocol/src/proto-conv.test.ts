@@ -574,6 +574,154 @@ describe("envelope M: strict parsing", () => {
   });
 });
 
+describe("FILE (§3.3, §8.3)", () => {
+  const file1: P.FileRef = { id: fill(32, 0x41), k: fill(32, 0x42), size: 123456, name: "report.pdf" };
+  const refFile = (x: P.FileRef, name: B = s2b(x.name)): B =>
+    cat(x.id, x.k, be32(x.size), be8(name.length), name);
+  const withContent = (content: B, o: Partial<RefM> = {}) => baseRefM({ type: 4, content, ...o });
+
+  it("is 69 + nlen bytes: 1..255 bytes of strict UTF-8, with no rule on the size or on the name's characters", () => {
+    expect(toHex(P.encodeFile(file1))).toBe(toHex(refFile(file1)));
+    expect(refFile(file1).length).toBe(69 + 10);
+    const anyOf: P.FileRef[] = [
+      { ...file1, size: 0 },
+      { ...file1, size: 0xffffffff },
+      { ...file1, name: "a".repeat(255) },
+      { ...file1, name: "../‮gnp.exe\u0000" }, // not a safe name, but no parse rule refuses it
+    ];
+    for (const x of anyOf) expect(P.parseFile(P.encodeFile(x))).toEqual(x);
+    const m = P.parseM(withContent(refFile(file1)));
+    expect(m.type === P.MT.FILE && m.file).toEqual(file1);
+  });
+
+  it("rejects an empty name, a wrong length, bad UTF-8, and lane ≠ from", () => {
+    const ok = refFile(file1);
+    const bads: B[] = [
+      refFile(file1, new Uint8Array(0)),
+      cat(ok.slice(0, 68), be8(11), ok.slice(69)), // nlen past the end
+      ok.slice(0, -1),
+      cat(ok, be8(0x61)),
+      refFile(file1, new Uint8Array([0xc0, 0xaf])), // an overlong form
+      refFile(file1, new Uint8Array([0xed, 0xa0, 0x80])), // a surrogate
+      new Uint8Array(68),
+    ];
+    for (const c of bads) {
+      expect(throwsError(() => P.parseFile(c))).toBe(true);
+      expect(throwsError(() => P.parseM(withContent(c)))).toBe(true);
+    }
+    expect(throwsError(() => P.parseM(withContent(ok, { lane: 2 })))).toBe(true);
+    const unencodable: P.FileRef[] = [
+      { ...file1, name: "" },
+      { ...file1, name: "a".repeat(256) },
+      { ...file1, name: "\ud800" },
+      { ...file1, size: -1 },
+      { ...file1, size: 2 ** 32 },
+      { ...file1, id: fill(31, 1) },
+    ];
+    for (const x of unencodable) expect(throwsError(() => P.encodeFile(x))).toBe(true);
+  });
+
+  it("is class 0 with a name of at most 60 bytes and class 1 otherwise, and round-trips as a row", () => {
+    for (const [len, cls] of [
+      [1, 0],
+      [60, 0],
+      [61, 1],
+      [255, 1],
+    ] as const) {
+      const m: P.Msg = { ...hdr(), type: P.MT.FILE, file: { ...file1, name: "a".repeat(len) } };
+      const r = P.buildRow(ctx0(), E, m);
+      expect([len, r.cls]).toEqual([len, cls]);
+      const v = P.acceptRow(rowCtx0, E, r.label, r.body);
+      expect(v.ok && v.msg).toEqual(m);
+    }
+  });
+
+  it("is junk to the earlier type set, and the next row's prevh over its stored body matches without a parse", () => {
+    const m: P.Msg = { ...hdr({ n: 6 }), type: P.MT.FILE, file: file1 };
+    const row = P.buildRow(ctx0(), E, m);
+    const earlier = [1, 2, 3, 8, 16, 17];
+    const opened = P.openRow(keys0.mk, E, row.label, row.body);
+    expect(earlier.includes(opened.M[1])).toBe(false);
+    const next: P.Msg = {
+      ...hdr({ n: 7, prev: { E, n: 6 }, prevh: P.prevh(row.label, row.body) }),
+      type: P.MT.TEXT,
+      text: "after",
+    };
+    const nextRow = P.buildRow(ctx0(), E, next);
+    const v = P.acceptRow(rowCtx0, E, nextRow.label, nextRow.body);
+    expect(v.ok && toHex(v.msg.prevh)).toBe(toHex(P.prevh(row.label, row.body)));
+  });
+
+  it("FILE_MAX: the blob of the largest file fits in BLOB_MAX, and fileBlobLen is the blob's length", () => {
+    expect(P.FILE_MAX).toBe(10 * 1024 * 1024);
+    expect(P.fileBlobLen(P.FILE_MAX)).toBe(10_747_944);
+    expect(P.fileBlobLen(P.FILE_MAX)).toBeLessThanOrEqual(P.BLOB_MAX);
+    for (const n of [0, 1, 1000, 65_536, 300_000])
+      expect(P.encryptBlob(new Uint8Array(n)).blob.length).toBe(P.fileBlobLen(n));
+  });
+});
+
+describe("safeFileName (§8.3)", () => {
+  const bytes = (x: string) => te.encode(x).length;
+
+  it("keeps an ordinary name", () => {
+    for (const n of ["report.pdf", "写真 2026-11-02.jpeg", ".bashrc", "a", "file", "x.tar.gz", "😀.txt"])
+      expect(P.safeFileName(n)).toBe(n);
+  });
+
+  it("replaces what a group name may not hold, and the path separators, with _", () => {
+    expect(P.safeFileName("a/b\\c.txt")).toBe("a_b_c.txt");
+    expect(P.safeFileName("../../etc/passwd")).toBe(".._.._etc_passwd");
+    expect(P.safeFileName("invoice‮fdp.exe")).toBe("invoice_fdp.exe");
+    expect(P.safeFileName("a⁧b⁩.txt")).toBe("a_b_.txt");
+    expect(P.safeFileName("x\u0000y\ny.txt")).toBe("x_y_y.txt");
+    expect(P.safeFileName("zero​width﻿.txt")).toBe("zero_width_.txt");
+    expect(P.safeFileName("ㅤ")).toBe("_");
+    expect(P.safeFileName("\ud800.txt")).toBe("_.txt");
+  });
+
+  it("trims whitespace, and an empty or dots-only name becomes file", () => {
+    expect(P.safeFileName("  a.txt 　")).toBe("a.txt");
+    for (const n of ["", "   ", ".", "..", "....", " . "]) expect(P.safeFileName(n)).toBe("file");
+  });
+
+  it("cuts a name over 255 bytes before its extension, at a character boundary", () => {
+    const a = P.safeFileName(`${"a".repeat(300)}.pdf`);
+    expect([bytes(a), a.endsWith(".pdf"), a.startsWith("aaaa")]).toEqual([255, true, true]);
+    const j = P.safeFileName(`${"あ".repeat(100)}.txt`);
+    expect(bytes(j)).toBeLessThanOrEqual(255);
+    expect(j).toBe(`${"あ".repeat(83)}.txt`);
+    const e = P.safeFileName("😀".repeat(100));
+    expect(e).toBe("😀".repeat(63));
+    // an extension of more than 32 bytes, or a leading dot only, is not kept: the name is cut at its end
+    expect(P.safeFileName(`${"a".repeat(250)}.${"b".repeat(40)}`)).toBe(`${"a".repeat(250)}.bbbb`);
+    expect(P.safeFileName(`.${"a".repeat(300)}`)).toBe(`.${"a".repeat(254)}`);
+    // a cut that ends in whitespace loses it
+    expect(P.safeFileName(`${"a".repeat(254)} b`)).toBe("a".repeat(254));
+  });
+
+  it("changes nothing in a safe name", () => {
+    const names = [
+      "report.pdf",
+      " ‮ x/y\\z ",
+      "",
+      "..",
+      `${"a".repeat(300)}.pdf`,
+      `${"a".repeat(254)} b`,
+      `${"あ".repeat(100)}.txt`,
+      "😀".repeat(100),
+      `${"a".repeat(250)}.${"b".repeat(40)}`,
+      `${" ".repeat(10)}${"a".repeat(260)}`,
+    ];
+    for (const n of names) {
+      const s = P.safeFileName(n);
+      expect(P.safeFileName(s)).toBe(s);
+      expect(bytes(s)).toBeGreaterThanOrEqual(1);
+      expect(bytes(s)).toBeLessThanOrEqual(255);
+    }
+  });
+});
+
 describe("REACTION (§3.3, §11.12)", () => {
   const refPrevh = (label: B, body: B): B =>
     new Uint8Array(createHash("sha256").update(refEnc("segv.sh/v2/prev", label, body)).digest()).slice(0, 16);
@@ -615,7 +763,7 @@ describe("REACTION (§3.3, §11.12)", () => {
     const m: P.Msg = { ...hdr(), type: P.MT.REACTION, reaction: { ...reaction1, emoji: "👍".repeat(8) } };
     expect(P.encodeReaction(m.type === P.MT.REACTION ? m.reaction : reaction1).length).toBe(62);
     expect(P.buildRow(ctx0(), E, m).cls).toBe(0);
-    for (const type of [0, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 18])
+    for (const type of [0, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 18])
       expect(throwsError(() => P.parseM(baseRefM({ type, content: new Uint8Array(0) })))).toBe(true);
   });
 
@@ -734,7 +882,7 @@ describe("conversation rows: seal, sign, open (§3.3)", () => {
       const body = P.sealRow(keys0.mk, E, label, M, P.signRow(bob.id.sigSk, conv, 0, E, label, M)).body;
       expect(P.acceptRow(rowCtx0, E, label, body)).toEqual({ ok: false, why: "malformed" });
     }
-    expect(Object.values(P.MT)).toEqual([1, 2, 3, 8, 16, 17]);
+    expect(Object.values(P.MT)).toEqual([1, 2, 3, 4, 8, 16, 17]);
   });
 
   it("flipping any byte of a body, or changing the label or E, makes the row fail to open", () => {
