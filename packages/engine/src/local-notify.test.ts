@@ -57,6 +57,7 @@ const arrival = (o: Partial<Arrival> = {}): Arrival => ({
   ref: REF,
   name: "@bob",
   handle: "bob",
+  kind: "text",
   text: "hello",
   unread: 1,
   ...o,
@@ -102,7 +103,10 @@ describe("noteFor (§11.13 steps 1–3)", () => {
     expect(noteFor(arrival({ text: "**hi** ||secret||", unread: 3 }), "message").body).toBe(
       "@bob: hi (spoiler) (+2)",
     );
-    expect(noteFor(arrival({ text: null }), "message").body).toBe("@bob sent an image");
+    expect(noteFor(arrival({ kind: "image", text: "" }), "message").body).toBe(
+      "@bob sent an image",
+    );
+    expect(noteFor(arrival({ kind: "file", text: "" }), "message").body).toBe("@bob sent a file");
     const long = noteFor(arrival({ text: "x".repeat(300) }), "message").body;
     expect(Array.from(long)).toHaveLength(200);
     expect(long.endsWith("…")).toBe(true);

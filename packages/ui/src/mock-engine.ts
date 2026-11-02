@@ -16,6 +16,7 @@ import type {
   ConversationView,
   Engine,
   EngineState,
+  FileRef,
   ImageRef,
   MemberView,
   MessageView,
@@ -201,6 +202,7 @@ class MockEngine implements Engine {
       kind: p.kind,
       text: p.text,
       image: p.image,
+      file: p.file,
       status: p.status ?? "sent",
       reactions: p.reactions ?? [],
     };
@@ -257,6 +259,17 @@ class MockEngine implements Engine {
           fromHandle: "bob",
           image: { id: "seed-landscape", k: "k", mime: "image/png", w: 1600, h: 1000 },
           ts: now - 25 * MIN,
+        }),
+        m({
+          kind: "file",
+          fromHandle: "bob",
+          file: {
+            id: "seed-file",
+            k: "k",
+            name: "会議資料 2026-11 リリース日程と鍵のローテーション.pdf",
+            size: 2_345_678,
+          },
+          ts: now - 24 * MIN,
         }),
         m({
           kind: "text",
@@ -606,6 +619,22 @@ class MockEngine implements Engine {
     this.settle(convId, key, "sent");
   }
 
+  async sendFile(convId: string, file: File): Promise<void> {
+    const c = this.conv(convId);
+    if (!c.canSend) this.fail(blockedMessage(c));
+    if (file.size > 10 * 1024 * 1024) this.fail("the file is too large");
+    const id = `local-file-${++this.local}`;
+    this.blobs.set(id, file);
+    const key = `local:${++this.local}`;
+    const ref: FileRef = { id, k: "k", name: file.name || "file", size: file.size };
+    this.pushMessage(
+      convId,
+      this.msg({ kind: "file", file: ref, mine: true, status: "sending", seq: 0, key }),
+    );
+    await sleep(700);
+    this.settle(convId, key, "sent");
+  }
+
   async addMembers(convId: string, handles: string[]): Promise<void> {
     const me = this.state.me!;
     for (const h of handles) if (!HANDLE_RE.test(h)) this.fail(`invalid handle: ${h}`);
@@ -664,6 +693,18 @@ class MockEngine implements Engine {
   }
   /** The mock keeps every image for the page's life. */
   releaseImage(_img: ImageRef): void {}
+
+  // ---- files ----
+  async loadFile(file: FileRef): Promise<string> {
+    const cached = this.urls.get(file.id);
+    if (cached) return cached;
+    await sleep(350);
+    const bytes = this.blobs.get(file.id) ?? new Blob([`mock file ${file.name}\n`]);
+    const url = URL.createObjectURL(new Blob([bytes], { type: "application/octet-stream" }));
+    this.urls.set(file.id, url);
+    return url;
+  }
+
   private async paint(w: number, h: number, seed: string): Promise<Blob> {
     const c = document.createElement("canvas");
     c.width = w;

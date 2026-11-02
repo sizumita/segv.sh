@@ -154,7 +154,7 @@ export class QuietClient {
   }
 
   /**
-   * A TEXT or IMAGE row of another member, stored at `t` (seconds since T0), was just shown and counted unread
+   * A TEXT, IMAGE or FILE row of another member, stored at `t` (seconds since T0), was just shown and counted unread
    * (§11.13): marked seen while this device is in use and the row is fresh enough to have rung.
    */
   shown(E: number, label: Uint8Array, t: number): void {

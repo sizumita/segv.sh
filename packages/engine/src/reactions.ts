@@ -1,4 +1,4 @@
-// Reactions (docs/PROTOCOL.md §11.12): which REACTION rows react to which TEXT or IMAGE row, and the state per target,
+// Reactions (docs/PROTOCOL.md §11.12): which REACTION rows react to which TEXT, IMAGE or FILE row, and the state per target,
 // member and emoji, walked in lane order with the 8-emoji rule. Pure functions of the rows a copy holds and accepts,
 // computed again whenever a row arrives or a §6.8 decision changes, so devices holding the same rows agree.
 import * as P from "@segv/protocol/proto";
@@ -9,7 +9,7 @@ import type { ReactionView } from "./types";
 export const MAX_REACTIONS = 8;
 
 /**
- * The message key of the row a REACTION row reacts to (§11.12 "Target"): a TEXT or IMAGE row the copy holds and
+ * The message key of the row a REACTION row reacts to (§11.12 "Target"): a TEXT, IMAGE or FILE row the copy holds and
  * accepts, in an epoch `te ≤ e` that the copy holds, on a lane `tl < |D_te|`, whose label and stored body `th` names.
  * Null while the target is not loaded or not decided, and for a row that reacts to nothing.
  */
@@ -59,14 +59,14 @@ export function reactionViews(byUid: Map<string, Set<string>>, selfUidB: string)
     .map(([emoji, n]) => ({ emoji, count: n, mine: mine.has(emoji) }));
 }
 
-/** Writes the reactions of every TEXT and IMAGE message of the copy into its views; true when one changed. */
+/** Writes the reactions of every TEXT, IMAGE and FILE message of the copy into its views; true when one changed. */
 export function refreshReactions(c: Copy, selfUidB: string): boolean {
   c.reactionsDirty = false;
   const sets = reactionSets(c);
   let changed = false;
   for (let i = 0; i < c.messages.length; i++) {
     const m = c.messages[i];
-    if (m.kind !== "text" && m.kind !== "image") continue;
+    if (m.kind !== "text" && m.kind !== "image" && m.kind !== "file") continue;
     const byUid = sets.get(m.key);
     const next = byUid ? reactionViews(byUid, selfUidB) : [];
     const same =

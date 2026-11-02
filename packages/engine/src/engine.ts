@@ -43,7 +43,7 @@ import { SelfLane } from "./selflane";
 import { readSnapshot } from "./snapshot";
 import { idbSessionStore, type SessionStore } from "./session";
 import type { ImageCache } from "./image-cache";
-import type { ConversationView, Engine, EngineState, ImageRef } from "./types";
+import type { ConversationView, Engine, EngineState, FileRef, ImageRef } from "./types";
 import { browserPasskeys } from "./webauthn";
 
 export type { EngineOptions } from "./options";
@@ -432,6 +432,8 @@ export class SegvEngine implements Engine {
     this.remembered = false;
     await this.sessionStore.clear().catch(() => {});
     this.msg?.images.clear();
+    for (const p of this.fileCache.values())
+      p.then((f) => URL.revokeObjectURL(f.url)).catch(() => {});
     this.resetData();
     this.account = null;
     this.self = null;
@@ -509,7 +511,16 @@ export class SegvEngine implements Engine {
     }
   }
 
-  /** §11.12: one emoji reaction to a TEXT or IMAGE message, without an echo; rejects with §11.3's errors. */
+  async sendFile(convId: string, file: File): Promise<void> {
+    this.requireAccount();
+    try {
+      await this.messaging().sendFile(convId, file);
+    } catch (e) {
+      this.patch({ error: message(e) });
+    }
+  }
+
+  /** §11.12: one emoji reaction to a TEXT, IMAGE or FILE message, without an echo; rejects with §11.3's errors. */
   async react(convId: string, messageKey: string, emoji: string, on: boolean): Promise<void> {
     this.requireAccount();
     await this.action(() => this.messaging().react(convId, messageKey, emoji, on));
@@ -559,6 +570,11 @@ export class SegvEngine implements Engine {
     this.msg?.releaseImage(img);
   }
 
+  loadFile(file: FileRef): Promise<string> {
+    if (!this.msg) return Promise.reject(new UserError("not signed in"));
+    return this.msg.loadFile(file);
+  }
+
   markRead(convId: string): void {
     this.msg?.markRead(convId);
     // Shown: its notifications close (§11.13 "Closing and the badge").
@@ -589,6 +605,11 @@ export class SegvEngine implements Engine {
   /** decrypted images of the session, by `id.k` */
   get images(): ImageCache | null {
     return this.msg?.images ?? null;
+  }
+
+  /** decrypted files of the session, by `id.k` */
+  get fileCache(): Map<string, Promise<{ url: string; size: number }>> {
+    return this.msg?.fileCache ?? new Map();
   }
 
   /** the per-conversation send chains */

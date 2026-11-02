@@ -32,6 +32,18 @@ export interface ImageRef {
   h: number;
 }
 
+/** A file of a FILE row (§8.3). */
+export interface FileRef {
+  /** b64u blob id; "" in the echo of a file still being sent */
+  id: string;
+  /** b64u key; "" in an echo */
+  k: string;
+  /** the safe name (§8.3): what the UI shows and saves the file as */
+  name: string;
+  /** bytes */
+  size: number;
+}
+
 /** One emoji under a message (§11.12): how many members have it on, and whether self is one of them. */
 export interface ReactionView {
   emoji: string;
@@ -49,11 +61,12 @@ export interface MessageView {
   mine: boolean;
   /** ms; sender time clamped to the row's public time ± 5 min (§11.8) */
   ts: number;
-  kind: "text" | "image" | "leave" | "system";
+  kind: "text" | "image" | "file" | "leave" | "system";
   text?: string; // text body, or the system line ("alice added bob")
   image?: ImageRef;
+  file?: FileRef;
   status: "sent" | "sending" | "failed";
-  /** the reactions to a TEXT or IMAGE message (§11.12); empty for every other message */
+  /** the reactions to a TEXT, IMAGE or FILE message (§11.12); empty for every other message */
   reactions: ReactionView[];
 }
 
@@ -162,6 +175,8 @@ export interface Engine {
   createConversation(handles: string[], name?: string): Promise<string>;
   sendText(convId: string, text: string): Promise<void>;
   sendImage(convId: string, file: File): Promise<void>;
+  /** Sends a file as it is (§8.3): no re-encoding, so its metadata goes with it. At most FILE_MAX bytes. */
+  sendFile(convId: string, file: File): Promise<void>;
   /** Resolves after the switch to the new epoch and the first delivery attempt (§6.3). */
   addMembers(convId: string, handles: string[]): Promise<void>;
   /** Resolves after the switch to the new epoch and the first delivery attempt (§6.3). */
@@ -169,7 +184,7 @@ export interface Engine {
   leave(convId: string): Promise<void>;
 
   /**
-   * Adds (`on`) or removes one emoji reaction to the TEXT or IMAGE message `messageKey` (§11.12): one REACTION row,
+   * Adds (`on`) or removes one emoji reaction to the TEXT, IMAGE or FILE message `messageKey` (§11.12): one REACTION row,
    * sent as a text is (§11.3) but without an echo. Resolves when the row counts as delivered; a reaction that would
    * change nothing resolves at once without a row.
    */
@@ -187,6 +202,11 @@ export interface Engine {
   loadImage(img: ImageRef): Promise<string>;
   /** The caller no longer shows an image that `loadImage` gave it: the URL may be revoked from now on. */
   releaseImage(img: ImageRef): void;
+  /**
+   * Downloads + decrypts a file, only when the user asks for it (§8.3). Resolves with an object URL of its bytes as
+   * `application/octet-stream`, cached by `id.k`; the UI saves it under `name` and never shows its content.
+   */
+  loadFile(file: FileRef): Promise<string>;
   /**
    * Resets `unread` and starts scrollback once (§11.10–§11.11): the "conversation pane is open" hint, even when
    * `unread` is 0. It accepts nothing.

@@ -238,7 +238,7 @@ export class PushClient {
   }
 
   /**
-   * After a successful TEXT or IMAGE put (§11.3 step 6): ask the server to ring the other lanes' bells. Never waits;
+   * After a successful TEXT, IMAGE or FILE put (§11.3 step 6): ask the server to ring the other lanes' bells. Never waits;
    * one retry within Δ after a network error, a timeout or a 5xx, none after a 4xx.
    */
   ring(E: number, label: Uint8Array, bells: Uint8Array[]): void {
