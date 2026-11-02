@@ -7,7 +7,7 @@
 //! the running one (scripts/bundle.mjs). Only builds made with SEGV_UPDATES=1 have a feed; any other build never looks.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 use tauri::menu::MenuItem;
 use tauri::{AppHandle, Config, Manager, Wry};
@@ -27,6 +27,10 @@ const TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// an update keeps the window as it was, whatever the arguments of the first launch said.
 const RELAUNCH: &str = "relaunch";
 const RELAUNCH_FOR: Duration = Duration::from_secs(10 * 60);
+/// The longest that the app's exit waits for an install that runs off the main thread (macOS): unpacking and moving
+/// the app takes a second or two.
+#[cfg(target_os = "macos")]
+const EXIT_WAIT: Duration = Duration::from_secs(30);
 
 const CHECK: &str = "Check for Updates…";
 
@@ -54,6 +58,16 @@ pub struct Updates {
     phase: Mutex<Phase>,
     last: Mutex<Option<SystemTime>>,
     item: Mutex<Option<MenuItem<Wry>>>,
+    install: Mutex<Install>,
+    installed: Condvar,
+}
+
+/// An install that runs off the main thread (macOS), which the app's exit waits for, and whether the app is exiting:
+/// an install that finishes then does not start the app again.
+#[derive(Default)]
+struct Install {
+    running: bool,
+    exiting: bool,
 }
 
 impl Updates {
@@ -89,6 +103,18 @@ impl Updates {
 
     fn ready(&self) -> bool {
         self.phase.lock().is_ok_and(|p| matches!(*p, Phase::Ready(_)))
+    }
+
+    fn install(&self) -> MutexGuard<'_, Install> {
+        self.install.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The install has ended; whether the app may start again, which it may not once it is exiting.
+    fn installed(&self) -> bool {
+        let mut i = self.install();
+        i.running = false;
+        self.installed.notify_all();
+        !i.exiting
     }
 
     fn label(&self, text: &str, enabled: bool) {
@@ -131,6 +157,8 @@ pub fn init(app: &AppHandle<Wry>) {
         phase: Mutex::new(Phase::Idle),
         last: Mutex::new(None),
         item: Mutex::new(None),
+        install: Mutex::new(Install::default()),
+        installed: Condvar::new(),
     });
 }
 
@@ -200,11 +228,30 @@ pub fn quit(app: &AppHandle<Wry>) {
 }
 
 /// The app exits (RunEvent::Exit). On macOS a downloaded update is installed, without a restart: the new version
-/// starts at the next launch. An exit that an install's restart asked for finds nothing ready.
+/// starts at the next launch. An install that is running already finishes first, so that the app is never left half
+/// replaced, and then does not start the app again; one that asks for an administrator's password is not waited for,
+/// since only the main thread, which is exiting, could ask. An exit that an install's restart asked for finds nothing
+/// ready and nothing running.
 #[cfg(target_os = "macos")]
 pub fn exiting(app: &AppHandle<Wry>) {
-    if app.try_state::<Updates>().is_some_and(|u| u.ready()) {
+    let Some(updates) = app.try_state::<Updates>() else {
+        return;
+    };
+    if updates.ready() {
         apply(app, After::Quit, false);
+        return;
+    }
+    let wait = replaceable();
+    let mut i = updates.install();
+    i.exiting = true;
+    if wait && i.running {
+        let (_held, timeout) = updates
+            .installed
+            .wait_timeout_while(i, EXIT_WAIT, |i| i.running)
+            .unwrap_or_else(PoisonError::into_inner);
+        if timeout.timed_out() {
+            eprintln!("segv: quitting before the update was installed");
+        }
     }
 }
 
@@ -326,19 +373,28 @@ fn apply(app: &AppHandle<Wry>, after: After, asked: bool) {
     updates.label("Installing Update…", false);
     let handle = app.clone();
     let run = move || {
-        if let Err(e) = install(&handle, &update, &bytes, after) {
-            eprintln!("segv: could not install the update: {e}");
-            clear_relaunch(&handle);
-            let updates = handle.state::<Updates>();
-            updates.set(Phase::Idle);
-            updates.say(&handle, "Could Not Install the Update");
+        let result = install(&handle, &update, &bytes, after);
+        let updates = handle.state::<Updates>();
+        let restart = updates.installed() && after != After::Quit;
+        match result {
+            Ok(()) if restart => handle.request_restart(),
+            // The app quits: the new version starts at the next launch, with the window.
+            Ok(()) => clear_relaunch(&handle),
+            Err(e) => {
+                eprintln!("segv: could not install the update: {e}");
+                clear_relaunch(&handle);
+                updates.set(Phase::Idle);
+                updates.say(&handle, "Could Not Install the Update");
+            }
         }
     };
-    // On macOS, the package is unpacked off the main thread, except as the app exits, which must wait for it.
+    // On macOS, the package is unpacked off the main thread, except as the app exits, which must wait for it anyway.
+    // The exit also waits for an install that runs (`exiting`).
     #[cfg(target_os = "macos")]
     if after == After::Quit {
         run();
     } else {
+        updates.install().running = true;
         std::thread::spawn(run);
     }
     // On Windows, the installer starts from the main thread, which removes the tray's icon before the app exits.
@@ -350,17 +406,14 @@ fn apply(app: &AppHandle<Wry>, after: After, asked: bool) {
     run();
 }
 
-/// macOS replaces the app's bundle and restarts it; Windows runs the installer, which replaces the app after this
-/// process has exited and starts it again unless the app was quitting. `install` only returns on a failure there.
+/// macOS replaces the app's bundle, which `apply` then restarts; Windows runs the installer, which replaces the app
+/// after this process has exited and starts it again unless the app was quitting. `install` only returns on a failure
+/// there.
 fn install(app: &AppHandle<Wry>, update: &Update, bytes: &[u8], after: After) -> Result<(), String> {
     mark_relaunch(app, after);
     #[cfg(windows)]
     let update = &update.clone().restart_after_install(after != After::Quit);
-    update.install(bytes).map_err(|e| e.to_string())?;
-    if after != After::Quit {
-        app.request_restart();
-    }
-    Ok(())
+    update.install(bytes).map_err(|e| e.to_string())
 }
 
 /// Whether this user may replace the app's bundle: write access to it and to the folder that holds it.
