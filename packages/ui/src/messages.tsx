@@ -1,21 +1,12 @@
-import {
-  $,
-  component$,
-  useContext,
-  useSignal,
-  useStore,
-  useTask$,
-  useVisibleTask$,
-} from "@qwik.dev/core";
+import { $, component$, useContext, useSignal, useStore, useVisibleTask$ } from "@qwik.dev/core";
 import type { ConversationView, MessageView } from "@segv/engine/types";
 import { quickList } from "./emoji";
 import { EmojiPicker, type Anchor } from "./emoji-picker";
-import { loadEngine } from "./engine-loader";
 import { MsgFile } from "./msg-file";
 import { MsgImage } from "./msg-image";
 import { MsgText } from "./msg-text";
-import { UiCtx } from "./state";
-import { clock, dayKey, dayLabel, errMsg, fullTime } from "./util";
+import { UiCtx, type UiState } from "./state";
+import { act, clock, dayKey, dayLabel, fullTime } from "./util";
 
 const GROUP_MS = 5 * 60_000;
 const NEAR_BOTTOM_PX = 48;
@@ -31,16 +22,19 @@ function remember(emoji: string): void {
   if (recent.length > 16) recent.length = 16;
 }
 
-/** Sends one reaction (§11.12), and remembers an emoji that it adds for the picker. */
-async function sendReaction(
-  convId: string,
-  key: string,
-  emoji: string,
-  on: boolean,
-): Promise<void> {
-  if (on) remember(emoji);
-  await (await loadEngine()).react(convId, key, emoji, on);
-}
+/**
+ * Sends one reaction (§11.12) and remembers an emoji that it adds, for the picker. Resolves true once sent; a rejection
+ * becomes `ui.localError`.
+ */
+const sendReaction = (ui: UiState, convId: string, key: string, emoji: string, on: boolean) =>
+  act(ui, async (e) => {
+    if (on) remember(emoji);
+    await e.react(convId, key, emoji, on);
+    return true;
+  });
+
+/** Self's emoji on a message, as sent. */
+const mine = (m: MessageView): string[] => m.reactions.filter((r) => r.mine).map((r) => r.emoji);
 
 /** A smiling face with a plus: add a reaction. */
 const ReactIcon = () => (
@@ -66,24 +60,19 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
   const box = useSignal<HTMLElement>();
   const stick = useSignal(true); // follow new messages unless the user scrolled up
   const newBelow = useSignal(false);
-  /** The message whose reactions the picker edits ('' = closed), and where its button is. */
-  const pick = useStore<{ key: string; anchor: Anchor }>({
+  /**
+   * The message whose reactions the picker edits ('' = closed), where the button that opened it is (`chip`: the one
+   * after the reactions, else the one among the actions), and its "frequently used" row as it was then (a JSON list).
+   * The pane is drawn again for each conversation (chat.tsx keys it), so none of this outlives one.
+   */
+  const pick = useStore<{ key: string; anchor: Anchor; chip: boolean; quick: string }>({
     key: "",
     anchor: { top: 0, bottom: 0, left: 0, right: 0 },
+    chip: false,
+    quick: "[]",
   });
   /** On a touch screen, which has no hover, the message whose actions a tap shows ('' = none). */
   const active = useSignal("");
-
-  // Both belong to the conversation shown. The task runs again on every change of the conversation (each message and
-  // reaction makes a new object), so it compares ids.
-  const shown = useSignal("");
-  useTask$(({ track }) => {
-    const id = track(() => props.conv.id);
-    if (id === shown.value) return;
-    shown.value = id;
-    pick.key = "";
-    active.value = "";
-  });
 
   // Auto-scroll: to the bottom when the conversation opens, and on new messages while stuck.
   useVisibleTask$(({ track }) => {
@@ -126,7 +115,10 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
         return;
       }
       const r = open.getBoundingClientRect();
+      const used = props.conv.messages.flatMap(mine).reverse();
       pick.anchor = { top: r.top, bottom: r.bottom, left: r.left, right: r.right };
+      pick.chip = !open.closest(".mtools");
+      pick.quick = JSON.stringify(quickList(recent, used));
       pick.key = key;
       return;
     }
@@ -139,20 +131,16 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
     const key = pick.key;
     pick.key = "";
     active.value = "";
+    const from = pick.chip ? ".reacts" : ".mtools";
     if (refocus && key)
       box.value
-        ?.querySelector<HTMLElement>(`.mtools [data-react-open="${CSS.escape(key)}"]`)
+        ?.querySelector<HTMLElement>(`${from} [data-react-open="${CSS.escape(key)}"]`)
         ?.focus({ preventScroll: true });
   });
 
-  const react = $(async (key: string, emoji: string, on: boolean) => {
-    ui.localError = "";
-    try {
-      await sendReaction(props.conv.id, key, emoji, on);
-    } catch (e) {
-      ui.localError = errMsg(e);
-    }
-  });
+  const react = $((key: string, emoji: string, on: boolean) =>
+    sendReaction(ui, props.conv.id, key, emoji, on),
+  );
 
   const msgs = props.conv.messages;
   // A reaction is a post: not in a read-only preview (it would accept the copy) or where nothing can be sent.
@@ -203,17 +191,19 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
                   data-key={m.key}
                 >
                   {tools && (
-                    <div class="mtools" role="toolbar" aria-label="message actions">
-                      <button
-                        type="button"
-                        data-react-open={m.key}
-                        aria-label="add a reaction"
-                        title="add a reaction"
-                        aria-haspopup="dialog"
-                        aria-expanded={pk === m.key}
-                      >
-                        <ReactIcon />
-                      </button>
+                    <div class="mtools-at">
+                      <div class="mtools" role="toolbar" aria-label="message actions">
+                        <button
+                          type="button"
+                          data-react-open={m.key}
+                          aria-label="add a reaction"
+                          title="add a reaction"
+                          aria-haspopup="dialog"
+                          aria-expanded={pk === m.key}
+                        >
+                          <ReactIcon />
+                        </button>
+                      </div>
                     </div>
                   )}
                   {head && (
@@ -253,13 +243,12 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
       )}
       {picked && (
         <EmojiPicker
+          key={pk}
           anchor={pick.anchor}
-          on={picked.reactions.filter((r) => r.mine).map((r) => r.emoji)}
-          quick={quickList(
-            recent,
-            msgs.flatMap((m) => m.reactions.filter((r) => r.mine).map((r) => r.emoji)).reverse(),
-          )}
-          onPick$={$((emoji: string, on: boolean) => react(pk, emoji, on))}
+          msgKey={pk}
+          on={JSON.stringify(mine(picked))}
+          quick={pick.quick}
+          onPick$={react}
           onClose$={closePicker}
         />
       )}
@@ -279,11 +268,8 @@ const Reactions = component$<{ convId: string; m: MessageView; canReact: boolean
     const toggle = $(async (emoji: string, on: boolean) => {
       if (busy.value) return;
       busy.value = true;
-      ui.localError = "";
       try {
-        await sendReaction(props.convId, props.m.key, emoji, on);
-      } catch (e) {
-        ui.localError = errMsg(e);
+        await sendReaction(ui, props.convId, props.m.key, emoji, on);
       } finally {
         busy.value = false;
       }

@@ -63,7 +63,7 @@ import type {
 import { Realtime } from "./realtime";
 import { keysChangedWarning, leftKeyCmp, liveAt, type SelfLane } from "./selflane";
 import { SNAP_RECORDS, firstFreePointer, writeSnapshot } from "./snapshot";
-import { MAX_REACTIONS, reactionSets, refreshReactions } from "./reactions";
+import { reactionSets, refreshReactions } from "./reactions";
 import { lanesEnd, olderInitialHistory, scrollback } from "./history";
 import { prepareImage } from "./image";
 import { ImageCache } from "./image-cache";
@@ -89,7 +89,7 @@ import {
   type FoundRow,
   type SyncCtx,
 } from "./sync";
-import type { ConversationView, MessageView } from "./types";
+import { MAX_REACTIONS, type ConversationView, type MessageView } from "./types";
 
 type Bytes = Uint8Array;
 

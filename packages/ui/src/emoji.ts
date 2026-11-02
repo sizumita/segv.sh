@@ -1,6 +1,8 @@
 // The emoji that the reaction picker offers (§11.12): every fully-qualified emoji of Unicode's emoji-test.txt with its
 // skin tones, in Unicode's order, named and searched by CLDR's English short names and keywords (emojibase-data).
 // Plain functions without Qwik or the DOM, so that Node can test them.
+// emojibase-data's English data as a file of the build, fetched when the picker first opens.
+import DATA_URL from "emojibase-data/en/data.json?url";
 import { MAX_EMOJI_BYTES } from "./util";
 
 /** The fields of an emojibase-data entry that the picker reads. */
@@ -129,15 +131,20 @@ export function emojiSet(raw: RawEmoji[]): EmojiSet {
 }
 
 let loading: Promise<EmojiSet> | undefined;
-/** The picker's emoji, loaded once, on first use (about 90 KB compressed). */
+/**
+ * The picker's emoji, fetched once, on first use (about 90 KB compressed). Fetched as data rather than imported as a
+ * module, so that only the converted set stays in memory, not emojibase-data's whole list as well.
+ */
 export function loadEmoji(): Promise<EmojiSet> {
-  loading ??= import("emojibase-data/en/data.json").then(
-    (m) => emojiSet(m.default as unknown as RawEmoji[]),
-    (e: unknown) => {
+  loading ??= fetch(DATA_URL)
+    .then((r) => {
+      if (!r.ok) throw new Error(`emoji data: HTTP ${r.status}`);
+      return r.json() as Promise<RawEmoji[]>;
+    })
+    .then(emojiSet, (e: unknown) => {
       loading = undefined;
       throw e;
-    },
-  );
+    });
   return loading;
 }
 

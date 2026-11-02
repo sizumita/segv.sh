@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as proto from "@segv/protocol/proto";
+import raw from "emojibase-data/en/data.json";
 import {
   drawn,
-  loadEmoji,
+  emojiSet,
   QUICK_DEFAULT,
   quickList,
   search,
@@ -10,9 +11,10 @@ import {
   toned,
   wireForm,
   type Emoji,
+  type RawEmoji,
 } from "./emoji";
 
-const set = await loadEmoji();
+const set = emojiSet(raw as unknown as RawEmoji[]);
 const all: Emoji[] = set.groups.flatMap((g) => g.list.flatMap((em) => [em, ...(em.skins ?? [])]));
 const byName = (name: string): Emoji => {
   const em = all.find((x) => x.name === name);

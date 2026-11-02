@@ -460,12 +460,18 @@ textarea:focus {
   background: color-mix(in srgb, var(--hi) 55%, transparent);
 }
 /* A message's actions: on its top right corner while it is hovered, focused from the keyboard, or tapped on a touch
-   screen. Hidden, they take no room. */
+   screen. Hidden, they take no room. Their holder has no height and sticks 14px below the top of the list, so that
+   they stay in view on a message whose top is scrolled out of it. */
+.mtools-at {
+  position: sticky;
+  top: 14px;
+  z-index: 2;
+  height: 0;
+}
 .mtools {
   position: absolute;
   top: -14px;
   right: 8px;
-  z-index: 2;
   display: flex;
   gap: 2px;
   padding: 2px;
@@ -477,17 +483,24 @@ textarea:focus {
   pointer-events: none;
   transition: opacity 0.1s;
 }
-.m.active > .mtools,
-.m:has(:focus-visible) > .mtools {
+.m.active .mtools,
+.m:has(:focus-visible) .mtools {
   opacity: 1;
   pointer-events: auto;
+}
+/* iOS Safari sends a tap's click to the page's handlers (Qwik's, on the document) only from what looks clickable. */
+@media (hover: none) {
+  .m,
+  .picker-back {
+    cursor: pointer;
+  }
 }
 /* A touch screen keeps :hover on whatever was tapped last: there a tap shows the actions (.active) instead. */
 @media (hover: hover) {
   .m:hover {
     background: color-mix(in srgb, var(--hi) 55%, transparent);
   }
-  .m:hover > .mtools {
+  .m:hover .mtools {
     opacity: 1;
     pointer-events: auto;
   }
@@ -727,7 +740,8 @@ textarea:focus {
   position: absolute;
   top: calc(100% + 4px);
   right: 0;
-  z-index: 3;
+  /* above the skin tones (.evars) and the footer */
+  z-index: 6;
   display: flex;
   padding: 4px;
   gap: 2px;
@@ -788,6 +802,8 @@ textarea:focus {
   font-family: var(--emoji);
   font-size: 22px;
   line-height: 1;
+  /* scrolled into view below the group's sticky heading */
+  scroll-margin-top: 30px;
 }
 .eb:hover:not(:disabled) {
   background: var(--hi);

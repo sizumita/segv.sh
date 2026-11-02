@@ -4,13 +4,16 @@ import {
   noSerialize,
   sync$,
   useOnDocument,
+  useOnWindow,
   useSignal,
   useStore,
+  useTask$,
   useVisibleTask$,
   type NoSerialize,
   type QRL,
   type Signal,
 } from "@qwik.dev/core";
+import { MAX_REACTIONS } from "@segv/engine/types";
 import {
   drawn,
   loadEmoji,
@@ -22,7 +25,7 @@ import {
   type EmojiSet,
 } from "./emoji";
 import { newestDrawn } from "./emoji-draw";
-import { errMsg, MAX_REACTIONS } from "./util";
+import { errMsg } from "./util";
 
 /** The button that opened the picker, in viewport pixels. */
 export interface Anchor {
@@ -62,6 +65,39 @@ function saveTone(n: number): void {
   }
 }
 
+/**
+ * Self's emoji on the message: those on by the state (`on`, a JSON list as sent) with the picks this picker has sent
+ * and the state does not show yet (`sent`: emoji → on), so that quick picks toggle from what the user last saw.
+ */
+function mineOf(on: string, sent: Record<string, boolean>): string[] {
+  const out = (JSON.parse(on) as string[]).filter((w) => sent[w] !== false);
+  for (const [w, v] of Object.entries(sent)) if (v && !out.includes(w)) out.push(w);
+  return out;
+}
+
+/**
+ * Beside the button that opened it (`a`), below it or else above, inside the window; on a phone a sheet at the bottom,
+ * placed by the stylesheet alone. Shown from then on (it is hidden until placed).
+ */
+function place(el: HTMLElement, a: Anchor): void {
+  if (matchMedia("(max-width: 720px)").matches) {
+    el.style.removeProperty("left");
+    el.style.removeProperty("top");
+  } else {
+    const m = 8;
+    const w = el.offsetWidth;
+    const h = el.offsetHeight;
+    const left = Math.max(m, Math.min(a.right - w, innerWidth - w - m));
+    const below = a.bottom + 4;
+    const above = a.top - 4 - h;
+    const top =
+      below + h <= innerHeight - m ? below : above >= m ? above : Math.max(m, innerHeight - h - m);
+    el.style.setProperty("left", `${left}px`);
+    el.style.setProperty("top", `${top}px`);
+  }
+  el.setAttribute("data-placed", "");
+}
+
 /** The picker opens on a click, so its tasks run once it is drawn, not once it scrolls into view. */
 const DOC_READY = { strategy: "document-ready" } as const;
 
@@ -82,10 +118,14 @@ const SEARCH_KEYS = sync$((e: KeyboardEvent, el: HTMLInputElement): void => {
   }
 });
 
-/** Arrow keys move between the emoji as they are laid out; up from the top row goes back to the search box. */
-const GRID_KEYS = sync$((e: KeyboardEvent, box: HTMLElement): void => {
+/**
+ * Arrow keys move between the emoji of the grid or of the skin tones, as they are laid out; up from the top row goes
+ * back to the search box.
+ */
+const GRID_KEYS = sync$((e: KeyboardEvent): void => {
   const cur = e.target as HTMLElement;
-  if (!cur.matches("[data-e]")) return;
+  const box = cur.matches("[data-e]") ? cur.closest(".egrid, .evars") : null;
+  if (!box) return;
   const all = Array.from(box.querySelectorAll<HTMLElement>("[data-e]"));
   const i = all.indexOf(cur);
   let next: HTMLElement | null | undefined;
@@ -116,18 +156,22 @@ const GRID_KEYS = sync$((e: KeyboardEvent, box: HTMLElement): void => {
 });
 
 /**
- * The reaction picker (§11.12): every emoji that this device draws, by group or by search, in the skin tone chosen on
- * this device, with each emoji's other tones on a right click or a long press. A pick adds the emoji, or removes it
- * when self has it on; a shift-click keeps the picker open. Escape, or a click outside, closes it.
+ * The reaction picker (§11.12) for one message: every emoji that this device draws, by group or by search, in the skin
+ * tone chosen on this device, with each emoji's other tones on a right click or a long press. A pick adds the emoji, or
+ * removes it when self has it on; a shift-click keeps the picker open. Escape, or a click outside, closes it. Its props
+ * are strings where they can be, so that it and its grid draw again only when they change.
  */
 export const EmojiPicker = component$<{
   anchor: Anchor;
-  /** the emoji that self has on for the message, as sent */
-  on: string[];
-  /** the "frequently used" row, as sent */
-  quick: string[];
-  onPick$: QRL<(emoji: string, on: boolean) => void>;
-  /** `refocus`: give the focus back to the message (escape, a pick), not on a click elsewhere */
+  /** the message's key */
+  msgKey: string;
+  /** the emoji that self has on for the message, as sent: a JSON list */
+  on: string;
+  /** the "frequently used" row, as sent: a JSON list */
+  quick: string;
+  /** sends one reaction; resolves true once sent */
+  onPick$: QRL<(msgKey: string, emoji: string, on: boolean) => Promise<boolean | undefined>>;
+  /** `refocus`: give the focus back to the message, after a pick or an escape from the keyboard */
   onClose$: QRL<(refocus: boolean) => void>;
 }>((props) => {
   const box = useSignal<HTMLElement>();
@@ -152,6 +196,15 @@ export const EmojiPicker = component$<{
   const tab = useSignal("quick");
   /** the group to scroll to once it is drawn */
   const goto = useSignal("");
+  /** this picker's picks that the state (`props.on`) does not show yet: emoji (as sent) → on */
+  const sent = useSignal<Record<string, boolean>>({});
+
+  // A pick that the state now shows is no longer pending.
+  useTask$(({ track }) => {
+    const on = new Set(JSON.parse(track(() => props.on)) as string[]);
+    const left = Object.entries(sent.value).filter(([w, v]) => on.has(w) !== v);
+    if (left.length !== Object.keys(sent.value).length) sent.value = Object.fromEntries(left);
+  });
 
   useVisibleTask$(async () => {
     tone.value = readTone();
@@ -164,36 +217,22 @@ export const EmojiPicker = component$<{
     }
   }, DOC_READY);
 
-  // Beside the button that opened it, below or else above, inside the window; a sheet at the bottom on a phone. It is
-  // hidden until placed, and only then can the search box take the focus (not on a touch screen, where the keyboard
-  // would cover the sheet).
+  // Only once placed can the search box take the focus (not on a touch screen, where the keyboard would cover it).
   useVisibleTask$(({ track }) => {
     const a = track(() => props.anchor);
     const el = box.value;
     if (!el) return;
-    if (matchMedia("(max-width: 720px)").matches) {
-      el.style.removeProperty("left");
-      el.style.removeProperty("top");
-    } else {
-      const m = 8;
-      const w = el.offsetWidth;
-      const h = el.offsetHeight;
-      const left = Math.max(m, Math.min(a.right - w, innerWidth - w - m));
-      const below = a.bottom + 4;
-      const above = a.top - 4 - h;
-      const top =
-        below + h <= innerHeight - m
-          ? below
-          : above >= m
-            ? above
-            : Math.max(m, innerHeight - h - m);
-      el.style.setProperty("left", `${left}px`);
-      el.style.setProperty("top", `${top}px`);
-    }
     const first = !el.hasAttribute("data-placed");
-    el.setAttribute("data-placed", "");
+    place(el, a);
     if (first && matchMedia("(hover: hover) and (pointer: fine)").matches) input.value?.focus();
   }, DOC_READY);
+  // A window that changes size (across the phone layout's width, too) places it again.
+  useOnWindow(
+    "resize",
+    $(() => {
+      if (box.value) place(box.value, props.anchor);
+    }),
+  );
 
   useVisibleTask$(({ track }) => {
     const key = track(() => goto.value);
@@ -219,7 +258,8 @@ export const EmojiPicker = component$<{
   useOnDocument(
     "keydown",
     $((e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
+      // An escape while an input method composes cancels the composition only.
+      if (e.key !== "Escape" || e.isComposing || e.keyCode === 229) return;
       if (variants.value) variants.value = "";
       else if (toneMenu.value) toneMenu.value = false;
       else props.onClose$(true);
@@ -235,34 +275,40 @@ export const EmojiPicker = component$<{
     }),
   );
 
-  const choose = $((e: string, keep: boolean) => {
+  /** `kb`: picked from the keyboard, which gets the focus back on the message. */
+  const choose = $(async (e: string, keep: boolean, kb: boolean) => {
     const w = wireForm(e);
-    const on = props.on.includes(w);
-    if (!on && props.on.length >= MAX_REACTIONS) {
+    const mine = mineOf(props.on, sent.value);
+    const on = mine.includes(w);
+    if (!on && mine.length >= MAX_REACTIONS) {
       note.value = `at most ${MAX_REACTIONS} of your reactions on one message`;
       return;
     }
     note.value = "";
-    void props.onPick$(w, !on);
-    if (!keep) void props.onClose$(true);
+    sent.value = { ...sent.value, [w]: !on };
+    const done = props.onPick$(props.msgKey, w, !on);
+    if (!keep) void props.onClose$(kb);
+    if (!(await done) && sent.value[w] === !on) {
+      const rest = { ...sent.value };
+      delete rest[w];
+      sent.value = rest;
+    }
   });
 
-  const onGridClick = $((ev: MouseEvent) => {
+  // One set of handlers for the grid and the skin tones. After a long press a touch screen may still send a click, to
+  // whatever now lies under the finger: it picks nothing.
+  const onClick = $((ev: MouseEvent) => {
     if (press.long) {
       press.long = false;
       return;
     }
     const e = (ev.target as Element).closest<HTMLElement>("[data-e]")?.dataset.e;
-    if (e) void choose(e, ev.shiftKey);
+    if (e) void choose(e, ev.shiftKey, ev.detail === 0);
   });
-  const onGridMenu = $((ev: MouseEvent) => {
-    const k = (ev.target as Element).closest<HTMLElement>("[data-k]")?.dataset.k;
-    if (k) variants.value = k;
-  });
-  const onGridDown = $((ev: PointerEvent) => {
+  const onDown = $((ev: PointerEvent) => {
     clearTimeout(press.timer);
     press.long = false;
-    const k = (ev.target as Element).closest<HTMLElement>("[data-k]")?.dataset.k;
+    const k = (ev.target as Element).closest<HTMLElement>(".egrid [data-k]")?.dataset.k;
     if (!k || ev.pointerType === "mouse") return;
     press.timer = setTimeout(() => {
       press.long = true;
@@ -274,6 +320,10 @@ export const EmojiPicker = component$<{
     const e = (ev.target as Element).closest<HTMLElement>("[data-e]")?.dataset.e;
     if (e && e !== preview.value) preview.value = e;
   });
+  const onMenu = $((ev: MouseEvent) => {
+    const k = (ev.target as Element).closest<HTMLElement>("[data-k]")?.dataset.k;
+    if (k) variants.value = k;
+  });
   const onGridScroll = $((_: Event, g: HTMLElement) => {
     clearTimeout(press.timer);
     let cur = "";
@@ -282,18 +332,6 @@ export const EmojiPicker = component$<{
       cur = sec.dataset.g ?? "";
     }
     if (cur && cur !== tab.value) tab.value = cur;
-  });
-  // After a long press a touch screen may still send a click, to whatever now lies under the finger.
-  const onVarsDown = $(() => {
-    press.long = false;
-  });
-  const onVarsClick = $((ev: MouseEvent) => {
-    if (press.long) {
-      press.long = false;
-      return;
-    }
-    const e = (ev.target as Element).closest<HTMLElement>("[data-e]")?.dataset.e;
-    if (e) void choose(e, ev.shiftKey);
   });
   const go = $((key: string) => {
     q.value = "";
@@ -309,11 +347,24 @@ export const EmojiPicker = component$<{
 
   const set = data.set;
   const base = variants.value ? set?.byForm.get(variants.value) : undefined;
+  const on = JSON.stringify(mineOf(props.on, sent.value));
   return (
     <>
       {/* The picker comes first: Qwik runs the visible tasks once the first element shows, and the backdrop shows on
           phones only. */}
-      <div class="picker" ref={box} role="dialog" aria-label="add a reaction">
+      <div
+        class="picker"
+        ref={box}
+        role="dialog"
+        aria-label="add a reaction"
+        onClick$={onClick}
+        onPointerDown$={onDown}
+        onPointerUp$={endPress}
+        onPointerCancel$={endPress}
+        onPointerOver$={onOver}
+        onFocusIn$={onOver}
+        onKeyDown$={GRID_KEYS}
+      >
         <div class="phead">
           <input
             ref={input}
@@ -361,14 +412,7 @@ export const EmojiPicker = component$<{
           class="egrid"
           ref={grid}
           preventdefault:contextmenu
-          onClick$={onGridClick}
-          onContextMenu$={onGridMenu}
-          onPointerDown$={onGridDown}
-          onPointerUp$={endPress}
-          onPointerCancel$={endPress}
-          onPointerOver$={onOver}
-          onFocusIn$={onOver}
-          onKeyDown$={GRID_KEYS}
+          onContextMenu$={onMenu}
           onScroll$={onGridScroll}
         >
           {data.error ? (
@@ -379,30 +423,21 @@ export const EmojiPicker = component$<{
               max={data.max}
               tone={tone.value}
               q={q.value}
-              on={props.on}
+              on={on}
               quick={props.quick}
             />
           )}
         </div>
         <Foot set={set} preview={preview} note={note} />
         {base && (
-          <div
-            class="evars"
-            role="group"
-            aria-label={`${base.name}: skin tones`}
-            onPointerDown$={onVarsDown}
-            onClick$={onVarsClick}
-            onPointerOver$={onOver}
-            onFocusIn$={onOver}
-            onKeyDown$={GRID_KEYS}
-          >
+          <div class="evars" role="group" aria-label={`${base.name}: skin tones`}>
             <p class="evhead">
               <span>{base.name}</span>
               <button type="button" class="link" onClick$={() => (variants.value = "")}>
                 back
               </button>
             </p>
-            <Variants base={base} max={data.max} on={props.on} />
+            <Variants base={base} max={data.max} on={on} />
           </div>
         )}
       </div>
@@ -436,12 +471,14 @@ const Cells = component$<{
   max: number;
   tone: number;
   q: string;
-  on: string[];
-  quick: string[];
+  /** self's emoji on the message, as sent: a JSON list */
+  on: string;
+  /** the "frequently used" row, as sent: a JSON list */
+  quick: string;
 }>((props) => {
   const set = props.set;
   if (!set) return <p class="pmsg dim">loading emoji…</p>;
-  const on = new Set(props.on);
+  const on = new Set(JSON.parse(props.on) as string[]);
   const { max, tone } = props;
   let first = true;
   const at = (em: Emoji, base?: Emoji) => {
@@ -459,7 +496,7 @@ const Cells = component$<{
       </section>
     );
   }
-  const quick = props.quick
+  const quick = (JSON.parse(props.quick) as string[])
     .map((e) => set.byForm.get(e))
     .filter((em): em is Emoji => !!em && drawn(em, max));
   return (
@@ -481,8 +518,8 @@ const Cells = component$<{
 });
 
 /** An emoji without a tone, then its skin tones: one row, or, for two people, a row per tone of the first. */
-const Variants = component$<{ base: Emoji; max: number; on: string[] }>((props) => {
-  const on = new Set(props.on);
+const Variants = component$<{ base: Emoji; max: number; on: string }>((props) => {
+  const on = new Set(JSON.parse(props.on) as string[]);
   const rank = (x: Emoji) => x.tone[0] * 10 + (x.tone[1] ?? x.tone[0]);
   const skins = (props.base.skins ?? [])
     .filter((x) => drawn(x, props.max))
