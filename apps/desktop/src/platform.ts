@@ -11,6 +11,7 @@ import type {
   PasskeyPlatform,
   SessionStore,
 } from "@segv/engine";
+import { openSettings } from "@segv/ui";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
@@ -107,6 +108,19 @@ export async function followOpens(): Promise<void> {
   };
   await listen<string>("segv:open", (e) => open(e.payload));
   open(await call<string | null>("page_ready"));
+}
+
+/**
+ * Opens the settings from the app's menu on macOS ("Settings…", ⌘,; src-tauri/src/lib.rs), and on Ctrl+, where the
+ * window has no menu bar (Windows). On macOS the menu takes ⌘, before the page sees it.
+ */
+export async function followSettings(): Promise<void> {
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "," || !(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || e.repeat) return;
+    e.preventDefault();
+    openSettings();
+  });
+  await listen("segv:settings", () => openSettings());
 }
 
 export function platform(): EngineOptions {

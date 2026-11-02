@@ -19,7 +19,7 @@ use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 #[cfg(not(target_os = "macos"))]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
-use tauri::{AppHandle, Manager as _, WindowEvent, Wry};
+use tauri::{AppHandle, Emitter as _, Manager as _, WindowEvent, Wry};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as _};
 use tauri_plugin_deep_link::DeepLinkExt as _;
 
@@ -61,6 +61,38 @@ fn open_link(app: &AppHandle<Wry>, url: &tauri::Url) {
     notify::open_in_app(app, &open);
 }
 
+/// Shows the window and asks the page to open its settings (apps/desktop/src/main.tsx).
+fn open_settings(app: &AppHandle<Wry>) {
+    show_main(app);
+    let _ = app.emit_to("main", "segv:settings", ());
+}
+
+/// The app's menu in the menu bar on macOS: the system's default one, with "Check for Updates…" (in a build that has a
+/// feed) and "Settings…" (⌘,) under the app's name, where a Mac app has them. On Windows the window has no menu bar;
+/// the page opens its settings on Ctrl+, itself.
+#[cfg(target_os = "macos")]
+fn app_menu(app: &AppHandle<Wry>) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItemKind, PredefinedMenuItem};
+    let menu = Menu::default(app)?;
+    // About, a separator, then the system's items (Services, Hide, Quit).
+    if let Some(MenuItemKind::Submenu(named)) = menu.items()?.into_iter().next() {
+        let mut at = 1;
+        if let Some(update) = update::menu_item(app)? {
+            named.insert(&update, at)?;
+            at += 1;
+        }
+        named.insert(&PredefinedMenuItem::separator(app)?, at)?;
+        named.insert(
+            &MenuItemBuilder::with_id("settings", "Settings…")
+                .accelerator("Cmd+,")
+                .build(app)?,
+            at + 1,
+        )?;
+    }
+    app.set_menu(menu)?;
+    Ok(())
+}
+
 fn tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
     let login = CheckMenuItemBuilder::with_id(
         "login",
@@ -89,21 +121,21 @@ fn tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
                 .build(app)?,
         )
         .build()?;
-    let tray = TrayIconBuilder::with_id("main")
-        .tooltip(name)
-        .menu(&menu)
-        .on_menu_event(move |app, e| match e.id().as_ref() {
-            "open" => show_main(app),
-            "login" => {
-                let a = app.autolaunch();
-                let on = !a.is_enabled().unwrap_or(false);
-                let _ = if on { a.enable() } else { a.disable() };
-                let _ = login.set_checked(a.is_enabled().unwrap_or(on));
-            }
-            "update" => update::clicked(app),
-            "quit" => update::quit(app),
-            _ => {}
-        });
+    // The events of every menu: the tray's, and the app's on macOS.
+    app.on_menu_event(move |app, e| match e.id().as_ref() {
+        "open" => show_main(app),
+        "settings" => open_settings(app),
+        "login" => {
+            let a = app.autolaunch();
+            let on = !a.is_enabled().unwrap_or(false);
+            let _ = if on { a.enable() } else { a.disable() };
+            let _ = login.set_checked(a.is_enabled().unwrap_or(on));
+        }
+        "update" => update::clicked(app),
+        "quit" => update::quit(app),
+        _ => {}
+    });
+    let tray = TrayIconBuilder::with_id("main").tooltip(name).menu(&menu);
     // The menu bar's icon is a template that the system tints, and a click opens the menu.
     #[cfg(target_os = "macos")]
     let tray = tray
@@ -213,6 +245,8 @@ pub fn run() {
             if updates {
                 update::init(&handle);
             }
+            #[cfg(target_os = "macos")]
+            app_menu(&handle)?;
             tray(&handle)?;
             update::start(&handle);
             // The installer registers the scheme on Windows; a development build registers itself.
