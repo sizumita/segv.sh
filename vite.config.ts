@@ -27,8 +27,8 @@ export default defineConfig({
   },
   // docs/PROTOCOL.md is the protocol specification, copied verbatim from its author's text on every
   // revision, so it is never reformatted here. The sources of packages/protocol and packages/server have never been
-  // formatted (the bare "lib" and "server" patterns of .prettierignore matched their old directories): they are
-  // formatted in a change of their own, which then removes them from this list.
+  // formatted: they are formatted in a change of their own, which then removes them from this list. Oxfmt also skips
+  // what .gitignore lists. It would read a .prettierignore as well, so patterns go here and nowhere else.
   fmt: {
     ignorePatterns: [
       "**/worker-configuration.d.ts",

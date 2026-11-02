@@ -69,12 +69,17 @@ function bellOf(e: Engine, id: string, u: TestUser): string {
 }
 
 /** The bells last registered for the device's endpoint. */
-const registered = (d: FakePushDevice): string[] => [...(server().push.subs.get(d.endpoint) ?? [])].sort();
+const registered = (d: FakePushDevice): string[] =>
+  [...(server().push.subs.get(d.endpoint) ?? [])].sort();
 
 /** Waits until the device's registration equals `bells` (re-sends are batched over Δ). */
 async function registeredAs(d: FakePushDevice, bells: string[]): Promise<void> {
   const want = [...bells].sort();
-  await waitFor(() => JSON.stringify(registered(d)) === JSON.stringify(want), `${d.name} registers ${want.length} bells`, 10_000);
+  await waitFor(
+    () => JSON.stringify(registered(d)) === JSON.stringify(want),
+    `${d.name} registers ${want.length} bells`,
+    10_000,
+  );
 }
 
 const ringCount = (): number => server().push.rings().length;
@@ -88,7 +93,8 @@ async function ringsAfter(fn: () => Promise<void>, engines: Engine[]) {
   return server().push.rings().slice(before);
 }
 
-const msgKey = (e: Engine, id: string, text: string): string => mustView(e, id).messages.find((m) => m.text === text)!.key;
+const msgKey = (e: Engine, id: string, text: string): string =>
+  mustView(e, id).messages.find((m) => m.text === text)!.key;
 
 describe("the registration set (§11.13)", () => {
   it("holds the bell of self's lane in each accepted copy's current epoch, as the other members compute it", async () => {
@@ -202,8 +208,16 @@ describe("re-sends and the subscription (§11.13)", () => {
     dev.onUnsubscribe = () => order.push("unsubscribe");
     const before = server().push.calls.length;
     await B.logout();
-    await waitFor(() => server().push.subsOf(ep).at(-1)?.tokens.length === 0, "the empty set", 10_000);
-    order.push(...server().push.calls.slice(before).map((c) => c.kind));
+    await waitFor(
+      () => server().push.subsOf(ep).at(-1)?.tokens.length === 0,
+      "the empty set",
+      10_000,
+    );
+    order.push(
+      ...server()
+        .push.calls.slice(before)
+        .map((c) => c.kind),
+    );
     expect(order).toEqual(["unsubscribe", "sub"]);
     expect(server().push.subs.has(ep)).toBe(false);
     // alice signs in on the same browser: notifications are off, nothing is registered for her
@@ -231,7 +245,12 @@ describe("re-sends and the subscription (§11.13)", () => {
 describe("rings (§11.3 step 6, §11.13)", () => {
   it("a TEXT rings once with the other lanes' bells; a REACTION and a LEAVE never ring", async () => {
     const [alice, bob, carol, dave] = ["alice", "bob", "carol", "dave"].map((h) => makeUser(h));
-    const engines = [await engineFor(alice), await engineFor(bob), await engineFor(carol), await engineFor(dave)];
+    const engines = [
+      await engineFor(alice),
+      await engineFor(bob),
+      await engineFor(carol),
+      await engineFor(dave),
+    ];
     const [A, B, C, D] = engines;
     const id = await A.createConversation(["bob", "carol", "dave"], "g");
     await settle(...engines);
@@ -239,9 +258,13 @@ describe("rings (§11.3 step 6, §11.13)", () => {
     await settle(...engines);
     const rings = await ringsAfter(() => A.sendText(id, "hello"), engines);
     expect(rings).toHaveLength(1);
-    expect([...rings[0].tokens].sort()).toEqual([bellOf(A, id, bob), bellOf(A, id, carol), bellOf(A, id, dave)].sort());
+    expect([...rings[0].tokens].sort()).toEqual(
+      [bellOf(A, id, bob), bellOf(A, id, carol), bellOf(A, id, dave)].sort(),
+    );
     expect(rings[0].E).toBe(server().era);
-    expect(await ringsAfter(() => B.react(id, msgKey(B, id, "hello"), "👍", true), engines)).toEqual([]);
+    expect(
+      await ringsAfter(() => B.react(id, msgKey(B, id, "hello"), "👍", true), engines),
+    ).toEqual([]);
     expect(await ringsAfter(() => D.leave(id), engines)).toEqual([]);
   });
 
@@ -310,7 +333,13 @@ describe("rings (§11.3 step 6, §11.13)", () => {
 
 describe("previews (§11.13)", () => {
   const ORIGIN = "https://segv.test";
-  const pushOf = (bells: string[]): Proposed => ({ title: "segv.sh", body: "new messages", tag: "segv", navigate: `${ORIGIN}/`, bells });
+  const pushOf = (bells: string[]): Proposed => ({
+    title: "segv.sh",
+    body: "new messages",
+    tag: "segv",
+    navigate: `${ORIGIN}/`,
+    bells,
+  });
 
   it("the cache names each registered copy, and the worker reads, verifies and previews the newest message", async () => {
     const [alice, bob] = ["alice", "bob"].map((h) => makeUser(h));
@@ -329,7 +358,10 @@ describe("previews (§11.13)", () => {
     expect(B.getState().preview).toBe("message");
     await settle(A, B);
     let cache = await readCache(n.store);
-    await waitFor(() => (void readCache(n.store).then((c) => (cache = c)), cache !== null), "cache written");
+    await waitFor(
+      () => (void readCache(n.store).then((c) => (cache = c)), cache !== null),
+      "cache written",
+    );
     const bell = bellOf(A, one, bob);
     const ref = mustView(B, one).ref;
     expect(cache!.preview).toBe("message");
@@ -341,7 +373,10 @@ describe("previews (§11.13)", () => {
     const frozen = cache;
     await A.sendText(one, "hello bob");
     await settle(A, B);
-    const deps = { ...browserDeps(ORIGIN, { fetch: server().fetchAs("bob-sw"), store: null }), readCache: async () => frozen };
+    const deps = {
+      ...browserDeps(ORIGIN, { fetch: server().fetchAs("bob-sw"), store: null }),
+      readCache: async () => frozen,
+    };
     const moves: unknown[] = [];
     deps.advance = async (m) => void moves.push(m);
     expect(await notesFor(pushOf([bell]), deps, Infinity)).toEqual([
@@ -354,7 +389,8 @@ describe("previews (§11.13)", () => {
     await waitFor(
       () => (
         void readCache(n.store).then((c) => (open = c)),
-        open?.copies[0].epoch?.next.some((s, j) => j !== open!.copies[0].epoch!.self && s.n > 0) ?? false
+        open?.copies[0].epoch?.next.some((s, j) => j !== open!.copies[0].epoch!.self && s.n > 0) ??
+          false
       ),
       "cache moved past alice's row",
     );

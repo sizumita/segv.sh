@@ -238,7 +238,9 @@ describe("leave order and WELCOMEs", () => {
     server().hooks.afterPut = undefined;
     expect(lost).toBe(1);
     expect(B.getState().error).toBe("");
-    expect(I(B).self!.fold.leaves.get(`${P.b64u(ep.D.conv)}.${P.b64u(conv(B, id).root)}`)).toHaveLength(1);
+    expect(
+      I(B).self!.fold.leaves.get(`${P.b64u(ep.D.conv)}.${P.b64u(conv(B, id).root)}`),
+    ).toHaveLength(1);
     await settle(A, B);
     expect(systemLines(A, id)).toContain("@bob left");
   });

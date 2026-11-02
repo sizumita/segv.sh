@@ -108,7 +108,9 @@ describe("winner", () => {
       bundleSize: P.SGB2_SIZES[0],
     });
     let early = 2;
-    server().blobreg.missNow((idB, now) => (idB === P.b64u(bundleId) && early-- > 0 ? now - 5 : null));
+    server().blobreg.missNow((idB, now) =>
+      idB === P.b64u(bundleId) && early-- > 0 ? now - 5 : null,
+    );
     postRow(ep, row);
     await settle(A, B);
     const metas = server().requests.filter(
@@ -210,7 +212,11 @@ describe("freezes", () => {
     const bi = P.memberIndex(ep.D, bob.uid);
     await commitChange(carol, ep, [alice, bob, carol], undefined, {
       patchBlob: (blob, EK) =>
-        replaceEntry(blob, bi, P.seal(bob.id.kemPk, P.REKEY_LABEL, P.rekeyCtx(ep.D.conv, 1, bi), EK)),
+        replaceEntry(
+          blob,
+          bi,
+          P.seal(bob.id.kemPk, P.REKEY_LABEL, P.rekeyCtx(ep.D.conv, 1, bi), EK),
+        ),
     });
     await settle(A, B, C);
     for (const X of [A, B, C]) {
@@ -381,7 +387,10 @@ describe("a removed receiver's epoch ends at the claim", () => {
     await settle(A, B, M);
     expect(mustView(A, id).frozen).toBe(true);
     server().tick(1001);
-    postRow(ep, buildMessage(bob, ep, { E: server().era, n: 0 }, { type: P.MT.TEXT, text: "late" }));
+    postRow(
+      ep,
+      buildMessage(bob, ep, { E: server().era, n: 0 }, { type: P.MT.TEXT, text: "late" }),
+    );
     await settle(A, B, M);
     expect(chat(A, id)).toEqual(["bob: late"]);
     void bi;
@@ -411,7 +420,8 @@ describe("bundle shape and undecided claims", () => {
       );
     await settle(A, B);
     const gets = (idB: string) =>
-      server().requests.filter((r) => r.method === "GET" && r.path === `/api/v2/blob/${idB}`).length;
+      server().requests.filter((r) => r.method === "GET" && r.path === `/api/v2/blob/${idB}`)
+        .length;
     expect(gets(big.id)).toBe(0);
     expect(gets(bad.id)).toBeGreaterThan(0);
     for (const X of [A, B]) expect(mustView(X, id).epoch).toBe(0);
@@ -563,7 +573,9 @@ describe("commits", () => {
     } = await group(["alice", "bob"]);
     const dave = makeUser("dave");
     server().hooks.beforeRequest = (m, p, who) =>
-      who === "alice" && m === "POST" && p === "/api/v2/inbox" ? new Promise<void>(() => {}) : undefined;
+      who === "alice" && m === "POST" && p === "/api/v2/inbox"
+        ? new Promise<void>(() => {})
+        : undefined;
     void A.addMembers(id, ["dave"]).catch(() => {});
     for (let i = 0; i < 100 && epoch(A, id).e < 1; i++) await sleep(50);
     expect(epoch(A, id).e).toBe(1);

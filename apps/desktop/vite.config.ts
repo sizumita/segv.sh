@@ -35,7 +35,11 @@ function qwikloaderPlugin(): Plugin {
       });
     },
     async generateBundle() {
-      this.emitFile({ type: "asset", fileName: "qwikloader.js", source: await readFile(QWIKLOADER, "utf8") });
+      this.emitFile({
+        type: "asset",
+        fileName: "qwikloader.js",
+        source: await readFile(QWIKLOADER, "utf8"),
+      });
     },
   };
 }
@@ -44,7 +48,9 @@ const ORIGIN = process.env.SEGV_ORIGIN ?? "https://segv.sh";
 const DEV_API = process.env.SEGV_DEV_API ?? "http://localhost:5173";
 
 export default defineConfig(({ command, mode }) => ({
-  plugins: lazyPlugins(() => (mode === "test" ? [] : [qwikloaderPlugin(), qwikVite({ csr: true })])),
+  plugins: lazyPlugins(() =>
+    mode === "test" ? [] : [qwikloaderPlugin(), qwikVite({ csr: true })],
+  ),
   define: {
     // A dev page calls its own origin (the proxy below); a built app the deployment's canonical origin.
     "import.meta.env.SEGV_ORIGIN": JSON.stringify(command === "serve" ? "" : ORIGIN),

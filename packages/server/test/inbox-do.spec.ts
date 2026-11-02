@@ -35,7 +35,11 @@ function box(E = E_NOW) {
   const g = gNext++;
   const stub = inboxStub(env, E, g);
   /** Runs `fn` inside the object with the clock at `now` (and the jitter fixed at `j` when given). */
-  const at = <R>(now: number, fn: (inst: Inner, state: DurableObjectState) => R | Promise<R>, j?: number) =>
+  const at = <R>(
+    now: number,
+    fn: (inst: Inner, state: DurableObjectState) => R | Promise<R>,
+    j?: number,
+  ) =>
     runInDurableObject(stub, async (inst: InboxDO, state) => {
       const x = inst as unknown as Inner;
       x.clock = () => now;
@@ -47,14 +51,21 @@ function box(E = E_NOW) {
     g,
     stub,
     at,
-    post: (now: number, rows: { eid: Uint8Array; body: Uint8Array }[], j = 0, bucket = 0): Promise<InboxPostOut> =>
-      at(now, (i) => i.post(E, g, bucket, rows), j),
-    read: (now: number, after = 0, limit = 1024): Promise<InboxReadOut> => at(now, (i) => i.read(E, g, 0, after, limit)),
+    post: (
+      now: number,
+      rows: { eid: Uint8Array; body: Uint8Array }[],
+      j = 0,
+      bucket = 0,
+    ): Promise<InboxPostOut> => at(now, (i) => i.post(E, g, bucket, rows), j),
+    read: (now: number, after = 0, limit = 1024): Promise<InboxReadOut> =>
+      at(now, (i) => i.read(E, g, 0, after, limit)),
     head: (now: number): Promise<InboxHead> => at(now, (i) => i.head(E, g)),
     meta: (k: string) =>
       runInDurableObject(
         stub,
-        (_i: InboxDO, state) => state.storage.sql.exec<{ v: number }>("SELECT v FROM meta WHERE k = ?", k).toArray()[0]?.v,
+        (_i: InboxDO, state) =>
+          state.storage.sql.exec<{ v: number }>("SELECT v FROM meta WHERE k = ?", k).toArray()[0]
+            ?.v,
       ),
   };
 }
@@ -143,7 +154,13 @@ describe("InboxDO slot clock", () => {
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       /** Runs `fn` as a redeploy with INBOX_SLOT_S = `slot` would. */
-      const deployed = <R>(bx: ReturnType<typeof box>, slot: number, now: number, fn: (inst: Inner) => R, j?: number) =>
+      const deployed = <R>(
+        bx: ReturnType<typeof box>,
+        slot: number,
+        now: number,
+        fn: (inst: Inner) => R,
+        j?: number,
+      ) =>
         bx.at(
           now,
           (inst) => {
@@ -161,13 +178,19 @@ describe("InboxDO slot clock", () => {
       expect(await b.meta("slot")).toBe(1);
       // A redeploy raises Δin to 3 s: closed_hw and rel stay in 1 s slots, so the new row closes a slot later.
       await evictDurableObject(b.stub);
-      expect(rels(await deployed(b, 3, t + 1_000, (i) => i.post(b.E, b.g, 0, [invite()]), 0))).toEqual([S + 2]);
+      expect(
+        rels(await deployed(b, 3, t + 1_000, (i) => i.post(b.E, b.g, 0, [invite()]), 0)),
+      ).toEqual([S + 2]);
       let r = await deployed(b, 3, t + 2_000, (i) => i.read(b.E, b.g, 0, 0, 10));
       expect(r.closed).toBe(S + 2);
       expect(r.rows.map((x) => x.rel)).toEqual([S + 2]);
       expect(await b.meta("slot")).toBe(1);
       expect(errors).toHaveBeenCalledTimes(1); // once per instance, however many calls
-      expect(JSON.parse(errors.mock.calls[0][0] as string)).toMatchObject({ E: b.E, pinned: 1, deployed: 3 });
+      expect(JSON.parse(errors.mock.calls[0][0] as string)).toMatchObject({
+        E: b.E,
+        pinned: 1,
+        deployed: 3,
+      });
 
       // Pinned by the first post (no read yet).
       const c = box();
@@ -203,7 +226,10 @@ describe("InboxDO posts", () => {
     const count = (bb: ReturnType<typeof box>) =>
       runInDurableObject(
         bb.stub,
-        (_i: InboxDO, s) => s.storage.sql.exec<{ n: number }>("SELECT n FROM cnt WHERE bucket = 0 AND day = ?", day).one().n,
+        (_i: InboxDO, s) =>
+          s.storage.sql
+            .exec<{ n: number }>("SELECT n FROM cnt WHERE bucket = 0 AND day = ?", day)
+            .one().n,
       );
     expect(await count(b)).toBe(32);
 
@@ -211,7 +237,11 @@ describe("InboxDO posts", () => {
     const c = box();
     await c.post(now, invites(1), 0);
     await runInDurableObject(c.stub, (_i: InboxDO, s) => {
-      s.storage.sql.exec("UPDATE cnt SET n = ? WHERE bucket = 0 AND day = ?", INBOX_DAY_CAP - 10, day);
+      s.storage.sql.exec(
+        "UPDATE cnt SET n = ? WHERE bucket = 0 AND day = ?",
+        INBOX_DAY_CAP - 10,
+        day,
+      );
     });
     const rows = invites(32);
     const res = rels(await c.post(now, rows, 0));
@@ -238,8 +268,12 @@ describe("InboxDO posts", () => {
     const r = await b.read(now + 20_000);
     expect(r.rows).toHaveLength(2);
     const day = Math.floor(P.secOf(now) / 86_400);
-    const n = await runInDurableObject(b.stub, (_i: InboxDO, s) =>
-      s.storage.sql.exec<{ n: number }>("SELECT n FROM cnt WHERE bucket = 0 AND day = ?", day).one().n,
+    const n = await runInDurableObject(
+      b.stub,
+      (_i: InboxDO, s) =>
+        s.storage.sql
+          .exec<{ n: number }>("SELECT n FROM cnt WHERE bucket = 0 AND day = ?", day)
+          .one().n,
     );
     expect(n).toBe(2);
   });
@@ -311,7 +345,9 @@ describe("InboxDO posts", () => {
     expect(total).toBe(7 * cap);
     const firstDay = P.secOf(start) / 86_400;
     const cnt = await runInDurableObject(b.stub, (_i: InboxDO, s) =>
-      s.storage.sql.exec<{ day: number; n: number }>("SELECT day, n FROM cnt WHERE bucket = 0 ORDER BY day").toArray(),
+      s.storage.sql
+        .exec<{ day: number; n: number }>("SELECT day, n FROM cnt WHERE bucket = 0 ORDER BY day")
+        .toArray(),
     );
     expect(cnt).toEqual(Array.from({ length: 7 }, (_, d) => ({ day: firstDay + d, n: cap })));
     expect((await b.read(P.eraEnd(b.E) - 1)).rows).toHaveLength(7 * cap);
@@ -325,8 +361,12 @@ describe("InboxDO posts", () => {
       expect(() => inst.head(b.E + 1, b.g)).toThrow(/does not match/);
       expect(() => inst.post(b.E, b.g, 0, [])).toThrow(TypeError);
       expect(() => inst.post(b.E, b.g, 0, invites(33))).toThrow(TypeError);
-      expect(() => inst.post(b.E, b.g, 0, [{ eid: P.random(15), body: P.random(P.INBOX_BODY_LEN) }])).toThrow(TypeError);
-      expect(() => inst.post(b.E, b.g, 0, [{ eid: P.random(16), body: P.random(P.INBOX_BODY_LEN - 1) }])).toThrow(TypeError);
+      expect(() =>
+        inst.post(b.E, b.g, 0, [{ eid: P.random(15), body: P.random(P.INBOX_BODY_LEN) }]),
+      ).toThrow(TypeError);
+      expect(() =>
+        inst.post(b.E, b.g, 0, [{ eid: P.random(16), body: P.random(P.INBOX_BODY_LEN - 1) }]),
+      ).toThrow(TypeError);
       expect(() => inst.post(b.E, b.g, -1, invites(1))).toThrow(TypeError);
       expect(() => inst.read(b.E, b.g, 0, -1, 10)).toThrow(RangeError);
       expect(() => inst.read(b.E, b.g, 0, 0, 0)).toThrow(RangeError);
@@ -366,8 +406,14 @@ describe("InboxDO reads", () => {
     };
     expect(await page(0, 1)).toMatchObject({ rels: Array(3).fill(S + 1), more: true });
     expect(await page(0, 3)).toMatchObject({ rels: Array(3).fill(S + 1), more: true });
-    expect(await page(0, 4)).toMatchObject({ rels: [...Array(3).fill(S + 1), ...Array(4).fill(S + 2)], more: true });
-    expect(await page(S + 1, 5)).toMatchObject({ rels: [...Array(4).fill(S + 2), ...Array(2).fill(S + 3)], more: false });
+    expect(await page(0, 4)).toMatchObject({
+      rels: [...Array(3).fill(S + 1), ...Array(4).fill(S + 2)],
+      more: true,
+    });
+    expect(await page(S + 1, 5)).toMatchObject({
+      rels: [...Array(4).fill(S + 2), ...Array(2).fill(S + 3)],
+      more: false,
+    });
     expect(await page(S + 3, 5)).toMatchObject({ rels: [], more: false });
     // Ordered by (rel, eid).
     const all = await page(0, 1024);
@@ -383,13 +429,17 @@ describe("InboxDO era end", () => {
   it("the constructor arms the seal alarm at end(E) + SKEW; an ended era arms nothing and seals in prepare()", async () => {
     const b = box();
     await b.read(Date.now());
-    expect(await runInDurableObject(b.stub, (_i: InboxDO, s) => s.storage.getAlarm())).toBe(P.eraEnd(b.E));
+    expect(await runInDurableObject(b.stub, (_i: InboxDO, s) => s.storage.getAlarm())).toBe(
+      P.eraEnd(b.E),
+    );
 
     const old = box(E_NOW - 2);
     const alarm = await runInDurableObject(old.stub, (_i: InboxDO, s) => s.storage.getAlarm());
     expect(alarm).toBeNull();
     expect(await old.meta("ended")).toBeUndefined();
-    const r = await runInDurableObject(old.stub, (inst: InboxDO) => inst.read(old.E, old.g, 0, 0, 10)); // real clock
+    const r = await runInDurableObject(old.stub, (inst: InboxDO) =>
+      inst.read(old.E, old.g, 0, 0, 10),
+    ); // real clock
     expect(r.ended).toBe(true);
     expect(r.closed).toBe(0); // no rows and nothing ever reported: closed_hw = 0
     expect(await old.meta("ended")).toBe(1);
@@ -454,7 +504,12 @@ describe("InboxDO era end", () => {
     const d = box();
     expect(await d.head(end - 1)).toMatchObject({ tLast: 0, ended: false });
     expect(await d.meta("closed_hw")).toBe(slotOf(end - 1));
-    expect(await d.read(end + DAY_MS)).toMatchObject({ closed: slotOf(end - 1), ended: true, more: false, rows: [] });
+    expect(await d.read(end + DAY_MS)).toMatchObject({
+      closed: slotOf(end - 1),
+      ended: true,
+      more: false,
+      rows: [],
+    });
     // With nothing ever reported, an empty era ends at closed = 0.
     expect(await box().read(end)).toMatchObject({ closed: 0, ended: true, rows: [] });
   });
@@ -482,7 +537,10 @@ describe("InboxDO era end", () => {
       expect(r.rows).toEqual([]);
     }
     // Posts closed at end(E); once the era has ended, a read returns the row and closed covers it.
-    expect(await call(end, (i) => i.post(b.E, b.g, 0, [invite()]))).toEqual({ s: "wrong_era", era: b.E + 1 });
+    expect(await call(end, (i) => i.post(b.E, b.g, 0, [invite()]))).toEqual({
+      s: "wrong_era",
+      era: b.E + 1,
+    });
     const r = await call(end + SKEW_MS, (i) => i.read(b.E, b.g, 0, 0, 1024));
     expect(r).toMatchObject({ closed: rel, ended: true, more: false });
     expect(r.rows.map((y) => [y.rel, P.b64u(y.eid)])).toEqual([[rel, P.b64u(x.eid)]]);
@@ -492,7 +550,11 @@ describe("InboxDO era end", () => {
     const [rel0] = rels(await c.post(end - D / 2, [x], D - 1));
     expect(rel0).toBe(rel);
     expect((await c.read(end - 1)).rows).toEqual([]);
-    expect(await c.read(end)).toMatchObject({ closed: rel, ended: true, rows: [{ rel, eid: x.eid, body: x.body }] });
+    expect(await c.read(end)).toMatchObject({
+      closed: rel,
+      ended: true,
+      rows: [{ rel, eid: x.eid, body: x.body }],
+    });
   });
 
   it("an alarm that fires before end(E) + SKEW sets no `ended` and re-arms at max(end(E) + SKEW, now + 1000)", async () => {
@@ -573,9 +635,16 @@ describe("InboxDO slot commitments", () => {
     const stored = () =>
       runInDurableObject(b.stub, (_i: InboxDO, s) =>
         s.storage.sql
-          .exec<{ rel: number; n: number; root: ArrayBuffer; head: ArrayBuffer }>("SELECT rel, n, root, head FROM slot ORDER BY rel")
+          .exec<{ rel: number; n: number; root: ArrayBuffer; head: ArrayBuffer }>(
+            "SELECT rel, n, root, head FROM slot ORDER BY rel",
+          )
           .toArray()
-          .map((r) => ({ rel: r.rel, n: r.n, root: P.b64u(new Uint8Array(r.root)), head: P.b64u(new Uint8Array(r.head)) })),
+          .map((r) => ({
+            rel: r.rel,
+            n: r.n,
+            root: P.b64u(new Uint8Array(r.root)),
+            head: P.b64u(new Uint8Array(r.head)),
+          })),
       );
     let want = recompute(rows);
     expect(P.b64u(h.head)).toBe(P.b64u(want.head));

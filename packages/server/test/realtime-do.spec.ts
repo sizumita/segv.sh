@@ -8,14 +8,22 @@ import type { RealtimeDO, RtLimits } from "../src/realtime-do";
 import type { RtPublishRow } from "../src/types";
 
 /** The protected / private fields the tests drive or observe. */
-type Inner = Pick<RealtimeDO, "publish"> & { clock: () => number; limits: RtLimits; pairs: number; seq: number };
+type Inner = Pick<RealtimeDO, "publish"> & {
+  clock: () => number;
+  limits: RtLimits;
+  pairs: number;
+  seq: number;
+};
 type Stub = DurableObjectStub<RealtimeDO>;
 type Frame = W.ServerFrame | { f: "text"; text: string };
 
 const HOUR_MS = 3_600_000;
 
 /** A fresh RealtimeDO instance per test (the class does not care about its name). */
-const fresh = (): Stub => (env.RT as unknown as DurableObjectNamespace<RealtimeDO>).getByName(`rt-test/${crypto.randomUUID()}`);
+const fresh = (): Stub =>
+  (env.RT as unknown as DurableObjectNamespace<RealtimeDO>).getByName(
+    `rt-test/${crypto.randomUUID()}`,
+  );
 const clientTag = (): string => P.hex(P.random(16));
 const topic = (): Uint8Array => P.random(16);
 const row = (t: Uint8Array, cls = 0): RtPublishRow => ({
@@ -27,12 +35,20 @@ const row = (t: Uint8Array, cls = 0): RtPublishRow => ({
   body: P.random(P.BODY_LENS[cls]),
 });
 
-const inside = <R>(stub: Stub, fn: (inst: Inner, state: DurableObjectState) => R | Promise<R>): Promise<R> =>
+const inside = <R>(
+  stub: Stub,
+  fn: (inst: Inner, state: DurableObjectState) => R | Promise<R>,
+): Promise<R> =>
   runInDurableObject(stub, (inst: RealtimeDO, state) => fn(inst as unknown as Inner, state));
 const setClock = (stub: Stub, ms: number) => inside(stub, (i) => void (i.clock = () => ms));
-const setLimits = (stub: Stub, l: Partial<RtLimits>) => inside(stub, (i) => void Object.assign(i.limits, l));
+const setLimits = (stub: Stub, l: Partial<RtLimits>) =>
+  inside(stub, (i) => void Object.assign(i.limits, l));
 
-async function eventually<T>(fn: () => Promise<T>, pred: (x: T) => boolean, what: string): Promise<T> {
+async function eventually<T>(
+  fn: () => Promise<T>,
+  pred: (x: T) => boolean,
+  what: string,
+): Promise<T> {
   let x = await fn();
   for (let i = 0; i < 250 && !pred(x); i++) {
     await new Promise((r) => setTimeout(r, 20));
@@ -42,7 +58,12 @@ async function eventually<T>(fn: () => Promise<T>, pred: (x: T) => boolean, what
   return x;
 }
 /** Waits until the object has processed control frames: its (topic, socket) pair count equals `n`. */
-const pairsAre = (stub: Stub, n: number) => eventually(() => inside(stub, (i) => i.pairs), (x) => x === n, `${n} pairs`);
+const pairsAre = (stub: Stub, n: number) =>
+  eventually(
+    () => inside(stub, (i) => i.pairs),
+    (x) => x === n,
+    `${n} pairs`,
+  );
 
 function watch(ws: WebSocket) {
   const frames: Frame[] = [];
@@ -52,7 +73,11 @@ function watch(ws: WebSocket) {
     for (const w of waiters) w(); // a waiter may delete itself: Set iteration allows that
   };
   ws.addEventListener("message", (e) => {
-    frames.push(typeof e.data === "string" ? { f: "text", text: e.data } : W.decodeServerFrame(new Uint8Array(e.data as ArrayBuffer)));
+    frames.push(
+      typeof e.data === "string"
+        ? { f: "text", text: e.data }
+        : W.decodeServerFrame(new Uint8Array(e.data as ArrayBuffer)),
+    );
     notify();
   });
   ws.addEventListener("close", (e) => {
@@ -71,7 +96,9 @@ function watch(ws: WebSocket) {
       };
       const timer = setTimeout(() => {
         waiters.delete(check);
-        reject(new Error(`timeout waiting for ${what}; frames=${frames.map((f) => f.f).join(",")}`));
+        reject(
+          new Error(`timeout waiting for ${what}; frames=${frames.map((f) => f.f).join(",")}`),
+        );
       }, 5000);
       waiters.add(check);
       check();
@@ -101,7 +128,10 @@ type Sock = ReturnType<typeof watch>;
 
 const upgrade = (stub: Stub, client: string | null = clientTag()) =>
   stub.fetch("https://rt.test/", {
-    headers: client === null ? { upgrade: "websocket" } : { upgrade: "websocket", "x-segv-client": client },
+    headers:
+      client === null
+        ? { upgrade: "websocket" }
+        : { upgrade: "websocket", "x-segv-client": client },
   });
 
 async function connect(stub: Stub, client: string | null = clientTag()): Promise<Sock> {
@@ -171,7 +201,10 @@ describe("RealtimeDO connect", () => {
         )
         .toArray()
         .map((r) => r.name),
-      keys: state.storage.sql.exec<{ k: string }>("SELECT k FROM meta").toArray().map((r) => r.k),
+      keys: state.storage.sql
+        .exec<{ k: string }>("SELECT k FROM meta")
+        .toArray()
+        .map((r) => r.k),
       kv: [...(await state.storage.list()).keys()],
     }));
     expect(stored).toEqual({ tables: ["meta"], keys: ["ws-tag-key"], kv: [] });
@@ -292,7 +325,10 @@ describe("RealtimeDO delivery", () => {
     const z = row(T2);
     const sends = vi.spyOn(WebSocket.prototype, "send");
     // ROWS frames only (the test pool talks to its host over a WebSocket too).
-    const rowsSent = () => sends.mock.calls.map((c) => c[0]).filter((m) => m instanceof Uint8Array && m[0] === W.RT_ROWS);
+    const rowsSent = () =>
+      sends.mock.calls
+        .map((c) => c[0])
+        .filter((m) => m instanceof Uint8Array && m[0] === W.RT_ROWS);
     let first: unknown[];
     let second: unknown[];
     try {
@@ -453,7 +489,10 @@ describe("RealtimeDO RESUME", () => {
     expect(seq).toBe(2);
     a.send({ f: "resume", boot, since: seq + 500, topics: [T] }); // e.g. a seq kept from another boot
     await a.until(() => a.frames.length >= 2, "GAP");
-    expect(a.frames).toEqual([expect.objectContaining({ f: "hello" }), { f: "gap", since: seq + 500 }]);
+    expect(a.frames).toEqual([
+      expect.objectContaining({ f: "hello" }),
+      { f: "gap", since: seq + 500 },
+    ]);
     await pairsAre(stub, 1); // the topics are installed
 
     const b = await connect(stub);
@@ -700,7 +739,8 @@ describe("RealtimeDO caps and age", () => {
     const full = await upgrade(stub, A);
     expect(full.status).toBe(429);
     await full.text();
-    for (const s of [...pinged, ...recent, ninth, ...more, otherClient]) expect(s.closed()).toBeNull();
+    for (const s of [...pinged, ...recent, ninth, ...more, otherClient])
+      expect(s.closed()).toBeNull();
 
     // The kept sockets still receive.
     const Tp = topic();
@@ -729,7 +769,10 @@ describe("RealtimeDO caps and age", () => {
       await res.text();
     } finally {
       errors.mockRestore();
-      await inside(stub, (_i, state) => void delete (state as unknown as Record<string, unknown>).acceptWebSocket);
+      await inside(
+        stub,
+        (_i, state) => void delete (state as unknown as Record<string, unknown>).acceptWebSocket,
+      );
     }
     const ok = await connect(stub);
     ok.ws.close(1000);

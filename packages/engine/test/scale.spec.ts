@@ -72,14 +72,17 @@ function measured(w: FakeWorld, who: string, from: number, self?: TestUser, unti
   const all = w.requests.slice(from).filter((r) => r.who === who);
   // The restore ends where the session goes live: its realtime socket opens (§11.4 step 9).
   const live = untilLive ? all.findIndex((r) => r.path === "/api/v2/rt") : -1;
-  const rs = (live >= 0 ? all.slice(0, live) : all)
-    .filter(
-      (r: FakeRequest) =>
-        r.who === who &&
-        !r.path.startsWith("/api/v2/inbox") &&
-        !r.path.startsWith("/api/v2/ckpt") &&
-        !(r.getKeys && r.getKeys.length > 0 && r.getKeys.every((k) => selfLabels.has(P.b64u(k.label)))),
-    );
+  const rs = (live >= 0 ? all.slice(0, live) : all).filter(
+    (r: FakeRequest) =>
+      r.who === who &&
+      !r.path.startsWith("/api/v2/inbox") &&
+      !r.path.startsWith("/api/v2/ckpt") &&
+      !(
+        r.getKeys &&
+        r.getKeys.length > 0 &&
+        r.getKeys.every((k) => selfLabels.has(P.b64u(k.label)))
+      ),
+  );
   return { count: rs.length, bytes: rs.reduce((n, r) => n + r.resBytes, 0), rs };
 }
 
@@ -205,7 +208,8 @@ describe("T5: catch-up after being offline", () => {
       await settle(A, B);
       await A.logout();
       if (noisy)
-        for (let i = 0; i < 10_000; i++) w.shard.commit(w.era, P.random(16), 0, P.random(P.BODY_LENS[0]));
+        for (let i = 0; i < 10_000; i++)
+          w.shard.commit(w.era, P.random(16), 0, P.random(P.BODY_LENS[0]));
       await B.sendText(id, "while you were away");
       const A2 = await engineFor(alice);
       const from = w.requests.length;
@@ -220,12 +224,20 @@ describe("T5: catch-up after being offline", () => {
 });
 
 /** Posts `count` TEXT rows of `from` on its lane of epoch `ep` in the current era, chained as its device chains them. */
-function postTexts(ep: Parameters<typeof buildMessage>[1], from: TestUser, count: number, first = 0): void {
+function postTexts(
+  ep: Parameters<typeof buildMessage>[1],
+  from: TestUser,
+  count: number,
+  first = 0,
+): void {
   let prev: (BuiltRow & { n: number }) | undefined;
   const E = server().era;
   for (let i = 0; i < count; i++) {
     const n = first + i;
-    const row = buildMessage(from, ep, { E, n, prev }, { type: P.MT.TEXT, text: `m${n}` } as P.MBody);
+    const row = buildMessage(from, ep, { E, n, prev }, {
+      type: P.MT.TEXT,
+      text: `m${n}`,
+    } as P.MBody);
     postRow(ep, row);
     prev = { ...row, n };
   }
@@ -237,7 +249,8 @@ function keysOn(w: FakeWorld, who: string, from: number, labels: Set<string>) {
   for (const r of w.requests.slice(from))
     if (r.who === who && r.getKeys)
       r.getKeys.forEach((k, i) => {
-        if (labels.has(P.b64u(k.label))) out.push({ mode: k.mode, hit: r.getStatuses?.[i]?.s === "hit" });
+        if (labels.has(P.b64u(k.label)))
+          out.push({ mode: k.mode, hit: r.getStatuses?.[i]?.s === "hit" });
       });
   return out;
 }
@@ -274,7 +287,9 @@ describe("T4: no replay of the whole history on a new device", () => {
     const short = await run(2000, 300, false);
     const long = await run(4000, 3, true);
     expect(Math.abs(long.restore.count - short.restore.count)).toBeLessThanOrEqual(1);
-    expect(Math.abs(long.restore.bytes - short.restore.bytes)).toBeLessThanOrEqual(short.restore.bytes * 0.05);
+    expect(Math.abs(long.restore.bytes - short.restore.bytes)).toBeLessThanOrEqual(
+      short.restore.bytes * 0.05,
+    );
     expect(short.bodies).toBe(HISTORY_INITIAL);
     expect(long.bodies).toBe(HISTORY_INITIAL);
   }, 600_000);
@@ -287,10 +302,11 @@ describe("T4: no replay of the whole history on a new device", () => {
     for (let i = 0; i < 10; i++)
       writeSelfRow(
         alice,
-        Array.from(
-          { length: 200 },
-          (): P.SelfRecord => ({ rtype: P.RT.CONTACT, uid: P.random(16), pin: P.random(32) }),
-        ),
+        Array.from({ length: 200 }, (): P.SelfRecord => ({
+          rtype: P.RT.CONTACT,
+          uid: P.random(16),
+          pin: P.random(32),
+        })),
       );
     const A2 = await engineFor(alice); // applies 2 000 records: more than 200 since the snapshot it read
     await settle(A2);
@@ -335,7 +351,11 @@ describe("T7: spam requests", () => {
           prev: P.ZERO32,
           by: s.uid,
           ts: w.now(),
-          members: members.map((u) => ({ uid: u.uid, sigPk: u.id.sigPk, kh: P.kemHash(u.id.kemPk) })),
+          members: members.map((u) => ({
+            uid: u.uid,
+            sigPk: u.id.sigPk,
+            kh: P.kemHash(u.id.kemPk),
+          })),
           name: null,
         });
         const b = P.buildBundle({
@@ -349,7 +369,13 @@ describe("T7: spam requests", () => {
           rm: 0,
         });
         const reg = w.putBlob(b.blob);
-        forgeJoin(alice, { conv, e: 0, EK, bundleId: P.fromB64u(reg.id), bundleSize: b.blob.length });
+        forgeJoin(alice, {
+          conv,
+          e: 0,
+          EK,
+          bundleId: P.fromB64u(reg.id),
+          bundleSize: b.blob.length,
+        });
       }
       await settle(A, B);
       w.advanceEra(); // the snapshot holds the live requests
@@ -359,9 +385,21 @@ describe("T7: spam requests", () => {
       const A2 = await restoreOnly(alice);
       const restore = measured(w, "alice", from, alice, true);
       const keys = restore.rs.reduce((n, r) => n + (r.getKeys?.length ?? 0), 0);
-      const blobs = restore.rs.filter((r) => r.method === "GET" && /^\/api\/v2\/blob\/[^/]+$/.test(r.path));
-      const dir = restore.rs.filter((r) => r.path.startsWith("/api/v2/dir") && !r.path.startsWith("/api/v2/dir/uid/"));
-      return { restore, keys, blobs: blobs.length, dir: dir.length, requests: I(A2).views().filter((v) => v.request).length };
+      const blobs = restore.rs.filter(
+        (r) => r.method === "GET" && /^\/api\/v2\/blob\/[^/]+$/.test(r.path),
+      );
+      const dir = restore.rs.filter(
+        (r) => r.path.startsWith("/api/v2/dir") && !r.path.startsWith("/api/v2/dir/uid/"),
+      );
+      return {
+        restore,
+        keys,
+        blobs: blobs.length,
+        dir: dir.length,
+        requests: I(A2)
+          .views()
+          .filter((v) => v.request).length,
+      };
     };
     const clean = await run(0, false);
     const spam = await run(100, true);
@@ -375,7 +413,9 @@ describe("T7: spam requests", () => {
 describe("T6: restore at scale", () => {
   it("50 groups of 32 members: under 600 requests, no bundle under DESC, history for 20 copies, one directory request", async () => {
     const w = server();
-    const others = Array.from({ length: 1000 }, (_, i) => makeUser(`m${String(i).padStart(4, "0")}`));
+    const others = Array.from({ length: 1000 }, (_, i) =>
+      makeUser(`m${String(i).padStart(4, "0")}`),
+    );
     for (let i = 0; i < 1000; i++) makeUser(`x${String(i).padStart(4, "0")}`); // 2 000 users in the directory
     const alice = makeUser("alice");
     const A = await engineFor(alice);
@@ -399,11 +439,18 @@ describe("T6: restore at scale", () => {
     const live = mine.findIndex((r) => r.path === "/api/v2/rt");
     const restore = live >= 0 ? mine.slice(0, live) : mine;
     expect(restore.length).toBeLessThan(600);
-    const blobs = restore.filter((r) => r.method === "GET" && /^\/api\/v2\/blob\/[^/]+$/.test(r.path));
+    const blobs = restore.filter(
+      (r) => r.method === "GET" && /^\/api\/v2\/blob\/[^/]+$/.test(r.path),
+    );
     expect(blobs.length).toBeLessThanOrEqual(1); // the snapshot's own blob only
     const dir = restore.filter((r) => r.path.startsWith("/api/v2/dir"));
     expect(dir.map((r) => r.path.split("/").slice(0, 5).join("/"))).toEqual(["/api/v2/dir/uid"]);
-    const withHistory = ids.filter((id) => (I(A2).views().find((v) => v.id === id)?.messages.length ?? 0) > 1);
+    const withHistory = ids.filter(
+      (id) =>
+        (I(A2)
+          .views()
+          .find((v) => v.id === id)?.messages.length ?? 0) > 1,
+    );
     expect(withHistory.length).toBe(20);
   }, 900_000);
 });

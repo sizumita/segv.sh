@@ -93,7 +93,8 @@ describe("1:1 conversations", () => {
     await settle(A, B);
     const tReg = epoch(B, id).tReg!;
     const hi = P.T0_MS + (tReg + server().params.delta) * 1000 + 300_000;
-    const line = (E: Parameters<typeof mustView>[0]) => mustView(E, id).messages.find((m) => m.kind === "system")!;
+    const line = (E: Parameters<typeof mustView>[0]) =>
+      mustView(E, id).messages.find((m) => m.kind === "system")!;
     expect(line(B).ts).toBe(hi);
     expect(mustView(B, id).lastTs).toBe(hi);
     const B2 = await engineFor(bob); // the restore takes t_reg from the REQUEST record

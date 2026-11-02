@@ -75,11 +75,18 @@ export async function startServer({ root, state, port, P }) {
   const path = config(root, state, P);
   const persist = join(state, "state");
   const env = { ...process.env, CI: "1", NO_COLOR: "1" };
-  const wrangler = (args, opts) => [process.execPath, [WRANGLER, ...args], { cwd: root, env, ...opts }];
+  const wrangler = (args, opts) => [
+    process.execPath,
+    [WRANGLER, ...args],
+    { cwd: root, env, ...opts },
+  ];
   execFileSync(
-    ...wrangler(["d1", "migrations", "apply", "DB", "--local", "-c", path, "--persist-to", persist], {
-      stdio: "pipe",
-    }),
+    ...wrangler(
+      ["d1", "migrations", "apply", "DB", "--local", "-c", path, "--persist-to", persist],
+      {
+        stdio: "pipe",
+      },
+    ),
   );
   const proc = spawn(
     ...wrangler(

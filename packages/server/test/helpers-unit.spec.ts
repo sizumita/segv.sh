@@ -6,7 +6,8 @@ import { dec64, enc64 } from "../src/b64";
 import { logErr } from "../src/http";
 import { appHosts } from "../src/hosts";
 
-const req = (ip?: string) => new Request("https://x/", { headers: ip === undefined ? {} : { "cf-connecting-ip": ip } });
+const req = (ip?: string) =>
+  new Request("https://x/", { headers: ip === undefined ? {} : { "cf-connecting-ip": ip } });
 
 describe("b64", () => {
   it("matches proto.b64u / proto.fromB64u for every length", () => {
@@ -50,7 +51,14 @@ describe("clientKey", () => {
     expect(clientKey(req())).toBe("x:unknown");
     expect(clientKey(req("not an ip"))).toBe("x:unknown");
     expect(clientKey(req("1.2.3.256"))).toBe("x:unknown");
-    for (const bad of ["1:2:3:4:5:6:7:8:9", "1::2::3", "12345::", ":1:2:3:4:5:6:7", "1:2:3:4:5:6:7:8::", "::1.2.3"]) {
+    for (const bad of [
+      "1:2:3:4:5:6:7:8:9",
+      "1::2::3",
+      "12345::",
+      ":1:2:3:4:5:6:7",
+      "1:2:3:4:5:6:7:8::",
+      "::1.2.3",
+    ]) {
       expect(clientKey(req(bad)), bad).toBe("x:invalid");
     }
   });
@@ -59,12 +67,18 @@ describe("clientKey", () => {
 describe("logErr", () => {
   it("redacts ids and addresses, keeps the message readable", () => {
     const id = P.b64u(P.random(32));
-    const msg = logErr(new Error(`put: The SHA-256 checksum you specified did not match (${P.hex(P.random(32))}) for b/${id} from 203.0.113.7 / 2001:db8::1`));
+    const msg = logErr(
+      new Error(
+        `put: The SHA-256 checksum you specified did not match (${P.hex(P.random(32))}) for b/${id} from 203.0.113.7 / 2001:db8::1`,
+      ),
+    );
     expect(msg).not.toContain(id);
     expect(msg).not.toContain("203.0.113.7");
     expect(msg).not.toContain("2001:db8::1");
     expect(msg).toContain("Error: put: The SHA-256 checksum you specified did not match");
-    expect(logErr(new Error("D1_ERROR: SQLITE_CONSTRAINT_PRIMARYKEY"))).toBe("Error: D1_ERROR: SQLITE_CONSTRAINT_PRIMARYKEY");
+    expect(logErr(new Error("D1_ERROR: SQLITE_CONSTRAINT_PRIMARYKEY"))).toBe(
+      "Error: D1_ERROR: SQLITE_CONSTRAINT_PRIMARYKEY",
+    );
     expect(logErr("x".repeat(1000)).length).toBeLessThanOrEqual(300);
   });
 });
@@ -81,7 +95,10 @@ describe("clientTag / appHosts", () => {
   });
 
   it("parses APP_HOSTS", () => {
-    expect(appHosts({ APP_HOSTS: " Segv.sh , localhost,," } as unknown as Env)).toEqual(["segv.sh", "localhost"]);
+    expect(appHosts({ APP_HOSTS: " Segv.sh , localhost,," } as unknown as Env)).toEqual([
+      "segv.sh",
+      "localhost",
+    ]);
     expect(appHosts({ APP_HOSTS: "" } as unknown as Env)).toEqual([]);
     expect(appHosts({} as unknown as Env)).toEqual([]);
   });

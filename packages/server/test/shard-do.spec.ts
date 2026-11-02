@@ -15,7 +15,11 @@ import { leafShardFromHash } from "../src/batch";
 import type { ShardDO } from "../src/shard-do";
 import { shardStub, type ShardFeedRow, type ShardPutResult, type ShardPutRow } from "../src/types";
 
-type Internals = { clock: () => number; params: { delta: number; skew: number }; fullBytes: number };
+type Internals = {
+  clock: () => number;
+  params: { delta: number; skew: number };
+  fullBytes: number;
+};
 
 const E_NOW = P.era(Date.now());
 let nextEra = E_NOW + 20;
@@ -33,11 +37,17 @@ async function setClock(E: number, ms: number, skew?: number): Promise<void> {
   });
 }
 const metaOf = (state: DurableObjectState, k: string): unknown =>
-  state.storage.sql.exec<{ v: SqlStorageValue }>("SELECT v FROM meta WHERE k = ?", k).toArray()[0]?.v ?? null;
+  state.storage.sql.exec<{ v: SqlStorageValue }>("SELECT v FROM meta WHERE k = ?", k).toArray()[0]
+    ?.v ?? null;
 const alarmOf = (E: number): Promise<number | null> =>
   runInDurableObject(stub(E), (_inst: ShardDO, state) => state.storage.getAlarm());
 
-const row = (cls = 0): ShardPutRow => ({ v: P.random(8), label: P.random(16), cls, body: P.random(P.BODY_LENS[cls]) });
+const row = (cls = 0): ShardPutRow => ({
+  v: P.random(8),
+  label: P.random(16),
+  cls,
+  body: P.random(P.BODY_LENS[cls]),
+});
 const put = (E: number, rows: ShardPutRow[]): Promise<ShardPutResult[]> => stub(E).put(E, 0, rows);
 async function putOk(E: number, rows: ShardPutRow[]): Promise<number> {
   const res = await put(E, rows);
@@ -58,8 +68,10 @@ interface Batch {
   rows: ShardFeedRow[];
 }
 /** §10.9 wire size of a batch: 72 + Σ (17 + len(body)). */
-const wireSize = (b: { rows: ShardFeedRow[] }): number => 72 + b.rows.reduce((n, r) => n + 17 + r.body.length, 0);
-const rowsBytes = (rows: ShardFeedRow[]): number => rows.reduce((n, r) => n + 17 + r.body.length, 0);
+const wireSize = (b: { rows: ShardFeedRow[] }): number =>
+  72 + b.rows.reduce((n, r) => n + 17 + r.body.length, 0);
+const rowsBytes = (rows: ShardFeedRow[]): number =>
+  rows.reduce((n, r) => n + 17 + r.body.length, 0);
 
 /** Every row of the closed batch t through feedRows, `budget` bytes per call, checking each call's contract. */
 async function rowsVia(E: number, t: number, budget: number): Promise<ShardFeedRow[]> {
@@ -106,7 +118,8 @@ function verifyChain(E: number, batches: Batch[]): Uint8Array {
   for (const b of batches) {
     expect(b.t).toBeGreaterThan(lastT);
     expect(b.rows).toHaveLength(b.n);
-    for (let k = 1; k < b.rows.length; k++) expect(P.byteCmp(b.rows[k - 1].label, b.rows[k].label)).toBeLessThan(0);
+    for (let k = 1; k < b.rows.length; k++)
+      expect(P.byteCmp(b.rows[k - 1].label, b.rows[k].label)).toBeLessThan(0);
     expect(b.root).toEqual(P.mth(b.rows.map((r) => P.leafShard(E, r.label, b.t, r.cls, r.body))));
     head = P.nextHead(P.shardCid(E, 0), head, b.t, b.n, b.root);
     expect(b.head).toEqual(head);
@@ -127,7 +140,12 @@ describe("ShardDO.put", () => {
     expect(ok).toHaveLength(1);
     const winner = ra[0].s === "ok" ? a : b;
     const loser = results.find((r) => r.s === "conflict");
-    expect(loser).toEqual({ s: "conflict", t: (ok[0] as { t: number }).t, cls: winner.cls, body: winner.body });
+    expect(loser).toEqual({
+      s: "conflict",
+      t: (ok[0] as { t: number }).t,
+      cls: winner.cls,
+      body: winner.body,
+    });
     const got = await stub(E).get(E, 0, [{ v: a.v, label: a.label, mode: 0 }]);
     expect(got).toEqual([{ s: "hit", t: P.secOf(at(E, 60)), cls: winner.cls, body: winner.body }]);
   });
@@ -170,9 +188,9 @@ describe("ShardDO.put", () => {
     const past = E_NOW - 1;
     const resPast = await put(past, [row()]);
     expect(resPast).toEqual([{ s: "wrong_era", era: P.era(Date.now()) }]);
-    expect(await stub(past).get(past, 0, [{ v: P.random(8), label: P.random(16), mode: 1 }])).toEqual([
-      { s: "miss", sealed: true },
-    ]);
+    expect(
+      await stub(past).get(past, 0, [{ v: P.random(8), label: P.random(16), mode: 1 }]),
+    ).toEqual([{ s: "miss", sealed: true }]);
     expect(await alarmOf(past)).toBeNull();
 
     // A future era with the real clock.
@@ -181,9 +199,9 @@ describe("ShardDO.put", () => {
       { s: "wrong_era", era: P.era(Date.now()) },
       { s: "wrong_era", era: P.era(Date.now()) },
     ]);
-    expect(await stub(fut).get(fut, 0, [{ v: P.random(8), label: P.random(16), mode: 1 }])).toEqual([
-      { s: "miss", sealed: false },
-    ]);
+    expect(await stub(fut).get(fut, 0, [{ v: P.random(8), label: P.random(16), mode: 1 }])).toEqual(
+      [{ s: "miss", sealed: false }],
+    );
 
     // The last millisecond of the era is accepted; end(E) is not (and with SKEW = 0 it also seals).
     const E = freshEra();
@@ -202,7 +220,9 @@ describe("ShardDO.put", () => {
     });
     const r = row();
     expect(await put(E, [r, row()])).toEqual([{ s: "full" }, { s: "full" }]);
-    expect(await stub(E).get(E, 0, [{ v: r.v, label: r.label, mode: 0 }])).toEqual([{ s: "miss", sealed: false }]);
+    expect(await stub(E).get(E, 0, [{ v: r.v, label: r.label, mode: 0 }])).toEqual([
+      { s: "miss", sealed: false },
+    ]);
   });
 
   it("get mode 1 answers HIT without the body", async () => {
@@ -210,9 +230,13 @@ describe("ShardDO.put", () => {
     await setClock(E, at(E, 7));
     const r = row(1);
     const t = await putOk(E, [r]);
-    expect(await stub(E).get(E, 0, [{ v: r.v, label: r.label, mode: 1 }])).toEqual([{ s: "hit", t, cls: 1 }]);
+    expect(await stub(E).get(E, 0, [{ v: r.v, label: r.label, mode: 1 }])).toEqual([
+      { s: "hit", t, cls: 1 },
+    ]);
     // Same label under another v is another key.
-    expect(await stub(E).get(E, 0, [{ v: P.random(8), label: r.label, mode: 0 }])).toEqual([{ s: "miss", sealed: false }]);
+    expect(await stub(E).get(E, 0, [{ v: P.random(8), label: r.label, mode: 0 }])).toEqual([
+      { s: "miss", sealed: false },
+    ]);
   });
 });
 
@@ -333,7 +357,13 @@ describe("ShardDO batches", () => {
     expect(all.map((b) => b.n)).toEqual([1, 2, 3, 4, 5]);
     verifyChain(E, all);
     const withBytes = (bs: Batch[]) => bs.map((b) => ({ ...b, bytes: wireSize(b) }));
-    const header = ({ t, n, root, head, rows }: Batch) => ({ t, n, root, head, bytes: wireSize({ rows }) });
+    const header = ({ t, n, root, head, rows }: Batch) => ({
+      t,
+      n,
+      root,
+      head,
+      bytes: wireSize({ rows }),
+    });
 
     // budget 1: one whole batch per page, sent without its rows (they come from feedRows).
     expect(await feedAll(E, 1)).toEqual(all);
@@ -351,7 +381,11 @@ describe("ShardDO batches", () => {
     // A page in the middle, and the empty tail.
     const mid = await stub(E).feedBatches(E, 0, all[1].t, wireSize(all[2]) + wireSize(all[3]));
     expect(mid.batches).toEqual(withBytes(all.slice(2, 4)));
-    expect(await stub(E).feedBatches(E, 0, all[4].t, 1 << 20)).toEqual({ batches: [], more: false, sealed: false });
+    expect(await stub(E).feedBatches(E, 0, all[4].t, 1 << 20)).toEqual({
+      batches: [],
+      more: false,
+      sealed: false,
+    });
     // The open batch is never in the feed, and its rows cannot be read with feedRows.
     await setClock(E, at(E, 30));
     const open = await putOk(E, [row()]);
@@ -383,14 +417,32 @@ describe("ShardDO batches", () => {
     }
     // Exact budget boundaries: a budget of the first three rows holds three; one byte less holds two.
     const three = rowsBytes(byLabel.slice(0, 3));
-    expect(await stub(E).feedRows(E, 0, t, null, three)).toEqual({ rows: byLabel.slice(0, 3), done: false });
-    expect(await stub(E).feedRows(E, 0, t, null, three - 1)).toEqual({ rows: byLabel.slice(0, 2), done: false });
+    expect(await stub(E).feedRows(E, 0, t, null, three)).toEqual({
+      rows: byLabel.slice(0, 3),
+      done: false,
+    });
+    expect(await stub(E).feedRows(E, 0, t, null, three - 1)).toEqual({
+      rows: byLabel.slice(0, 2),
+      done: false,
+    });
     // budget 1 still makes progress: one row per call.
-    expect(await stub(E).feedRows(E, 0, t, byLabel[4].label, 1)).toEqual({ rows: [byLabel[5]], done: false });
+    expect(await stub(E).feedRows(E, 0, t, byLabel[4].label, 1)).toEqual({
+      rows: [byLabel[5]],
+      done: false,
+    });
     // The last row is done; past it there is nothing left.
-    expect(await stub(E).feedRows(E, 0, t, byLabel[10].label, 1)).toEqual({ rows: [byLabel[11]], done: true });
-    expect(await stub(E).feedRows(E, 0, t, byLabel[11].label, 1 << 20)).toEqual({ rows: [], done: true });
-    expect(await stub(E).feedRows(E, 0, t, new Uint8Array(16).fill(0xff), 1 << 20)).toEqual({ rows: [], done: true });
+    expect(await stub(E).feedRows(E, 0, t, byLabel[10].label, 1)).toEqual({
+      rows: [byLabel[11]],
+      done: true,
+    });
+    expect(await stub(E).feedRows(E, 0, t, byLabel[11].label, 1 << 20)).toEqual({
+      rows: [],
+      done: true,
+    });
+    expect(await stub(E).feedRows(E, 0, t, new Uint8Array(16).fill(0xff), 1 << 20)).toEqual({
+      rows: [],
+      done: true,
+    });
     // A cursor between two labels (label 6 minus one, as a 128-bit number) starts at the next one.
     const between = byLabel[6].label.slice();
     for (let k = 15; k >= 0 && between[k]-- === 0; k--);
@@ -464,8 +516,16 @@ describe("ShardDO batches", () => {
     const t = await putOk(E, [row(0), row(3), row(1)]);
     await setClock(E, c + 5000); // tpub(now) > open_t: the batch is due, and its alarm has not run
     for (let k = 0; k < 2; k++) {
-      expect(await stub(E).feedBatches(E, 0, 0, 1 << 30)).toEqual({ batches: [], more: false, sealed: false });
-      expect(await stub(E).feedBatches(E, 0, 0, 1)).toEqual({ batches: [], more: false, sealed: false });
+      expect(await stub(E).feedBatches(E, 0, 0, 1 << 30)).toEqual({
+        batches: [],
+        more: false,
+        sealed: false,
+      });
+      expect(await stub(E).feedBatches(E, 0, 0, 1)).toEqual({
+        batches: [],
+        more: false,
+        sealed: false,
+      });
       await runInDurableObject(stub(E), (inst: ShardDO, state) => {
         expect(() => inst.feedRows(E, 0, t, null, 1 << 20)).toThrow(/no closed batch/);
         expect(metaOf(state, "open_t")).toBe(t);
@@ -573,9 +633,12 @@ describe("ShardDO identity and alarms", () => {
 
   it("a DO of an era that has already ended arms no alarm in its constructor and seals in prepare()", async () => {
     // The constructor runs before a test can reach the object: spy on setAlarm of every storage in the isolate.
-    const proto = await runInDurableObject(stub(freshEra()), (_inst: ShardDO, state) => Object.getPrototypeOf(state.storage));
+    const proto = await runInDurableObject(stub(freshEra()), (_inst: ShardDO, state) =>
+      Object.getPrototypeOf(state.storage),
+    );
     const setAlarm = vi.spyOn(proto as DurableObjectStorage, "setAlarm");
-    const stateOf = (E: number) => runInDurableObject(stub(E), (_inst: ShardDO, state) => metaOf(state, "state"));
+    const stateOf = (E: number) =>
+      runInDurableObject(stub(E), (_inst: ShardDO, state) => metaOf(state, "state"));
     try {
       // The spy sees the constructor of a running era arm its seal alarm …
       const live = freshEra();
@@ -611,7 +674,8 @@ describe("ShardDO identity and alarms", () => {
         internals(inst).clock = () => ms;
         internals(inst).params = { ...internals(inst).params, delta };
       });
-    const pinned = () => runInDurableObject(stub(E), (_inst: ShardDO, state) => metaOf(state, "delta"));
+    const pinned = () =>
+      runInDurableObject(stub(E), (_inst: ShardDO, state) => metaOf(state, "delta"));
 
     // The first put pins the deployment Δ = 10.
     await deploy(c, 10);
@@ -632,7 +696,12 @@ describe("ShardDO identity and alarms", () => {
       expect((await stub(E).head(E, 0)).tLast).toBe(t1);
       expect(await pinned()).toBe(10);
       expect(logged()).toHaveLength(1); // once per instance, however many calls
-      expect(JSON.parse(String(logged()[0][0]))).toEqual({ msg: expect.any(String), E, pinned: 10, env: DELTA });
+      expect(JSON.parse(String(logged()[0][0]))).toEqual({
+        msg: expect.any(String),
+        E,
+        pinned: 10,
+        env: DELTA,
+      });
 
       // A new instance (Δ = 1 from the env) keeps Δ = 10 for t and for the batch alarm it re-arms, and logs once.
       await evictDurableObject(stub(E));
@@ -662,7 +731,9 @@ describe("ShardDO batches of thousands of rows", () => {
       ]) {
         const label = P.random(16);
         const body = P.random(P.BODY_LENS[cls]);
-        expect(leafShardFromHash(E, label, t, cls, P.H(body))).toEqual(P.leafShard(E, label, t, cls, body));
+        expect(leafShardFromHash(E, label, t, cls, P.H(body))).toEqual(
+          P.leafShard(E, label, t, cls, body),
+        );
       }
     }
   });
@@ -675,7 +746,10 @@ describe("ShardDO batches of thousands of rows", () => {
       await setClock(E, ms);
       let t = -1;
       for (let k = 0; k < N; k += PER_PUT) {
-        t = await putOk(E, Array.from({ length: PER_PUT }, (_, j) => row((k + j) % 4)));
+        t = await putOk(
+          E,
+          Array.from({ length: PER_PUT }, (_, j) => row((k + j) % 4)),
+        );
       }
       return t;
     }
@@ -690,8 +764,14 @@ describe("ShardDO batches of thousands of rows", () => {
     async function closing(what: string, op: () => Promise<unknown>): Promise<void> {
       log.length = 0;
       await op();
-      expect(log.filter((q) => /\bbody\b/.test(q)), `${what} read no body`).toEqual([]);
-      expect(log.some((q) => /SELECT label, cls, bh FROM row/.test(q)), `${what} closed a batch`).toBe(true);
+      expect(
+        log.filter((q) => /\bbody\b/.test(q)),
+        `${what} read no body`,
+      ).toEqual([]);
+      expect(
+        log.some((q) => /SELECT label, cls, bh FROM row/.test(q)),
+        `${what} closed a batch`,
+      ).toBe(true);
     }
 
     // A batch closed by head() …
@@ -707,7 +787,9 @@ describe("ShardDO batches of thousands of rows", () => {
     // … and one closed by sealing.
     const t3 = await fill(P.eraEnd(E) - 1000);
     await setClock(E, P.eraEnd(E));
-    await closing("sealing", async () => expect(await stub(E).head(E, 0)).toMatchObject({ sealed: true, tLast: t3 }));
+    await closing("sealing", async () =>
+      expect(await stub(E).head(E, 0)).toMatchObject({ sealed: true, tLast: t3 }),
+    );
 
     const h = await stub(E).head(E, 0);
     const batches = await feedAll(E); // 4 MiB pages: every batch is larger, so its rows come through feedRows
