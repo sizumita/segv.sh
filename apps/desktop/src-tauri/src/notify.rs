@@ -304,8 +304,9 @@ mod imp {
     use super::{FIXED_TAG, Note};
     use tauri::Manager;
     use windows::Data::Xml::Dom::XmlDocument;
+    use windows::Foundation::{DateTime, IReference, PropertyValue};
     use windows::UI::Notifications::{NotificationSetting, ToastNotification, ToastNotificationManager, ToastNotifier};
-    use windows::core::{HSTRING, Result};
+    use windows::core::{HSTRING, Interface, Result};
 
     /// The group of every toast of the app.
     const GROUP: &str = "segv";
@@ -347,21 +348,68 @@ mod imp {
         }
     }
 
+    /// The tag of the toast that `prime` shows and removes.
+    const PRIME_TAG: &str = "segv-prime";
+
     /// Windows asks no permission: the user turns an app's notifications off in Settings, which the notifier reports.
-    fn setting() -> String {
-        match notifier().and_then(|n| n.Setting()) {
-            Ok(NotificationSetting::Enabled) => "granted",
-            _ => "denied",
+    /// An app without package identity can read the setting only once it has shown a toast: until then `Setting`
+    /// fails ("Element not found"). So a first toast is shown without a popup and removed at once, as the Windows
+    /// Community Toolkit does (ToastNotificationManagerCompat.PreRegisterIdentityLessApp). If the setting still cannot
+    /// be read, the error is reported, not taken for the user's choice.
+    fn setting() -> std::result::Result<String, String> {
+        let read = || notifier()?.Setting();
+        let s = read().or_else(|_| {
+            prime();
+            read()
+        });
+        match s {
+            Ok(NotificationSetting::Enabled) => Ok("granted".into()),
+            Ok(_) => Ok("denied".into()),
+            Err(e) => Err(format!("could not read the system's notification setting: {e}")),
         }
-        .into()
+    }
+
+    /// Shows a toast that never pops up, expires in 15 seconds, and is removed from the notification center at once.
+    fn prime() {
+        let show = || -> Result<()> {
+            let doc = XmlDocument::new()?;
+            doc.LoadXml(&HSTRING::from(
+                "<toast activationType=\"protocol\" launch=\"segv://open\"><visual><binding template=\"ToastGeneric\">\
+                 <text>segv.sh</text></binding></visual></toast>",
+            ))?;
+            let t = ToastNotification::CreateToastNotification(&doc)?;
+            t.SetTag(&HSTRING::from(PRIME_TAG))?;
+            t.SetGroup(&HSTRING::from(GROUP))?;
+            t.SetSuppressPopup(true)?;
+            t.SetExpirationTime(&expires_in(15)?)?;
+            notifier()?.Show(&t)?;
+            close(PRIME_TAG);
+            Ok(())
+        };
+        if let Err(e) = show() {
+            eprintln!("segv: could not show the first notification: {e}");
+        }
+    }
+
+    /// The time `secs` seconds from now, as a toast's expiration time (100 ns intervals since 1601-01-01 UTC).
+    fn expires_in(secs: u64) -> Result<IReference<DateTime>> {
+        const UNIX_FROM_1601: u64 = 11_644_473_600;
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let ticks = (unix + UNIX_FROM_1601 + secs) * 10_000_000;
+        PropertyValue::CreateDateTime(DateTime {
+            UniversalTime: ticks as i64,
+        })?
+        .cast()
     }
 
     pub async fn permission() -> std::result::Result<String, String> {
-        Ok(setting())
+        setting()
     }
 
     pub async fn request() -> std::result::Result<String, String> {
-        Ok(setting())
+        setting()
     }
 
     fn escape(s: &str) -> String {
