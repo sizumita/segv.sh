@@ -42,6 +42,7 @@ import { QuietClient, localQuietStore, pageInUse } from "./quiet";
 import { SelfLane } from "./selflane";
 import { readSnapshot } from "./snapshot";
 import { idbSessionStore, type SessionStore } from "./session";
+import type { ImageCache } from "./image-cache";
 import type { ConversationView, Engine, EngineState, FileRef, ImageRef } from "./types";
 import { browserPasskeys } from "./webauthn";
 
@@ -430,7 +431,7 @@ export class SegvEngine implements Engine {
     this.previewStore.save("none");
     this.remembered = false;
     await this.sessionStore.clear().catch(() => {});
-    for (const p of this.imageCache.values()) p.then((u) => URL.revokeObjectURL(u)).catch(() => {});
+    this.msg?.images.clear();
     for (const p of this.fileCache.values())
       p.then((f) => URL.revokeObjectURL(f.url)).catch(() => {});
     this.resetData();
@@ -565,6 +566,10 @@ export class SegvEngine implements Engine {
     return this.msg.loadImage(img);
   }
 
+  releaseImage(img: ImageRef): void {
+    this.msg?.releaseImage(img);
+  }
+
   loadFile(file: FileRef): Promise<string> {
     if (!this.msg) return Promise.reject(new UserError("not signed in"));
     return this.msg.loadFile(file);
@@ -598,8 +603,8 @@ export class SegvEngine implements Engine {
   }
 
   /** decrypted images of the session, by `id.k` */
-  get imageCache(): Map<string, Promise<string>> {
-    return this.msg?.imageCache ?? new Map();
+  get images(): ImageCache | null {
+    return this.msg?.images ?? null;
   }
 
   /** decrypted files of the session, by `id.k` */

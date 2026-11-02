@@ -691,6 +691,9 @@ class MockEngine implements Engine {
     this.urls.set(img.id, url);
     return url;
   }
+  /** The mock keeps every image for the page's life. */
+  releaseImage(_img: ImageRef): void {}
+
   // ---- files ----
   async loadFile(file: FileRef): Promise<string> {
     const cached = this.urls.get(file.id);

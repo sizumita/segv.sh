@@ -267,6 +267,15 @@ renders, passkeys, and several devices at once (`apps/web/test/e2e/web.mjs`). Th
 they are enforced, in the packages' tests. On the way, the run takes a screenshot of each screen in the light and the
 dark color scheme and at a phone's width, in `apps/web/.wrangler/e2e/shots/web`, or under the directory in `E2E_SHOTS`.
 
+A heavier run, not part of the tests, measures what the page keeps as messages arrive: bob sends messages and images
+to alice in several conversations, first while her page is hidden, as a closed desktop window is, then while it shows
+them, and each phase prints alice's live JS heap after a full garbage collection, the highest heap of the phase and its
+script time. Compare the numbers before and after a change to the engine or the UI:
+
+```bash
+cd apps/web && node test/e2e/memory.mjs --convs 6 --messages 150   # --snapshot <file> saves a heap snapshot
+```
+
 On Windows, the same run can drive the installed desktop app instead (`apps/web/test/e2e/windows.mjs`): the accounts
 are made in Chromium, and the app unlocks with a recovery code, since a test cannot answer the system's passkey
 requests. Build the app for the local deployment, install it, and pass its program:

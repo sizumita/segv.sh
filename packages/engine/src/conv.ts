@@ -14,6 +14,8 @@ export const P0 = 2;
 export const HISTORY_INITIAL = 30;
 export const HISTORY_COPIES = 20;
 export const VIEW_MESSAGES = 500;
+/** Messages a copy keeps beyond the VIEW_MESSAGES that its view shows, before it drops the oldest (trimMessages). */
+export const MESSAGE_SLACK = 100;
 export const MAX_TEXT_BYTES = 12_000;
 export const SEND_ATTEMPTS = 8;
 /** Shown times are clamped to the row's stored time ± this (§11.8). */
@@ -352,12 +354,6 @@ export function newControl(start: Slot): ControlLane {
   };
 }
 
-/** The kemPk of member j from the epoch's bundle (§5.4), or null when this device did not open the bundle. */
-export function pkOf(ep: Epoch, j: number): Bytes | null {
-  if (!ep.pks) return null;
-  return ep.pks.slice(j * 1216, (j + 1) * 1216);
-}
-
 export function currentEpoch(c: Copy): Epoch {
   const ep = c.epochs.get(c.current);
   if (!ep) throw new UserError("conversation not ready");
@@ -393,7 +389,19 @@ export function insertMessage(c: Copy, m: MessageView, order: number[]): boolean
   while (i > 0 && cmpOrder(c.order.get(c.messages[i - 1].key), order) > 0) i--;
   c.messages.splice(i, 0, m);
   if (m.kind !== "system" || m.ts > 0) c.lastTs = Math.max(c.lastTs, m.ts);
+  trimMessages(c);
   return true;
+}
+
+/**
+ * Drops the oldest messages once the copy holds MESSAGE_SLACK more than its view shows, which it would never show: a
+ * session that runs for days would otherwise keep every message it applied. The rows' state stays (their order,
+ * applied rows and reactions), so a dropped message is not inserted again; scrollback stops at VIEW_MESSAGES
+ * (§11.10).
+ */
+export function trimMessages(c: Copy): void {
+  const over = c.messages.length - VIEW_MESSAGES;
+  if (over > MESSAGE_SLACK) c.messages.splice(0, over);
 }
 
 export function removeMessage(c: Copy, key: string): void {
@@ -555,6 +563,18 @@ function blockedOf(c: Copy, ep: Epoch, x: ViewCtx): Blocked {
   return "";
 }
 
+/** The last fingerprint computed for a member of a descriptor, with the kemPk it was computed from. */
+const fingerprints = new WeakMap<P.Member, { kemPk: Bytes; fp: string }>();
+
+/** A member's fingerprint (§2.2), computed once: every view of every copy shows it again. */
+function fingerprintOf(m: P.Member, kemPk: Bytes): string {
+  const hit = fingerprints.get(m);
+  if (hit && P.equalBytes(hit.kemPk, kemPk)) return hit.fp;
+  const fp = P.fingerprint(m.uid, m.sigPk, kemPk);
+  fingerprints.set(m, { kemPk: kemPk.slice(), fp });
+  return fp;
+}
+
 export function viewOf(c: Copy, x: ViewCtx): ConversationView | null {
   const ep = c.epochs.get(c.current);
   if (!ep) return null;
@@ -564,12 +584,12 @@ export function viewOf(c: Copy, x: ViewCtx): ConversationView | null {
     // a request's members other than its D.by (rootBy) are unknown until it is opened (§11.5)
     const known = c.request && !self && !P.equalBytes(m.uid, c.rootBy) ? undefined : x.user(uidB);
     const handle = self ? x.selfHandle : memberHandle(m, known).handle;
-    const kemPk = pkOf(ep, j) ?? known?.kemPk ?? null;
+    // member j's kemPk from the epoch's bundle (§5.4), when this device opened the bundle
+    const kemPk = ep.pks?.subarray(j * 1216, (j + 1) * 1216) ?? known?.kemPk ?? null;
     return {
       uid: uidB,
       handle,
-      fingerprint:
-        kemPk && (self || !handle.startsWith("?")) ? P.fingerprint(m.uid, m.sigPk, kemPk) : "",
+      fingerprint: kemPk && (self || !handle.startsWith("?")) ? fingerprintOf(m, kemPk) : "",
       left: self ? c.left : leftIn(c, ep, uidB),
     };
   });

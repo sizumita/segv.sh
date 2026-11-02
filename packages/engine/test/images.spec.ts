@@ -115,7 +115,7 @@ describe("images", () => {
     await settle(E);
     expect(E.getState().me?.handle).toBe("dave");
     expect(E.getState().error).toBe(""); // alice's failure is not reported in dave's session
-    expect(I(E).imageCache.size).toBe(0); // alice's plaintext is not cached in dave's session
+    expect(I(E).images?.size ?? 0).toBe(0); // alice's plaintext is not cached in dave's session
     void bob;
   });
 

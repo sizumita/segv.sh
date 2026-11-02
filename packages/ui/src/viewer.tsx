@@ -6,6 +6,7 @@ import {
   useVisibleTask$,
   type NoSerialize,
 } from "@qwik.dev/core";
+import { loadEngine } from "./engine-loader";
 import { UiCtx } from "./state";
 import { extFor } from "./util";
 
@@ -29,6 +30,30 @@ export const Viewer = component$(() => {
   const ui = useContext(UiCtx);
   const closeBtn = useSignal<HTMLButtonElement>();
   const share = useSignal<NoSerialize<File>>();
+
+  // The viewer holds its image while open, as the message that opened it does while shown: that message may leave the
+  // screen (another conversation, newer messages), and the engine frees an image that nothing holds.
+  useVisibleTask$(async ({ track, cleanup }) => {
+    const v = track(() => ui.viewer);
+    if (!v) return;
+    let gone = false;
+    let release: (() => void) | null = null;
+    cleanup(() => {
+      gone = true;
+      release?.();
+    });
+    try {
+      const engine = await loadEngine();
+      const u = await engine.loadImage(v.img);
+      release = () => engine.releaseImage(v.img);
+      if (gone) return release();
+      // The image was freed before the viewer held it, and fetched again: show the URL that is held.
+      if (u !== v.src && u.startsWith("blob:") && ui.viewer === v)
+        ui.viewer = noSerialize({ ...v, src: u });
+    } catch {
+      // the viewer keeps the URL it was given
+    }
+  });
 
   useVisibleTask$(async ({ track }) => {
     const src = track(() => ui.viewer?.src);

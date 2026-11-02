@@ -17,16 +17,26 @@ export const MsgImage = component$<{ img: ImageRef; hold?: boolean }>((props) =>
   const attempt = useSignal(0);
   const asked = useSignal(false);
 
-  // Default strategy (intersection-observer): only images that scroll into view are downloaded.
-  useVisibleTask$(async ({ track }) => {
+  // Default strategy (intersection-observer): only images that scroll into view are downloaded. The engine keeps the
+  // image while this component shows it, and may free it once the component is gone or shows another.
+  useVisibleTask$(async ({ track, cleanup }) => {
     track(() => props.img.id);
     track(() => attempt.value);
     if (track(() => !!props.hold && !asked.value)) return;
     const img = props.img;
     url.value = "";
     err.value = "";
+    let gone = false;
+    let release: (() => void) | null = null;
+    cleanup(() => {
+      gone = true;
+      release?.();
+    });
     try {
-      const u = await (await loadEngine()).loadImage(img);
+      const engine = await loadEngine();
+      const u = await engine.loadImage(img);
+      release = () => engine.releaseImage(img);
+      if (gone) return release();
       // Only ever display object URLs minted by the engine.
       if (typeof u !== "string" || !u.startsWith("blob:")) throw new Error("unexpected image url");
       if (props.img.id === img.id) url.value = u;
@@ -50,6 +60,7 @@ export const MsgImage = component$<{ img: ImageRef; hold?: boolean }>((props) =>
               w: props.img.w,
               h: props.img.h,
               mime: props.img.mime,
+              img: props.img,
             });
           }}
         >
