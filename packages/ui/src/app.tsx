@@ -29,6 +29,17 @@ import { Viewer } from "./viewer";
 
 const KEYS = Object.keys(initialEngineState()) as (keyof EngineState)[];
 
+/** The window event that asks the UI to open its settings. */
+const OPEN_SETTINGS = "segv-open-settings";
+
+/**
+ * Opens the settings while signed in: an app's own menu or shortcut (the desktop app's "Settings…", ⌘, or Ctrl+,).
+ * Does nothing while signed out, or while the recovery code is shown.
+ */
+export function openSettings(): void {
+  window.dispatchEvent(new Event(OPEN_SETTINGS));
+}
+
 /** Signed in, and the restore has put every conversation in the list. */
 const restored = (s: EngineState) =>
   !!s.me && (s.phase === "ready" || s.phase === "working") && !s.syncing;
@@ -58,6 +69,12 @@ export const App = component$(() => {
       const onWorker = (e: MessageEvent) => openFromWorker(e.data);
       navigator.serviceWorker?.addEventListener("message", onWorker);
       cleanup(() => navigator.serviceWorker?.removeEventListener("message", onWorker));
+      const onOpenSettings = () => {
+        const signedIn = state.phase === "ready" || (state.phase === "working" && !!state.me);
+        if (signedIn && !ui.recovery) ui.settings = true;
+      };
+      window.addEventListener(OPEN_SETTINGS, onOpenSettings);
+      cleanup(() => window.removeEventListener(OPEN_SETTINGS, onOpenSettings));
       ui.visible = document.visibilityState === "visible";
       ui.now = Date.now();
       const tick = window.setInterval(() => (ui.now = Date.now()), 30_000);
