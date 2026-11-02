@@ -841,10 +841,16 @@ textarea:focus {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding: 8px 12px;
+  /* It scrolls when the picker is short (a phone held sideways); the footer lies over its last 40px. */
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 8px 12px 48px;
   background: var(--surface);
   -webkit-touch-callout: none;
   user-select: none;
+}
+.evars > * {
+  flex: none;
 }
 .evhead {
   display: flex;
