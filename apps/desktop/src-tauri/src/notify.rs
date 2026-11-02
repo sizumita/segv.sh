@@ -54,6 +54,7 @@ pub fn show_window<R: Runtime>(app: &AppHandle<R>) {
     let Some(w) = app.get_webview_window("main") else {
         return;
     };
+    crate::background::shown(&w);
     let _ = w.unminimize();
     let _ = w.show();
     let _ = w.set_focus();

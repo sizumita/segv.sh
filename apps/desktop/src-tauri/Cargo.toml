@@ -27,6 +27,8 @@ tauri = { version = "2.12.5", features = ["macos-private-api", "tray-icon", "ima
 tauri-plugin-autostart = "2.7.0"
 tauri-plugin-deep-link = "2.6.3"
 tauri-plugin-single-instance = { version = "2.5.5", features = ["deep-link"] }
+# Tauri's own runtime, built with fewer workers (src/lib.rs).
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "time"] }
 # The system's TLS (Security.framework, SChannel) for the update feed and its packages, instead of rustls and ring.
 tauri-plugin-updater = { version = "2.14.1", default-features = false, features = [
   "native-tls",
@@ -46,6 +48,8 @@ security-framework = { version = "3.7.0", features = ["OSX_10_15"] }
 
 [target.'cfg(windows)'.dependencies]
 sha2 = "0.10.9"
+# The WebView2 interfaces that Tauri hands out (src/background.rs): the version that Tauri uses.
+webview2-com = "0.39.1"
 windows = { version = "0.62.2", features = [
   "Data_Xml_Dom",
   "UI_Notifications",

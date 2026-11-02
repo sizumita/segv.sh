@@ -2,10 +2,11 @@
 //! own package and shown at `tauri://localhost` (`https://tauri.localhost` on Windows), with the platform that a web
 //! view lacks in native code: the remembered session under a key of the system's key store (session.rs), passkeys of
 //! the canonical host (passkey.rs), the system's notifications and the app's badge (notify.rs, badge.rs). The app
-//! keeps running with its window closed, with an icon in the menu bar or the system tray, MAY start hidden when the
-//! user signs in to the system, tells the page when the system wakes (wake.rs), opens `segv:` links, and a published
-//! build updates itself (update.rs).
+//! keeps running with its window closed, with an icon in the menu bar or the system tray and its page hidden
+//! (background.rs), MAY start hidden when the user signs in to the system, tells the page when the system wakes
+//! (wake.rs), opens `segv:` links, and a published build updates itself (update.rs).
 
+mod background;
 #[cfg(any(windows, test))]
 mod badge;
 mod notify;
@@ -194,7 +195,22 @@ fn main_window(app: &AppHandle<Wry>) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Tauri's async runtime with two workers, not one per core: its work is a few commands that wait on the system and
+/// the updater's requests, which leave more workers idle with their stacks.
+fn async_runtime() {
+    if let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        tauri::async_runtime::set(runtime.handle().clone());
+        // Runs as long as the app.
+        std::mem::forget(runtime);
+    }
+}
+
 pub fn run() {
+    async_runtime();
     let context = tauri::generate_context!();
     // Before any window: the taskbar groups the app's windows under the AppUserModelID that they start with.
     #[cfg(windows)]
@@ -263,6 +279,8 @@ pub fn run() {
             let hidden = update::relaunched_hidden(&handle).unwrap_or_else(|| std::env::args().any(|a| a == HIDDEN));
             if !hidden || !launched_by.is_empty() {
                 show_main(&handle);
+            } else if let Some(window) = handle.get_webview_window("main") {
+                background::hidden(&window);
             }
             for url in launched_by {
                 open_link(&handle, &url);
@@ -276,6 +294,9 @@ pub fn run() {
             {
                 api.prevent_close();
                 let _ = window.hide();
+                if let Some(window) = window.app_handle().get_webview_window("main") {
+                    background::hidden(&window);
+                }
                 update::window_closed(window.app_handle());
             }
         })

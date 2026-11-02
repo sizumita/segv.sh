@@ -3434,6 +3434,8 @@ dependencies = [
  "tauri-plugin-deep-link",
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
+ "tokio",
+ "webview2-com",
  "windows",
  "windows-registry",
  "windows-version",

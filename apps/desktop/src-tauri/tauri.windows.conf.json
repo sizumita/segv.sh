@@ -12,7 +12,7 @@
         "minHeight": 420,
         "visible": false,
         "backgroundThrottling": "disabled",
-        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,IntensiveWakeUpThrottling --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows",
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,IntensiveWakeUpThrottling --disable-background-timer-throttling",
         "scrollBarStyle": "fluentOverlay",
         "useHttpsScheme": true,
         "dragDropEnabled": false
