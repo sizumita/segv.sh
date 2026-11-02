@@ -1,4 +1,4 @@
-// Notifications (docs/PROTOCOL.md §11.13): the registration set, its re-sends, the rings after a TEXT or IMAGE, and
+// Notifications (docs/PROTOCOL.md §11.13): the registration set, its re-sends, the rings after a TEXT, IMAGE or FILE, and
 // the device's subscription at logout, against FakeWorld's push endpoints and a fake browser per device.
 import { describe, expect, it } from "vite-plus/test";
 import {
@@ -266,6 +266,20 @@ describe("rings (§11.3 step 6, §11.13)", () => {
       await ringsAfter(() => B.react(id, msgKey(B, id, "hello"), "👍", true), engines),
     ).toEqual([]);
     expect(await ringsAfter(() => D.leave(id), engines)).toEqual([]);
+  });
+
+  it("a FILE rings once, as a TEXT does", async () => {
+    const [alice, bob] = ["alice", "bob"].map((h) => makeUser(h));
+    const engines = [await engineFor(alice), await engineFor(bob)];
+    const [A, B] = engines;
+    const id = await A.createConversation(["bob"]);
+    await settle(...engines);
+    await B.accept(id);
+    await settle(...engines);
+    const file = new File([P.utf8("notes") as BlobPart], "notes.txt", { type: "text/plain" });
+    const rings = await ringsAfter(() => A.sendFile(id, file), engines);
+    expect(rings).toHaveLength(1);
+    expect([...rings[0].tokens]).toEqual([bellOf(A, id, bob)]);
   });
 
   it("after an epoch change a TEXT also rings the old bells of the members silent in the new epoch", async () => {

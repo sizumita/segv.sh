@@ -2,8 +2,8 @@
 
 English | [日本語](README.ja.md)
 
-segv.sh is an end-to-end encrypted messenger for the web, for one-to-one and group conversations with text and
-images. A passkey unlocks your keys in the browser through the WebAuthn PRF extension, and any device can restore all
+segv.sh is an end-to-end encrypted messenger for the web, for one-to-one and group conversations with text, images
+and files. A passkey unlocks your keys in the browser through the WebAuthn PRF extension, and any device can restore all
 of your conversations and their history with that passkey or a recovery code.
 
 The server is designed to be public: anyone may read every byte of conversation data it stores, so that data holds
@@ -18,8 +18,8 @@ The reference deployment runs at <https://segv.sh>.
 
 ## Features
 
-- One-to-one and group conversations (up to 32 members) with text and images. Text is shown with the Markdown
-  that Discord supports: bold, italics, spoilers, code, quotes, headings, lists and links.
+- One-to-one and group conversations (up to 32 members) with text, images and files (up to 10 MB). Text is shown with
+  the Markdown that Discord supports: bold, italics, spoilers, code, quotes, headings, lists and links.
 - Sign-in with a passkey. A recovery code, shown once at registration, unlocks the account without a passkey, and
   more passkeys can be added later.
 - Restore on any device: a passkey or the recovery code brings back every conversation and its history, including the
@@ -65,6 +65,9 @@ The specification calls this design a Label-Indexed Store. On top of it:
   your contacts and pinned keys are appended to an encrypted self lane that only your account can find and read.
 - **Images** are re-encoded in the browser, which strips EXIF and location data, then encrypted with a random key,
   padded, and stored in R2 under the hash of the ciphertext. The key travels only inside the message.
+- **Files** are sent as they are, metadata included, and stored the same way: the name travels only inside the
+  message, and the server sees only the padded length of the ciphertext. A recipient's device downloads a file only
+  when they save it, and never opens it inside the app.
 
 ### Why not Double Ratchet or MLS?
 
@@ -80,7 +83,7 @@ more here than forward secrecy. [docs/DESIGN.md](docs/DESIGN.md) §1 (in Japanes
 The current implementation is stage 1 of protocol v2. Working:
 
 - registration with a passkey, and sign-in with a passkey or the recovery code;
-- one-to-one and group conversations with text and images;
+- one-to-one and group conversations with text, images and files;
 - restore after a reload or on another device, including the history of earlier epochs;
 - adding and removing members, leaving, and moving to a new key after a leave;
 - integrity checks: the signed checkpoint chain, write receipts, detection of missing rows, and split-view detection;
@@ -101,12 +104,12 @@ server code, but cannot break the cryptography; and **malicious members** of a c
 
 segv.sh protects:
 
-- **Confidentiality, including against a future quantum computer.** Message text, images, conversation names and
-  member lists can be read only with a member's passkey PRF output, recovery code or account key, or with the epoch
+- **Confidentiality, including against a future quantum computer.** Message text, images, files, conversation names
+  and member lists can be read only with a member's passkey PRF output, recovery code or account key, or with the epoch
   key. Every key is delivered with X-Wing, and everything else uses 256-bit symmetric cryptography.
 - **Unlinkability in the public data.** Rows carry no sender, recipient or conversation, and labels are independent
   PRF outputs. The public data shows the era, rounded time and size class of each row, inbox counts per time slot, the
-  directory of handles and public keys, and, once per hour, whether any image or key bundle was uploaded.
+  directory of handles and public keys, and, once per hour, whether any image, file or key bundle was uploaded.
 - **Anonymous invites.** The recipient of a first-contact invite cannot be identified from the public data, even with
   a quantum computer.
 - **Authenticity among members.** Every row is signed by its sender inside the encryption, and replaying it into
@@ -150,7 +153,7 @@ segv.sh does not protect against:
 
 Notifications are off unless the deployment configures them and the user turns them on, per device. A device that
 does registers a "bell" for each conversation it accepted: a value derived from that conversation's epoch key, which
-every member can compute and no one else can. After sending a text or an image, a client asks the server to ring the
+every member can compute and no one else can. After sending a text, an image or a file, a client asks the server to ring the
 other members' bells, and the server sends each registered device one contentless push, at most once a minute. The
 push names, encrypted to the device, the bells that rang. By default the device shows the fixed text "new messages". A
 device that keeps its session can instead show the conversation's name, or its name and newest message: it looks the
@@ -194,7 +197,7 @@ The app is a Qwik v2 site with a client engine that runs entirely in the browser
 | `CheckpointDO`          | Every 60 seconds, signs the heads of the shard, inbox, upload registry and directory into a checkpoint chain                                                                                      |
 | `PushDO` (optional)     | The sealed notification registrations of the devices that turned notifications on, and the notifications; written once a day, with a sealed journal of fixed size written once a minute           |
 | D1                      | The directory (handle ↔ account id ↔ public keys, key wraps) and its public, hash-chained log                                                                                                     |
-| R2                      | Encrypted images and key bundles, content-addressed and immutable                                                                                                                                 |
+| R2                      | Encrypted images, files and key bundles, content-addressed and immutable                                                                                                                          |
 
 The server keeps no sessions and no login state: signing in means unlocking keys in the browser. Writes are anonymous;
 abuse is limited by proof of work, which grows with the number of bytes stored, and by per-IP rate limits.
@@ -211,7 +214,7 @@ A pnpm workspace: the app that ships lives in `apps/`, the code it is built from
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `apps/web/`          | The Worker that serves segv.sh: its entry (`/api/*` goes to the API, everything else to Qwik's server-side rendering), Qwik Router's routes, static files, `wrangler.jsonc` and the end-to-end tests   |
 | `packages/protocol/` | The protocol's cryptographic core and encodings (`proto.ts`) and strict codecs for the binary API formats (`wire.ts`), shared by the browser, the Worker and the Durable Objects; uses only `@noble/*` |
-| `packages/engine/`   | The client engine: unlock and accounts, conversations, membership, delivery, restore, integrity, passkeys, images, notifications; tested against `FakeWorld`, an in-memory server                      |
+| `packages/engine/`   | The client engine: unlock and accounts, conversations, membership, delivery, restore, integrity, passkeys, images, files, notifications; tested against `FakeWorld`, an in-memory server               |
 | `packages/ui/`       | The Qwik UI, which talks to the engine only through its `Engine` interface                                                                                                                             |
 | `packages/server/`   | The Worker's API, the Durable Objects, the D1 directory and its schema (`migrations/`), tested on the Workers runtime                                                                                  |
 | `docs/`              | The specification and the design rationale                                                                                                                                                             |

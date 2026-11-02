@@ -17,9 +17,11 @@ import {
   openRequest,
   ready,
   register,
+  saveFile,
   seen,
   seenImage,
   send,
+  sendFile,
   sendImage,
   settings,
   signInWithPasskey,
@@ -39,7 +41,9 @@ export async function web({ base, browser, shots, P, Wire }) {
   const t4 = `carol here secret-4 ${sfx}`;
   const t5 = `after removal secret-5 ${sfx}`;
   const t6 = `from alice's second device secret-6 ${sfx}`;
-  const secrets = [t1, t2, t3, t4, t5, t6];
+  const fileName = `minutes-${sfx}.txt`;
+  const fileText = `議事録 secret-file ${sfx}\n`;
+  const secrets = [t1, t2, t3, t4, t5, t6, fileName, fileText];
   const screen = (d, title) => shots.screen(d.page, title);
   let codeAlice = "";
 
@@ -71,7 +75,7 @@ export async function web({ base, browser, shots, P, Wire }) {
   });
 
   await step(
-    "1:1: reading a request does not accept it; text both ways, a reaction, an image",
+    "1:1: reading a request does not accept it; text both ways, a reaction, an image, a file",
     async () => {
       await newConversation(A, H.bob, undefined, { atForm: () => screen(A, "new conversation") });
       await send(A, t1);
@@ -89,6 +93,9 @@ export async function web({ base, browser, shots, P, Wire }) {
       await theirs.locator(".react", { hasText: "👍 1" }).waitFor({ timeout: T });
       await sendImage(A, `img ${sfx}`);
       await seenImage(B);
+      await sendFile(B, fileName, fileText, { atMenu: () => screen(B, "attach menu") });
+      const saved = await saveFile(A, fileName);
+      check(saved === fileText, `alice saved ${JSON.stringify(saved)}`);
       await screen(A, "conversation");
       await openImage(A);
       await screen(A, "image");

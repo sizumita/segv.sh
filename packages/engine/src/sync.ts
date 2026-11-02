@@ -36,7 +36,7 @@ export interface SyncCtx {
   /** a row or line was applied */
   changed(): void;
   /**
-   * a TEXT or IMAGE row of another member was shown and counted unread: marked seen while in use, and notified by an
+   * a TEXT, IMAGE or FILE row of another member was shown and counted unread: marked seen while in use, and notified by an
    * app without push (§11.13)
    */
   shown?(E: number, label: Bytes, t: number, c: Copy, view: MessageView): void;
@@ -299,7 +299,8 @@ export const rowOrder = (ts: number, e: number, E: number, lane: number, n: numb
 
 /**
  * Processes one stored row of lane j at (E, n) (§3.3, §11.6): junk occupies its slot (an undecryptable row gives the
- * noise warning); a valid row updates the lane and is shown (TEXT, IMAGE), joined (WELCOME), or recorded as a leave (LEAVE).
+ * noise warning); a valid row updates the lane and is shown (TEXT, IMAGE, FILE), joined (WELCOME), or recorded as a leave
+ * (LEAVE).
  */
 export function applyLaneRow(
   ctx: SyncCtx,
@@ -368,7 +369,7 @@ export function applyLaneRow(
     ctx.changed();
     return;
   }
-  if (m.type !== P.MT.TEXT && m.type !== P.MT.IMAGE) return;
+  if (m.type !== P.MT.TEXT && m.type !== P.MT.IMAGE && m.type !== P.MT.FILE) return;
   // What a REACTION to this row names: its label and stored body under the epoch's route key (§3.3).
   const th = P.reactTh(ep.keys.rk, r.label, r.body);
   if (c.reactions.size) c.reactionsDirty = true; // a waiting reaction's target may have come
@@ -387,20 +388,9 @@ export function applyLaneRow(
     fromHandle: ctx.handleOf(c, ep, j),
     mine,
     ts,
-    kind: m.type === P.MT.TEXT ? "text" : "image",
     status: "sent",
     reactions: [],
-    ...(m.type === P.MT.TEXT
-      ? { text: m.text }
-      : {
-          image: {
-            id: P.b64u(m.image.id),
-            k: P.b64u(m.image.k),
-            mime: P.MIME[m.image.mime as P.MimeCode],
-            w: m.image.w,
-            h: m.image.h,
-          },
-        }),
+    ...messageBody(m),
   };
   const echo = ctx.takeEcho(key);
   if (echo) removeMessage(echo.c, echo.echoKey);
@@ -410,6 +400,38 @@ export function applyLaneRow(
   ep.rows.set(key, { j, E: r.E, n: r.n, t: r.t, unread, shown: true, th });
   if (unread) ctx.shown?.(r.E, r.label, r.t, c, view);
   ctx.changed();
+}
+
+/** The kind and content of the view of a TEXT, IMAGE or FILE row. */
+function messageBody(
+  m: P.MBody & { type: typeof P.MT.TEXT | typeof P.MT.IMAGE | typeof P.MT.FILE },
+): Pick<MessageView, "kind" | "text" | "image" | "file"> {
+  switch (m.type) {
+    case P.MT.TEXT:
+      return { kind: "text", text: m.text };
+    case P.MT.IMAGE:
+      return {
+        kind: "image",
+        image: {
+          id: P.b64u(m.image.id),
+          k: P.b64u(m.image.k),
+          mime: P.MIME[m.image.mime as P.MimeCode],
+          w: m.image.w,
+          h: m.image.h,
+        },
+      };
+    case P.MT.FILE:
+      // The name as the sender's client sent it need not be safe: it is shown and saved as its safe name (§8.3).
+      return {
+        kind: "file",
+        file: {
+          id: P.b64u(m.file.id),
+          k: P.b64u(m.file.k),
+          name: P.safeFileName(m.file.name),
+          size: m.file.size,
+        },
+      };
+  }
 }
 
 /** Re-labels the handles of applied messages (after a lookup resolved a member). */
