@@ -3307,8 +3307,11 @@ costs a catch-up (§11.6), never a lost row.
 - Ping every 30 s. When no frame (the `pong` or any other) arrives within 10 s of a ping, give the socket up and
   reconnect at once: a socket can die without a close event, and the server answers every ping while the socket lives.
   Give up a connection attempt that has not opened within 15 s, and retry it with the backoff.
-- In a browser, when the page is shown again or the network comes back, ping an open socket at once (as above), or
-  connect at once without waiting for the backoff (but not during the 60 s wait after a 1008 or 1013).
+- In a browser, when the page is shown again or the network comes back, and in a desktop app also when the system
+  wakes or the network changes (§11.14), ping an open socket at once (as above), or connect at once without waiting for
+  the backoff (but not during the 60 s wait after a 1008 or 1013). An open socket that has received no frame for more
+  than 60 s by the wall clock, two ping intervals, as after the system slept, is given up and replaced at once instead
+  of pinged: its own pings would have been answered.
 - On any frame the client cannot parse, close and reconnect.
 
 ### 10.9 Params, eras, checkpoints, feed
@@ -4542,9 +4545,14 @@ browser client does, with these differences:
   hides its content in the system's app switcher. It is a gate in the app's interface, not a key: the files and keys
   above stay readable to the notification handler, whose notifications follow the device's preview (§11.13).
 - **Desktop.** The desktop app keeps running when its window is closed, with an icon in the menu bar or the system tray,
-  and MAY start hidden when the user signs in to the system. While it runs it keeps its realtime socket, reconnects when
-  the system wakes, notifies as §11.13 says ("Apps without push"), and shows the badge where the system has one (the
-  Dock on macOS, the taskbar button's overlay on Windows).
+  and MAY start hidden when the user signs in to the system. While it runs it keeps its realtime socket, notifies as
+  §11.13 says ("Apps without push"), and shows the badge where the system has one (the Dock on macOS, the taskbar
+  button's overlay on Windows). Its timers (the pings and reconnects of §10.8, the catch-up of §11.6, the notifications
+  of §11.13) keep their schedule while the window is closed, which a hidden web view does not promise for the page's
+  own timers: while the page is hidden, the app's native code also wakes it when its earliest timer is due. The native
+  code also tells the page when the system wakes from sleep and when the network changes (an interface or an address
+  comes or goes), which the page cannot see for itself, and the page then wakes its sockets (§10.8) and catches up
+  (§11.6).
 - **Updates.** A desktop app distributed outside a store MAY update itself. It reads a feed at a fixed `https` URL
   built into it, which the deployment's server does not serve, and sends with that request and the download no
   cookie, credential or other value that names the user, the account or the device. The feed names the newest version
@@ -4568,6 +4576,8 @@ browser client does, with these differences:
   (for segv.sh `segv:`, whose `segv://open#c/<ref>` names a conversation), and a page of the web app MAY offer to open
   a conversation URL in it, with the fragment carried over. A conversation
   URL that the app opens shows that copy as in a browser, and a notification of the app opens its copy's URL in the app.
+  A link of a message to any other `http` or `https` URL opens in the system's browser, never in the app's window, which
+  shows the app's own pages only ("Origin" above).
 
 The server answers a native app as it answers a browser. Its requests differ only in their `Origin` header, which,
 like the User-Agent that every client already sends, tells O which kind of app sent them (§13.5).

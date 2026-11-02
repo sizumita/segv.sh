@@ -46,7 +46,8 @@ import type { ImageCache } from "./image-cache";
 import type { ConversationView, Engine, EngineState, FileRef, ImageRef } from "./types";
 import { browserPasskeys } from "./webauthn";
 
-export type { EngineOptions } from "./options";
+export { alarmClock, type AlarmClock, type AlarmClockOptions } from "./alarm-clock";
+export type { EngineClock, EngineOptions, EngineTimer } from "./options";
 export type { LocalNotification, LocalNotifier, LocalPermission, LocalStore } from "./local-notify";
 export type { SessionStore } from "./session";
 export type { PasskeyPlatform } from "./webauthn";

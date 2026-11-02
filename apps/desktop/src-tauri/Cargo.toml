@@ -27,8 +27,8 @@ tauri = { version = "2.12.5", features = ["macos-private-api", "tray-icon", "ima
 tauri-plugin-autostart = "2.7.0"
 tauri-plugin-deep-link = "2.6.3"
 tauri-plugin-single-instance = { version = "2.5.5", features = ["deep-link"] }
-# Tauri's own runtime, built with fewer workers (src/lib.rs).
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "time"] }
+# Tauri's own runtime, built with fewer workers (src/lib.rs), and the page's alarm on it (src/alarm.rs).
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "sync", "time"] }
 # The system's TLS (Security.framework, SChannel) for the update feed and its packages, instead of rustls and ring.
 tauri-plugin-updater = { version = "2.14.1", default-features = false, features = [
   "native-tls",
@@ -54,6 +54,9 @@ windows = { version = "0.62.2", features = [
   "Data_Xml_Dom",
   "UI_Notifications",
   "Win32_Foundation",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_NetworkManagement_Ndis",
+  "Win32_Networking_WinSock",
   "Win32_Networking_WindowsWebServices",
   "Win32_Security_Cryptography",
   "Win32_System_Power",
