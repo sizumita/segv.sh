@@ -3,13 +3,15 @@
 //! view lacks in native code: the remembered session under a key of the system's key store (session.rs), passkeys of
 //! the canonical host (passkey.rs), the system's notifications and the app's badge (notify.rs, badge.rs). The app
 //! keeps running with its window closed, with an icon in the menu bar or the system tray, MAY start hidden when the
-//! user signs in to the system, tells the page when the system wakes (wake.rs), and opens `segv:` links.
+//! user signs in to the system, tells the page when the system wakes (wake.rs), opens `segv:` links, and a published
+//! build updates itself (update.rs).
 
 #[cfg(any(windows, test))]
 mod badge;
 mod notify;
 mod passkey;
 mod session;
+mod update;
 mod wake;
 
 use tauri::image::Image;
@@ -17,17 +19,23 @@ use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 #[cfg(not(target_os = "macos"))]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
-use tauri::{AppHandle, WindowEvent, Wry};
+use tauri::{AppHandle, Manager as _, WindowEvent, Wry};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as _};
 use tauri_plugin_deep_link::DeepLinkExt as _;
 
 /// The argument that the login item passes: start in the menu bar, without the window.
 const HIDDEN: &str = "--hidden";
 
-/// The app's AppUserModelID on Windows: its bundle identifier, which Tauri's installer gives the Start menu shortcut.
-/// The process takes it too, so that its taskbar button, its badge and its notifications belong to that shortcut.
+/// The app's AppUserModelID on Windows: its bundle identifier (`sh.segv.desktop`, or `sh.segv.desktop.canary` for
+/// segv.sh Canary), which Tauri's installer gives the Start menu shortcut. The process takes it too, so that its
+/// taskbar button, its badge and its notifications belong to that shortcut.
 #[cfg(windows)]
-pub(crate) const AUMID: &str = "sh.segv.desktop";
+static AUMID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+#[cfg(windows)]
+pub(crate) fn aumid() -> &'static str {
+    AUMID.get().map_or("sh.segv.desktop", String::as_str)
+}
 
 fn show_main(app: &AppHandle<Wry>) {
     notify::show_window(app);
@@ -35,7 +43,7 @@ fn show_main(app: &AppHandle<Wry>) {
 
 /// The scheme of the app's links (§11.14 "Links"): the first of the deep-link plugin's desktop schemes, `segv` for the
 /// app of segv.sh and `segv-canary` for segv.sh Canary (scripts/bundle.mjs).
-fn link_scheme(app: &AppHandle<Wry>) -> Option<String> {
+pub(crate) fn link_scheme(app: &AppHandle<Wry>) -> Option<String> {
     let desktop = app.config().plugins.0.get("deep-link")?.get("desktop")?;
     Some(desktop.get("schemes")?.get(0)?.as_str()?.to_owned())
 }
@@ -66,9 +74,13 @@ fn tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
     .build(app)?;
     // The product's name: "segv.sh", or "segv.sh Canary" (scripts/bundle.mjs).
     let name = &app.package_info().name;
-    let menu = MenuBuilder::new(app)
+    let mut menu = MenuBuilder::new(app)
         .item(&MenuItemBuilder::with_id("open", format!("Open {name}")).build(app)?)
-        .separator()
+        .separator();
+    if let Some(update) = update::menu_item(app)? {
+        menu = menu.item(&update).separator();
+    }
+    let menu = menu
         .item(&login)
         .separator()
         .item(
@@ -88,7 +100,8 @@ fn tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
                 let _ = if on { a.enable() } else { a.disable() };
                 let _ = login.set_checked(a.is_enabled().unwrap_or(on));
             }
-            "quit" => app.exit(0),
+            "update" => update::clicked(app),
+            "quit" => update::quit(app),
             _ => {}
         });
     // The menu bar's icon is a template that the system tints, and a click opens the menu.
@@ -97,10 +110,14 @@ fn tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
         .icon(Image::from_bytes(include_bytes!("../icons/tray.png"))?)
         .icon_as_template(true)
         .show_menu_on_left_click(true);
-    // The system tray's icon is the app's, a click opens the window and a right click the menu.
+    // The system tray's icon is the app's (the one of its executable on Windows, segv.sh Canary's for that app), a click
+    // opens the window and a right click the menu.
     #[cfg(not(target_os = "macos"))]
     let tray = tray
-        .icon(Image::from_bytes(include_bytes!("../icons/32x32.png"))?)
+        .icon(match app.default_window_icon() {
+            Some(icon) => icon.clone(),
+            None => Image::from_bytes(include_bytes!("../icons/32x32.png"))?,
+        })
         .show_menu_on_left_click(false)
         .on_tray_icon_event(|tray, e| {
             if let TrayIconEvent::Click {
@@ -130,6 +147,7 @@ fn main_window(app: &AppHandle<Wry>) -> tauri::Result<()> {
     let mica = windows_version::OsVersion::current().build >= 22000;
     let backdrop = if mica { "mica" } else { "none" };
     let mut window = tauri::WebviewWindowBuilder::from_config(app, &conf)?
+        .title(&app.package_info().name)
         .initialization_script(format!(
             "Object.defineProperty(window,\"__SEGV_WINDOW__\",{{value:Object.freeze({{os:\"windows\",backdrop:\"{backdrop}\"}})}});"
         ))
@@ -145,12 +163,16 @@ fn main_window(app: &AppHandle<Wry>) -> tauri::Result<()> {
 }
 
 pub fn run() {
+    let context = tauri::generate_context!();
     // Before any window: the taskbar groups the app's windows under the AppUserModelID that they start with.
     #[cfg(windows)]
-    let _ = unsafe {
-        windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(&windows::core::HSTRING::from(AUMID))
-    };
-    let app = tauri::Builder::default()
+    {
+        let _ = AUMID.set(context.config().identifier.clone());
+        let _ = unsafe {
+            windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(&windows::core::HSTRING::from(aumid()))
+        };
+    }
+    let mut builder = tauri::Builder::default()
         .manage(notify::Opens::default())
         // A second launch (or a link opened on Windows and Linux) goes to the running app.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| show_main(app)))
@@ -158,7 +180,13 @@ pub fn run() {
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             Some(vec![HIDDEN]),
-        ))
+        ));
+    // The plugin's commands stay out of the page's reach: capabilities/main.json grants none of them.
+    let updates = update::configured(context.config());
+    if updates {
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    }
+    let app = builder
         .invoke_handler(tauri::generate_handler![
             session::session_load,
             session::session_save,
@@ -175,14 +203,18 @@ pub fn run() {
             passkey::passkey_prf,
             passkey::passkey_sign_in,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             let handle = app.handle().clone();
             #[cfg(windows)]
             main_window(&handle)?;
             session::prepare();
             notify::init(&handle);
             wake::observe(&handle);
+            if updates {
+                update::init(&handle);
+            }
             tray(&handle)?;
+            update::start(&handle);
             // The installer registers the scheme on Windows; a development build registers itself.
             #[cfg(all(windows, debug_assertions))]
             let _ = app.deep_link().register_all();
@@ -193,7 +225,9 @@ pub fn run() {
                 }
             });
             let launched_by = app.deep_link().get_current().ok().flatten().unwrap_or_default();
-            if !std::env::args().any(|a| a == HIDDEN) || !launched_by.is_empty() {
+            // The restart of an update keeps the window as it was; another launch shows it unless the login item's.
+            let hidden = update::relaunched_hidden(&handle).unwrap_or_else(|| std::env::args().any(|a| a == HIDDEN));
+            if !hidden || !launched_by.is_empty() {
                 show_main(&handle);
             }
             for url in launched_by {
@@ -208,16 +242,19 @@ pub fn run() {
             {
                 api.prevent_close();
                 let _ = window.hide();
+                update::window_closed(window.app_handle());
             }
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("could not start segv.sh");
 
     app.run(|app, event| {
-        // The Dock icon of a running app whose window is closed.
         #[cfg(target_os = "macos")]
-        if let tauri::RunEvent::Reopen { .. } = event {
-            show_main(app);
+        match event {
+            // The Dock icon of a running app whose window is closed.
+            tauri::RunEvent::Reopen { .. } => show_main(app),
+            tauri::RunEvent::Exit => update::exiting(app),
+            _ => {}
         }
         #[cfg(not(target_os = "macos"))]
         let _ = (app, event);

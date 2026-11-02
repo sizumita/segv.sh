@@ -27,9 +27,16 @@ tauri = { version = "2.12.5", features = ["macos-private-api", "tray-icon", "ima
 tauri-plugin-autostart = "2.7.0"
 tauri-plugin-deep-link = "2.6.3"
 tauri-plugin-single-instance = { version = "2.5.5", features = ["deep-link"] }
+# The system's TLS (Security.framework, SChannel) for the update feed and its packages, instead of rustls and ring.
+tauri-plugin-updater = { version = "2.14.1", default-features = false, features = [
+  "native-tls",
+  "system-proxy",
+  "zip",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
+libc = "0.2.191"
 objc2 = "0.6.5"
 objc2-app-kit = "0.3.2"
 objc2-authentication-services = "0.3.2"

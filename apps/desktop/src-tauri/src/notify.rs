@@ -312,7 +312,16 @@ mod imp {
     const GROUP: &str = "segv";
 
     fn aumid() -> HSTRING {
-        HSTRING::from(crate::AUMID)
+        HSTRING::from(crate::aumid())
+    }
+
+    /// The `segv://open` link of the app's own scheme (`segv-canary:` for segv.sh Canary), with a fragment.
+    fn link(fragment: &str) -> String {
+        let scheme = super::APP
+            .get()
+            .and_then(crate::link_scheme)
+            .unwrap_or_else(|| "segv".into());
+        format!("{scheme}://open{fragment}")
     }
 
     fn notifier() -> Result<ToastNotifier> {
@@ -329,9 +338,12 @@ mod imp {
     /// also covers a development build, which has none. The uninstaller removes the key (windows/hooks.nsh).
     pub fn init() {
         let register = || -> windows::core::Result<()> {
-            let key =
-                windows_registry::CURRENT_USER.create(format!(r"Software\Classes\AppUserModelId\{}", crate::AUMID))?;
-            key.set_string("DisplayName", "segv.sh")?;
+            let key = windows_registry::CURRENT_USER
+                .create(format!(r"Software\Classes\AppUserModelId\{}", crate::aumid()))?;
+            let name = super::APP
+                .get()
+                .map_or_else(|| "segv.sh".into(), |app| app.package_info().name.clone());
+            key.set_string("DisplayName", name)?;
             key.set_string("CustomActivator", ACTIVATOR)?;
             let icon = super::APP
                 .get()
@@ -373,10 +385,11 @@ mod imp {
     fn prime() {
         let show = || -> Result<()> {
             let doc = XmlDocument::new()?;
-            doc.LoadXml(&HSTRING::from(
-                "<toast activationType=\"protocol\" launch=\"segv://open\"><visual><binding template=\"ToastGeneric\">\
+            doc.LoadXml(&HSTRING::from(format!(
+                "<toast activationType=\"protocol\" launch=\"{}\"><visual><binding template=\"ToastGeneric\">\
                  <text>segv.sh</text></binding></visual></toast>",
-            ))?;
+                escape(&link(""))
+            )))?;
             let t = ToastNotification::CreateToastNotification(&doc)?;
             t.SetTag(&HSTRING::from(PRIME_TAG))?;
             t.SetGroup(&HSTRING::from(GROUP))?;
@@ -432,15 +445,15 @@ mod imp {
 
     fn toast(n: &Note) -> Result<ToastNotification> {
         // The tag has been checked: the fixed one, or 12 base64url characters.
-        let link = if n.tag == FIXED_TAG {
-            "segv://open".to_string()
+        let launch = if n.tag == FIXED_TAG {
+            link("")
         } else {
-            format!("segv://open#c/{}", n.tag)
+            link(&format!("#c/{}", n.tag))
         };
         let xml = format!(
             "<toast activationType=\"protocol\" launch=\"{}\"><visual><binding template=\"ToastGeneric\">\
              <text hint-maxLines=\"1\">{}</text><text>{}</text></binding></visual></toast>",
-            escape(&link),
+            escape(&launch),
             escape(&n.title),
             escape(&n.body),
         );

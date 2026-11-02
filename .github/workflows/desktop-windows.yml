@@ -1,7 +1,8 @@
 # Builds the desktop app's Windows installers (docs/DEVELOPMENT.md, "Desktop app"): an NSIS installer for x64 and one
 # for ARM64, kept as the run's artifacts for 14 days. It runs for a pull request that changes the desktop app, and when
 # started by hand from the Actions tab (GitHub offers that once this file is on the default branch). It is for trying
-# a branch on Windows, not a release: nothing is signed, so SmartScreen warns, and nothing is published.
+# a branch on Windows, not a release: nothing is signed, so SmartScreen warns, nothing is published, and the app does
+# not update itself. The published installers come from desktop.yml.
 #
 # - No job has secrets, and the GITHUB_TOKEN can only read the repository.
 # - Dependencies come from pnpm-lock.yaml, without install scripts and without a cache. Cargo takes the versions of
