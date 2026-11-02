@@ -162,8 +162,7 @@ jobs:
           path: target/universal-apple-darwin/release
 
       # scripts/prepare-signing.sh checks the secrets, so that a wrong one is named here rather than by a failure later,
-      # and writes the certificate again in the form that the runner's `security import` reads. Tauri imports it into a
-      # keychain of its own, signs the app with the entitlements and the provisioning profile (scripts/bundle.mjs), has
+      # and writes the profile and the API key to files. Tauri imports the certificate into a keychain of its own, signs the app with the entitlements and the provisioning profile (scripts/bundle.mjs), has
       # Apple notarize it and staples the ticket to it. It only signs the disk image, which this step then has notarized
       # and stapled too. The files are written to a directory that only this step uses, and deleted at its end. It runs
       # Node, the CLI's binary, OpenSSL and Apple's tools, not pnpm.
