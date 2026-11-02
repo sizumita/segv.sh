@@ -161,10 +161,12 @@ jobs:
           artifact-ids: ${{ needs.build.outputs.artifact-id }}
           path: target/universal-apple-darwin/release
 
-      # Tauri imports the certificate into a keychain of its own, signs the app with the entitlements and the
-      # provisioning profile (scripts/bundle.mjs), has Apple notarize it and staples the ticket to it. It only signs the
-      # disk image, which this step then has notarized and stapled too. The profile and the API key are written to a
-      # directory that only this step uses, and deleted at its end. It runs Node and the CLI's binary, not pnpm.
+      # scripts/prepare-signing.sh checks the secrets, so that a wrong one is named here rather than by a failure later,
+      # and writes the certificate again in the form that the runner's `security import` reads. Tauri imports it into a
+      # keychain of its own, signs the app with the entitlements and the provisioning profile (scripts/bundle.mjs), has
+      # Apple notarize it and staples the ticket to it. It only signs the disk image, which this step then has notarized
+      # and stapled too. The files are written to a directory that only this step uses, and deleted at its end. It runs
+      # Node, the CLI's binary, OpenSSL and Apple's tools, not pnpm.
       - name: Bundle, sign and notarize
         env:
           SEGV_VERSION: ${{ needs.build.outputs.version }}
@@ -178,6 +180,7 @@ jobs:
           APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
           APPLE_PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
           ENVIRONMENT: ${{ github.ref_type == 'tag' && 'production' || 'canary' }}
+          IDENTIFIER: ${{ github.ref_type == 'tag' && 'sh.segv.desktop' || 'sh.segv.desktop.canary' }}
         run: |
           missing=()
           for v in APPLE_SIGNING_IDENTITY APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_API_KEY APPLE_API_ISSUER \
@@ -191,11 +194,7 @@ jobs:
           chmod +x target/universal-apple-darwin/release/segv-desktop
           dir="$(mktemp -d)"
           trap 'rm -rf "${dir}"' EXIT
-          (umask 077
-            base64 --decode <<<"${APPLE_PROVISIONING_PROFILE_BASE64}" >"${dir}/segv.provisionprofile"
-            printf '%s\n' "${APPLE_API_PRIVATE_KEY}" >"${dir}/AuthKey_${APPLE_API_KEY}.p8")
-          export APPLE_PROVISIONING_PROFILE="${dir}/segv.provisionprofile"
-          export APPLE_API_KEY_PATH="${dir}/AuthKey_${APPLE_API_KEY}.p8"
+          source apps/desktop/scripts/prepare-signing.sh "${dir}" "${IDENTIFIER}"
           node apps/desktop/scripts/bundle.mjs bundle --ci --target "${TARGET}" --bundles app,dmg
           dmg=(target/universal-apple-darwin/release/bundle/dmg/*.dmg)
           result="$(xcrun notarytool submit "${dmg[0]}" --wait --output-format json \

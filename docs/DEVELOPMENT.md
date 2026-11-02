@@ -176,6 +176,13 @@ of the environment `canary` (for `main`) or `production` (for release tags), whi
    base64 -i segv.sh_Developer_ID.provisionprofile | gh secret set APPLE_PROVISIONING_PROFILE_BASE64 --env production
    ```
 
+Before it signs, the job checks these secrets (`apps/desktop/scripts/prepare-signing.sh`) and names the one at fault:
+a password that does not open the certificate, a certificate that is not the team's Developer ID Application, or a
+profile of another app, a development profile, or one made for another certificate. It prints the SHA-256 of the `.p12`
+it received, which `shasum -a 256 DeveloperID.p12` prints too when the secret holds that file. It then writes the
+certificate again in the oldest form of PKCS#12, which `security import` reads on every macOS: a `.p12` that a newer
+macOS or OpenSSL exports may not import on the runner's.
+
 The Canary's passkeys also need `canary.segv.sh` to name the app (`APPLE_APP_IDS` of `env.canary` in
 `apps/web/wrangler.jsonc`), as segv.sh names `sh.segv.desktop`.
 
