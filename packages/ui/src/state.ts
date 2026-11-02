@@ -1,5 +1,5 @@
 import { createContextId, type NoSerialize } from "@qwik.dev/core";
-import type { EngineState } from "@segv/engine/types";
+import type { EngineState, ImageRef } from "@segv/engine/types";
 
 /**
  * The lists on the left: `chats`, `requests` (request copies, §11.5, shown as a preview until accepted) and
@@ -27,8 +27,8 @@ export interface UiState {
   visible: boolean;
   /** clock for relative times, refreshed every 30 s */
   now: number;
-  /** full-size image overlay */
-  viewer: NoSerialize<{ src: string; w: number; h: number; mime: string }>;
+  /** full-size image overlay: the engine's object URL of `img`, which the viewer holds while open */
+  viewer: NoSerialize<{ src: string; w: number; h: number; mime: string; img: ImageRef }>;
   /** the URL of a [label](url) link the user clicked, to confirm before it opens ('' = none) */
   leaving: string;
 }

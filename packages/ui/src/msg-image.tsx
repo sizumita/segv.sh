@@ -60,6 +60,7 @@ export const MsgImage = component$<{ img: ImageRef; hold?: boolean }>((props) =>
               w: props.img.w,
               h: props.img.h,
               mime: props.img.mime,
+              img: props.img,
             });
           }}
         >
