@@ -1,8 +1,10 @@
-# Deploys https://segv.sh to Cloudflare on every push to main.
+# Deploys the web app and the API to Cloudflare: every push to main to https://canary.segv.sh, and every release tag
+# (vX.Y.Z) to https://segv.sh (docs/DEPLOYMENT.md, "Deploying from GitHub Actions").
 #
-# - The Cloudflare credentials exist only as secrets of the "production" environment, which accepts
-#   deployments from main alone, and only the Deploy step reads them. The API token is account-owned and
-#   limited to Editor on the segv-sh Worker (docs/DEPLOYMENT.md, "Deploying from GitHub Actions").
+# - The Cloudflare credentials exist only as secrets of two environments, and only the Deploy step reads them:
+#   "canary", which accepts deployments from main alone, and "production", which accepts them from release tags alone.
+#   Each API token is account-owned and limited to Editor on its own Worker (segv-sh-canary, segv-sh).
+# - A release tag deploys only a commit of main, which canary.segv.sh has run first: the build job checks it.
 # - Checks, tests and the build run in a job with no secrets. The deploy job runs on a fresh runner and
 #   executes only Wrangler, on the files that the build job produced.
 # - Dependencies come from pnpm-lock.yaml, without install scripts and without a cache. pnpm is the release that
@@ -15,13 +17,14 @@ name: Deploy
 on:
   push:
     branches: [main]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
 
 permissions: {}
 
-# One run at a time, in push order: a newer push replaces a run that is still waiting, and a deployment
+# One run at a time per deployment, in push order: a newer push replaces a run that is still waiting, and a deployment
 # that has started is never cancelled.
 concurrency:
-  group: deploy-production
+  group: deploy-${{ github.ref_type == 'tag' && 'production' || 'canary' }}
   cancel-in-progress: false
 
 defaults:
@@ -41,10 +44,20 @@ jobs:
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
+      # A tag's run fetches the whole history, to check that the tag is on main.
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: ${{ github.ref_type == 'tag' && '0' || '1' }}
+
+      - name: Check that the tag is on main
+        if: github.ref_type == 'tag'
+        run: |
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::${GITHUB_REF_NAME} is not a commit of main: a release deploys only what canary.segv.sh ran."
+            exit 1
+          fi
 
       # The version comes from "packageManager" in package.json.
       - name: Set up pnpm
@@ -80,7 +93,9 @@ jobs:
 
       - name: Check the Wrangler configuration
         working-directory: apps/web
-        run: pnpm exec wrangler deploy --dry-run
+        run: |
+          pnpm exec wrangler deploy --dry-run --env=""
+          pnpm exec wrangler deploy --dry-run --env canary
 
       - name: Upload the build
         id: upload
@@ -104,8 +119,8 @@ jobs:
     permissions:
       contents: read
     environment:
-      name: production
-      url: https://segv.sh
+      name: ${{ github.ref_type == 'tag' && 'production' || 'canary' }}
+      url: ${{ github.ref_type == 'tag' && 'https://segv.sh' || 'https://canary.segv.sh' }}
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -140,15 +155,18 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
+          if [[ "${GITHUB_REF_TYPE}" == tag ]]; then target=production; args=(--env=""); else target=canary; args=(--env canary); fi
           if [[ -z "${CLOUDFLARE_API_TOKEN}" || -z "${CLOUDFLARE_ACCOUNT_ID}" ]]; then
-            echo "::error::Set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID as secrets of the production environment."
+            echo "::error::Set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID as secrets of the ${target} environment."
             exit 1
           fi
-          node_modules/.bin/wrangler deploy --message "GitHub Actions: ${GITHUB_SHA}"
+          node_modules/.bin/wrangler deploy "${args[@]}" --message "GitHub Actions: ${GITHUB_REF_NAME} ${GITHUB_SHA}"
 
       # A 503 here means that a secret is missing or a variable is invalid (docs/DEPLOYMENT.md).
       - name: Check the deployment
+        env:
+          URL: ${{ github.ref_type == 'tag' && 'https://segv.sh' || 'https://canary.segv.sh' }}
         run: >-
           curl --fail --silent --show-error --output /dev/null
           --retry 5 --retry-all-errors --retry-delay 5 --max-time 10
-          https://segv.sh/api/v2/params
+          "${URL}/api/v2/params"

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- segv.sh Canary: the app's icon (../icon.svg) in canary yellow, with a black cursor -->
+  <rect x="100" y="100" width="824" height="824" rx="185" ry="185" fill="#ffcc00"/>
+  <rect x="306" y="615" width="412" height="103" fill="#000"/>
+</svg>

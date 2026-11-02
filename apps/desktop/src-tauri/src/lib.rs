@@ -33,9 +33,16 @@ fn show_main(app: &AppHandle<Wry>) {
     notify::show_window(app);
 }
 
-/// A `segv:` link (§11.14 "Links"): `segv://open#c/<ref>` opens that conversation, any other one the app.
+/// The scheme of the app's links (§11.14 "Links"): the first of the deep-link plugin's desktop schemes, `segv` for the
+/// app of segv.sh and `segv-canary` for segv.sh Canary (scripts/bundle.mjs).
+fn link_scheme(app: &AppHandle<Wry>) -> Option<String> {
+    let desktop = app.config().plugins.0.get("deep-link")?.get("desktop")?;
+    Some(desktop.get("schemes")?.get(0)?.as_str()?.to_owned())
+}
+
+/// A link of the app's scheme (§11.14 "Links"): `segv://open#c/<ref>` opens that conversation, any other one the app.
 fn open_link(app: &AppHandle<Wry>, url: &tauri::Url) {
-    if url.scheme() != "segv" {
+    if link_scheme(app).as_deref() != Some(url.scheme()) {
         return;
     }
     let open = url
@@ -57,19 +64,21 @@ fn tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
     )
     .checked(app.autolaunch().is_enabled().unwrap_or(false))
     .build(app)?;
+    // The product's name: "segv.sh", or "segv.sh Canary" (scripts/bundle.mjs).
+    let name = &app.package_info().name;
     let menu = MenuBuilder::new(app)
-        .item(&MenuItemBuilder::with_id("open", "Open segv.sh").build(app)?)
+        .item(&MenuItemBuilder::with_id("open", format!("Open {name}")).build(app)?)
         .separator()
         .item(&login)
         .separator()
         .item(
-            &MenuItemBuilder::with_id("quit", "Quit segv.sh")
+            &MenuItemBuilder::with_id("quit", format!("Quit {name}"))
                 .accelerator("CmdOrCtrl+Q")
                 .build(app)?,
         )
         .build()?;
     let tray = TrayIconBuilder::with_id("main")
-        .tooltip("segv.sh")
+        .tooltip(name)
         .menu(&menu)
         .on_menu_event(move |app, e| match e.id().as_ref() {
             "open" => show_main(app),

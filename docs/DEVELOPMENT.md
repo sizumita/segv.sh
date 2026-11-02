@@ -89,6 +89,8 @@ on macOS 15 or later, and on Windows 10 22H2 or Windows 11.
   development profile lists the Macs it runs on). Without them the app is signed ad hoc and signs in with the
   recovery code only. Passkeys of a deployment also need its `/.well-known/apple-app-site-association` to name the app
   (`APPLE_APP_IDS`, see [DEPLOYMENT.md](DEPLOYMENT.md)), and macOS reads it only for an app in `/Applications`.
+  `SEGV_CHANNEL=canary` builds segv.sh Canary instead (`segv.sh Canary.app`, "Releases" below), which calls
+  `https://canary.segv.sh` unless `SEGV_ORIGIN` says otherwise.
 - On Windows, `pnpm --filter @segv/desktop run bundle -- --debug --bundles nsis` builds
   `target/debug/bundle/nsis/segv.sh_0.1.0_x64-setup.exe`, an installer for the current user that needs no administrator.
   It makes the Start menu shortcut with the app's AppUserModelID (`sh.segv.desktop`), under which the app registers
@@ -110,6 +112,72 @@ on macOS 15 or later, and on Windows 10 22H2 or Windows 11.
 
 Linux builds compile, but they neither keep the session nor show notifications yet: the key store and the
 notifications of Linux are not wired up.
+
+## Releases
+
+segv.sh ships from two places. Every push to `main` deploys <https://canary.segv.sh> and builds segv.sh Canary; a
+release tag `vX.Y.Z` on a commit of `main` deploys <https://segv.sh> and builds segv.sh
+([DEPLOYMENT.md](DEPLOYMENT.md), "Canary" and "Deploying from GitHub Actions").
+
+|                 | Canary                                                                                                                         | Release                                                                                                     |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
+| Started by      | a push to `main` (the macOS app: one that changes it)                                                                          | a tag `vX.Y.Z` on a commit of `main`                                                                        |
+| Web app and API | <https://canary.segv.sh>, with accounts of its own                                                                             | <https://segv.sh>                                                                                           |
+| macOS app       | segv.sh Canary, `sh.segv.desktop.canary`, links `segv-canary:`                                                                 | segv.sh, `sh.segv.desktop`, links `segv:`                                                                   |
+| App version     | `X.Y.Z-canary.N`                                                                                                               | `X.Y.Z`                                                                                                     |
+| Download        | [segv.sh-Canary.dmg](https://github.com/sizumita/segv.sh/releases/download/canary/segv.sh-Canary.dmg), the prerelease `canary` | [segv.sh.dmg](https://github.com/sizumita/segv.sh/releases/latest/download/segv.sh.dmg), the latest release |
+
+segv.sh Canary is another app, so that it installs next to segv.sh: its own data, keychain items, notifications and
+login item, its own icon, and the account of canary.segv.sh, which has nothing of segv.sh's. Both are universal apps,
+signed with the team's Developer ID and notarized by Apple, and both keep their passkeys in `/Applications` only.
+
+`apps/desktop/scripts/version.mjs` gives the versions. A release has its tag's. A Canary build is a prerelease of the
+next version: the last release tag before it with its patch raised, or `version` in `tauri.conf.json` when that is
+higher (raise it there before a minor or a major release), and N is the number of commits since that tag. By semver,
+every Canary build sorts above the release before it and below the release after it. The build number
+(`CFBundleVersion`) is the number of commits of the build's history.
+
+To release, tag a commit of `main` that canary.segv.sh has run, and push the tag:
+
+```bash
+git tag v0.1.0 <commit>
+git push origin v0.1.0
+```
+
+`.github/workflows/deploy.yml` deploys it to segv.sh, and `.github/workflows/desktop-macos.yml` builds the app and
+publishes the tag's release, whose notes GitHub writes from the pull requests since the previous tag. Apply the
+release's D1 migrations to segv.sh before pushing the tag ([DEPLOYMENT.md](DEPLOYMENT.md), "Updating").
+
+### Signing the macOS app
+
+`desktop-macos.yml` compiles the app in a job without secrets, then bundles, signs and notarizes that binary in a job
+of the environment `canary` (for `main`) or `production` (for release tags), which holds these secrets. Set them up once:
+
+1. A **Developer ID Application** certificate of the team, which only the team's Account Holder can create (Apple
+   Developer › Certificates). Export it with its private key from Keychain Access as a `.p12` file with a password.
+2. The App IDs `sh.segv.desktop` and `sh.segv.desktop.canary`, each with the **Associated Domains** capability.
+3. A **Developer ID** provisioning profile for each App ID, with that certificate (Apple Developer › Profiles). Unlike a
+   development profile, it lists no Macs. The system checks it at every launch of the app; it is valid for 18 years,
+   and a new certificate needs new profiles.
+4. An **App Store Connect API key** for notarization (App Store Connect › Users and Access › Integrations, a team key
+   with the Developer role). Note its key ID and issuer ID, and download its `.p8` file, which Apple offers only once.
+5. The secrets. Both environments get the same certificate and API key, and each its own app's profile:
+
+   ```bash
+   for env in canary production; do
+     base64 -i DeveloperID.p12 | gh secret set APPLE_CERTIFICATE --env "$env"
+     gh secret set APPLE_CERTIFICATE_PASSWORD --env "$env"
+     gh secret set APPLE_SIGNING_IDENTITY --env "$env"   # Developer ID Application: <name> (NBDP5VK335)
+     gh secret set APPLE_API_KEY --env "$env"            # the key ID
+     gh secret set APPLE_API_ISSUER --env "$env"         # the issuer ID
+     gh secret set APPLE_API_PRIVATE_KEY --env "$env" < AuthKey_<key ID>.p8
+   done
+   base64 -i segv.sh_Canary_Developer_ID.provisionprofile | gh secret set APPLE_PROVISIONING_PROFILE_BASE64 --env canary
+   base64 -i segv.sh_Developer_ID.provisionprofile | gh secret set APPLE_PROVISIONING_PROFILE_BASE64 --env production
+   ```
+
+The Canary's passkeys also need `canary.segv.sh` to name the app (`APPLE_APP_IDS` of `env.canary` in
+`apps/web/wrangler.jsonc`), as segv.sh names `sh.segv.desktop`.
 
 ## Tests
 
