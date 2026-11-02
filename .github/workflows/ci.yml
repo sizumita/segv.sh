@@ -3,6 +3,9 @@
 # signatures, and the format of the lockfile. The audit also runs every week, since advisories are published against
 # versions that are already locked. Pushes to main are checked by the Deploy workflow.
 #
+# A pull request that changes what the apps show (.github/scripts/screenshots.mjs) also gets the end-to-end test of the
+# installed Windows app, and the Screenshots workflow (screenshots.yml) then posts the screens of both tests to it.
+#
 # - No job has secrets, and the GITHUB_TOKEN can only read the repository.
 # - Dependencies come from pnpm-lock.yaml, without install scripts and without a cache.
 # - pnpm is the release that "packageManager" in package.json pins, installed by pnpm/action-setup. The repository
@@ -33,6 +36,39 @@ env:
   WRANGLER_SEND_METRICS: "false"
 
 jobs:
+  # Whether the pull request changes what the apps show (or how the tests take its screenshots). A run started by hand
+  # takes everything.
+  changes:
+    name: Look for UI changes
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      ui: ${{ steps.ui.outputs.ui }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Compare the changed files with the UI's
+        id: ui
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -z "$PR" ]; then
+            echo "ui=true" >> "$GITHUB_OUTPUT"
+          else
+            gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename' \
+              | node .github/scripts/screenshots.mjs ui-changed >> "$GITHUB_OUTPUT"
+          fi
+          cat "$GITHUB_OUTPUT"
+
   # The same checks as the build job of the Deploy workflow.
   check:
     name: Check, test and build
@@ -116,17 +152,99 @@ jobs:
         working-directory: apps/web
         run: pnpm exec playwright install --with-deps --only-shell chromium
 
-      # Builds the app, serves it with wrangler dev, and drives it with headless Chromium.
+      # Builds the app, serves it with wrangler dev, and drives it with headless Chromium (apps/web/test/e2e/web.mjs).
       - name: End-to-end test
         env:
           E2E_SHOTS: ${{ runner.temp }}/e2e-shots
         run: pnpm run test:e2e
 
+      # A screenshot of each screen, and of each page at a failure. The Screenshots workflow reads it by this name.
       - name: Upload the screenshots
-        if: failure()
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: e2e-screenshots
+          name: screens-web
+          path: ${{ runner.temp }}/e2e-shots
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The desktop app on Windows: built for the end-to-end test's local deployment (wrangler dev on port 8817), installed
+  # by its installer, and driven through its web view's DevTools port (apps/web/test/e2e/windows.mjs). Only for a pull
+  # request that changes what the apps show: building the app takes several minutes.
+  e2e-windows:
+    name: End-to-end test (Windows app)
+    needs: changes
+    if: needs.changes.outputs.ui == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The version comes from "packageManager" in package.json.
+      - name: Set up pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      # The accounts are made in Chromium, whose virtual authenticators answer passkey requests; the app cannot.
+      - name: Install Chromium
+        working-directory: apps/web
+        run: pnpm exec playwright install --only-shell chromium
+
+      - name: Build the web app
+        run: pnpm run build
+
+      # Unsigned, like the installers of the "Desktop app for Windows" workflow, and calling the local deployment.
+      - name: Build the app's installer
+        env:
+          SEGV_ORIGIN: http://localhost:8817
+        run: pnpm --filter @segv/desktop run bundle -- --ci --bundles nsis
+
+      # For the current user, silently, as a user's install; the uninstall entry names the installed program.
+      - name: Install the app
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          Start-Process -FilePath $setup.FullName -ArgumentList '/S' -Wait
+          $entry = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\segv.sh'
+          $exe = Join-Path $entry.InstallLocation.Trim('"') $entry.MainBinaryName
+          if (-not (Test-Path $exe)) { throw "not installed: $exe" }
+          "SEGV_APP=$exe" >> $env:GITHUB_ENV
+
+      # The test opens the web view's DevTools port with WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS, which WebView2 ignores
+      # in an elevated app, and every process of the runner is elevated. A machine-wide policy applies to it: for this
+      # app only, named by its AppUserModelID and by its program.
+      - name: Open the app's DevTools port
+        shell: pwsh
+        run: |
+          $key = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments'
+          New-Item -Path $key -Force | Out-Null
+          foreach ($app in 'sh.segv.desktop', (Split-Path $env:SEGV_APP -Leaf)) {
+            New-ItemProperty -Path $key -Name $app -Value '--remote-debugging-port=9222' -PropertyType String -Force | Out-Null
+          }
+
+      - name: End-to-end test
+        env:
+          E2E_SHOTS: ${{ runner.temp }}/e2e-shots
+        run: pnpm run test:e2e --no-build --windows-app "$SEGV_APP"
+
+      - name: Upload the screenshots
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: screens-windows
           path: ${{ runner.temp }}/e2e-shots
           if-no-files-found: ignore
           retention-days: 7

@@ -262,7 +262,36 @@ HEADED=1 pnpm run test:e2e        # watch the browsers
 E2E_PORT=9000 pnpm run test:e2e   # use another port
 ```
 
-Screenshots are written to `apps/web/.wrangler/e2e/shots`, or to the directory in `E2E_SHOTS`.
+The tests check only what needs the whole system: the production Worker with its Durable Objects, D1 and R2, the UI it
+renders, passkeys, and several devices at once (`apps/web/test/e2e/web.mjs`). The rules themselves are tested where
+they are enforced, in the packages' tests. On the way, the run takes a screenshot of each screen in the light and the
+dark color scheme and at a phone's width, in `apps/web/.wrangler/e2e/shots/web`, or under the directory in `E2E_SHOTS`.
+
+On Windows, the same run can drive the installed desktop app instead (`apps/web/test/e2e/windows.mjs`): the accounts
+are made in Chromium, and the app unlocks with a recovery code, since a test cannot answer the system's passkey
+requests. Build the app for the local deployment, install it, and pass its program:
+
+```bash
+SEGV_ORIGIN=http://localhost:8817 pnpm --filter @segv/desktop run bundle -- --bundles nsis
+pnpm run test:e2e --windows-app "$LOCALAPPDATA/segv.sh/segv-desktop.exe"
+```
+
+Its web view (WebView2) opens a DevTools port for the run (`E2E_CDP_PORT`, 9222), which Playwright drives as it drives
+Chromium. WebView2 takes that flag from the environment only when the app is not elevated: run it from a normal
+terminal (CI, whose processes are elevated, sets a machine-wide policy instead). WKWebView has no such port, so the
+macOS app is not tested this way.
+
+### Screenshots in pull requests
+
+When a pull request changes what the apps show (the paths in `.github/scripts/screenshots.mjs`), CI also runs the
+Windows app's end-to-end test, and the Screenshots workflow (`.github/workflows/screenshots.yml`) posts the screens of
+both runs in one comment on the pull request, which each later run updates. The images are committed to
+`refs/screenshots/pr-<number>`, outside the branches, so that no clone fetches them; delete such a ref with
+`git push origin --delete refs/screenshots/pr-<number>`. To see the comment for local screenshots:
+
+```bash
+node .github/scripts/screenshots.mjs preview apps/web/.wrangler/e2e/shots
+```
 
 ## Before a pull request
 
