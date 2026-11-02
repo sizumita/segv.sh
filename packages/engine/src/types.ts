@@ -180,8 +180,13 @@ export interface Engine {
    */
   accept(convId: string): Promise<void>;
 
-  /** Downloads + decrypts an image. Resolves with an object URL (cached per image id). */
+  /**
+   * Downloads + decrypts an image. Resolves with an object URL (cached per image id and key), which stays valid until
+   * the caller calls `releaseImage` for it once it no longer shows it (not after a rejection).
+   */
   loadImage(img: ImageRef): Promise<string>;
+  /** The caller no longer shows an image that `loadImage` gave it: the URL may be revoked from now on. */
+  releaseImage(img: ImageRef): void;
   /**
    * Resets `unread` and starts scrollback once (§11.10–§11.11): the "conversation pane is open" hint, even when
    * `unread` is 0. It accepts nothing.

@@ -435,7 +435,7 @@ export interface EngineI {
   convs: Map<string, unknown>;
   queue: Promise<unknown>;
   sendChains: Map<string, Promise<unknown>>;
-  imageCache: Map<string, Promise<string>>;
+  images: { readonly size: number } | null;
   pending: Map<string, string>;
   fatal: boolean;
   generation: number;

@@ -279,6 +279,11 @@ export function verifyUser(u: UserJson): DirUser | null {
 /** Users per prefix page (§10.6). */
 const PREFIX_PAGE = 256;
 const MAX_PREFIX_PAGES = 4096;
+/**
+ * The prefix answers a session keeps, the most recently used: each holds every bundle of its bucket, and a session that
+ * runs for days looks up many. One operation reads far fewer.
+ */
+const PREFIX_CACHE = 64;
 /** Fewer users than this on a page for p ≥ 1 gives a noise warning (§10.6). */
 const MIN_PREFIX_USERS = 8;
 export const FEW_USERS_WARNING = "the directory answered fewer accounts than expected";
@@ -328,7 +333,7 @@ export class Api {
   private paramsCache: { p: Params; at: number } | null = null;
   private paramsPending: Promise<Params> | null = null;
   private dirSeqPending: Promise<number> | null = null;
-  /** complete prefix answers of the session, each with the sequence number of its fetch */
+  /** the session's complete prefix answers (at most PREFIX_CACHE), each with the sequence number of its fetch */
   private readonly prefixCache = new Map<string, { seq: number; run: Promise<UserJson[]> }>();
   /** prefix fetches started so far, and the count when the current operation began (§10.6 "fresh") */
   private prefixFetches = 0;
@@ -946,7 +951,12 @@ export class Api {
     const p = await this.prefixBits();
     const key = `${kind}/${p}/${P.topBits(pre, p)}`;
     const cached = this.prefixCache.get(key);
-    if (cached && !fresh) return { run: cached.run, fresh: cached.seq > this.operationSince };
+    if (cached && !fresh) {
+      // the most recently used last, so the oldest goes first (PREFIX_CACHE)
+      this.prefixCache.delete(key);
+      this.prefixCache.set(key, cached);
+      return { run: cached.run, fresh: cached.seq > this.operationSince };
+    }
     const seq = ++this.prefixFetches;
     const run = (async () => {
       try {
@@ -965,7 +975,12 @@ export class Api {
       }
     })();
     const entry = { seq, run };
+    this.prefixCache.delete(key);
     this.prefixCache.set(key, entry);
+    for (const k of this.prefixCache.keys()) {
+      if (this.prefixCache.size <= PREFIX_CACHE) break;
+      this.prefixCache.delete(k);
+    }
     run.catch(() => {
       if (this.prefixCache.get(key) === entry) this.prefixCache.delete(key);
     });

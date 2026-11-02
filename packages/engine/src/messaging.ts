@@ -21,6 +21,7 @@ import {
   refOf,
   rowKey,
   systemLine,
+  trimMessages,
   unknownHandle,
   viewOf,
   type Copy,
@@ -65,6 +66,7 @@ import { SNAP_RECORDS, firstFreePointer, writeSnapshot } from "./snapshot";
 import { MAX_REACTIONS, reactionSets, refreshReactions } from "./reactions";
 import { lanesEnd, olderInitialHistory, scrollback } from "./history";
 import { prepareImage } from "./image";
+import { ImageCache } from "./image-cache";
 import type { Arrival } from "./local-notify";
 import type { CacheCopy } from "./notify-cache";
 import {
@@ -208,7 +210,7 @@ export class Messaging {
   /** EPOCH_PENDING records this session wrote (resumed at once, §6.11) */
   private readonly ownPending = new Set<string>();
   /** decrypted images by `id.k` (never by id alone, §8.1) */
-  readonly imageCache = new Map<string, Promise<string>>();
+  readonly images = new ImageCache();
   /** copies with a scheduled re-evaluation of their control lane (an undecided row, or finality, §6.4–§6.5) */
   private readonly settleTimers = new Set<string>();
   /** LEAVE records being written, by copy key and epoch (one write per session, §6.9) */
@@ -353,12 +355,14 @@ export class Messaging {
   }
 
   private every(ms: () => number, fn: () => Promise<unknown>): void {
+    // The loop's one slot in `timers`, which each tick replaces: a session runs for days, a tick every few seconds.
+    const slot = this.timers.length;
     const tick = () => {
       if (this.stopped) return;
       void fn()
         .catch(() => {})
         .finally(() => {
-          if (!this.stopped) this.timers.push(this.h.clock.setTimer(tick, ms()));
+          if (!this.stopped) this.timers[slot] = this.h.clock.setTimer(tick, ms());
         });
     };
     this.timers.push(this.h.clock.setTimer(tick, ms()));
@@ -882,6 +886,7 @@ export class Messaging {
     while (i > 0 && (c.order.get(c.messages[i - 1].key)?.[0] ?? Infinity) > ts) i--;
     c.messages.splice(i, 0, m);
     c.lastTs = Math.max(c.lastTs, ts);
+    trimMessages(c);
   }
 
   /** Holds every copy the fold names that is not held yet: CONV_JOINs, live REQUESTs, then legacy skip records. */
@@ -2833,11 +2838,10 @@ export class Messaging {
         await this.h.api.putBlob(P.fromB64u(id), blob, (m) => this.h.progress(m));
         this.h.check();
         const k = P.b64u(key);
-        this.imageCache.set(
+        this.images.put(
           `${id}.${k}`,
-          Promise.resolve(
-            URL.createObjectURL(new Blob([img.bytes as BlobPart], { type: img.mime })),
-          ),
+          URL.createObjectURL(new Blob([img.bytes as BlobPart], { type: img.mime })),
+          img.bytes.length,
         );
         await this.acceptForPost(c);
         const mime = img.mime === "image/webp" ? 1 : 2;
@@ -2860,25 +2864,29 @@ export class Messaging {
     return this.h.track(next);
   }
 
-  /** Downloads, checks and decrypts an image; cached by `id.k` (§8.1). Resolves with an object URL. */
+  /**
+   * Downloads, checks and decrypts an image; cached by `id.k` (§8.1). Resolves with an object URL, held until
+   * `releaseImage`.
+   */
   loadImage(img: { id: string; k: string; mime: string }): Promise<string> {
     if (!/^[A-Za-z0-9_-]{43}$/.test(img.id) || !/^[A-Za-z0-9_-]{43}$/.test(img.k))
       return Promise.reject(new Error("bad image reference"));
     if (img.mime !== "image/webp" && img.mime !== "image/jpeg")
       return Promise.reject(new Error("bad image type"));
-    const cacheKey = `${img.id}.${img.k}`;
-    let p = this.imageCache.get(cacheKey);
-    if (!p) {
-      p = (async () => {
-        const got = await this.h.api.getBlobUpTo(P.fromB64u(img.id), P.BLOB_MAX);
-        if (!got) throw new Error("image not found");
-        const data = P.decryptBlob(got, img.id, P.fromB64u(img.k));
-        return URL.createObjectURL(new Blob([data as BlobPart], { type: img.mime }));
-      })();
-      this.imageCache.set(cacheKey, p);
-      p.catch(() => this.imageCache.delete(cacheKey));
-    }
-    return p;
+    return this.images.hold(`${img.id}.${img.k}`, async () => {
+      const got = await this.h.api.getBlobUpTo(P.fromB64u(img.id), P.BLOB_MAX);
+      if (!got) throw new Error("image not found");
+      const data = P.decryptBlob(got, img.id, P.fromB64u(img.k));
+      return {
+        url: URL.createObjectURL(new Blob([data as BlobPart], { type: img.mime })),
+        size: data.length,
+      };
+    });
+  }
+
+  /** The UI no longer shows an image that `loadImage` gave it. */
+  releaseImage(img: { id: string; k: string }): void {
+    this.images.release(`${img.id}.${img.k}`);
   }
 
   // ───────────────────────── sending (§11.3) ─────────────────────────
@@ -2897,6 +2905,7 @@ export class Messaging {
       reactions: [],
     };
     c.messages.push(m);
+    trimMessages(c);
     this.h.changed();
     return m;
   }

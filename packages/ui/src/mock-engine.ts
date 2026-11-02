@@ -662,6 +662,8 @@ class MockEngine implements Engine {
     this.urls.set(img.id, url);
     return url;
   }
+  /** The mock keeps every image for the page's life. */
+  releaseImage(_img: ImageRef): void {}
   private async paint(w: number, h: number, seed: string): Promise<Blob> {
     const c = document.createElement("canvas");
     c.width = w;

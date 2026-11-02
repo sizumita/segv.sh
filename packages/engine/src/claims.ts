@@ -182,6 +182,8 @@ export async function settleControl(h: ControlHost, c: Copy): Promise<boolean> {
     }
     await h.onFinal(c, ep, w);
     w.processed = true;
+    // The bundle was read (the next epoch's keys, or why there are none): a winner restored from records has none.
+    w.blob = new Uint8Array(0);
     ctl.pendingSince = null;
     return c.current !== ep.e;
   }
