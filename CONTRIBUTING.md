@@ -40,7 +40,9 @@ pnpm run build
 
 When you change the client, the UI or the Worker, also run `pnpm run test:e2e`. When you change
 `apps/web/wrangler.jsonc`, also run `pnpm exec wrangler deploy --dry-run` in `apps/web` after `pnpm run build`. GitHub
-Actions runs all of these, the end-to-end test and `pnpm audit` on every pull request.
+Actions runs all of these, the end-to-end test and `pnpm audit` on every pull request. When a pull request changes the
+UI, it also tests the installed Windows app and comments with a screenshot of each screen
+([docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#screenshots-in-pull-requests)).
 
 ## Guidelines
 

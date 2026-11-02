@@ -2,9 +2,10 @@
 //! launch and every four hours after that, downloads a newer version in the background, and installs it when that
 //! interrupts nothing: at once while its window is closed, starting again in the menu bar or the system tray without
 //! the window; otherwise when the window is next closed, when the app quits, or when the user picks "Restart to
-//! Update" in the tray's menu. Before anything is installed, the updater plugin checks the package's signature against
-//! the channel's key, that the signature is for the version that the feed names, and that this version is newer than
-//! the running one (scripts/bundle.mjs). Only builds made with SEGV_UPDATES=1 have a feed; any other build never looks.
+//! Update" in the tray's menu or, on macOS, in the app's menu. Before anything is installed, the updater plugin checks
+//! the package's signature against the channel's key, that the signature is for the version that the feed names, and
+//! that this version is newer than the running one (scripts/bundle.mjs). Only builds made with SEGV_UPDATES=1 have a
+//! feed; any other build never looks.
 
 use std::path::PathBuf;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
@@ -162,15 +163,20 @@ pub fn init(app: &AppHandle<Wry>) {
     });
 }
 
-/// The tray's menu item of the updates, in a build that has a feed.
+/// The menu item of the updates, in a build that has a feed: one item, which the tray's menu and the app's menu on
+/// macOS both hold, so that its text changes in both.
 pub fn menu_item(app: &AppHandle<Wry>) -> tauri::Result<Option<MenuItem<Wry>>> {
     let Some(updates) = app.try_state::<Updates>() else {
         return Ok(None);
     };
-    let item = MenuItem::with_id(app, "update", CHECK, true, None::<&str>)?;
-    if let Ok(mut i) = updates.item.lock() {
-        *i = Some(item.clone());
+    let Ok(mut held) = updates.item.lock() else {
+        return Ok(None);
+    };
+    if let Some(item) = held.as_ref() {
+        return Ok(Some(item.clone()));
     }
+    let item = MenuItem::with_id(app, "update", CHECK, true, None::<&str>)?;
+    *held = Some(item.clone());
     Ok(Some(item))
 }
 
