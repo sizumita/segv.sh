@@ -184,7 +184,7 @@ export interface Epoch {
   lanesOn: boolean;
   /** the valid rows applied in this epoch, of any type (the initial history's "fewer than 30 rows", §11.4 step 6) */
   loaded: number;
-  /** applied TEXT and IMAGE rows by message key (§6.8 retraction) */
+  /** applied TEXT, IMAGE and FILE rows by message key (§6.8 retraction) */
   rows: Map<string, AppliedRow>;
 }
 

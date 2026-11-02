@@ -594,6 +594,18 @@ textarea:focus {
 .imgbtn:hover:not(:disabled) {
   background: none;
 }
+.file {
+  display: inline-block;
+  max-width: 100%;
+  margin: 4px 0 2px;
+  padding: 4px 10px;
+  border: 1px solid var(--fg);
+  vertical-align: top;
+}
+.fname {
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
 .newbelow {
   position: absolute;
   left: 50%;
@@ -620,6 +632,51 @@ textarea:focus {
 }
 .composer .send {
   margin-left: auto;
+}
+.inputrow {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+}
+.inputrow textarea {
+  flex: 1;
+}
+/* The "+" beside the message box, and its menu above it. */
+.attach {
+  position: relative;
+  flex: none;
+}
+.plus {
+  width: 36px;
+  height: calc(2lh + 10px);
+  padding: 0;
+}
+.plus span {
+  font-size: 20px;
+  line-height: 1;
+}
+.plus[aria-expanded="true"] {
+  background: var(--fg);
+  color: var(--bg);
+}
+.attach .menu {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 4px);
+  z-index: 5;
+  display: grid;
+  min-width: max-content;
+  background: var(--bg);
+  border: 1px solid var(--fg);
+}
+.attach .menu button {
+  border: 0;
+  padding: 6px 12px;
+  text-align: left;
+}
+.attach .menu .note {
+  margin-left: 1ch;
+  opacity: 0.7;
 }
 .btn {
   position: relative;

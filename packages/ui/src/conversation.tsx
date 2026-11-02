@@ -127,9 +127,9 @@ const RequestBar = component$<{ conv: ConversationView }>((props) => {
         {who ? `from @${who}, who is not in your contacts.` : "from someone not in your contacts."}
       </p>
       <p class="dim small">
-        you can read it here without accepting it; images load only when you open them. accept to
-        reply. accepting adds {who ? `@${who}` : "the sender"} to your contacts, so their next
-        conversations are not requests.
+        you can read it here without accepting it; images and files load only when you open them.
+        accept to reply. accepting adds {who ? `@${who}` : "the sender"} to your contacts, so their
+        next conversations are not requests.
         {conv.members.length > 2 && " the other members' handles are looked up when you accept."}
       </p>
       <p class="row">

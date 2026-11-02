@@ -1893,7 +1893,7 @@ export function acceptOldRow(row: WalkRow, epochs: readonly WalkEpoch[], selfRem
 export const M_VER = 2;
 export const M_HEADER_LEN = 62;
 /** The types of M (§3.3): every other value is invalid. */
-export const MT = { TEXT: 1, IMAGE: 2, REACTION: 3, WELCOME: 8, CLAIM: 16, LEAVE: 17 } as const;
+export const MT = { TEXT: 1, IMAGE: 2, REACTION: 3, FILE: 4, WELCOME: 8, CLAIM: 16, LEAVE: 17 } as const;
 export type MsgType = (typeof MT)[keyof typeof MT];
 const MSG_TYPES: readonly number[] = Object.values(MT);
 /** lane of a CLAIM. */
@@ -1932,6 +1932,78 @@ export function encodeImage(x: ImageRef): Bytes {
   const out = concat(fixed(x.id, 32, "image id"), fixed(x.k, 32, "image key"), u8(x.mime), u16(x.w), u16(x.h));
   parseImage(out);
   return out;
+}
+
+/** The largest file a client sends (§8.3): its blob always fits in BLOB_MAX. */
+export const FILE_MAX = 10 * 1024 * 1024;
+/** A FILE's name is 1..255 bytes of valid UTF-8 (§3.3). */
+export const MAX_FILE_NAME_BYTES = 255;
+/** FILE content without its name: id, k, size, nlen. */
+export const FILE_FIXED = 69;
+
+/**
+ * FILE content (§3.3, §8.3): `id[32] | k[32] | u32 size | u8 nlen | name[nlen]`, a file of `size` bytes sent as the
+ * blob `id` under the key `k`. `size` has no parse rule, and neither has the name's content: a receiver shows and
+ * saves `safeFileName(name)`.
+ */
+export interface FileRef {
+  /** raw blob id (H(blob)) */
+  id: Bytes;
+  k: Bytes;
+  size: number;
+  name: string;
+}
+
+export function parseFile(b: Bytes): FileRef {
+  const r = new Rd(b, "file");
+  const id = r.bytes(32);
+  const k = r.bytes(32);
+  const size = r.u32();
+  const nlen = r.u8();
+  if (nlen < 1) bad("file: empty name");
+  const name = decodeUtf8(r.bytes(nlen), "file name");
+  r.end();
+  return { id, k, size, name };
+}
+
+export function encodeFile(x: FileRef): Bytes {
+  const n = encodeUtf8(x.name, "file name");
+  if (n.length < 1 || n.length > MAX_FILE_NAME_BYTES) bad("file: bad name length");
+  const out = concat(fixed(x.id, 32, "file id"), fixed(x.k, 32, "file key"), u32(x.size), u8(n.length), n);
+  parseFile(out);
+  return out;
+}
+
+/** The length of the blob of a file of `size` bytes (§3.2, §8.3): nonce + padme(size + 1) + tag. */
+export const fileBlobLen = (size: number): number => NONCE_LEN + padmeLength(size + 1) + TAG_LEN;
+
+// What a group name may not hold (BAD_NAME_CHARS), and the path separators, each of which becomes "_" in a file name.
+const BAD_FILE_NAME_CHARS = /[\p{Cc}\p{Cf}\p{Cs}\u061c\u2028\u2029\u115f\u1160\u3164\uffa0\u2800/\\]/gu;
+const MAX_FILE_EXT_BYTES = 32;
+
+/**
+ * The safe name of a file (§8.3), which is what a client sends, shows and saves. A display and save rule, never a
+ * parse rule; applying it to a safe name changes nothing.
+ */
+export function safeFileName(name: string): string {
+  let s = name.replace(BAD_FILE_NAME_CHARS, "_");
+  const bytes = (x: string) => te.encode(x).length;
+  if (bytes(s) > MAX_FILE_NAME_BYTES) {
+    const dot = s.lastIndexOf(".");
+    const ext = dot > 0 && bytes(s.slice(dot)) <= MAX_FILE_EXT_BYTES ? s.slice(dot) : "";
+    const base = Array.from(ext ? s.slice(0, dot) : s);
+    let room = MAX_FILE_NAME_BYTES - bytes(ext);
+    let keep = 0;
+    for (const ch of base) {
+      const n = bytes(ch);
+      if (n > room) break;
+      room -= n;
+      keep++;
+    }
+    s = base.slice(0, keep).join("") + ext;
+  }
+  s = s.trim();
+  return s === "" || /^\.+$/.test(s) ? "file" : s;
 }
 
 /** A REACTION's emoji is 1..32 bytes of valid UTF-8 (§3.3). */
@@ -2020,6 +2092,7 @@ export type MBody =
   | { type: typeof MT.TEXT; text: string }
   | { type: typeof MT.IMAGE; image: ImageRef }
   | { type: typeof MT.REACTION; reaction: Reaction }
+  | { type: typeof MT.FILE; file: FileRef }
   | { type: typeof MT.WELCOME; join: Join }
   | { type: typeof MT.CLAIM; claim: Claim }
   | { type: typeof MT.LEAVE };
@@ -2036,6 +2109,8 @@ function encodeContent(m: MBody): Bytes {
       return encodeImage(m.image);
     case MT.REACTION:
       return encodeReaction(m.reaction);
+    case MT.FILE:
+      return encodeFile(m.file);
     case MT.WELCOME:
       return encodeJ(m.join);
     case MT.CLAIM:
@@ -2056,6 +2131,8 @@ function parseContent(type: number, c: Bytes): MBody {
       return { type: MT.IMAGE, image: parseImage(c) };
     case MT.REACTION:
       return { type: MT.REACTION, reaction: parseReaction(c) };
+    case MT.FILE:
+      return { type: MT.FILE, file: parseFile(c) };
     case MT.WELCOME:
       return { type: MT.WELCOME, join: parseJ(c) };
     case MT.CLAIM:
@@ -2069,7 +2146,7 @@ function parseContent(type: number, c: Bytes): MBody {
 }
 
 /**
- * Parses M and checks every parse rule of §3.3 (none needs epoch context): ver, type ∈ {1, 2, 3, 8, 16, 17}, content,
+ * Parses M and checks every parse rule of §3.3 (none needs epoch context): ver, type ∈ {1, 2, 3, 4, 8, 16, 17}, content,
  * `lane = from` for lane rows and `lane = 0xFFFF` with NONE / ZERO16 prev fields for a CLAIM, `from < 32`, the
  * position rule, prevh = ZERO16 with NONE, ts ≤ 2^53 − 1, ck16 = ZERO16 with ckq = 0, len. `from < |D_e|`, the
  * label, a CLAIM's m = |D_e| and the signature are contextual (acceptRow).

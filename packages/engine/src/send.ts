@@ -1,7 +1,7 @@
 // Sending a row on one's own lane (docs/PROTOCOL.md §11.3): the control probe before every send, the processing
 // wait, the refusals (removed, left, frozen with a removal, a WELCOME that no longer qualifies), the rotation after a
 // leave, the slot (never below the lane head's era), the fresh-probe check after the proof of work, and the handling
-// of OK, CONFLICT, WRONG_ERA and lost answers, with the late-row rule. TEXT, IMAGE, REACTION, LEAVE and WELCOME use
+// of OK, CONFLICT, WRONG_ERA and lost answers, with the late-row rule. TEXT, IMAGE, FILE, REACTION, LEAVE and WELCOME use
 // this path.
 import * as P from "@segv/protocol/proto";
 import * as W from "@segv/protocol/wire";
@@ -63,7 +63,7 @@ export interface SendCtx {
    */
   welcomeTo?: Bytes;
   qualifies?: (c: Copy, ep: Epoch, uid: Bytes) => boolean;
-  /** a TEXT or IMAGE is stored (also a late one): ring the other members' bells (§11.13); never waits */
+  /** a TEXT, IMAGE or FILE is stored (also a late one): ring the other members' bells (§11.13); never waits */
   ring?: (c: Copy, ep: Epoch, E: number, label: Bytes) => void;
 }
 
@@ -157,8 +157,9 @@ async function steps12(
 ): Promise<{ ep: Epoch; sent: Stamp; answered: Stamp }> {
   for (let rotations = 0; ;) {
     const { ep, sent, answered, timedOut } = await probeAndWait(ctx, c);
-    // texts, images and reactions (§6.6 step 6, §11.3 steps 2–3, §11.12)
-    const visible = type === P.MT.TEXT || type === P.MT.IMAGE || type === P.MT.REACTION;
+    // texts, images, files and reactions (§6.6 step 6, §11.3 steps 2–3, §11.12)
+    const visible =
+      type === P.MT.TEXT || type === P.MT.IMAGE || type === P.MT.FILE || type === P.MT.REACTION;
     if (ctx.welcomeTo) {
       if (timedOut) throw new UserError(CHANGING);
       if (!ctx.qualifies?.(c, ep, ctx.welcomeTo)) throw new WelcomeRefused();
@@ -183,7 +184,7 @@ export interface SentRow extends FoundRow {
 }
 
 /**
- * Sends one TEXT or IMAGE row (§11.3). Resolves with the stored row once it counts as delivered; throws a UserError
+ * Sends one TEXT, IMAGE or FILE row (§11.3). Resolves with the stored row once it counts as delivered; throws a UserError
  * with the "not delivered" text (or a step-2 refusal) otherwise.
  */
 export async function sendRow(ctx: SendCtx, c: Copy, content: P.MBody): Promise<SentRow> {
@@ -248,7 +249,7 @@ export async function sendRow(ctx: SendCtx, c: Copy, content: P.MBody): Promise<
       found.t = res.t;
       ctx.applyOwn(c, ep, found);
       // Stored: an OK, a lost answer's retry or probe that finds our body, a late row too (§11.3 step 6, §11.13).
-      if (content.type === P.MT.TEXT || content.type === P.MT.IMAGE)
+      if (content.type === P.MT.TEXT || content.type === P.MT.IMAGE || content.type === P.MT.FILE)
         ctx.ring?.(c, ep, Estar, row.label);
       // Step 8: a late row counts as delivered only while the copy is still in its epoch, or in e+1 with no own row
       // there (the others still follow self's lane of e).

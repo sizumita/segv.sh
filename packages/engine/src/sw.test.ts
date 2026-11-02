@@ -230,6 +230,17 @@ describe("the notifications of a push (§11.13)", () => {
     ]);
   });
 
+  it("`message`: a file is `@x sent a file`, without its name", async () => {
+    const a = makeConv();
+    const c: NotifyCache = { v: 1, preview: "message", deltaS: 10, copies: [a.copy] };
+    const w = world(c);
+    w.put(a.row(1, 0, { type: P.MT.TEXT, text: "hi" }, { ts: NOW - 2000 }));
+    const file = { id: P.random(32), k: P.random(32), size: 10, name: "secret plan.pdf" };
+    w.put(a.row(1, 1, { type: P.MT.FILE, file }, { ts: NOW - 1000 }));
+    const notes = await notesFor(proposed([a.bell]), w.deps, later);
+    expect(notes.map((n) => n.body)).toEqual(["@bob sent a file (+1)"]);
+  });
+
   it("keeps only rows that verify: a wrong signer, a reaction and junk occupy their slots but show nothing", async () => {
     const a = makeConv();
     const c: NotifyCache = { v: 1, preview: "message", deltaS: 10, copies: [a.copy] };

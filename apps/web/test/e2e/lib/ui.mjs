@@ -1,5 +1,6 @@
 // What a user does in @segv/ui, for any page that shows it: the web app in Chromium, or the desktop app's web view.
 // Each function takes a device `d`, { name, page }, and finds the UI by its roles and labels.
+import { readFile } from "node:fs/promises";
 import { check, T, watch } from "./harness.mjs";
 
 /**
@@ -187,10 +188,36 @@ export async function sendImage(d, label) {
     return Array.from(new Uint8Array(await b.arrayBuffer()));
   }, label);
   await d.page
-    .locator("input[type=file]")
+    .getByLabel("attach image")
     .setInputFiles({ name: "pic.png", mimeType: "image/png", buffer: Buffer.from(bytes) });
   await d.page.getByRole("button", { name: "send", exact: true }).click();
   await d.page.locator('.thread img[src^="blob:"]').first().waitFor({ timeout: T });
+}
+
+/**
+ * Sends a text file named `name` that holds `text`, as a file: "+", then "file" in its menu, then the file picker.
+ * `atMenu` runs while the menu is open.
+ */
+export async function sendFile(d, name, text, { atMenu } = {}) {
+  await d.page.getByRole("button", { name: "attach", exact: true }).click();
+  const item = d.page.locator(".attach .menu").getByRole("button", { name: /^file\b/ });
+  await item.waitFor({ timeout: T });
+  await atMenu?.();
+  const [chooser] = await Promise.all([d.page.waitForEvent("filechooser", { timeout: T }), item.click()]);
+  check(chooser.isMultiple(), `${d.name}: the file picker takes several files`);
+  await chooser.setFiles({ name, mimeType: "text/plain", buffer: Buffer.from(text, "utf8") });
+  check(!(await d.page.locator(".attach .menu").isVisible()), `${d.name}: the menu stays open`);
+  await d.page.getByRole("button", { name: "send", exact: true }).click();
+  await d.page.locator(".thread").getByRole("button", { name: `save ${name}` }).first().waitFor({ timeout: T });
+}
+
+/** Saves the conversation's file `name` (a download) and returns what it holds, as UTF-8. */
+export async function saveFile(d, name) {
+  const save = d.page.locator(".thread").getByRole("button", { name: `save ${name}` }).first();
+  await save.waitFor({ timeout: T });
+  const [download] = await Promise.all([d.page.waitForEvent("download", { timeout: T }), save.click()]);
+  check(download.suggestedFilename() === name, `${d.name}: saved as ${download.suggestedFilename()}`);
+  return readFile(await download.path(), "utf8");
 }
 
 /** Waits until the conversation shows an image of `sendImage` decoded at its full width. */
