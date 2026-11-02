@@ -50,7 +50,8 @@ describe("creation crash and resume", () => {
     const A = await engineFor(alice);
     let release!: () => void;
     server().hooks.beforeRequest = (m, p) => {
-      if (m === "PUT" && p.startsWith("/api/v2/blob/")) return new Promise<void>((r) => (release = r));
+      if (m === "PUT" && p.startsWith("/api/v2/blob/"))
+        return new Promise<void>((r) => (release = r));
     };
     const pending = A.createConversation(["bob"]).catch(() => null);
     await sleep(50);
@@ -72,7 +73,9 @@ describe("delivery under limits", () => {
     const id = await A.createConversation(names, "capped");
     await settle(A);
     expect(postSizes()[0]).toBe(4); // one batched post
-    const warnings = A.getState().warnings.filter((w) => w.endsWith("has not been notified yet; retrying"));
+    const warnings = A.getState().warnings.filter((w) =>
+      w.endsWith("has not been notified yet; retrying"),
+    );
     expect(warnings).toHaveLength(2);
     server().inbox.rollDay();
     server().tick(10_000); // the first retry is due 10 s later
@@ -159,7 +162,11 @@ describe("a parked WELCOME (§6.7 step 4, §7.3)", () => {
     let failing = true;
     // the J's blob/meta fails transiently, so the WELCOME's J parks (§6.7 step 1)
     server().hooks.fail = (m, p, who) =>
-      failing && who === "dave" && m === "GET" && p.startsWith("/api/v2/blob/") && p.endsWith("/meta")
+      failing &&
+      who === "dave" &&
+      m === "GET" &&
+      p.startsWith("/api/v2/blob/") &&
+      p.endsWith("/meta")
         ? "before"
         : undefined;
     const g = await A.createConversation(["carol", "dave"], "g");

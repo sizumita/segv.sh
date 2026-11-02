@@ -32,14 +32,18 @@ async function group(names: string[], name = "g") {
 }
 
 const warnings = (e: Engine) => e.getState().warnings;
-const ids = (e: Engine) => I(e).views().map((v) => [v.id, v.epoch, v.blocked, v.request] as const);
+const ids = (e: Engine) =>
+  I(e)
+    .views()
+    .map((v) => [v.id, v.epoch, v.blocked, v.request] as const);
 
 /** The (era, rel) of the invite carrying J(e) of `convId` in `u`'s inbox. */
 function inviteOf(u: TestUser, convId: Uint8Array, e: number): { E: number; rel: number } {
   for (const E of server().inbox.eraList())
     for (const r of server().inbox.rowsOf(E)) {
       const o = P.tryOpenInvite(u.id.kemSk, E, 0, r.eid, r.body);
-      if (o?.kind === "join" && P.equalBytes(o.join.conv, convId) && o.join.e === e) return { E, rel: r.rel };
+      if (o?.kind === "join" && P.equalBytes(o.join.conv, convId) && o.join.e === e)
+        return { E, rel: r.rel };
     }
   throw new Error(`no invite for e = ${e}`);
 }
@@ -73,7 +77,9 @@ function legacySkip(
 
 /** bob's blob GETs and meta requests for a bundle since request index `from`. */
 function bundleAsks(who: string, from: number, id: Uint8Array): { blob: number; meta: number } {
-  const reqs = server().requests.slice(from).filter((r) => r.who === who);
+  const reqs = server()
+    .requests.slice(from)
+    .filter((r) => r.who === who);
   return {
     blob: reqs.filter((r) => r.method === "GET" && r.path === `/api/v2/blob/${P.b64u(id)}`).length,
     meta: reqs.filter((r) => r.path === `/api/v2/blob/${P.b64u(id)}/meta`).length,
@@ -127,11 +133,19 @@ describe("legacy skip records (§7.2)", () => {
     await settle(A, B, C);
     await A.addMembers(id, ["bob"]);
     await settle(A, B, C);
-    expect(ids(B).map((x) => x[0]).sort()).toEqual([id, `${id}~1`].sort());
+    expect(
+      ids(B)
+        .map((x) => x[0])
+        .sort(),
+    ).toEqual([id, `${id}~1`].sort());
     const w = conv(A, id).epochs.get(0)!.ctl.winner!;
     writeSelfRow(bob, legacySkip(bob, G, conv(A, id).epochs.get(2)!, { E: w.E, n: w.n }));
     await settle(A, B, C);
-    expect(ids(B).map((x) => x[0]).sort()).toEqual([id, `${id}~1`].sort());
+    expect(
+      ids(B)
+        .map((x) => x[0])
+        .sort(),
+    ).toEqual([id, `${id}~1`].sort());
     expect(warnings(B)).toEqual([]);
     const B2 = await engineFor(bob);
     await settle(A, B2, C);
@@ -223,6 +237,10 @@ describe("legacy skip records (§7.2)", () => {
       ].sort(),
     );
     expect(warnings(B2)).toEqual([]);
-    expect(I(B2).views().some((v) => v.name.startsWith("⚠"))).toBe(false);
+    expect(
+      I(B2)
+        .views()
+        .some((v) => v.name.startsWith("⚠")),
+    ).toBe(false);
   });
 });

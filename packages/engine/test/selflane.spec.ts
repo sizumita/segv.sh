@@ -2,7 +2,16 @@
 // records kept apart (§7.2), ENDED, the REQUEST bounds, LEFT's least key, and pin mismatches.
 import { describe, expect, it } from "vite-plus/test";
 import { SelfFold, copyKey, leftKeyCmp } from "../src/selflane";
-import { I, P, engineFor, freshWorldPerTest, makeUser, server, settle, writeSelfRow } from "./harness";
+import {
+  I,
+  P,
+  engineFor,
+  freshWorldPerTest,
+  makeUser,
+  server,
+  settle,
+  writeSelfRow,
+} from "./harness";
 
 freshWorldPerTest();
 
@@ -72,17 +81,46 @@ describe("the self-lane fold (§7.3)", () => {
 
   it("keeps bit1 EPOCH records apart, unites DELIVERED uids, keeps every EPOCH_PENDING, and the latest HEADS entry", () => {
     const { f } = fold();
-    const ep = { rtype: P.RT.EPOCH, conv, root: rootA, ...mat, e: 3, claim: P.NONE, flags: 0 } as const;
+    const ep = {
+      rtype: P.RT.EPOCH,
+      conv,
+      root: rootA,
+      ...mat,
+      e: 3,
+      claim: P.NONE,
+      flags: 0,
+    } as const;
     f.apply([ep, { ...ep, flags: P.EPOCH_SKIP }], 1);
     expect(f.epochs.get(`${copyKey({ conv, root: rootA })}:3`)!.flags).toBe(0);
     expect(f.skips.map((s) => [s.rec.e, s.rec.flags])).toEqual([[3, P.EPOCH_SKIP]]);
     const d = { rtype: P.RT.DELIVERED, conv, root: rootA, e: 0, bundleId: fill(32, 5) } as const;
-    f.apply([{ ...d, uids: [fill(16, 1)] }, { ...d, uids: [fill(16, 2), fill(16, 1)] }], 1);
+    f.apply(
+      [
+        { ...d, uids: [fill(16, 1)] },
+        { ...d, uids: [fill(16, 2), fill(16, 1)] },
+      ],
+      1,
+    );
     expect([...f.delivered.values()][0].size).toBe(2);
-    const pend: P.EpochPendingRec = { rtype: P.RT.EPOCH_PENDING, conv, root: rootA, ...mat, tReg: 7, uids: [] };
+    const pend: P.EpochPendingRec = {
+      rtype: P.RT.EPOCH_PENDING,
+      conv,
+      root: rootA,
+      ...mat,
+      tReg: 7,
+      uids: [],
+    };
     f.apply([pend, pend], 1);
     expect(f.pending).toHaveLength(2);
-    const entry = (cnt: number): P.HeadsEntry => ({ conv, root: rootA, e: 0, lastTs: cnt, ctl: { E: 1, cnt }, lanes: [{ E: 1, cnt }], followed: [] });
+    const entry = (cnt: number): P.HeadsEntry => ({
+      conv,
+      root: rootA,
+      e: 0,
+      lastTs: cnt,
+      ctl: { E: 1, cnt },
+      lanes: [{ E: 1, cnt }],
+      followed: [],
+    });
     f.apply([{ rtype: P.RT.HEADS, Ein: 5, relIn: 9, entries: [entry(4)] }], 1);
     f.apply([{ rtype: P.RT.HEADS, Ein: 5, relIn: 3, entries: [entry(2)] }], 2);
     expect(f.cursor).toEqual({ E: 5, rel: 9 }); // the cursor takes the maximum
@@ -91,7 +129,13 @@ describe("the self-lane fold (§7.3)", () => {
 
   it("keeps the first ENDED record per copy", () => {
     const { f } = fold();
-    const ended = (e: number): P.EndedRec => ({ rtype: P.RT.ENDED, conv, root: rootA, e, claim: { E: 4, n: e } });
+    const ended = (e: number): P.EndedRec => ({
+      rtype: P.RT.ENDED,
+      conv,
+      root: rootA,
+      e,
+      claim: { E: 4, n: e },
+    });
     f.apply([ended(2)], 1);
     f.apply([ended(5)], 2);
     expect(f.ended.get(copyKey({ conv, root: rootA }))!.e).toBe(2);
@@ -129,7 +173,15 @@ describe("the self-lane fold (§7.3)", () => {
   it("gives a first-release tab's CONFIRMED (in a row without HEADS) and via-5 CONV_JOIN after a bit1 record to its copy", () => {
     const { f } = fold();
     const k = copyKey({ conv, root: rootA });
-    const bit1: P.EpochRec = { rtype: P.RT.EPOCH, conv, root: rootA, ...mat, e: 4, claim: { E: 3, n: 0 }, flags: P.EPOCH_SKIP };
+    const bit1: P.EpochRec = {
+      rtype: P.RT.EPOCH,
+      conv,
+      root: rootA,
+      ...mat,
+      e: 4,
+      claim: { E: 3, n: 0 },
+      flags: P.EPOCH_SKIP,
+    };
     const confirmed: P.ConfirmedRec = { rtype: P.RT.CONFIRMED, conv, root: rootA };
     const heads: P.HeadsRec = { rtype: P.RT.HEADS, Ein: 1, relIn: 0, entries: [] };
     f.apply([request(conv)], 1); // the legacy copy is a request
@@ -148,7 +200,15 @@ describe("the self-lane fold (§7.3)", () => {
   it("keeps the latest HEADS entry per copy and epoch, so a legacy key's entries can be split by epoch", () => {
     const { f } = fold();
     const k = copyKey({ conv, root: rootA });
-    const entry = (e: number, cnt: number): P.HeadsEntry => ({ conv, root: rootA, e, lastTs: cnt, ctl: { E: 1, cnt }, lanes: [{ E: 1, cnt }], followed: [] });
+    const entry = (e: number, cnt: number): P.HeadsEntry => ({
+      conv,
+      root: rootA,
+      e,
+      lastTs: cnt,
+      ctl: { E: 1, cnt },
+      lanes: [{ E: 1, cnt }],
+      followed: [],
+    });
     f.apply([{ rtype: P.RT.HEADS, Ein: 1, relIn: 0, entries: [entry(2, 1)] }], 1);
     f.apply([{ rtype: P.RT.HEADS, Ein: 1, relIn: 0, entries: [entry(5, 2)] }], 2);
     f.apply([{ rtype: P.RT.HEADS, Ein: 1, relIn: 0, entries: [entry(2, 3)] }], 3);
@@ -159,7 +219,15 @@ describe("the self-lane fold (§7.3)", () => {
 
   it("keeps per (copy, e, uid) the LEFT record with the least (t, position), NONE after every real position", () => {
     const { f } = fold();
-    const left = (t: number, row: P.Pos): P.LeftRec => ({ rtype: P.RT.LEFT, conv, root: rootA, e: 2, uid: fill(16, 7), t, row });
+    const left = (t: number, row: P.Pos): P.LeftRec => ({
+      rtype: P.RT.LEFT,
+      conv,
+      root: rootA,
+      e: 2,
+      uid: fill(16, 7),
+      t,
+      row,
+    });
     f.apply([left(10, P.NONE), left(10, { E: 3, n: 5 }), left(11, { E: 3, n: 1 })], 1);
     expect([...f.lefts.values()]).toEqual([left(10, { E: 3, n: 5 })]);
     expect(leftKeyCmp(left(10, { E: 3, n: 5 }), left(10, P.NONE))).toBeLessThan(0);
@@ -200,7 +268,11 @@ describe("the self lane across an era boundary (§7.2, §11.7)", () => {
   it("applies a sibling's row in era E that lands after this device's own row in E+1", async () => {
     const bob = makeUser("bob");
     const B = await engineFor(bob);
-    const contact = (v: number): P.ContactRec => ({ rtype: P.RT.CONTACT, uid: fill(16, v), pin: fill(32, v) });
+    const contact = (v: number): P.ContactRec => ({
+      rtype: P.RT.CONTACT,
+      uid: fill(16, v),
+      pin: fill(32, v),
+    });
     const E = server().era;
     writeSelfRow(bob, [contact(1)]);
     await settle(B);

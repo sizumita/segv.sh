@@ -10,11 +10,35 @@ import * as P from "@segv/protocol/proto";
 import * as W from "@segv/protocol/wire";
 import { _resetSettingLogsForTests } from "../src/env";
 import { parseAppOrigins } from "../src/origins";
-import { AASA_PATH, ASSETLINKS_PATH, parseAndroidApps, parseAppleAppIds, wellKnown } from "../src/well-known";
-import { ORIGIN, api, direct, envWith, errorOf, nowOf, powHeader, rtClient, rtUpgrade, sleep, until, type ApiInit } from "./helpers";
+import {
+  AASA_PATH,
+  ASSETLINKS_PATH,
+  parseAndroidApps,
+  parseAppleAppIds,
+  wellKnown,
+} from "../src/well-known";
+import {
+  ORIGIN,
+  api,
+  direct,
+  envWith,
+  errorOf,
+  nowOf,
+  powHeader,
+  rtClient,
+  rtUpgrade,
+  sleep,
+  until,
+  type ApiInit,
+} from "./helpers";
 
 /** The APP_ORIGINS of ../wrangler.test.jsonc. */
-const APP = ["tauri://localhost", "https://tauri.localhost", "capacitor://app.segv.test", "https://app.segv.test"];
+const APP = [
+  "tauri://localhost",
+  "https://tauri.localhost",
+  "capacitor://app.segv.test",
+  "https://app.segv.test",
+];
 /** Origins that are not app origins: other sites, the deployment's own origin, and near misses of the app origins. */
 const FOREIGN = [
   "https://evil.example",
@@ -29,7 +53,11 @@ const FOREIGN = [
   "capacitor://app.segv.test.evil.example",
 ];
 const CORS = ["access-control-allow-origin", "access-control-expose-headers", "vary"];
-const PREFLIGHT = ["access-control-allow-methods", "access-control-allow-headers", "access-control-max-age"];
+const PREFLIGHT = [
+  "access-control-allow-methods",
+  "access-control-allow-headers",
+  "access-control-max-age",
+];
 
 /** workerd's caches.default (the DOM lib typing does not know it). */
 const edgeCache = (): Cache => (caches as unknown as { default: Cache }).default;
@@ -42,7 +70,8 @@ function expectCors(res: Response, origin: string, what: string): void {
 }
 
 function expectNoCors(res: Response, what: string): void {
-  for (const h of [...CORS, ...PREFLIGHT, "access-control-allow-credentials"]) expect(res.headers.get(h), `${what}: ${h}`).toBeNull();
+  for (const h of [...CORS, ...PREFLIGHT, "access-control-allow-credentials"])
+    expect(res.headers.get(h), `${what}: ${h}`).toBeNull();
 }
 
 const withOrigin = (origin: string, init: ApiInit = {}): ApiInit => ({
@@ -50,7 +79,11 @@ const withOrigin = (origin: string, init: ApiInit = {}): ApiInit => ({
   headers: { ...(init.headers as Record<string, string> | undefined), origin },
 });
 
-const preflight = (origin: string | null, method = "POST", extra: Record<string, string> = {}): ApiInit => ({
+const preflight = (
+  origin: string | null,
+  method = "POST",
+  extra: Record<string, string> = {},
+): ApiInit => ({
   method: "OPTIONS",
   headers: {
     ...(origin === null ? {} : { origin }),
@@ -62,7 +95,10 @@ const preflight = (origin: string | null, method = "POST", extra: Record<string,
 
 /** A rate-limit binding that refuses every token and counts the calls. */
 function denyAll() {
-  const l = { calls: 0, limit: async (): Promise<{ success: boolean }> => (l.calls++, { success: false }) };
+  const l = {
+    calls: 0,
+    limit: async (): Promise<{ success: boolean }> => (l.calls++, { success: false }),
+  };
   return l;
 }
 
@@ -83,19 +119,28 @@ beforeEach(() => _resetSettingLogsForTests());
 
 describe("APP_ORIGINS (§9.7)", () => {
   it("parses a list of https:, capacitor: and tauri: origins", () => {
-    expect(parseAppOrigins("capacitor://app.segv.sh,https://app.segv.sh,tauri://localhost,https://tauri.localhost")).toEqual([
+    expect(
+      parseAppOrigins(
+        "capacitor://app.segv.sh,https://app.segv.sh,tauri://localhost,https://tauri.localhost",
+      ),
+    ).toEqual([
       "capacitor://app.segv.sh",
       "https://app.segv.sh",
       "tauri://localhost",
       "https://tauri.localhost",
     ]);
-    expect(parseAppOrigins(" tauri://localhost , https://a-b.example.com,tauri://localhost")).toEqual(["tauri://localhost", "https://a-b.example.com"]);
-    expect(parseAppOrigins(`https://${"a".repeat(63)}.example`)).toEqual([`https://${"a".repeat(63)}.example`]);
+    expect(
+      parseAppOrigins(" tauri://localhost , https://a-b.example.com,tauri://localhost"),
+    ).toEqual(["tauri://localhost", "https://a-b.example.com"]);
+    expect(parseAppOrigins(`https://${"a".repeat(63)}.example`)).toEqual([
+      `https://${"a".repeat(63)}.example`,
+    ]);
     const longest = `${Array.from({ length: 3 }, () => "a".repeat(63)).join(".")}.${"b".repeat(61)}`; // 253 characters
     expect(parseAppOrigins(`tauri://${longest}`)).toEqual([`tauri://${longest}`]);
     expect(parseAppOrigins(`tauri://${longest}b`)).toBeNull();
     // Unset or empty: no app origins, and nothing invalid.
-    for (const raw of [undefined, null, "", "  "]) expect(parseAppOrigins(raw), String(raw)).toEqual([]);
+    for (const raw of [undefined, null, "", "  "])
+      expect(parseAppOrigins(raw), String(raw)).toEqual([]);
   });
 
   it("refuses the whole list when any entry is not the serialization of such an origin", () => {
@@ -151,7 +196,10 @@ describe("APP_ORIGINS (§9.7)", () => {
       }
     });
     expect(lines).toHaveLength(1);
-    expect(JSON.parse(lines[0])).toEqual({ msg: "native apps are refused: invalid setting", setting: "APP_ORIGINS" });
+    expect(JSON.parse(lines[0])).toEqual({
+      msg: "native apps are refused: invalid setting",
+      setting: "APP_ORIGINS",
+    });
     expect(lines[0]).not.toContain("tauri");
     // Unset or empty: refused too, and nothing is logged.
     for (const APP_ORIGINS of [undefined, ""]) {
@@ -184,12 +232,30 @@ describe("cross-origin requests (§10.1)", () => {
     const answers: [number, Response][] = [
       [404, await api("/api/v2/nope", withOrigin(origin))],
       [404, await api("/api/log", withOrigin(origin))],
-      [405, await api("/api/v2/params", withOrigin(origin, { method: "POST", body: new Uint8Array(1) }))],
+      [
+        405,
+        await api(
+          "/api/v2/params",
+          withOrigin(origin, { method: "POST", body: new Uint8Array(1) }),
+        ),
+      ],
       [405, await api("/api/v2/params", withOrigin(origin, { method: "OPTIONS" }))], // OPTIONS that is not a preflight
-      [403, await api("/api/v2/put", withOrigin(origin, { method: "POST", body: new Uint8Array(3) }))],
-      [413, await api("/api/v2/put", withOrigin(origin, { method: "POST", body: new Uint8Array(W.PUT_MAX_BYTES + 1) }))],
+      [
+        403,
+        await api("/api/v2/put", withOrigin(origin, { method: "POST", body: new Uint8Array(3) })),
+      ],
+      [
+        413,
+        await api(
+          "/api/v2/put",
+          withOrigin(origin, { method: "POST", body: new Uint8Array(W.PUT_MAX_BYTES + 1) }),
+        ),
+      ],
       [426, await api("/api/v2/rt", withOrigin(origin))],
-      [421, await api("/api/v2/params", withOrigin(origin, { origin: "https://elsewhere.example" }))],
+      [
+        421,
+        await api("/api/v2/params", withOrigin(origin, { origin: "https://elsewhere.example" })),
+      ],
       [429, await direct(`/api/v2/era/${E}`, withOrigin(origin), { RL_READ: deny })],
       [503, await direct("/api/v2/params", withOrigin(origin), { SRV_KEY: undefined })],
     ];
@@ -232,7 +298,9 @@ describe("cross-origin requests (§10.1)", () => {
         expect(res.status, what).toBe(204);
         expect(res.headers.get("access-control-allow-origin"), what).toBe(origin);
         expect(res.headers.get("access-control-allow-methods"), what).toBe("GET, POST, PUT");
-        expect(res.headers.get("access-control-allow-headers"), what).toBe("content-type, x-segv-pow");
+        expect(res.headers.get("access-control-allow-headers"), what).toBe(
+          "content-type, x-segv-pow",
+        );
         expect(res.headers.get("access-control-max-age"), what).toBe("600");
         expect(res.headers.get("vary"), what).toBe("origin");
         expect(res.headers.get("access-control-allow-credentials"), what).toBeNull();
@@ -276,7 +344,11 @@ describe("cross-origin requests (§10.1)", () => {
     const pow = await powHeader("blob", P.fromB64u(id), { bytes: blob.length });
     const put = await api(
       `/api/v2/blob/${id}`,
-      withOrigin(origin, { method: "PUT", body: blob, headers: { "content-type": "application/octet-stream", "x-segv-pow": pow } }),
+      withOrigin(origin, {
+        method: "PUT",
+        body: blob,
+        headers: { "content-type": "application/octet-stream", "x-segv-pow": pow },
+      }),
     );
     expect(put.status, await put.clone().text()).toBe(201);
     expectCors(put, origin, "201");
@@ -285,7 +357,11 @@ describe("cross-origin requests (§10.1)", () => {
     expectCors(g1, origin, "first GET");
     const key = `${ORIGIN}/api/v2/blob/${id}`;
     let stored: Response | undefined;
-    await until(async () => (stored = await edgeCache().match(key)) !== undefined, "cache entry", 3000);
+    await until(
+      async () => (stored = await edgeCache().match(key)) !== undefined,
+      "cache entry",
+      3000,
+    );
     for (const h of [...CORS, "x-segv-now"]) expect(stored!.headers.get(h), h).toBeNull();
     await stored!.arrayBuffer();
     // Gone from R2: only caches.default can answer now.
@@ -337,11 +413,17 @@ describe("realtime Origin (§10.8)", () => {
 
 // ───────────────────────────── association files ─────────────────────────────
 
-const FP1 = "14:6D:E9:83:C5:73:06:50:D8:EE:B9:95:2F:34:FC:64:16:A0:83:42:E6:1D:BE:A8:8A:04:96:B2:3F:CF:44:E5";
-const FP2 = "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89";
+const FP1 =
+  "14:6D:E9:83:C5:73:06:50:D8:EE:B9:95:2F:34:FC:64:16:A0:83:42:E6:1D:BE:A8:8A:04:96:B2:3F:CF:44:E5";
+const FP2 =
+  "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89";
 
 /** wellKnown() with some settings replaced, on the canonical test host. */
-function wk(path: string, overrides: Record<string, unknown> = {}, method = "GET"): Response | null {
+function wk(
+  path: string,
+  overrides: Record<string, unknown> = {},
+  method = "GET",
+): Response | null {
   const url = new URL(`${ORIGIN}${path}`);
   return wellKnown(new Request(url, { method }), envWith(overrides), url);
 }
@@ -363,19 +445,45 @@ describe("association files (§11.14)", () => {
   });
 
   it("serves assetlinks.json: get_login_creds and handle_all_urls for each package and its fingerprints", async () => {
-    const relation = ["delegate_permission/common.get_login_creds", "delegate_permission/common.handle_all_urls"];
+    const relation = [
+      "delegate_permission/common.get_login_creds",
+      "delegate_permission/common.handle_all_urls",
+    ];
     const res = await api(ASSETLINKS_PATH);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("application/json");
     expect(res.headers.get("cache-control")).toBe("public, max-age=3600");
     expectNoCors(res, "assetlinks");
     expect(await res.json()).toEqual([
-      { relation, target: { namespace: "android_app", package_name: "test.segv.app", sha256_cert_fingerprints: [FP1] } },
+      {
+        relation,
+        target: {
+          namespace: "android_app",
+          package_name: "test.segv.app",
+          sha256_cert_fingerprints: [FP1],
+        },
+      },
     ]);
-    const two = wk(ASSETLINKS_PATH, { ANDROID_APPS: `sh.segv.app@${FP1}, sh.segv.app@${FP2},sh.segv.beta@${FP2}` })!;
+    const two = wk(ASSETLINKS_PATH, {
+      ANDROID_APPS: `sh.segv.app@${FP1}, sh.segv.app@${FP2},sh.segv.beta@${FP2}`,
+    })!;
     expect(await two.json()).toEqual([
-      { relation, target: { namespace: "android_app", package_name: "sh.segv.app", sha256_cert_fingerprints: [FP1, FP2] } },
-      { relation, target: { namespace: "android_app", package_name: "sh.segv.beta", sha256_cert_fingerprints: [FP2] } },
+      {
+        relation,
+        target: {
+          namespace: "android_app",
+          package_name: "sh.segv.app",
+          sha256_cert_fingerprints: [FP1, FP2],
+        },
+      },
+      {
+        relation,
+        target: {
+          namespace: "android_app",
+          package_name: "sh.segv.beta",
+          sha256_cert_fingerprints: [FP2],
+        },
+      },
     ]);
   });
 
@@ -386,7 +494,12 @@ describe("association files (§11.14)", () => {
     const post = wk(AASA_PATH, {}, "POST")!;
     expect(post.status).toBe(405);
     expect(post.headers.get("allow")).toBe("GET, HEAD");
-    for (const path of ["/.well-known/apple-app-site-association/", "/apple-app-site-association", "/.well-known/assetlinks", "/"]) {
+    for (const path of [
+      "/.well-known/apple-app-site-association/",
+      "/apple-app-site-association",
+      "/.well-known/assetlinks",
+      "/",
+    ]) {
       expect(wk(path), path).toBeNull();
     }
   });
@@ -428,10 +541,15 @@ describe("association files (§11.14)", () => {
     ];
     for (const raw of appleBad) expect(parseAppleAppIds(raw), raw).toBeNull();
     for (const raw of androidBad) expect(parseAndroidApps(raw), raw).toBeNull();
-    expect(parseAppleAppIds("NBDP5VK335.sh.segv.desktop, NBDP5VK335.sh.segv-ios")).toEqual(["NBDP5VK335.sh.segv.desktop", "NBDP5VK335.sh.segv-ios"]);
+    expect(parseAppleAppIds("NBDP5VK335.sh.segv.desktop, NBDP5VK335.sh.segv-ios")).toEqual([
+      "NBDP5VK335.sh.segv.desktop",
+      "NBDP5VK335.sh.segv-ios",
+    ]);
     const lines = await logsDuring("association file", async () => {
-      for (const raw of appleBad) expect(wk(AASA_PATH, { APPLE_APP_IDS: raw })!.status, raw).toBe(404);
-      for (const raw of androidBad) expect(wk(ASSETLINKS_PATH, { ANDROID_APPS: raw })!.status, raw).toBe(404);
+      for (const raw of appleBad)
+        expect(wk(AASA_PATH, { APPLE_APP_IDS: raw })!.status, raw).toBe(404);
+      for (const raw of androidBad)
+        expect(wk(ASSETLINKS_PATH, { ANDROID_APPS: raw })!.status, raw).toBe(404);
       // The other file is unaffected.
       expect(wk(ASSETLINKS_PATH, { APPLE_APP_IDS: appleBad[0] })!.status).toBe(200);
     });

@@ -56,11 +56,15 @@ function latestSnapshot(u: TestUser): P.SelfRecord[] {
 }
 
 /** `who`'s requests since request index `from`. */
-const since = (who: string, from: number) => server().requests.slice(from).filter((r) => r.who === who);
+const since = (who: string, from: number) =>
+  server()
+    .requests.slice(from)
+    .filter((r) => r.who === who);
 const metaOf = (who: string, from: number, id: Uint8Array) =>
   since(who, from).filter((r) => r.path === `/api/v2/blob/${P.b64u(id)}/meta`).length;
 const blobOf = (who: string, from: number, id: Uint8Array) =>
-  since(who, from).filter((r) => r.method === "GET" && r.path === `/api/v2/blob/${P.b64u(id)}`).length;
+  since(who, from).filter((r) => r.method === "GET" && r.path === `/api/v2/blob/${P.b64u(id)}`)
+    .length;
 
 describe("snapshots (§7.4)", () => {
   it("a live device writes the new era's snapshot; the next restore reads it and the self delta after it", async () => {
@@ -83,8 +87,12 @@ describe("snapshots (§7.4)", () => {
     expect(chat(A3, id)).toEqual(["alice: one", "bob: two"]);
     expect(mustView(A3, id).name).toBe("# g");
     // the snapshot's blob was read; one more snapshot is not written in the same era
-    expect(since("alice", from).some((r) => r.method === "GET" && r.path.startsWith("/api/v2/blob/"))).toBe(true);
-    const puts = since("alice", from).filter((r) => r.method === "PUT" && r.path.startsWith("/api/v2/blob/"));
+    expect(
+      since("alice", from).some((r) => r.method === "GET" && r.path.startsWith("/api/v2/blob/")),
+    ).toBe(true);
+    const puts = since("alice", from).filter(
+      (r) => r.method === "PUT" && r.path.startsWith("/api/v2/blob/"),
+    );
     expect(puts).toEqual([]);
     void bob;
   });
@@ -129,7 +137,7 @@ describe("snapshots (§7.4)", () => {
     B3.markRead(id);
     await settle(A, B3, C);
     expect(chat(B3, id)).toEqual(["alice: in e0", "carol: in e2"]);
-    expect(systemLines(B3, id)).toContain('@alice renamed the conversation to “x”');
+    expect(systemLines(B3, id)).toContain("@alice renamed the conversation to “x”");
     await B3.sendText(id, "after the snapshot");
     await settle(A, B3, C);
     expect(chat(A, id).at(-1)).toBe("bob: after the snapshot");
@@ -225,7 +233,11 @@ describe("snapshots (§7.4)", () => {
       await settle(B2, C, D);
     }
     const B3 = await engineFor(bob);
-    expect(I(B3).views().map((v) => v.id)).toEqual([]);
+    expect(
+      I(B3)
+        .views()
+        .map((v) => v.id),
+    ).toEqual([]);
   });
 });
 
@@ -245,7 +257,15 @@ describe("control positions at restore (§7.3, §11.4 step 5)", () => {
         const ep = epoch(A, id);
         const bundleId = P.random(32);
         junk.push(bundleId);
-        postRow(ep, buildClaim(alice, ep, { hD: P.random(32), ekc: P.random(32), bundleId, bundleSize: 23456 }));
+        postRow(
+          ep,
+          buildClaim(alice, ep, {
+            hD: P.random(32),
+            ekc: P.random(32),
+            bundleId,
+            bundleSize: 23456,
+          }),
+        );
       }
     };
     for (const name of ["a", "b", "c"]) {

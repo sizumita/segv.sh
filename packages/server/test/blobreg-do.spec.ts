@@ -32,7 +32,9 @@ async function setClock(ms: number, delta?: number): Promise<void> {
 }
 const metaOf = (k: string): Promise<unknown> =>
   runInDurableObject(reg(), (_inst: BlobRegDO, state) => {
-    const r = state.storage.sql.exec<{ v: SqlStorageValue }>("SELECT v FROM meta WHERE k = ?", k).toArray()[0];
+    const r = state.storage.sql
+      .exec<{ v: SqlStorageValue }>("SELECT v FROM meta WHERE k = ?", k)
+      .toArray()[0];
     return r?.v ?? null;
   });
 const batchDue = (t: number): number => P.T0_MS + (t + DELTA) * 1000 + 1000;
@@ -42,7 +44,9 @@ async function recomputeHead(): Promise<{ head: Uint8Array; closedT: number }> {
   return runInDurableObject(reg(), (_inst: BlobRegDO, state) => {
     const sql = state.storage.sql;
     const batches = sql
-      .exec<{ t: number; n: number; root: ArrayBuffer; head: ArrayBuffer }>("SELECT t, n, root, head FROM batch ORDER BY t")
+      .exec<{ t: number; n: number; root: ArrayBuffer; head: ArrayBuffer }>(
+        "SELECT t, n, root, head FROM batch ORDER BY t",
+      )
       .toArray();
     let head: Uint8Array = P.ZERO32;
     for (const b of batches) {
@@ -59,7 +63,9 @@ async function recomputeHead(): Promise<{ head: Uint8Array; closedT: number }> {
     }
     // Every registration at or below closed_t is inside a batch.
     const last = batches[batches.length - 1]?.t ?? -1;
-    const committed = sql.exec<{ n: number }>("SELECT count(*) AS n FROM blob WHERE t <= ?", last).one().n;
+    const committed = sql
+      .exec<{ n: number }>("SELECT count(*) AS n FROM blob WHERE t <= ?", last)
+      .one().n;
     expect(committed).toBe(batches.reduce((n, b) => n + b.n, 0));
     return { head, closedT: last };
   });
@@ -130,10 +136,14 @@ describe("BlobRegDO", () => {
     await setClock(c);
     // An earlier test's batch alarm may still be scheduled (min(current, due) keeps it): let it run first.
     await runDurableObjectAlarm(reg());
-    expect(await runInDurableObject(reg(), (_inst: BlobRegDO, state) => state.storage.getAlarm())).toBeNull();
+    expect(
+      await runInDurableObject(reg(), (_inst: BlobRegDO, state) => state.storage.getAlarm()),
+    ).toBeNull();
     const a = await reg().register(P.random(32), 7);
     expect(a.t).toBe(P.secOf(c));
-    const alarm = await runInDurableObject(reg(), (_inst: BlobRegDO, state) => state.storage.getAlarm());
+    const alarm = await runInDurableObject(reg(), (_inst: BlobRegDO, state) =>
+      state.storage.getAlarm(),
+    );
     expect(alarm).toBe(batchDue(a.t));
 
     await setClock(batchDue(a.t));
@@ -160,20 +170,26 @@ describe("BlobRegDO", () => {
     const c = later();
     await setClock(c);
     const ids = Array.from({ length: 6 }, () => P.random(32));
-    for (const [k, id] of ids.entries()) expect((await reg().register(id, 100 + k)).created).toBe(true);
+    for (const [k, id] of ids.entries())
+      expect((await reg().register(id, 100 + k)).created).toBe(true);
     await runInDurableObject(reg(), (_inst: BlobRegDO, state) => state.storage.deleteAlarm());
     await evictDurableObject(reg());
     // The constructor re-arms the open batch's alarm.
     const t = P.secOf(c);
-    expect(await runInDurableObject(reg(), (_inst: BlobRegDO, state) => state.storage.getAlarm())).toBe(batchDue(t));
+    expect(
+      await runInDurableObject(reg(), (_inst: BlobRegDO, state) => state.storage.getAlarm()),
+    ).toBe(batchDue(t));
     await setClock(batchDue(t));
     expect(await runDurableObjectAlarm(reg())).toBe(true);
     const h = await reg().head();
     expect(h.tLast).toBe(t);
     expect(await recomputeHead()).toEqual({ head: h.head, closedT: t });
-    for (const [k, id] of ids.entries()) expect(await reg().meta(id)).toEqual({ hit: true, t, size: 100 + k });
+    for (const [k, id] of ids.entries())
+      expect(await reg().meta(id)).toEqual({ hit: true, t, size: 100 + k });
     // No batch left open: the alarm handler armed nothing.
-    expect(await runInDurableObject(reg(), (_inst: BlobRegDO, state) => state.storage.getAlarm())).toBeNull();
+    expect(
+      await runInDurableObject(reg(), (_inst: BlobRegDO, state) => state.storage.getAlarm()),
+    ).toBeNull();
   });
 
   it("rejects malformed RPC input", async () => {
@@ -193,7 +209,9 @@ describe("BlobRegDO", () => {
     const fresh = () => ns.getByName(`blobreg/v2/pin-${k++}-${Date.now()}`);
     const pinnedOf = (r: DurableObjectStub<BlobRegDO>) =>
       runInDurableObject(r, (_inst: BlobRegDO, state) => {
-        const row = state.storage.sql.exec<{ v: SqlStorageValue }>("SELECT v FROM meta WHERE k = 'delta'").toArray()[0];
+        const row = state.storage.sql
+          .exec<{ v: SqlStorageValue }>("SELECT v FROM meta WHERE k = 'delta'")
+          .toArray()[0];
         return row?.v ?? null;
       });
     const run = (r: DurableObjectStub<BlobRegDO>, ms: number, delta: number) =>
@@ -224,8 +242,10 @@ describe("BlobRegDO", () => {
       expect(await b.meta(P.random(32))).toEqual({ hit: false, now: s + 13 });
       await run(b, x + 17_000, DELTA);
       await b.meta(P.random(32));
-      const hw = await runInDurableObject(b, (_inst: BlobRegDO, state) =>
-        state.storage.sql.exec<{ v: number }>("SELECT v FROM meta WHERE k = 'hw'").one().v,
+      const hw = await runInDurableObject(
+        b,
+        (_inst: BlobRegDO, state) =>
+          state.storage.sql.exec<{ v: number }>("SELECT v FROM meta WHERE k = 'hw'").one().v,
       );
       expect(hw).toBe(s + 13); // same Δ = 10 window as s + 13: no second write
       expect(await pinnedOf(b)).toBe(10);
@@ -236,7 +256,9 @@ describe("BlobRegDO", () => {
       // A new instance (deployment Δ = 1) re-arms the open batch's alarm under the pinned Δ, and logs once itself.
       await runInDurableObject(b, (_inst: BlobRegDO, state) => state.storage.deleteAlarm());
       await evictDurableObject(b);
-      const alarm = await runInDurableObject(b, (_inst: BlobRegDO, state) => state.storage.getAlarm());
+      const alarm = await runInDurableObject(b, (_inst: BlobRegDO, state) =>
+        state.storage.getAlarm(),
+      );
       expect(alarm).toBe(P.T0_MS + (late.t + 10) * 1000 + 1000);
       expect(logged()).toHaveLength(2);
     } finally {

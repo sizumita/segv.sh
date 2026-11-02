@@ -2,7 +2,20 @@
 // from the self lane, and a creation resolves before its commit wait, holds own sends until the decoy is stored, and
 // never turns a transient lookup failure into "unknown".
 import { describe, expect, it } from "vite-plus/test";
-import { I, P, chat, engineFor, freshWorldPerTest, makeUser, mustView, server, settle, systemLines, view, type W } from "./harness";
+import {
+  I,
+  P,
+  chat,
+  engineFor,
+  freshWorldPerTest,
+  makeUser,
+  mustView,
+  server,
+  settle,
+  systemLines,
+  view,
+  type W,
+} from "./harness";
 
 freshWorldPerTest();
 
@@ -40,7 +53,8 @@ describe("restore from the self lane", () => {
     await settle(A, A2, B, B2);
     expect(chat(B, one)).toEqual(["alice: hello bob", "bob: hi alice", "alice: back"]);
     expect(chat(B2, one)).toEqual(["alice: hello bob", "bob: hi alice", "alice: back"]);
-    for (const E of [A, A2, B, B2]) expect([E.getState().error, E.getState().warnings]).toEqual(["", []]);
+    for (const E of [A, A2, B, B2])
+      expect([E.getState().error, E.getState().warnings]).toEqual(["", []]);
     void carol;
   });
 });
@@ -73,14 +87,17 @@ describe("creation", () => {
     await settle(A);
     const mine = view(A, id)!.messages.find((m) => m.mine)!;
     expect(mine.status).toBe("sent");
-    const byLabel = (hex: string) => server().shard.rows().find((r) => P.hex(r.label) === hex)!;
+    const byLabel = (hex: string) =>
+      server()
+        .shard.rows()
+        .find((r) => P.hex(r.label) === hex)!;
     const decoy = byLabel(P.hex(decoyLabel!));
     const text = byLabel(mine.key.split(":")[1]);
     expect(text.t).toBeGreaterThanOrEqual(decoy.t);
     server().hooks.beforePut = undefined;
   });
 
-  it("a failed handle lookup fails the creation with the request error, never \"unknown\"", async () => {
+  it('a failed handle lookup fails the creation with the request error, never "unknown"', async () => {
     makeUser("bob");
     const A = await engineFor(makeUser("alice"));
     server().dir.failDir(() => true, 1);
@@ -93,7 +110,11 @@ describe("creation", () => {
     // a complete answer without the handle is "unknown"; with it, the creation succeeds
     await expect(A.createConversation(["nobody"])).rejects.toThrow(/unknown: @nobody/);
     const id = await A.createConversation(["bob"]);
-    expect(I(A).views().map((v) => v.id)).toContain(id);
+    expect(
+      I(A)
+        .views()
+        .map((v) => v.id),
+    ).toContain(id);
   });
 });
 
@@ -116,6 +137,10 @@ describe("scrollback after a reload", () => {
     expect(after.length).toBeGreaterThan(60);
     expect(after.at(-1)).toBe("alice: m 99");
     expect(after[0]).toBe("alice: m 0"); // the whole history fits VIEW_MESSAGES
-    expect(I(B2).views().find((v) => v.id === id)!.unread).toBe(0); // scrollback never counts as unread
+    expect(
+      I(B2)
+        .views()
+        .find((v) => v.id === id)!.unread,
+    ).toBe(0); // scrollback never counts as unread
   });
 });

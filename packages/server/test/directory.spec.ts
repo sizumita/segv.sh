@@ -82,15 +82,22 @@ function makeAccount(handle = freshHandle(), uid = P.random(16), credId = P.rand
 const newPasskey = (a: Account, credId = P.random(16)): Signed =>
   P.makeWrap(a.uid, "passkey", credId, P.credKem(P.random(32), credId), a.AK, a.ident, Date.now());
 
-const registerBody = (a: Account, wraps: unknown[] = [a.passkey, a.recovery]): Record<string, unknown> => ({
+const registerBody = (
+  a: Account,
+  wraps: unknown[] = [a.passkey, a.recovery],
+): Record<string, unknown> => ({
   bundle: a.bundle,
   sig: a.sig,
   wraps,
 });
-const register = (a: Account, wraps?: unknown[]) => dirRegister(env, registerBody(a, wraps), Date.now());
+const register = (a: Account, wraps?: unknown[]) =>
+  dirRegister(env, registerBody(a, wraps), Date.now());
 
 /** Signs arbitrary bundle text (or fields) with `a`'s key, so only the form can be wrong. */
-function signBundle(a: Account, b: string | Record<string, unknown>): { bundle: string; sig: string } {
+function signBundle(
+  a: Account,
+  b: string | Record<string, unknown>,
+): { bundle: string; sig: string } {
   const bundle = typeof b === "string" ? b : JSON.stringify(b);
   return { bundle, sig: P.b64u(P.sign(P.bundleSigMsg(bundle), a.ident.sigSk)) };
 }
@@ -100,7 +107,8 @@ function signRecord(a: Account, r: string | Record<string, unknown>): Signed {
 }
 const fields = (text: string) => JSON.parse(text) as Record<string, unknown>;
 /** Same fields in another key order. */
-const reorder = (o: Record<string, unknown>, keys: string[]) => Object.fromEntries(keys.map((k) => [k, o[k]]));
+const reorder = (o: Record<string, unknown>, keys: string[]) =>
+  Object.fromEntries(keys.map((k) => [k, o[k]]));
 
 /** A canonical-alphabet b64u string with non-zero leftover bits (rejected by strict decoders). */
 function nonCanonical(s: string): string {
@@ -126,7 +134,11 @@ async function rejects(p: Promise<unknown>, status: number, msg?: RegExp): Promi
 }
 
 async function all<T>(sql: string, ...args: unknown[]): Promise<T[]> {
-  return (await env.DB.prepare(sql).bind(...args).all<T>()).results;
+  return (
+    await env.DB.prepare(sql)
+      .bind(...args)
+      .all<T>()
+  ).results;
 }
 
 /** Row counts, the dirlog head seq and dirmeta.users. */
@@ -137,14 +149,19 @@ async function dirState() {
     env.DB.prepare("SELECT coalesce(max(seq), 0) AS n FROM dirlog"),
     env.DB.prepare("SELECT v AS n FROM dirmeta WHERE k = 'users'"),
   ]);
-  return { users: u.results[0].n, wraps: w.results[0].n, head: l.results[0].n, meta: m.results[0].n };
+  return {
+    users: u.results[0].n,
+    wraps: w.results[0].n,
+    head: l.results[0].n,
+    meta: m.results[0].n,
+  };
 }
 
 /** Pages the whole dirlog and recomputes the chain from ZERO32: contiguous seqs from 1, every h matches. */
 async function verifiedDirlog(): Promise<DirlogEntry[]> {
   const out: DirlogEntry[] = [];
   let head: { seq: number; h: string };
-  for (let after = 0; ; ) {
+  for (let after = 0; ;) {
     const pg = await dirlogPage(env, after, 1000);
     out.push(...pg.entries);
     head = pg.head;
@@ -167,7 +184,9 @@ const wrapRef = (w: Signed) => P.b64u(P.dirlogRefWrap(w.record, P.fromB64u(w.sig
 
 /** Temporarily sets dirmeta.users (P is derived from it) and drops the cached P. */
 async function withUsers<T>(n: number, f: () => Promise<T>): Promise<T> {
-  const before = (await env.DB.prepare("SELECT v FROM dirmeta WHERE k = 'users'").first<{ v: number }>())!.v;
+  const before = (await env.DB.prepare("SELECT v FROM dirmeta WHERE k = 'users'").first<{
+    v: number;
+  }>())!.v;
   await env.DB.prepare("UPDATE dirmeta SET v = ?1 WHERE k = 'users'").bind(n).run();
   _resetDirectoryCacheForTests();
   try {
@@ -240,7 +259,9 @@ describe("schema", () => {
       expect(await currentP(env)).toBe(1);
       expect(P.serverP(64)).toBe(1);
     } finally {
-      await env.DB.prepare("UPDATE dirmeta SET v = (SELECT count(*) FROM user) WHERE k = 'users'").run();
+      await env.DB.prepare(
+        "UPDATE dirmeta SET v = (SELECT count(*) FROM user) WHERE k = 'users'",
+      ).run();
       _resetDirectoryCacheForTests();
     }
     expect(await dirState()).toMatchObject({ users: 2, meta: 2 });
@@ -258,7 +279,12 @@ describe("dirRegister", () => {
     expect(dirseq).toBe(s0.head + 1);
 
     const s1 = await dirState();
-    expect(s1).toEqual({ users: s0.users + 1, wraps: s0.wraps + 2, head: s0.head + 3, meta: s0.meta + 1 });
+    expect(s1).toEqual({
+      users: s0.users + 1,
+      wraps: s0.wraps + 2,
+      head: s0.head + 3,
+      meta: s0.meta + 1,
+    });
 
     const [u] = await all<Record<string, unknown>>("SELECT * FROM user WHERE uid = ?1", a.uidB64);
     expect(u).toEqual({
@@ -271,10 +297,25 @@ describe("dirRegister", () => {
       reg_era: P.era(now),
       dirseq,
     });
-    const wraps = await all<Record<string, unknown>>("SELECT * FROM wrap WHERE uid = ?1 ORDER BY dirseq", a.uidB64);
+    const wraps = await all<Record<string, unknown>>(
+      "SELECT * FROM wrap WHERE uid = ?1 ORDER BY dirseq",
+      a.uidB64,
+    );
     expect(wraps).toEqual([
-      { uid: a.uidB64, id: P.b64u(a.credId), record: a.passkey.record, sig: a.passkey.sig, dirseq: dirseq + 1 },
-      { uid: a.uidB64, id: P.b64u(a.recId), record: a.recovery.record, sig: a.recovery.sig, dirseq: dirseq + 2 },
+      {
+        uid: a.uidB64,
+        id: P.b64u(a.credId),
+        record: a.passkey.record,
+        sig: a.passkey.sig,
+        dirseq: dirseq + 1,
+      },
+      {
+        uid: a.uidB64,
+        id: P.b64u(a.recId),
+        record: a.recovery.record,
+        sig: a.recovery.sig,
+        dirseq: dirseq + 2,
+      },
     ]);
 
     // dirlog: user first, then the wraps, chained from the previous head.
@@ -294,10 +335,19 @@ describe("dirRegister", () => {
 
     // Exact lookups: own bundle by uid; passkey and recovery login by id (the wraps open to the AK).
     const me = await dirByUid(env, a.uidB64);
-    expect(me).toEqual({ uid: a.uidB64, handle: a.handle, bundle: a.bundle, sig: a.sig, regEra: P.era(now), dirseq });
+    expect(me).toEqual({
+      uid: a.uidB64,
+      handle: a.handle,
+      bundle: a.bundle,
+      sig: a.sig,
+      regEra: P.era(now),
+      dirseq,
+    });
     const user = P.verifyBundle(me!.bundle, me!.sig);
     const pk = await dirWrapsById(env, P.b64u(a.credId), a.uidB64);
-    expect(pk).toEqual([{ uid: a.uidB64, record: a.passkey.record, sig: a.passkey.sig, dirseq: dirseq + 1 }]);
+    expect(pk).toEqual([
+      { uid: a.uidB64, record: a.passkey.record, sig: a.passkey.sig, dirseq: dirseq + 1 },
+    ]);
     const pw = P.verifyWrap(pk[0].record, pk[0].sig, user.sigPk);
     expect(P.equalBytes(P.unwrapAK(pw, a.cred, user.sigPk), a.AK)).toBe(true);
     const rk = await dirWrapsById(env, P.b64u(a.recId), null);
@@ -316,7 +366,9 @@ describe("dirRegister", () => {
       if (!(e instanceof HttpError && e.status === 409)) throw e;
     });
     const { dirseq } = await register(long, [long.passkey]);
-    expect((await dirWrapsById(env, P.b64u(long.credId), null)).map((w) => w.dirseq)).toEqual([dirseq + 1]);
+    expect((await dirWrapsById(env, P.b64u(long.credId), null)).map((w) => w.dirseq)).toEqual([
+      dirseq + 1,
+    ]);
   });
 
   it("409 on a taken handle or uid, and nothing is written", async () => {
@@ -342,10 +394,18 @@ describe("dirRegister", () => {
     const s0 = await dirState();
     const sig = P.fromB64u(a.sig);
     sig[0] ^= 1;
-    await rejects(dirRegister(env, { ...registerBody(a), sig: P.b64u(sig) }, Date.now()), 400, /signature/);
+    await rejects(
+      dirRegister(env, { ...registerBody(a), sig: P.b64u(sig) }, Date.now()),
+      400,
+      /signature/,
+    );
     // a valid signature over other text
     const other = signBundle(a, { ...fields(a.bundle), ts: 1 });
-    await rejects(dirRegister(env, { ...registerBody(a), sig: other.sig }, Date.now()), 400, /signature/);
+    await rejects(
+      dirRegister(env, { ...registerBody(a), sig: other.sig }, Date.now()),
+      400,
+      /signature/,
+    );
     expect(await dirByUid(env, a.uidB64)).toBeNull();
     expect(await dirState()).toEqual(s0);
   });
@@ -356,7 +416,15 @@ describe("dirRegister", () => {
     // b's record (b's uid, b's key)
     await rejects(register(a, [a.passkey, b.passkey]), 400, /wraps\[1\]: uid/);
     // a's uid, signed by b's key
-    const forged = P.makeWrap(a.uid, "passkey", P.random(16), P.credKem(P.random(32), P.random(16)), a.AK, b.ident, Date.now());
+    const forged = P.makeWrap(
+      a.uid,
+      "passkey",
+      P.random(16),
+      P.credKem(P.random(32), P.random(16)),
+      a.AK,
+      b.ident,
+      Date.now(),
+    );
     await rejects(register(a, [forged]), 400, /wraps\[0\]: bad signature/);
     await rejects(register(a, [a.recovery, forged]), 400, /wraps\[1\]: bad signature/);
     expect(await dirByUid(env, a.uidB64)).toBeNull();
@@ -368,7 +436,10 @@ describe("dirRegister", () => {
     const sameId = newPasskey(a, a.credId); // another record under the same credential id
     const cases: [string, unknown][] = [
       ["no wraps", registerBody(a, [])],
-      ["5 wraps", registerBody(a, [a.passkey, a.recovery, newPasskey(a), newPasskey(a), newPasskey(a)])],
+      [
+        "5 wraps",
+        registerBody(a, [a.passkey, a.recovery, newPasskey(a), newPasskey(a), newPasskey(a)]),
+      ],
       ["duplicate record", registerBody(a, [a.passkey, a.passkey])],
       ["duplicate id", registerBody(a, [a.passkey, sameId])],
       ["wraps not an array", { ...registerBody(a), wraps: a.passkey }],
@@ -386,9 +457,11 @@ describe("dirRegister", () => {
       ["body null", null],
     ];
     for (const [what, body] of cases) {
-      await rejects(dirRegister(env, body as Record<string, unknown>, Date.now()), 400).catch((e: unknown) => {
-        throw new Error(`${what}: ${String(e)}`);
-      });
+      await rejects(dirRegister(env, body as Record<string, unknown>, Date.now()), 400).catch(
+        (e: unknown) => {
+          throw new Error(`${what}: ${String(e)}`);
+        },
+      );
     }
     expect(await dirState()).toEqual(s0);
   });
@@ -405,12 +478,22 @@ describe("dirRegister", () => {
       ["trailing whitespace", a.bundle + " "],
       ["duplicate key", a.bundle.replace('{"v":2,', '{"v":2,"v":2,')],
       ["number spelling", a.bundle.replace('{"v":2,', '{"v":2.0,')],
-      ["escaped character", a.bundle.replace(`"handle":"${h}"`, `"handle":"\\u00${h.charCodeAt(0).toString(16)}${h.slice(1)}"`)],
+      [
+        "escaped character",
+        a.bundle.replace(
+          `"handle":"${h}"`,
+          `"handle":"\\u00${h.charCodeAt(0).toString(16)}${h.slice(1)}"`,
+        ),
+      ],
     ];
     for (const [what, t] of texts) {
       const b = signBundle(a, t);
       expect(b.bundle, what).not.toBe(a.bundle);
-      await rejects(dirRegister(env, { ...b, wraps: [a.passkey] }, Date.now()), 400, /invalid bundle/).catch((e: unknown) => {
+      await rejects(
+        dirRegister(env, { ...b, wraps: [a.passkey] }, Date.now()),
+        400,
+        /invalid bundle/,
+      ).catch((e: unknown) => {
         throw new Error(`${what}: ${String(e)}`);
       });
     }
@@ -445,17 +528,28 @@ describe("dirRegister", () => {
     ];
     for (const [what, o] of cases) {
       const b = signBundle(a, o);
-      await rejects(dirRegister(env, { ...b, wraps: [a.passkey] }, Date.now()), 400).catch((e: unknown) => {
-        throw new Error(`${what}: ${String(e)}`);
-      });
+      await rejects(dirRegister(env, { ...b, wraps: [a.passkey] }, Date.now()), 400).catch(
+        (e: unknown) => {
+          throw new Error(`${what}: ${String(e)}`);
+        },
+      );
     }
     // the bundle signature itself: 63 / 65 bytes, padded, non-canonical
     const sig = P.fromB64u(a.sig);
-    for (const s of [P.b64u(sig.subarray(0, 63)), P.b64u(P.concat(sig, P.random(1))), `${a.sig}==`, nonCanonical(a.sig)]) {
+    for (const s of [
+      P.b64u(sig.subarray(0, 63)),
+      P.b64u(P.concat(sig, P.random(1))),
+      `${a.sig}==`,
+      nonCanonical(a.sig),
+    ]) {
       await rejects(dirRegister(env, { ...registerBody(a), sig: s }, Date.now()), 400);
     }
     // over 8 KiB (checked before parsing)
-    await rejects(dirRegister(env, { ...registerBody(a), bundle: a.bundle + " ".repeat(8192) }, Date.now()), 400, /too large/);
+    await rejects(
+      dirRegister(env, { ...registerBody(a), bundle: a.bundle + " ".repeat(8192) }, Date.now()),
+      400,
+      /too large/,
+    );
     expect(await dirByUid(env, a.uidB64)).toBeNull();
   });
 
@@ -490,10 +584,17 @@ describe("dirRegister", () => {
       });
     }
     const sig = P.fromB64u(a.passkey.sig);
-    await rejects(register(a, [{ record: a.passkey.record, sig: P.b64u(sig.subarray(0, 63)) }]), 400);
+    await rejects(
+      register(a, [{ record: a.passkey.record, sig: P.b64u(sig.subarray(0, 63)) }]),
+      400,
+    );
     await rejects(register(a, [{ record: a.passkey.record, sig: 7 }]), 400);
     await rejects(register(a, [{ record: fields(a.passkey.record), sig: a.passkey.sig }]), 400);
-    await rejects(register(a, [{ record: a.passkey.record + " ".repeat(8192), sig: a.passkey.sig }]), 400, /too large/);
+    await rejects(
+      register(a, [{ record: a.passkey.record + " ".repeat(8192), sig: a.passkey.sig }]),
+      400,
+      /too large/,
+    );
     expect(await dirByUid(env, a.uidB64)).toBeNull();
   });
 
@@ -501,7 +602,10 @@ describe("dirRegister", () => {
     const a = makeAccount();
     const s0 = await dirState();
     // A KEM key nobody can encapsulate to, correctly signed.
-    const badKem = signBundle(a, { ...fields(a.bundle), kem: P.b64u(new Uint8Array(P.KEM_PK_LEN).fill(0xff)) });
+    const badKem = signBundle(a, {
+      ...fields(a.bundle),
+      kem: P.b64u(new Uint8Array(P.KEM_PK_LEN).fill(0xff)),
+    });
     await rejects(dirRegister(env, { ...badKem, wraps: [a.passkey] }, Date.now()), 400, /KEM/);
     // A small-order signing key (the identity point) with the universal forgery R = identity, S = 0.
     const identity = new Uint8Array(32);
@@ -521,7 +625,8 @@ describe("dirRegister", () => {
     expect(A.isTorsionFree()).toBe(false);
     // The Worker's own (WebCrypto) checks accept every signature: only checkUserKeys can refuse the key.
     expect(await ed25519Verify(pk, P.fromB64u(body.sig), P.bundleSigMsg(body.bundle))).toBe(true);
-    for (const w of body.wraps) expect(await ed25519Verify(pk, P.fromB64u(w.sig), P.wrapSigMsg(w.record))).toBe(true);
+    for (const w of body.wraps)
+      expect(await ed25519Verify(pk, P.fromB64u(w.sig), P.wrapSigMsg(w.record))).toBe(true);
     const s0 = await dirState();
     await rejects(dirRegister(env, body, Date.now()), 400, /signing key/);
     expect(await dirState()).toEqual(s0);
@@ -544,8 +649,12 @@ describe("dirAddWrap", () => {
     expect(dirseq).toBeGreaterThan(d0 + 2);
     expect(await dirState()).toEqual({ ...s0, wraps: s0.wraps + 1, head: s0.head + 1 });
     const { entries } = await dirlogPage(env, s0.head, 10);
-    expect(entries.map((e) => [e.seq, e.kind, e.ref])).toEqual([[dirseq, P.DIRLOG_WRAP, wrapRef(w)]]);
-    expect(await dirWrapsById(env, P.b64u(credId), null)).toEqual([{ uid: a.uidB64, ...w, dirseq }]);
+    expect(entries.map((e) => [e.seq, e.kind, e.ref])).toEqual([
+      [dirseq, P.DIRLOG_WRAP, wrapRef(w)],
+    ]);
+    expect(await dirWrapsById(env, P.b64u(credId), null)).toEqual([
+      { uid: a.uidB64, ...w, dirseq },
+    ]);
 
     const s1 = await dirState();
     await rejects(dirAddWrap(env, { ...w }), 409, /duplicate/);
@@ -562,13 +671,28 @@ describe("dirAddWrap", () => {
     await register(a);
     const s0 = await dirState();
     const other = makeAccount();
-    const forged = P.makeWrap(a.uid, "recovery", P.random(16), P.credKem(P.random(32), P.random(16)), a.AK, other.ident, Date.now());
+    const forged = P.makeWrap(
+      a.uid,
+      "recovery",
+      P.random(16),
+      P.credKem(P.random(32), P.random(16)),
+      a.AK,
+      other.ident,
+      Date.now(),
+    );
     await rejects(dirAddWrap(env, { ...forged }), 400, /signature/);
     const w = newPasskey(a);
     await rejects(dirAddWrap(env, { ...w, x: 1 }), 400);
     await rejects(dirAddWrap(env, { record: w.record }), 400);
-    await rejects(dirAddWrap(env, { ...signRecord(a, { ...fields(w.record), x: 1 }) }), 400, /canonical|fields/);
-    await rejects(dirAddWrap(env, { ...signRecord(a, w.record.replace('{"v":2,', '{"v":2, ')) }), 400);
+    await rejects(
+      dirAddWrap(env, { ...signRecord(a, { ...fields(w.record), x: 1 }) }),
+      400,
+      /canonical|fields/,
+    );
+    await rejects(
+      dirAddWrap(env, { ...signRecord(a, w.record.replace('{"v":2,', '{"v":2, ')) }),
+      400,
+    );
     expect(await dirState()).toEqual(s0);
   });
 
@@ -576,10 +700,13 @@ describe("dirAddWrap", () => {
     const a = makeAccount();
     await register(a); // 2 wraps
     for (let i = 2; i < MAX_WRAPS_PER_UID - 4; i++) await dirAddWrap(env, { ...newPasskey(a) });
-    const count = async () => (await all<{ n: number }>("SELECT count(*) AS n FROM wrap WHERE uid = ?1", a.uidB64))[0].n;
+    const count = async () =>
+      (await all<{ n: number }>("SELECT count(*) AS n FROM wrap WHERE uid = ?1", a.uidB64))[0].n;
     expect(await count()).toBe(MAX_WRAPS_PER_UID - 4);
     // 8 concurrent adds at 60: exactly 4 land, the others see the cap (the count is read with the head).
-    const results = await Promise.allSettled(Array.from({ length: 8 }, () => dirAddWrap(env, { ...newPasskey(a) })));
+    const results = await Promise.allSettled(
+      Array.from({ length: 8 }, () => dirAddWrap(env, { ...newPasskey(a) })),
+    );
     expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(4);
     for (const r of results.filter((x): x is PromiseRejectedResult => x.status === "rejected")) {
       expect(r.reason).toBeInstanceOf(HttpError);
@@ -618,12 +745,16 @@ describe("dirWrapsById", () => {
     const seqs = Array.from({ length: 70 }, (_, i) => 1e12 + i).sort(() => Math.random() - 0.5);
     await env.DB.batch(
       seqs.map((s) =>
-        env.DB.prepare("INSERT INTO wrap (uid, id, record, sig, dirseq) VALUES (?1, ?2, 'r', 's', ?3)").bind(P.b64u(P.random(16)), id, s),
+        env.DB.prepare(
+          "INSERT INTO wrap (uid, id, record, sig, dirseq) VALUES (?1, ?2, 'r', 's', ?3)",
+        ).bind(P.b64u(P.random(16)), id, s),
       ),
     );
     try {
       const got = await dirWrapsById(env, id, null);
-      expect(got.map((w) => w.dirseq)).toEqual(Array.from({ length: MAX_WRAPS_PER_ID }, (_, i) => 1e12 + i));
+      expect(got.map((w) => w.dirseq)).toEqual(
+        Array.from({ length: MAX_WRAPS_PER_ID }, (_, i) => 1e12 + i),
+      );
     } finally {
       await env.DB.prepare("DELETE FROM wrap WHERE id = ?1").bind(id).run();
     }
@@ -631,10 +762,26 @@ describe("dirWrapsById", () => {
 
   it("400 for malformed ids and uids", async () => {
     const good = P.b64u(P.random(16));
-    for (const id of ["", "A", "AA==", "AB", "a+b/", "a b", P.b64u(P.random(1024)), nonCanonical(P.b64u(P.random(20)))]) {
+    for (const id of [
+      "",
+      "A",
+      "AA==",
+      "AB",
+      "a+b/",
+      "a b",
+      P.b64u(P.random(1024)),
+      nonCanonical(P.b64u(P.random(20))),
+    ]) {
       await rejects(dirWrapsById(env, id, null), 400, /invalid id/);
     }
-    for (const uid of ["", P.b64u(P.random(15)), P.b64u(P.random(17)), `${good}==`, nonCanonical(good), "x".repeat(22)]) {
+    for (const uid of [
+      "",
+      P.b64u(P.random(15)),
+      P.b64u(P.random(17)),
+      `${good}==`,
+      nonCanonical(good),
+      "x".repeat(22),
+    ]) {
       await rejects(dirWrapsById(env, P.b64u(P.random(16)), uid), 400, /invalid uid/);
     }
     await rejects(dirByUid(env, P.b64u(P.random(15))), 400, /invalid uid/);
@@ -656,7 +803,10 @@ describe("prefix lookups", () => {
         }
         if (pmax < 32) {
           for (const kind of ["h", "u"] as const) {
-            const e = (await rejects(dirByPrefix(env, kind, pmax + 1, 0, null), 409)) as PrefixBitsError;
+            const e = (await rejects(
+              dirByPrefix(env, kind, pmax + 1, 0, null),
+              409,
+            )) as PrefixBitsError;
             expect(e).toBeInstanceOf(PrefixBitsError);
             expect(e.P).toBe(Pn);
             expect(e.extra).toEqual({ p: Pn });
@@ -680,7 +830,9 @@ describe("prefix lookups", () => {
   it("p = 0, 1 and 32 return exactly the matching rows, by uid; the stored prefixes are hpre / upre", async () => {
     const accts = Array.from({ length: 6 }, () => makeAccount());
     for (const a of accts) await register(a);
-    const rows = await all<{ uid: string; handle: string; hpre: number; upre: number }>("SELECT uid, handle, hpre, upre FROM user");
+    const rows = await all<{ uid: string; handle: string; hpre: number; upre: number }>(
+      "SELECT uid, handle, hpre, upre FROM user",
+    );
     for (const r of rows) {
       expect(r.hpre).toBe(P.hpre(r.handle));
       expect(r.upre).toBe(P.upre(P.fromB64u(r.uid)));
@@ -704,7 +856,10 @@ describe("prefix lookups", () => {
             .map((r) => r.uid)
             .sort(byteOrder);
           const got = await allPages(kind, p, x);
-          expect(got.map((u) => u.uid), `${kind} p=${p} x=${x}`).toEqual(want);
+          expect(
+            got.map((u) => u.uid),
+            `${kind} p=${p} x=${x}`,
+          ).toEqual(want);
         }
         // each account is found by its own 32-bit prefix
         for (const a of accts) {
@@ -723,8 +878,12 @@ describe("prefix lookups", () => {
       for (const paged of [false, true]) {
         const plan = async (wide: boolean) => {
           const stmt = env.DB.prepare(`EXPLAIN QUERY PLAN ${prefixSql(kind, paged, wide)}`);
-          const args = paged ? [0, 2 ** 31 - 1, PREFIX_PAGE + 1, "AAAAAAAAAAAAAAAAAAAAAA"] : [0, 2 ** 31 - 1, PREFIX_PAGE + 1];
-          return (await stmt.bind(...args).all<{ detail: string }>()).results.map((r) => r.detail).join(" | ");
+          const args = paged
+            ? [0, 2 ** 31 - 1, PREFIX_PAGE + 1, "AAAAAAAAAAAAAAAAAAAAAA"]
+            : [0, 2 ** 31 - 1, PREFIX_PAGE + 1];
+          return (await stmt.bind(...args).all<{ detail: string }>()).results
+            .map((r) => r.detail)
+            .join(" | ");
         };
         const narrow = await plan(false);
         expect(narrow, narrow).toContain(index);
@@ -776,7 +935,10 @@ describe("prefix lookups", () => {
   it(`pages of ${PREFIX_PAGE} with after and more`, async () => {
     const V = 0x5eed0001;
     const n = PREFIX_PAGE + 44;
-    const fake = Array.from({ length: n }, (_, i) => ({ uid: P.b64u(P.random(16)), handle: `zz_page_${i}_${P.hex(P.random(3))}` }));
+    const fake = Array.from({ length: n }, (_, i) => ({
+      uid: P.b64u(P.random(16)),
+      handle: `zz_page_${i}_${P.hex(P.random(3))}`,
+    }));
     await env.DB.batch(
       fake.map((u, i) =>
         env.DB.prepare(
@@ -830,7 +992,14 @@ describe("prefix lookups", () => {
     const p = Math.min(P0 + 1, 32);
     const users = await allPages("h", p, P.topBits(P.hpre(a.handle), p));
     const mine = users.find((u) => u.uid === a.uidB64);
-    expect(mine).toEqual({ uid: a.uidB64, handle: a.handle, bundle: a.bundle, sig: a.sig, regEra: P.era(Date.now()), dirseq });
+    expect(mine).toEqual({
+      uid: a.uidB64,
+      handle: a.handle,
+      bundle: a.bundle,
+      sig: a.sig,
+      regEra: P.era(Date.now()),
+      dirseq,
+    });
     expect(users.length).toBeGreaterThan(0);
     for (const u of users) {
       const v = P.verifyBundle(u.bundle, u.sig);
@@ -910,22 +1079,38 @@ describe("dirlog", () => {
       },
     });
     const counted = new Proxy(env, { get: (t, k) => (k === "DB" ? db : Reflect.get(t, k)) });
-    const res = await Promise.all(accts.map((a) => dirRegister(counted, registerBody(a), Date.now())));
+    const res = await Promise.all(
+      accts.map((a) => dirRegister(counted, registerBody(a), Date.now())),
+    );
     expect(conflicts).toBeGreaterThan(0);
     const seqs = res.map((r) => r.dirseq);
     expect(new Set(seqs).size).toBe(8);
     const s1 = await dirState();
-    expect(s1).toEqual({ users: s0.users + 8, wraps: s0.wraps + 16, head: s0.head + 24, meta: s0.meta + 8 });
+    expect(s1).toEqual({
+      users: s0.users + 8,
+      wraps: s0.wraps + 16,
+      head: s0.head + 24,
+      meta: s0.meta + 8,
+    });
     expect(s1.meta).toBe(s1.users);
 
     const log = await verifiedDirlog();
     expect(log).toHaveLength(s1.head);
     // Every entry is one user or wrap row, and each registration's entries are contiguous (user, then wraps).
-    const users = await all<{ bundle: string; sig: string; dirseq: number }>("SELECT bundle, sig, dirseq FROM user");
-    const wraps = await all<{ record: string; sig: string; dirseq: number }>("SELECT record, sig, dirseq FROM wrap");
+    const users = await all<{ bundle: string; sig: string; dirseq: number }>(
+      "SELECT bundle, sig, dirseq FROM user",
+    );
+    const wraps = await all<{ record: string; sig: string; dirseq: number }>(
+      "SELECT record, sig, dirseq FROM wrap",
+    );
     expect(users.length + wraps.length).toBe(log.length);
-    for (const u of users) expect(log[u.dirseq - 1]).toMatchObject({ kind: P.DIRLOG_USER, ref: userRef(u.bundle, u.sig) });
-    for (const w of wraps) expect(log[w.dirseq - 1]).toMatchObject({ kind: P.DIRLOG_WRAP, ref: wrapRef(w) });
+    for (const u of users)
+      expect(log[u.dirseq - 1]).toMatchObject({
+        kind: P.DIRLOG_USER,
+        ref: userRef(u.bundle, u.sig),
+      });
+    for (const w of wraps)
+      expect(log[w.dirseq - 1]).toMatchObject({ kind: P.DIRLOG_WRAP, ref: wrapRef(w) });
     accts.forEach((a, i) => {
       expect(log[seqs[i]].ref).toBe(wrapRef(a.passkey));
       expect(log[seqs[i] + 1].ref).toBe(wrapRef(a.recovery));
@@ -946,7 +1131,14 @@ describe("D1 failures", () => {
     const db =
       mode === "sync"
         ? new Proxy(env.DB, { get: () => fail })
-        : new Proxy(env.DB, { get: (t, k) => (k === "prepare" ? () => stmt : k === "batch" || k === "exec" ? reject : Reflect.get(t, k)) });
+        : new Proxy(env.DB, {
+            get: (t, k) =>
+              k === "prepare"
+                ? () => stmt
+                : k === "batch" || k === "exec"
+                  ? reject
+                  : Reflect.get(t, k),
+          });
     return new Proxy(env, { get: (t, k) => (k === "DB" ? db : Reflect.get(t, k)) });
   }
 
@@ -969,7 +1161,8 @@ describe("D1 failures", () => {
       await rejects(dirlogPage(bad, 0, 10), 503);
       await rejects(dirlogHead(bad), 503);
       expect(errors).toHaveBeenCalled();
-      for (const call of errors.mock.calls) expect(String(call[0])).not.toMatch(/q3Z9_xK2mP0aB7cD1eF4gH/);
+      for (const call of errors.mock.calls)
+        expect(String(call[0])).not.toMatch(/q3Z9_xK2mP0aB7cD1eF4gH/);
       // nothing was written, and the real directory is unaffected
       expect(await dirByUid(env, a.uidB64)).toBeNull();
       expect((await dirByUid(env, b.uidB64))!.bundle).toBe(b.bundle);
@@ -979,7 +1172,11 @@ describe("D1 failures", () => {
   it("currentP never throws: the last good P (0 if none) while D1 fails, one read and one log line per back-off", async () => {
     let failing = true;
     let reads = 0;
-    const stmt = { bind: () => stmt, first: () => Promise.reject(new Error("D1_ERROR: Network connection lost.")), all: () => stmt.first() };
+    const stmt = {
+      bind: () => stmt,
+      first: () => Promise.reject(new Error("D1_ERROR: Network connection lost.")),
+      all: () => stmt.first(),
+    };
     const db = new Proxy(env.DB, {
       get: (t, k) =>
         k === "prepare"
@@ -988,7 +1185,8 @@ describe("D1 failures", () => {
     });
     const flaky = new Proxy(env, { get: (t, k) => (k === "DB" ? db : Reflect.get(t, k)) });
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
-    const dirmetaLogs = () => errors.mock.calls.filter((c) => /dirmeta read failed/.test(String(c[0]))).length;
+    const dirmetaLogs = () =>
+      errors.mock.calls.filter((c) => /dirmeta read failed/.test(String(c[0]))).length;
     await withUsers(2 ** 20, async () => {
       let clock = Date.now();
       vi.spyOn(Date, "now").mockImplementation(() => clock);
@@ -1013,7 +1211,10 @@ describe("D1 failures", () => {
       expect(reads).toBe(3);
       expect(dirmetaLogs()).toBe(2);
       // Prefix lookups keep checking p against the last good P (the page itself then fails with 503).
-      const e = (await rejects(dirByPrefix(flaky, "h", P.serverP(2 ** 20) + 2, 0, null), 409)) as PrefixBitsError;
+      const e = (await rejects(
+        dirByPrefix(flaky, "h", P.serverP(2 ** 20) + 2, 0, null),
+        409,
+      )) as PrefixBitsError;
       expect(e.extra).toEqual({ p: P.serverP(2 ** 20) });
       await rejects(dirByPrefix(flaky, "h", P.serverP(2 ** 20) + 1, 0, null), 503);
       expect(reads).toBe(4); // the page query, not dirmeta
@@ -1035,7 +1236,9 @@ describe("D1 failures", () => {
             // Reads (the head) go through; every write batch loses the race.
             if (stmts.length === 1) return t.batch(stmts);
             writes++;
-            return Promise.reject(new Error("D1_ERROR: UNIQUE constraint failed: dirlog.seq: SQLITE_CONSTRAINT"));
+            return Promise.reject(
+              new Error("D1_ERROR: UNIQUE constraint failed: dirlog.seq: SQLITE_CONSTRAINT"),
+            );
           };
         }
         const v = Reflect.get(t, k) as unknown;
@@ -1051,9 +1254,15 @@ describe("D1 failures", () => {
   });
 
   it("classifies D1 constraint errors", () => {
-    expect(uniqueFailure(new Error("D1_ERROR: UNIQUE constraint failed: dirlog.seq: SQLITE_CONSTRAINT"))).toBe("dirlog.seq");
-    expect(uniqueFailure(new Error("UNIQUE constraint failed: wrap.uid, wrap.id"))).toBe("wrap.uid");
-    const wrapped = new Error("D1_ERROR", { cause: new Error("UNIQUE constraint failed: user.handle") });
+    expect(
+      uniqueFailure(new Error("D1_ERROR: UNIQUE constraint failed: dirlog.seq: SQLITE_CONSTRAINT")),
+    ).toBe("dirlog.seq");
+    expect(uniqueFailure(new Error("UNIQUE constraint failed: wrap.uid, wrap.id"))).toBe(
+      "wrap.uid",
+    );
+    const wrapped = new Error("D1_ERROR", {
+      cause: new Error("UNIQUE constraint failed: user.handle"),
+    });
     expect(uniqueFailure(wrapped)).toBe("user.handle");
     expect(uniqueFailure(new Error("D1_ERROR: Network connection lost."))).toBeNull();
     expect(uniqueFailure("nope")).toBeNull();

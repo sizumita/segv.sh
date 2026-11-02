@@ -55,9 +55,15 @@ describe("followed lanes at restore", () => {
     const A2 = await engineFor(alice);
     const after = server().requests.slice(before);
     const gets = after.filter((r) => r.who === "alice" && r.getKeys);
-    const old = new Set(Array.from({ length: 64 }, (_, n) => P.b64u(P.Lmsg(ep0.keys.rk, bj, server().era, n))));
+    const old = new Set(
+      Array.from({ length: 64 }, (_, n) => P.b64u(P.Lmsg(ep0.keys.rk, bj, server().era, n))),
+    );
     const fetched = gets.reduce(
-      (k, r) => k + r.getKeys!.filter((x, i) => x.mode === 0 && old.has(P.b64u(x.label)) && r.getStatuses?.[i]?.s === "hit").length,
+      (k, r) =>
+        k +
+        r.getKeys!.filter(
+          (x, i) => x.mode === 0 && old.has(P.b64u(x.label)) && r.getStatuses?.[i]?.s === "hit",
+        ).length,
       0,
     );
     // Only the initial history of the previous epoch may read bob's old rows (the last HISTORY_INITIAL slots).

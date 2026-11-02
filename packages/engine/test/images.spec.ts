@@ -36,7 +36,8 @@ async function urlBytes(url: string): Promise<Uint8Array> {
   return new Uint8Array(await b.arrayBuffer());
 }
 
-const blobGets = () => server().requests.filter((r) => r.path.startsWith("/api/v2/blob/") && r.method === "GET").length;
+const blobGets = () =>
+  server().requests.filter((r) => r.path.startsWith("/api/v2/blob/") && r.method === "GET").length;
 
 describe("images", () => {
   it("sends an encrypted image that the other member can load", async () => {
@@ -83,7 +84,9 @@ describe("images", () => {
     const shown = mustView(A, stranger).messages.find((m) => m.kind === "image")!;
     expect(shown.fromHandle).toBe("mallory");
     await expect(A.loadImage(shown.image!)).rejects.toThrow();
-    await expect(A.loadImage({ ...real, id: "../../api/v2/params" })).rejects.toThrow(/bad image reference/);
+    await expect(A.loadImage({ ...real, id: "../../api/v2/params" })).rejects.toThrow(
+      /bad image reference/,
+    );
   });
 
   it("engine-11: an image upload in flight across a logout does not touch the next account", async () => {
@@ -97,7 +100,10 @@ describe("images", () => {
       if (m === "PUT" && p.startsWith("/api/v2/blob/") && !release)
         return new Promise<void>((r) => (release = r));
     };
-    const p = E.sendImage(id, new File([P.utf8("alice only") as BlobPart], "a.webp", { type: "image/webp" }));
+    const p = E.sendImage(
+      id,
+      new File([P.utf8("alice only") as BlobPart], "a.webp", { type: "image/webp" }),
+    );
     await sleep(50);
     expect(release).toBeTypeOf("function");
     await E.logout();
@@ -125,7 +131,10 @@ describe("images", () => {
       if (m === "PUT" && p.startsWith("/api/v2/blob/") && !release)
         return new Promise<void>((r) => (release = r));
     };
-    const p = E.sendImage(id, new File([P.utf8("picked by alice") as BlobPart], "a.webp", { type: "image/webp" }));
+    const p = E.sendImage(
+      id,
+      new File([P.utf8("picked by alice") as BlobPart], "a.webp", { type: "image/webp" }),
+    );
     await sleep(50);
     await E.logout();
     await I(E).unlock(dave.AK, dave.uid, "dave"); // same tab, another account that is in the same conversation

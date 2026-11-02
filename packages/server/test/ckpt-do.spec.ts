@@ -39,14 +39,20 @@ async function tick(): Promise<CkptRecord> {
   expect(r).not.toBeNull();
   return r!;
 }
-const headOf = (r: CkptRecord, cid: string): Uint8Array | undefined => r.heads.find((h) => h.cid === cid)?.head;
+const headOf = (r: CkptRecord, cid: string): Uint8Array | undefined =>
+  r.heads.find((h) => h.cid === cid)?.head;
 
 async function shardClock(E: number, ms: number): Promise<void> {
   await runInDurableObject(shardStub(env, E, 0), (inst: ShardDO) => {
     (inst as unknown as { clock: () => number }).clock = () => ms;
   });
 }
-const shardRow = () => ({ v: P.random(8), label: P.random(16), cls: 0, body: P.random(P.BODY_LENS[0]) });
+const shardRow = () => ({
+  v: P.random(8),
+  label: P.random(16),
+  cls: 0,
+  body: P.random(P.BODY_LENS[0]),
+});
 /** Puts one row into shard E at `ms` and leaves the shard's clock 3 s later (the next head() closes the batch). */
 async function shardWrite(E: number, ms: number): Promise<void> {
   await shardClock(E, ms);
@@ -60,7 +66,9 @@ async function withEnv(patch: Record<string, unknown>, fn: () => Promise<void>):
   await runInDurableObject(ck(), (inst: CheckpointDO) => {
     const self = inst as unknown as CkInternals;
     real = self.env;
-    self.env = new Proxy(real, { get: (t, k) => (typeof k === "string" && k in patch ? patch[k] : Reflect.get(t, k)) });
+    self.env = new Proxy(real, {
+      get: (t, k) => (typeof k === "string" && k in patch ? patch[k] : Reflect.get(t, k)),
+    });
   });
   try {
     await fn();
@@ -71,7 +79,9 @@ async function withEnv(patch: Record<string, unknown>, fn: () => Promise<void>):
   }
 }
 /** A DO namespace whose every object fails head(). */
-const deadNs = { getByName: () => ({ head: () => Promise.reject(new Error("component unavailable")) }) };
+const deadNs = {
+  getByName: () => ({ head: () => Promise.reject(new Error("component unavailable")) }),
+};
 
 /** Checks one record: sorted cids, hd = H(heads), C chains from `prevC`, and the signature. */
 function checkRecord(r: CkptRecord, prevC: Uint8Array): void {
@@ -126,7 +136,9 @@ describe("CheckpointDO", () => {
     const tail = await ck().range(r1.q, 10);
     expect(tail!.from).toEqual({ q: r1.q, C: r1.C });
     expect(tail!.entries.map((e) => e.q)).toEqual([r2.q]);
-    expect(P.ckptC(tail!.from.C, tail!.entries[0].q, tail!.entries[0].sec, tail!.entries[0].hd)).toEqual(tail!.latest.C);
+    expect(
+      P.ckptC(tail!.from.C, tail!.entries[0].q, tail!.entries[0].sec, tail!.entries[0].hd),
+    ).toEqual(tail!.latest.C);
     expect((await ck().range(r2.q, 5))!.entries).toEqual([]);
     expect(await ck().range(r2.q + 1, 5)).toBeNull();
     expect(await ck().get(0)).toBeNull();
@@ -188,20 +200,28 @@ describe("CheckpointDO", () => {
         expect((await tick()).q).toBe(r1.q);
       });
       // The shard still fails while the dirlog moves: the new checkpoint carries the old shard head.
-      await withEnv({ SHARD: deadNs, DB: fakeDb(async () => ({ seq: 9, h: P.b64u(X) })) }, async () => {
-        const r = await tick();
-        expect(r.q).toBe(r1.q + 1);
-        expect(headOf(r, P.shardCid(F, 0))).toEqual(h1);
-        expect(headOf(r, P.DIRLOG_CID)).toEqual(X);
-      });
+      await withEnv(
+        { SHARD: deadNs, DB: fakeDb(async () => ({ seq: 9, h: P.b64u(X) })) },
+        async () => {
+          const r = await tick();
+          expect(r.q).toBe(r1.q + 1);
+          expect(headOf(r, P.shardCid(F, 0))).toEqual(h1);
+          expect(headOf(r, P.DIRLOG_CID)).toEqual(X);
+        },
+      );
       // D1 fails: the dirlog keeps X.
-      await withEnv({ DB: fakeDb(async () => Promise.reject(new Error("D1_ERROR: network connection lost"))) }, async () => {
-        const r = await tick();
-        expect(headOf(r, P.DIRLOG_CID)).toEqual(X);
-        expect(headOf(r, P.shardCid(F, 0))).toEqual(h2);
-      });
+      await withEnv(
+        { DB: fakeDb(async () => Promise.reject(new Error("D1_ERROR: network connection lost"))) },
+        async () => {
+          const r = await tick();
+          expect(headOf(r, P.DIRLOG_CID)).toEqual(X);
+          expect(headOf(r, P.shardCid(F, 0))).toEqual(h2);
+        },
+      );
       // A missing dirlog table (before migration 0003) or an empty one is ZERO32.
-      const noTable = fakeDb(async () => Promise.reject(new Error("D1_ERROR: no such table: dirlog: SQLITE_ERROR")));
+      const noTable = fakeDb(async () =>
+        Promise.reject(new Error("D1_ERROR: no such table: dirlog: SQLITE_ERROR")),
+      );
       await withEnv({ DB: noTable }, async () => {
         expect(headOf(await tick(), P.DIRLOG_CID)).toEqual(P.ZERO32);
       });
@@ -229,7 +249,9 @@ describe("CheckpointDO", () => {
       await withEnv({ SHARD: deadNs, INBOX: deadNs }, async () => {
         r1 = await tick();
       });
-      expect(errors.mock.calls.filter((c) => String(c[0]).includes("did not answer"))).toHaveLength(4);
+      expect(errors.mock.calls.filter((c) => String(c[0]).includes("did not answer"))).toHaveLength(
+        4,
+      );
     } finally {
       errors.mockRestore();
     }
@@ -314,7 +336,9 @@ describe("CheckpointDO", () => {
     await runInDurableObject(ck(), (_inst: CheckpointDO, state) => state.storage.deleteAlarm());
     await evictDurableObject(ck());
     const t0 = Date.now();
-    const armed = await runInDurableObject(ck(), (_inst: CheckpointDO, state) => state.storage.getAlarm());
+    const armed = await runInDurableObject(ck(), (_inst: CheckpointDO, state) =>
+      state.storage.getAlarm(),
+    );
     expect(armed).not.toBeNull();
     expect(armed!).toBeGreaterThanOrEqual(t0 + 59_000);
     expect(armed!).toBeLessThanOrEqual(Date.now() + 60_000);
@@ -334,7 +358,9 @@ describe("CheckpointDO", () => {
       expect(await state.storage.getAlarm()).toBe(armed);
     });
     for (let k = 0; k < 3; k++) await ck().ensure();
-    expect(await runInDurableObject(ck(), (_inst: CheckpointDO, state) => state.storage.getAlarm())).toBe(armed);
+    expect(
+      await runInDurableObject(ck(), (_inst: CheckpointDO, state) => state.storage.getAlarm()),
+    ).toBe(armed);
     expect((await ck().latest())?.q ?? 0).toBe(q0);
 
     // ensure() is also the safety net when the alarm went missing.

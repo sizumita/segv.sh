@@ -34,19 +34,31 @@ const bytesOf = async (res: Response) => new Uint8Array(await res.arrayBuffer())
 const whoHeader = (who?: string): Record<string, string> => (who ? { "x-fake-who": who } : {});
 const nowHeader = (res: Response) => Number(res.headers.get("x-segv-now"));
 
-const putRow = (E: number, label: Uint8Array, opts: { cls?: number; topic?: Uint8Array; body?: Uint8Array } = {}): W.PutRow => {
+const putRow = (
+  E: number,
+  label: Uint8Array,
+  opts: { cls?: number; topic?: Uint8Array; body?: Uint8Array } = {},
+): W.PutRow => {
   const cls = opts.cls ?? 0;
   return { E, label, cls, topic: opts.topic ?? ZERO16, body: opts.body ?? junkBody(cls) };
 };
 
 async function put(rows: W.PutRow[], who?: string): Promise<W.PutResult[]> {
-  const res = await fetch("/api/v2/put", { method: "POST", body: W.encodePutRequest(rows) as BodyInit, headers: whoHeader(who) });
+  const res = await fetch("/api/v2/put", {
+    method: "POST",
+    body: W.encodePutRequest(rows) as BodyInit,
+    headers: whoHeader(who),
+  });
   expect(res.status).toBe(200);
   return W.decodePutResponse(await bytesOf(res));
 }
 
 async function get(keys: W.GetKey[], who?: string): Promise<W.GetStatus[]> {
-  const res = await fetch("/api/v2/get", { method: "POST", body: W.encodeGetRequest(keys) as BodyInit, headers: whoHeader(who) });
+  const res = await fetch("/api/v2/get", {
+    method: "POST",
+    body: W.encodeGetRequest(keys) as BodyInit,
+    headers: whoHeader(who),
+  });
   expect(res.status).toBe(200);
   return W.decodeGetResponse(
     await bytesOf(res),
@@ -57,7 +69,11 @@ async function get(keys: W.GetKey[], who?: string): Promise<W.GetStatus[]> {
 const invite = (): W.InboxPostRow => ({ eid: P.random(16), body: P.random(P.INBOX_BODY_LEN) });
 
 const inboxPost = (E: number, rows: W.InboxPostRow[], who?: string) =>
-  fetch("/api/v2/inbox", { method: "POST", body: W.encodeInboxPost({ E, bucket: 0, rows }) as BodyInit, headers: whoHeader(who) });
+  fetch("/api/v2/inbox", {
+    method: "POST",
+    body: W.encodeInboxPost({ E, bucket: 0, rows }) as BodyInit,
+    headers: whoHeader(who),
+  });
 
 async function inboxRead(E: number, after = 0, limit?: number) {
   const res = await fetch(`/api/v2/inbox/${E}/0?after=${after}${limit ? `&limit=${limit}` : ""}`);
@@ -73,10 +89,15 @@ const IMMUTABLE = "public, max-age=31536000, immutable";
 const HSTS = "max-age=63072000; includeSubDomains";
 
 /** Moves the world clock to `ms` (sockets stay open). */
-const setNow = (world: FakeWorld, ms: number) => world.advance(ms - world.now(), { keepSockets: true });
+const setNow = (world: FakeWorld, ms: number) =>
+  world.advance(ms - world.now(), { keepSockets: true });
 
 const postJson = (path: string, body: unknown) =>
-  fetch(path, { method: "POST", body: JSON.stringify(body), headers: { "content-type": "application/json" } });
+  fetch(path, {
+    method: "POST",
+    body: JSON.stringify(body),
+    headers: { "content-type": "application/json" },
+  });
 
 /** Moves the world clock to ~20 ms after a whole second, so the next steps stay inside one inbox slot / Δ. */
 function alignToSecond(world: FakeWorld): void {
@@ -90,13 +111,25 @@ function openRt(who: string | null) {
   ws.binaryType = "arraybuffer";
   const frames: (W.ServerFrame | string)[] = [];
   const state: { closed: number | null } = { closed: null };
-  ws.onmessage = (ev) => frames.push(typeof ev.data === "string" ? ev.data : W.decodeServerFrame(new Uint8Array(ev.data as ArrayBuffer)));
+  ws.onmessage = (ev) =>
+    frames.push(
+      typeof ev.data === "string"
+        ? ev.data
+        : W.decodeServerFrame(new Uint8Array(ev.data as ArrayBuffer)),
+    );
   ws.onclose = (ev) => {
     state.closed = ev.code;
   };
   const rows = () => frames.flatMap((f) => (typeof f !== "string" && f.f === "rows" ? f.rows : []));
   const kinds = () => frames.map((f) => (typeof f === "string" ? f : f.f));
-  return { ws, frames, state, rows, kinds, send: (f: W.ClientFrame) => ws.send(W.encodeClientFrame(f)) };
+  return {
+    ws,
+    frames,
+    state,
+    rows,
+    kinds,
+    send: (f: W.ClientFrame) => ws.send(W.encodeClientFrame(f)),
+  };
 }
 
 async function hello(c: ReturnType<typeof openRt>) {
@@ -116,10 +149,33 @@ describe("clock and response headers", () => {
     const id = P.b64u(P.H(blob));
     const cases: [string, () => Promise<Response>, number, string][] = [
       ["params", () => fetch("/api/v2/params"), 200, "no-store"],
-      ["put", () => fetch("/api/v2/put", { method: "POST", body: W.encodePutRequest([putRow(E, P.random(16))]) as BodyInit }), 200, "no-store"],
-      ["get", () => fetch("/api/v2/get", { method: "POST", body: W.encodeGetRequest([{ E, label: P.random(16), mode: 0 }]) as BodyInit }), 200, "no-store"],
+      [
+        "put",
+        () =>
+          fetch("/api/v2/put", {
+            method: "POST",
+            body: W.encodePutRequest([putRow(E, P.random(16))]) as BodyInit,
+          }),
+        200,
+        "no-store",
+      ],
+      [
+        "get",
+        () =>
+          fetch("/api/v2/get", {
+            method: "POST",
+            body: W.encodeGetRequest([{ E, label: P.random(16), mode: 0 }]) as BodyInit,
+          }),
+        200,
+        "no-store",
+      ],
       ["blob meta miss", () => fetch(`/api/v2/blob/${id}/meta`), 404, "no-store"],
-      ["blob put", () => fetch(`/api/v2/blob/${id}`, { method: "PUT", body: blob as BodyInit }), 201, "no-store"],
+      [
+        "blob put",
+        () => fetch(`/api/v2/blob/${id}`, { method: "PUT", body: blob as BodyInit }),
+        201,
+        "no-store",
+      ],
       ["blob meta hit", () => fetch(`/api/v2/blob/${id}/meta`), 200, "no-store"],
       ["blob get", () => fetch(`/api/v2/blob/${id}`), 200, "public, max-age=31536000, immutable"],
       ["inbox post", () => inboxPost(E, [invite()]), 200, "no-store"],
@@ -145,7 +201,8 @@ describe("clock and response headers", () => {
       expect(res.headers.get("x-content-type-options"), what).toBe("nosniff");
       expect(res.headers.get("referrer-policy"), what).toBe("no-referrer");
       expect(res.headers.get("strict-transport-security"), what).toBeNull(); // http
-      if (status >= 400) expect(typeof ((await res.json()) as { error?: unknown }).error, what).toBe("string");
+      if (status >= 400)
+        expect(typeof ((await res.json()) as { error?: unknown }).error, what).toBe("string");
     }
     const res405 = await fetch("/api/v2/put");
     expect(res405.headers.get("allow")).toBe("POST");
@@ -156,7 +213,14 @@ describe("clock and response headers", () => {
     // Over https every response also carries HSTS: JSON, binary, errors, cacheable and 304 alike.
     const cases2: [string, RequestInit | undefined, number][] = [
       ["/api/v2/params", undefined, 200],
-      ["/api/v2/get", { method: "POST", body: W.encodeGetRequest([{ E, label: P.random(16), mode: 1 }]) as BodyInit }, 200],
+      [
+        "/api/v2/get",
+        {
+          method: "POST",
+          body: W.encodeGetRequest([{ E, label: P.random(16), mode: 1 }]) as BodyInit,
+        },
+        200,
+      ],
       [`/api/v2/blob/${id}`, undefined, 200],
       [`/api/v2/blob/${id}`, { headers: { "if-none-match": `"${id}"` } }, 304],
       ["/api/v2/rt", undefined, 426],
@@ -179,7 +243,9 @@ describe("clock and response headers", () => {
     expect(a.ws.upgradeStatus).toBe(101);
     expect([...a.ws.upgradeHeaders!.keys()]).toEqual([]); // no x-segv-now, HSTS, nosniff or no-referrer
     expect(Math.abs(h.now - world.now())).toBeLessThan(1000);
-    expect(world.requests.filter((r) => r.path === "/api/v2/rt").map((r) => r.status)).toEqual([101]);
+    expect(world.requests.filter((r) => r.path === "/api/v2/rt").map((r) => r.status)).toEqual([
+      101,
+    ]);
     // Over wss (an https request to the Worker) the 101 has no HSTS either.
     const S = world.WebSocketAs("alice");
     const s = new S("wss://segv.test/api/v2/rt");
@@ -205,7 +271,10 @@ describe("clock and response headers", () => {
     expect((await refused("alice", "wss://segv.test/api/v2/rt")).upgradeStatus).toBe(429);
     world.rateLimits({ RL_READ: { limit: 0 } });
     const limited = await refused("bob");
-    expect([limited.upgradeStatus, limited.upgradeHeaders!.get("retry-after")]).toEqual([429, "60"]);
+    expect([limited.upgradeStatus, limited.upgradeHeaders!.get("retry-after")]).toEqual([
+      429,
+      "60",
+    ]);
     world.rateLimits(false);
     world.wsEnabled = false;
     expect((await refused("carol")).upgradeStatus).toBe(503);
@@ -219,7 +288,9 @@ describe("clock and response headers", () => {
       const ws = new WS("ws://segv.test/api/v2/rt");
       await waitFor(() => ws.readyState === FakeWebSocket.CLOSED, "failed upgrade");
       expect([ws.upgradeStatus, ws.upgradeHeaders], mode).toEqual([0, null]);
-      expect(world.requests[world.requests.length - 1].status, mode).toBe(mode === "before" ? 0 : 101);
+      expect(world.requests[world.requests.length - 1].status, mode).toBe(
+        mode === "before" ? 0 : 101,
+      );
     }
     world.hooks.fail = undefined;
   });
@@ -259,7 +330,14 @@ describe("clock and response headers", () => {
       shards: 1,
       p: 0,
       pow: { register: 0, wrap: 0, put: 0, inbox: 0, blob: 0 },
-      limits: { putRows: 16, putBytes: 263345, getKeys: 256, topics: 256, blobMax: 12582912, textMax: 12000 },
+      limits: {
+        putRows: 16,
+        putBytes: 263345,
+        getKeys: 256,
+        topics: 256,
+        blobMax: 12582912,
+        textMax: 12000,
+      },
     });
     expect(j.srvKey).toBe(P.b64u(world.srvKey));
     expect(j.kcommit).toBe(P.b64u(P.kcommit(P.kroute(world.routeKey, world.era))));
@@ -316,7 +394,11 @@ describe("shard", () => {
     const res = await put([putRow(E, L2, { body: first }), putRow(E, L2), putRow(E, P.random(16))]);
     expect(res.map((x) => x.s)).toEqual(["ok", "conflict", "ok"]);
     expect(res[1]).toMatchObject({ s: "conflict", body: first });
-    expect(world.requests[world.requests.length - 1].putResults?.map((x) => x.s)).toEqual(["ok", "conflict", "ok"]);
+    expect(world.requests[world.requests.length - 1].putResults?.map((x) => x.s)).toEqual([
+      "ok",
+      "conflict",
+      "ok",
+    ]);
 
     const st = await get([
       { E, label: L, mode: 0 },
@@ -343,7 +425,11 @@ describe("shard", () => {
     const E = world.era;
     world.advance(P.eraStart(E + 1) - 1000 - world.now(), { keepSockets: true });
     expect(world.era).toBe(E);
-    const early = await put([putRow(E + 1, P.random(16)), putRow(E, P.random(16)), putRow(E + 2, P.random(16))]);
+    const early = await put([
+      putRow(E + 1, P.random(16)),
+      putRow(E, P.random(16)),
+      putRow(E + 2, P.random(16)),
+    ]);
     expect(early[0]).toMatchObject({ s: "ok", t: P.secOf(P.eraStart(E + 1)) });
     expect(early[1].s).toBe("ok");
     expect(early[2]).toEqual({ s: "wrong_era", era: E });
@@ -359,7 +445,9 @@ describe("shard", () => {
     expect(late).toEqual({ s: "wrong_era", era: E });
     // Below E_FIRST: MISS(sealed = 1) without touching a shard.
     world.params.efirst = E;
-    expect(await get([{ E: E - 1, label: P.random(16), mode: 0 }])).toEqual([{ s: "miss", sealed: true }]);
+    expect(await get([{ E: E - 1, label: P.random(16), mode: 0 }])).toEqual([
+      { s: "miss", sealed: true },
+    ]);
   });
 
   it("sealing: MISS(sealed) only once the era is sealed (sealDelayMs, sealPrevious)", async () => {
@@ -369,18 +457,24 @@ describe("shard", () => {
     await put([putRow(E0, L)]);
     world.advanceEra();
     // Default: sealed at end(E) + SKEW.
-    expect(await get([{ E: E0, label: P.random(16), mode: 1 }])).toEqual([{ s: "miss", sealed: true }]);
+    expect(await get([{ E: E0, label: P.random(16), mode: 1 }])).toEqual([
+      { s: "miss", sealed: true },
+    ]);
 
     world.sealDelayMs = 3_600_000;
     const E1 = world.era;
     await put([putRow(E1, L)]);
     world.advanceEra();
-    expect(await get([{ E: E1, label: P.random(16), mode: 1 }])).toEqual([{ s: "miss", sealed: false }]);
+    expect(await get([{ E: E1, label: P.random(16), mode: 1 }])).toEqual([
+      { s: "miss", sealed: false },
+    ]);
     expect((await get([{ E: E1, label: L, mode: 1 }]))[0].s).toBe("hit");
     expect((await put([putRow(E1, P.random(16))]))[0]).toEqual({ s: "wrong_era", era: E1 + 1 });
 
     world.sealPrevious();
-    expect(await get([{ E: E1, label: P.random(16), mode: 1 }])).toEqual([{ s: "miss", sealed: true }]);
+    expect(await get([{ E: E1, label: P.random(16), mode: 1 }])).toEqual([
+      { s: "miss", sealed: true },
+    ]);
   });
 
   it("/era/{E} answers from the world clock: sealed = now ≥ end(E) + SKEW, whatever the shard says (sealDelayMs, sealPrevious, shardLagMs)", async () => {
@@ -402,15 +496,33 @@ describe("shard", () => {
     world.sealPrevious();
     expect(await get([{ E, label: P.random(16), mode: 1 }])).toEqual([{ s: "miss", sealed: true }]);
     const open = await era(E);
-    expect(open.j).toEqual({ era: E, start: P.eraStart(E), end: P.eraEnd(E), delta: 1, shards: 1, kcommit: P.b64u(world.kcommitOf(E)), sealed: false });
+    expect(open.j).toEqual({
+      era: E,
+      start: P.eraStart(E),
+      end: P.eraEnd(E),
+      delta: 1,
+      shards: 1,
+      kcommit: P.b64u(world.kcommitOf(E)),
+      sealed: false,
+    });
     expect(open.res.headers.get("cache-control")).toBe("no-store");
 
     // From end(E) + SKEW: sealed and immutable, while the shard of E + 1 is still open (sealDelayMs) and lags.
     setNow(world, P.eraEnd(E + 1) + 2000);
     world.shardLagMs = 600_000;
-    expect(await get([{ E: E + 1, label: P.random(16), mode: 1 }])).toEqual([{ s: "miss", sealed: false }]);
+    expect(await get([{ E: E + 1, label: P.random(16), mode: 1 }])).toEqual([
+      { s: "miss", sealed: false },
+    ]);
     const sealed = await era(E + 1);
-    expect(sealed.j).toEqual({ era: E + 1, start: P.eraStart(E + 1), end: P.eraEnd(E + 1), delta: 1, shards: 1, kcommit: P.b64u(world.kcommitOf(E + 1)), sealed: true });
+    expect(sealed.j).toEqual({
+      era: E + 1,
+      start: P.eraStart(E + 1),
+      end: P.eraEnd(E + 1),
+      delta: 1,
+      shards: 1,
+      kcommit: P.b64u(world.kcommitOf(E + 1)),
+      sealed: true,
+    });
     expect(sealed.res.headers.get("cache-control")).toBe(IMMUTABLE);
     expect((await era(E)).j.sealed).toBe(true);
 
@@ -444,7 +556,9 @@ describe("shard", () => {
     const h = world.shard.head(E);
     expect(h.head).toEqual(head);
     expect(h.tLast).toBe(page.batches[1].t);
-    const after = W.decodeFeed(await bytesOf(await fetch(`/api/v2/feed/${E}/0?after=${page.batches[0].t}`)));
+    const after = W.decodeFeed(
+      await bytesOf(await fetch(`/api/v2/feed/${E}/0?after=${page.batches[0].t}`)),
+    );
     expect(after.batches.map((b) => b.t)).toEqual([page.batches[1].t]);
 
     // The clock steps back 3 s: the next row gets t = closed_t + Δ, not a t inside a closed batch.
@@ -486,7 +600,10 @@ describe("shard", () => {
     expect((await get([{ E, label: L, mode: 0 }], "alice"))[0]).toMatchObject({ s: "hit", body });
     // The per-client transport attributes requests the same way as the header.
     const bobFetch = world.fetchAs("bob");
-    const res = await bobFetch("/api/v2/get", { method: "POST", body: W.encodeGetRequest([{ E, label: L, mode: 1 }]) as BodyInit });
+    const res = await bobFetch("/api/v2/get", {
+      method: "POST",
+      body: W.encodeGetRequest([{ E, label: L, mode: 1 }]) as BodyInit,
+    });
     expect(W.decodeGetResponse(await bytesOf(res), [1])[0].s).toBe("miss");
     expect(world.requests[world.requests.length - 1].who).toBe("bob");
     world.shard.unhide(E, L, "bob");
@@ -497,7 +614,12 @@ describe("shard", () => {
     expect((await get([{ E, label: L, mode: 1 }]))[0]).toEqual({ s: "hit", t: t0 + 7, cls: 0 });
     const other = junkBody(1);
     world.shard.rewrite(E, L, { cls: 1, body: other });
-    expect((await get([{ E, label: L, mode: 0 }]))[0]).toEqual({ s: "hit", t: t0 + 7, cls: 1, body: other });
+    expect((await get([{ E, label: L, mode: 0 }]))[0]).toEqual({
+      s: "hit",
+      t: t0 + 7,
+      cls: 1,
+      body: other,
+    });
     const [c] = await put([putRow(E, L)]);
     expect(c).toMatchObject({ s: "conflict", cls: 1, body: other });
   });
@@ -508,14 +630,21 @@ describe("shard", () => {
     const L1 = P.random(16);
     world.hooks.fail = (m, p) => (m === "POST" && p === "/api/v2/put" ? "after" : null);
     const body1 = W.encodePutRequest([putRow(E, L1)]);
-    await expect(fetch("/api/v2/put", { method: "POST", body: body1 as BodyInit })).rejects.toThrow(TypeError);
+    await expect(fetch("/api/v2/put", { method: "POST", body: body1 as BodyInit })).rejects.toThrow(
+      TypeError,
+    );
     expect(world.shard.hasLabel(E, L1)).toBe(true);
     const lost = world.requests[world.requests.length - 1];
     expect(lost).toMatchObject({ status: 200, reqBytes: body1.length, resBytes: 1 + 1 + 4 + 64 });
 
     const L2 = P.random(16);
     world.hooks.fail = () => "before";
-    await expect(fetch("/api/v2/put", { method: "POST", body: W.encodePutRequest([putRow(E, L2)]) as BodyInit })).rejects.toThrow(TypeError);
+    await expect(
+      fetch("/api/v2/put", {
+        method: "POST",
+        body: W.encodePutRequest([putRow(E, L2)]) as BodyInit,
+      }),
+    ).rejects.toThrow(TypeError);
     expect(world.shard.hasLabel(E, L2)).toBe(false);
     expect(world.requests[world.requests.length - 1].status).toBe(0);
     world.hooks.fail = undefined;
@@ -548,7 +677,10 @@ describe("shard", () => {
       world.advance(5_000, { keepSockets: true }); // the put is held while the world clock moves
     };
     const started = world.now();
-    const res = await fetch("/api/v2/put", { method: "POST", body: W.encodePutRequest([putRow(E, P.random(16))]) as BodyInit });
+    const res = await fetch("/api/v2/put", {
+      method: "POST",
+      body: W.encodePutRequest([putRow(E, P.random(16))]) as BodyInit,
+    });
     world.hooks.beforePut = undefined;
     expect(res.status).toBe(200);
     expect(world.now() - started).toBeGreaterThanOrEqual(5_000);
@@ -572,10 +704,18 @@ describe("blobs", () => {
     expect(await r2.json()).toEqual(j1);
 
     const other = P.random(100);
-    expect((await fetch(`/api/v2/blob/${id.slice(0, -2)}AA`, { method: "PUT", body: other as BodyInit })).status).toBe(400);
+    expect(
+      (await fetch(`/api/v2/blob/${id.slice(0, -2)}AA`, { method: "PUT", body: other as BodyInit }))
+        .status,
+    ).toBe(400);
     const tiny = P.random(40);
-    expect((await fetch(`/api/v2/blob/${P.b64u(P.H(tiny))}`, { method: "PUT", body: tiny as BodyInit })).status).toBe(400);
-    expect((await fetch("/api/v2/blob/not-an-id", { method: "PUT", body: tiny as BodyInit })).status).toBe(400);
+    expect(
+      (await fetch(`/api/v2/blob/${P.b64u(P.H(tiny))}`, { method: "PUT", body: tiny as BodyInit }))
+        .status,
+    ).toBe(400);
+    expect(
+      (await fetch("/api/v2/blob/not-an-id", { method: "PUT", body: tiny as BodyInit })).status,
+    ).toBe(400);
 
     const g = await fetch(`/api/v2/blob/${id}`);
     expect(g.status).toBe(200);
@@ -606,18 +746,25 @@ describe("blobs", () => {
 
     // The BlobReg clock steps back 5 s: a later registration still gets t ≥ every now ever reported.
     world.advance(-5000);
-    const put1 = (await (await fetch(`/api/v2/blob/${id}`, { method: "PUT", body: blob as BodyInit })).json()) as { t: number };
+    const put1 = (await (
+      await fetch(`/api/v2/blob/${id}`, { method: "PUT", body: blob as BodyInit })
+    ).json()) as { t: number };
     expect(put1.t).toBe(mj.now);
     expect(put1.t).toBeGreaterThan(P.tpub(world.now(), 1));
     expect(await (await fetch(`/api/v2/blob/${id}/meta`)).json()).toEqual({ t: put1.t, size: 500 });
 
     world.blobreg.missNow((_id, now) => now - 30);
-    const m2 = (await (await fetch(`/api/v2/blob/${P.b64u(P.random(32))}/meta`)).json()) as { now: number };
+    const m2 = (await (await fetch(`/api/v2/blob/${P.b64u(P.random(32))}/meta`)).json()) as {
+      now: number;
+    };
     expect(m2.now).toBe(P.secOf(world.now()) - 30);
     world.blobreg.missNow(null);
 
     world.blobreg.forceT(id, put1.t + 100);
-    expect(await (await fetch(`/api/v2/blob/${id}/meta`)).json()).toEqual({ t: put1.t + 100, size: 500 });
+    expect(await (await fetch(`/api/v2/blob/${id}/meta`)).json()).toEqual({
+      t: put1.t + 100,
+      size: 500,
+    });
   });
 
   it("GET carries content-length = the byte length, fresh and from the cache; a 304 carries none", async () => {
@@ -729,19 +876,27 @@ describe("inbox", () => {
     expect(res.results.slice(5).every((x) => "error" in x && x.error === "full")).toBe(true);
     expect(W.parseInboxPostResults(res, 32)).toHaveLength(32);
 
-    const again = (await (await inboxPost(E, [rows[0], { eid: rows[1].eid, body: P.random(P.INBOX_BODY_LEN) }])).json()) as {
+    const again = (await (
+      await inboxPost(E, [rows[0], { eid: rows[1].eid, body: P.random(P.INBOX_BODY_LEN) }])
+    ).json()) as {
       results: W.InboxPostResult[];
     };
     expect(again.results).toEqual([res.results[0], { error: "conflict" }]);
 
     world.inbox.rollDay();
-    const later = (await (await inboxPost(E, [rows[5]])).json()) as { results: W.InboxPostResult[] };
+    const later = (await (await inboxPost(E, [rows[5]])).json()) as {
+      results: W.InboxPostResult[];
+    };
     expect("rel" in later.results[0]).toBe(true);
 
-    expect((await fetch("/api/v2/inbox", { method: "POST", body: P.random(10) as BodyInit })).status).toBe(400);
+    expect(
+      (await fetch("/api/v2/inbox", { method: "POST", body: P.random(10) as BodyInit })).status,
+    ).toBe(400);
     const bad = W.encodeInboxPost({ E, bucket: 0, rows: [invite()] });
     bad[5] = 1; // bucket 1
-    expect((await fetch("/api/v2/inbox", { method: "POST", body: bad as BodyInit })).status).toBe(400);
+    expect((await fetch("/api/v2/inbox", { method: "POST", body: bad as BodyInit })).status).toBe(
+      400,
+    );
   });
 
   it("reads return whole rel groups and page with more", async () => {
@@ -767,7 +922,9 @@ describe("inbox", () => {
     const world = server();
     world.advanceEra();
     const E = world.era;
-    const posted = (await (await inboxPost(E, [invite()])).json()) as { results: { rel: number }[] };
+    const posted = (await (await inboxPost(E, [invite()])).json()) as {
+      results: { rel: number }[];
+    };
     const rel = posted.results[0].rel;
     // A read near the end of the era reports a closed far above rel and persists it as closed_hw.
     world.advance(P.eraEnd(E) - 1000 - world.now(), { keepSockets: true });
@@ -807,7 +964,10 @@ describe("inbox", () => {
   it("posts in the SKEW window before start(E) count against the era's first day", async () => {
     const world = new FakeWorld({ skew: 2 });
     const post = async (E: number, rows: W.InboxPostRow[]) => {
-      const res = await world.fetch("/api/v2/inbox", { method: "POST", body: W.encodeInboxPost({ E, bucket: 0, rows }) as BodyInit });
+      const res = await world.fetch("/api/v2/inbox", {
+        method: "POST",
+        body: W.encodeInboxPost({ E, bucket: 0, rows }) as BodyInit,
+      });
       expect(res.status).toBe(200);
       return ((await res.json()) as { results: W.InboxPostResult[] }).results;
     };
@@ -825,7 +985,9 @@ describe("inbox", () => {
   it("era rules: wrong era 409, ended eras immutable, 410 below E_now − 3, 400 above", async () => {
     const world = server();
     const E0 = world.era;
-    const posted = (await (await inboxPost(E0, [invite(), invite()])).json()) as { results: { rel: number }[] };
+    const posted = (await (await inboxPost(E0, [invite(), invite()])).json()) as {
+      results: { rel: number }[];
+    };
     world.advanceEra();
     const ended = await inboxRead(E0);
     expect(ended.r!.closed).toBe(posted.results[0].rel);
@@ -857,7 +1019,9 @@ describe("inbox", () => {
       return j;
     });
     const relOf = async (rows: W.InboxPostRow[]) =>
-      ((await (await inboxPost(E, rows)).json()) as { results: W.InboxPostResult[] }).results.map((x) => ("rel" in x ? x.rel : x.error));
+      ((await (await inboxPost(E, rows)).json()) as { results: W.InboxPostResult[] }).results.map(
+        (x) => ("rel" in x ? x.rel : x.error),
+      );
     const cases: [number, number][] = [
       [0, s + 1],
       [500, s + 1],
@@ -877,7 +1041,9 @@ describe("inbox", () => {
 
     // No draw for an idempotent retry, a conflict or a full row.
     world.inbox.dayCap = world.inbox.rowsOf(E).length;
-    expect(await relOf([first, { eid: first.eid, body: P.random(P.INBOX_BODY_LEN) }, invite()])).toEqual([s + 1, "conflict", "full"]);
+    expect(
+      await relOf([first, { eid: first.eid, body: P.random(P.INBOX_BODY_LEN) }, invite()]),
+    ).toEqual([s + 1, "conflict", "full"]);
     expect(calls).toHaveLength(cases.length);
     world.inbox.dayCap = 2000;
 
@@ -913,7 +1079,10 @@ describe("inbox", () => {
     const E = world.era;
     const D = 1000;
     const K = (P.eraEnd(E) - P.T0_MS) / D; // the slot that closes at end(E)
-    const relOf = async (rows: W.InboxPostRow[]) => ((await (await inboxPost(E, rows)).json()) as { results: { rel: number }[] }).results.map((x) => x.rel);
+    const relOf = async (rows: W.InboxPostRow[]) =>
+      ((await (await inboxPost(E, rows)).json()) as { results: { rel: number }[] }).results.map(
+        (x) => x.rel,
+      );
     setNow(world, P.eraEnd(E) - D / 2);
     const plain = invite();
     expect(await relOf([plain])).toEqual([K]); // j = 0
@@ -969,7 +1138,10 @@ describe("inbox", () => {
     // An explicit era; two calls refuse the next two posts.
     world.inbox.wrongEraOnce(E + 1);
     world.inbox.wrongEraOnce();
-    expect(await (await inboxPost(E, [invite()])).json()).toEqual({ error: "wrong era", era: E + 1 });
+    expect(await (await inboxPost(E, [invite()])).json()).toEqual({
+      error: "wrong era",
+      era: E + 1,
+    });
     expect(await (await inboxPost(E, [invite()])).json()).toEqual({ error: "wrong era", era: E });
     expect((await inboxPost(E, [invite()])).status).toBe(200);
 
@@ -977,9 +1149,17 @@ describe("inbox", () => {
     world.inbox.wrongEraOnce(E + 7);
     const bad = W.encodeInboxPost({ E, bucket: 0, rows: [invite()] });
     bad[5] = 1; // bucket 1
-    expect((await fetch("/api/v2/inbox", { method: "POST", body: bad as BodyInit })).status).toBe(400);
-    expect(await (await inboxPost(E + 1, [invite()])).json()).toEqual({ error: "wrong era", era: E });
-    expect(await (await inboxPost(E, [invite()])).json()).toEqual({ error: "wrong era", era: E + 7 });
+    expect((await fetch("/api/v2/inbox", { method: "POST", body: bad as BodyInit })).status).toBe(
+      400,
+    );
+    expect(await (await inboxPost(E + 1, [invite()])).json()).toEqual({
+      error: "wrong era",
+      era: E,
+    });
+    expect(await (await inboxPost(E, [invite()])).json()).toEqual({
+      error: "wrong era",
+      era: E + 7,
+    });
     expect(world.inbox.rowsOf(E)).toHaveLength(2);
   });
 
@@ -989,7 +1169,9 @@ describe("inbox", () => {
     setNow(world, P.eraStart(E) + P.ERA_MS / 2 + 20); // mid-era, 20 ms into slot s
     world.inboxLagMs = 5000;
     const s = Math.floor((world.now() - P.T0_MS) / 1000);
-    const posted = (await (await inboxPost(E, [invite()])).json()) as { results: { rel: number }[] };
+    const posted = (await (await inboxPost(E, [invite()])).json()) as {
+      results: { rel: number }[];
+    };
     expect(posted.results[0].rel).toBe(s - 4); // ⌊(ms − 5000)/1000⌋ + 1
     const r = await inboxRead(E);
     expect(r.r).toEqual({ closed: s - 5, more: false, rows: [] });
@@ -1036,7 +1218,12 @@ describe("realtime", () => {
     await sleep(5);
 
     // Two rows in the same put (same millisecond) for T1, one for T2, one without a topic.
-    await put([putRow(E, P.random(16), { topic: T1 }), putRow(E, P.random(16), { topic: T1 }), putRow(E, P.random(16), { topic: T2 }), putRow(E, P.random(16))]);
+    await put([
+      putRow(E, P.random(16), { topic: T1 }),
+      putRow(E, P.random(16), { topic: T1 }),
+      putRow(E, P.random(16), { topic: T2 }),
+      putRow(E, P.random(16)),
+    ]);
     await waitFor(() => a.rows().length === 2 && b.rows().length === 1, "ROWS");
     expect(a.rows().map((r) => r.seq)).toEqual([1, 2]);
     expect(a.rows().every((r) => P.equalBytes(r.topic, T1))).toBe(true);
@@ -1123,7 +1310,10 @@ describe("realtime", () => {
 
     // dropPublish loses matching rows (not in the ring either).
     world.rt.dropPublish((r) => r.cls === 1);
-    await put([putRow(E, P.random(16), { topic: T, cls: 1 }), putRow(E, P.random(16), { topic: T })]);
+    await put([
+      putRow(E, P.random(16), { topic: T, cls: 1 }),
+      putRow(E, P.random(16), { topic: T }),
+    ]);
     await waitFor(() => c.rows().length === 2, "the undropped row");
     expect(c.rows()[1].cls).toBe(0);
     expect(world.rt.stats.dropped).toBe(1);
@@ -1152,9 +1342,14 @@ describe("realtime", () => {
   it("refuses a ninth socket of one client (429); the plain WebSocket global connects anonymously", async () => {
     const world = server();
     const socks = Array.from({ length: 9 }, () => openRt("alice"));
-    await waitFor(() => socks.every((s) => s.frames.length > 0 || s.state.closed !== null), "upgrades");
+    await waitFor(
+      () => socks.every((s) => s.frames.length > 0 || s.state.closed !== null),
+      "upgrades",
+    );
     expect(socks.filter((s) => s.state.closed === 1006)).toHaveLength(1);
-    expect(socks.map((s) => s.ws.upgradeStatus).sort()).toEqual([...Array(8).fill(101), 429].sort());
+    expect(socks.map((s) => s.ws.upgradeStatus).sort()).toEqual(
+      [...Array(8).fill(101), 429].sort(),
+    );
 
     const g = new WebSocket("ws://segv.test/api/v2/rt") as unknown as FakeWebSocket;
     expect(g).toBeInstanceOf(FakeWebSocket);
@@ -1268,8 +1463,17 @@ describe("rate limits", () => {
     expect(nowHeader(limited)).toBeGreaterThan(0);
     // Another client, another route class, and params are not affected.
     expect((await inboxPost(E, [invite()], "bob")).status).toBe(200);
-    expect((await fetch("/api/v2/get", { method: "POST", body: W.encodeGetRequest([{ E, label: P.random(16), mode: 1 }]) as BodyInit, headers: whoHeader("alice") })).status).toBe(200);
-    for (let i = 0; i < 20; i++) expect((await fetch("/api/v2/params", { headers: whoHeader("alice") })).status).toBe(200);
+    expect(
+      (
+        await fetch("/api/v2/get", {
+          method: "POST",
+          body: W.encodeGetRequest([{ E, label: P.random(16), mode: 1 }]) as BodyInit,
+          headers: whoHeader("alice"),
+        })
+      ).status,
+    ).toBe(200);
+    for (let i = 0; i < 20; i++)
+      expect((await fetch("/api/v2/params", { headers: whoHeader("alice") })).status).toBe(200);
 
     world.advance(60_000, { keepSockets: true });
     expect((await inboxPost(E, [invite()], "alice")).status).toBe(200);
@@ -1308,12 +1512,23 @@ describe("Worker order and response cache", () => {
       ["/api/v2/era/65535", undefined, 400],
       [`/api/v2/feed/${E}/70000`, undefined, 400],
     ];
-    for (const [path, init, status] of cases) expect((await fetch(path, init)).status, path).toBe(status);
+    for (const [path, init, status] of cases)
+      expect((await fetch(path, init)).status, path).toBe(status);
     // Past the checks the limiter answers.
-    for (const path of [`/api/v2/inbox/${E}/0`, `/api/v2/feed/${E}/0`, `/api/v2/blob/${id}`, `/api/v2/blob/${id}/meta`, "/api/v2/ckpt/1", `/api/v2/era/${E}`]) {
+    for (const path of [
+      `/api/v2/inbox/${E}/0`,
+      `/api/v2/feed/${E}/0`,
+      `/api/v2/blob/${id}`,
+      `/api/v2/blob/${id}/meta`,
+      "/api/v2/ckpt/1",
+      `/api/v2/era/${E}`,
+    ]) {
       expect((await fetch(path)).status, path).toBe(429);
     }
-    expect((await fetch(`/api/v2/blob/${id}`, { method: "PUT", body: P.random(100) as BodyInit })).status).toBe(429);
+    expect(
+      (await fetch(`/api/v2/blob/${id}`, { method: "PUT", body: P.random(100) as BodyInit }))
+        .status,
+    ).toBe(429);
     // Query integers parse as the Worker's intParam does (leading zeros allowed).
     world.rateLimits(false);
     expect((await fetch(`/api/v2/inbox/${E}/0?after=007`)).status).toBe(200);
@@ -1362,7 +1577,8 @@ describe("Worker order and response cache", () => {
     await put([putRow(E0, label)]);
     world.advanceEra(); // era E0 seals, so its feed page is immutable
     world.rateLimits({ RL_READ: { limit: 3 } });
-    for (const path of [`/api/v2/blob/${id}`, "/api/v2/ckpt/1", `/api/v2/feed/${E0}/0`]) expect((await fetch(path)).status, path).toBe(200);
+    for (const path of [`/api/v2/blob/${id}`, "/api/v2/ckpt/1", `/api/v2/feed/${E0}/0`])
+      expect((await fetch(path)).status, path).toBe(200);
     const page = await bytesOf(await fetch(`/api/v2/feed/${E0}/0`));
     // Every further read of those keys is a cache hit, which the limiter does not count.
     for (let i = 0; i < 5; i++) {
@@ -1403,7 +1619,12 @@ describe("directory", () => {
     const user = P.verifyBundle(byUid.user.bundle, byUid.user.sig);
     expect(user).toMatchObject({ uid: u.uidB, handle: "alice" });
     expect(user.sigPk).toEqual(u.id.sigPk);
-    expect(byUid.user).toMatchObject({ uid: u.uidB, handle: "alice", regEra: world.era, dirseq: 1 });
+    expect(byUid.user).toMatchObject({
+      uid: u.uidB,
+      handle: "alice",
+      regEra: world.era,
+      dirseq: 1,
+    });
     expect((await fetch(`/api/v2/dir/uid/${P.b64u(P.random(16))}`)).status).toBe(404);
     expect((await fetch("/api/v2/dir/uid/xyz")).status).toBe(400);
 
@@ -1425,11 +1646,15 @@ describe("directory", () => {
     const { j: wr } = await getJson(`/api/v2/dir/wraps/${P.b64u(u.rk.id)}`);
     expect(wr.wraps).toHaveLength(1);
     expect(P.verifyWrap(wr.wraps[0].record, wr.wraps[0].sig, u.id.sigPk).kind).toBe("recovery");
-    expect((await getJson(`/api/v2/dir/wraps/${P.b64u(u.rk.id)}?uid=${P.b64u(P.random(16))}`)).j.wraps).toEqual([]);
+    expect(
+      (await getJson(`/api/v2/dir/wraps/${P.b64u(u.rk.id)}?uid=${P.b64u(P.random(16))}`)).j.wraps,
+    ).toEqual([]);
     expect((await getJson(`/api/v2/dir/wraps/${P.b64u(P.random(20))}`)).j.wraps).toEqual([]);
 
     // Conflicts: the same handle with other keys, the same uid with another handle.
-    expect((await postJson("/api/v2/register", registrationOf(newTestUser("alice")))).status).toBe(409);
+    expect((await postJson("/api/v2/register", registrationOf(newTestUser("alice")))).status).toBe(
+      409,
+    );
     const sameUid = { ...newTestUser("alice2"), uid: u.uid, uidB: u.uidB };
     expect((await postJson("/api/v2/register", registrationOf(sameUid))).status).toBe(409);
 
@@ -1454,12 +1679,25 @@ describe("directory", () => {
     expect(await w1.json()).toEqual({ dirseq: 5 });
     expect((await postJson("/api/v2/wraps", wrap)).status).toBe(409);
     const stranger = newTestUser("nobody");
-    expect((await postJson("/api/v2/wraps", P.makeWrap(stranger.uid, "passkey", credId, pk, stranger.AK, stranger.id, 1))).status).toBe(404);
+    expect(
+      (
+        await postJson(
+          "/api/v2/wraps",
+          P.makeWrap(stranger.uid, "passkey", credId, pk, stranger.AK, stranger.id, 1),
+        )
+      ).status,
+    ).toBe(404);
     const forged = P.makeWrap(u.uid, "passkey", P.random(32), pk, u.AK, v.id, 1);
     expect((await postJson("/api/v2/wraps", forged)).status).toBe(400);
     // Anyone may file a record under someone else's id with their own uid (ids are public).
-    expect(world.dir.postWrap(P.makeWrap(v.uid, "recovery", u.rk.id, v.rk, v.AK, v.id, 1)).status).toBe(200);
-    expect((await getJson(`/api/v2/dir/wraps/${P.b64u(u.rk.id)}`)).j.wraps.map((x: { uid: string }) => x.uid)).toEqual([u.uidB, v.uidB]);
+    expect(
+      world.dir.postWrap(P.makeWrap(v.uid, "recovery", u.rk.id, v.rk, v.AK, v.id, 1)).status,
+    ).toBe(200);
+    expect(
+      (await getJson(`/api/v2/dir/wraps/${P.b64u(u.rk.id)}`)).j.wraps.map(
+        (x: { uid: string }) => x.uid,
+      ),
+    ).toEqual([u.uidB, v.uidB]);
   });
 
   it("the dirlog chain recomputes with dirlogH; p grows with the users", async () => {
@@ -1480,7 +1718,11 @@ describe("directory", () => {
     }
     expect(P.b64u(h)).toBe(j.head.h);
     const u0 = world.dir.byUid(users[0].uidB)!;
-    expect(j.entries[0]).toMatchObject({ seq: 1, kind: P.DIRLOG_USER, ref: P.b64u(P.dirlogRefUser(u0.bundle, P.fromB64u(u0.sig))) });
+    expect(j.entries[0]).toMatchObject({
+      seq: 1,
+      kind: P.DIRLOG_USER,
+      ref: P.b64u(P.dirlogRefUser(u0.bundle, P.fromB64u(u0.sig))),
+    });
     expect(j.entries[1].kind).toBe(P.DIRLOG_WRAP);
     const page = (await getJson("/api/v2/dirlog?after=120&limit=5")).j;
     expect(page.entries.map((e: { seq: number }) => e.seq)).toEqual([121, 122, 123, 124, 125]);
@@ -1513,8 +1755,14 @@ describe("directory", () => {
 
     // Infinity until failDir(null); dir/uid, dir/wraps and dirlog are never affected.
     world.dir.failDir(() => true, Infinity);
-    for (const path of ["/api/v2/dir/h/0/0", "/api/v2/dir/u/1/1", "/api/v2/dir/h/0/0"]) expect((await fetch(path)).status, path).toBe(503);
-    for (const path of [`/api/v2/dir/uid/${u.uidB}`, `/api/v2/dir/wraps/${P.b64u(u.rk.id)}`, "/api/v2/dirlog"]) expect((await fetch(path)).status, path).toBe(200);
+    for (const path of ["/api/v2/dir/h/0/0", "/api/v2/dir/u/1/1", "/api/v2/dir/h/0/0"])
+      expect((await fetch(path)).status, path).toBe(503);
+    for (const path of [
+      `/api/v2/dir/uid/${u.uidB}`,
+      `/api/v2/dir/wraps/${P.b64u(u.rk.id)}`,
+      "/api/v2/dirlog",
+    ])
+      expect((await fetch(path)).status, path).toBe(200);
     world.dir.failDir(null);
     expect((await fetch("/api/v2/dir/h/0/0")).status).toBe(200);
 
@@ -1522,7 +1770,9 @@ describe("directory", () => {
     world.dir.failDir((q) => q.who === "carol", 1);
     world.dir.failDir(() => true, 1);
     const asCarol = () => fetch("/api/v2/dir/h/0/0", { headers: whoHeader("carol") });
-    expect([(await asCarol()).status, (await asCarol()).status, (await asCarol()).status]).toEqual([503, 503, 200]);
+    expect([(await asCarol()).status, (await asCarol()).status, (await asCarol()).status]).toEqual([
+      503, 503, 200,
+    ]);
   });
 });
 
@@ -1536,7 +1786,10 @@ describe("checkpoints", () => {
     expect((await fetch("/api/v2/ckpt/latest")).status).toBe(404);
 
     const verifyEntry = (j: Record<string, any>, prevC: Uint8Array) => {
-      const heads = (j.heads as { cid: string; head: string }[]).map((x) => ({ cid: x.cid, head: P.fromB64u(x.head) }));
+      const heads = (j.heads as { cid: string; head: string }[]).map((x) => ({
+        cid: x.cid,
+        head: P.fromB64u(x.head),
+      }));
       const hd = P.ckptHd(heads);
       expect(P.b64u(hd)).toBe(j.hd);
       const C = P.ckptC(prevC, j.q, j.sec, hd);
@@ -1549,13 +1802,25 @@ describe("checkpoints", () => {
     expect(world.ckpt.tick()?.q).toBe(1);
     const l1 = (await getJson("/api/v2/ckpt/latest")).j;
     const C1 = verifyEntry(l1, P.ZERO32);
-    expect(l1.heads.map((x: { cid: string }) => x.cid)).toEqual(["blobreg", "dirlog", `inbox/${E - 1}/0`, `inbox/${E}/0`, `shard/${E - 1}/0`, `shard/${E}/0`]);
+    expect(l1.heads.map((x: { cid: string }) => x.cid)).toEqual([
+      "blobreg",
+      "dirlog",
+      `inbox/${E - 1}/0`,
+      `inbox/${E}/0`,
+      `shard/${E - 1}/0`,
+      `shard/${E}/0`,
+    ]);
     expect(world.ckpt.tick()).toBeNull(); // the 60 s alarm has not fired again yet
     world.advance(CKPT_PERIOD_MS, { keepSockets: true });
     expect(world.ckpt.tick()?.q).toBe(2);
     const l2 = (await getJson("/api/v2/ckpt/latest")).j;
     const C2 = verifyEntry(l2, C1);
-    expect(l2.heads.map((x: { cid: string }) => x.cid)).toEqual(["blobreg", "dirlog", `inbox/${E}/0`, `shard/${E}/0`]);
+    expect(l2.heads.map((x: { cid: string }) => x.cid)).toEqual([
+      "blobreg",
+      "dirlog",
+      `inbox/${E}/0`,
+      `shard/${E}/0`,
+    ]);
     world.advance(CKPT_PERIOD_MS, { keepSockets: true });
     expect(world.ckpt.tick()).toBeNull(); // unchanged heads: no new q
 
@@ -1569,7 +1834,9 @@ describe("checkpoints", () => {
     const shardHead = l3.heads.find((x: { cid: string }) => x.cid === `shard/${E}/0`).head;
     expect(shardHead).toBe(P.b64u(world.shard.head(E).head));
     expect(shardHead).not.toBe(P.b64u(P.ZERO32));
-    expect(l3.heads.find((x: { cid: string }) => x.cid === "dirlog").head).toBe(P.b64u(world.dir.head().h));
+    expect(l3.heads.find((x: { cid: string }) => x.cid === "dirlog").head).toBe(
+      P.b64u(world.dir.head().h),
+    );
 
     const one = await getJson("/api/v2/ckpt/1");
     expect(one.j).toEqual(l1);
@@ -1579,10 +1846,17 @@ describe("checkpoints", () => {
     expect(range.from).toEqual({ q: 0, C: P.b64u(P.ZERO32) });
     expect(range.entries.map((e: { q: number }) => e.q)).toEqual([1, 2, 3]);
     let C = P.fromB64u(range.from.C);
-    for (const e of range.entries as { q: number; sec: number; hd: string }[]) C = P.ckptC(C, e.q, e.sec, P.fromB64u(e.hd));
+    for (const e of range.entries as { q: number; sec: number; hd: string }[])
+      C = P.ckptC(C, e.q, e.sec, P.fromB64u(e.hd));
     expect(P.b64u(C)).toBe(range.latest.C);
-    expect(P.verify(P.fromB64u(range.latest.sig), P.ckptSigMsg(range.latest.q, C), srvKey)).toBe(true);
-    expect((await getJson("/api/v2/ckpt/range?after=1&limit=1")).j.entries.map((e: { q: number }) => e.q)).toEqual([2]);
+    expect(P.verify(P.fromB64u(range.latest.sig), P.ckptSigMsg(range.latest.q, C), srvKey)).toBe(
+      true,
+    );
+    expect(
+      (await getJson("/api/v2/ckpt/range?after=1&limit=1")).j.entries.map(
+        (e: { q: number }) => e.q,
+      ),
+    ).toEqual([2]);
     expect((await fetch("/api/v2/ckpt/range?after=4")).status).toBe(404);
 
     // A fork from q = 3: equal q with a different C (what a client that stored C_3 detects); C_2 unchanged.
@@ -1623,8 +1897,20 @@ describe("checkpoints", () => {
   it("collects the previous era's heads only when E_now − 1 ≥ max(E_FIRST, 0)", () => {
     const E = server().era;
     const cids = (w: FakeWorld) => w.ckpt.tick()!.heads.map((h) => h.cid);
-    expect(cids(new FakeWorld({ efirst: E }))).toEqual(["blobreg", "dirlog", `inbox/${E}/0`, `shard/${E}/0`]);
-    expect(cids(new FakeWorld({ efirst: E - 1 }))).toEqual(["blobreg", "dirlog", `inbox/${E - 1}/0`, `inbox/${E}/0`, `shard/${E - 1}/0`, `shard/${E}/0`]);
+    expect(cids(new FakeWorld({ efirst: E }))).toEqual([
+      "blobreg",
+      "dirlog",
+      `inbox/${E}/0`,
+      `shard/${E}/0`,
+    ]);
+    expect(cids(new FakeWorld({ efirst: E - 1 }))).toEqual([
+      "blobreg",
+      "dirlog",
+      `inbox/${E - 1}/0`,
+      `inbox/${E}/0`,
+      `shard/${E - 1}/0`,
+      `shard/${E}/0`,
+    ]);
   });
 });
 

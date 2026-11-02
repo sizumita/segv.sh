@@ -1,7 +1,16 @@
 // HEADS rows (docs/PROTOCOL.md §7.3 "HEADS splitting"): the records waiting for the next HEADS row and the entries are
 // spread over as many self rows as needed, each within the cls-3 budget and the record cap.
 import { describe, expect, it } from "vite-plus/test";
-import { I, P, engineFor, makeUser, freshWorldPerTest, selfRowsOf, server, settleTimeout } from "./harness";
+import {
+  I,
+  P,
+  engineFor,
+  makeUser,
+  freshWorldPerTest,
+  selfRowsOf,
+  server,
+  settleTimeout,
+} from "./harness";
 
 freshWorldPerTest();
 
@@ -15,7 +24,9 @@ describe("HEADS rows", () => {
     const alice = makeUser("alice");
     const A = await engineFor(alice);
     const msg = (A as unknown as { msg: MessagingI }).msg;
-    const before = server().requests.filter((r) => r.who === "alice" && r.path === "/api/v2/put").length;
+    const before = server().requests.filter(
+      (r) => r.who === "alice" && r.path === "/api/v2/put",
+    ).length;
     // 600 CONTACT records (51 B each): more than the 255-record cap and the 16 KB budget of one row
     const contacts: P.ContactRec[] = Array.from({ length: 600 }, () => ({
       rtype: P.RT.CONTACT,
@@ -44,7 +55,13 @@ describe("HEADS entries over several rows (M6 test 11)", () => {
     const A = await engineFor(alice);
     const ids: string[] = [];
     // 70 groups of 32: an entry of 68 + 6·32 = 260 B each, more than one cls-3 row holds
-    for (let g = 0; g < 70; g++) ids.push(await A.createConversation(users.map((u) => u.handle), `g${g}`));
+    for (let g = 0; g < 70; g++)
+      ids.push(
+        await A.createConversation(
+          users.map((u) => u.handle),
+          `g${g}`,
+        ),
+      );
     const msg = (A as unknown as { msg: MessagingI & { lastHeads: string } }).msg;
     msg.lastHeads = "";
     (msg as unknown as { headsDue: boolean }).headsDue = true;
@@ -59,6 +76,11 @@ describe("HEADS entries over several rows (M6 test 11)", () => {
     await A.logout();
     const A2 = await engineFor(alice);
     expect(I(A2).views().length).toBe(70);
-    for (const id of ids) expect(I(A2).views().some((v) => v.id === id)).toBe(true);
+    for (const id of ids)
+      expect(
+        I(A2)
+          .views()
+          .some((v) => v.id === id),
+      ).toBe(true);
   }, 300_000);
 });

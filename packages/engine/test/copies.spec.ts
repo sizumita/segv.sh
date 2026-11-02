@@ -77,10 +77,14 @@ const isWarned = (v: { name: string }) => v.name.startsWith("⚠");
 
 /** bob's requests since request index `from`: blob GETs and meta requests for a bundle, and get keys of a lane. */
 function asks(who: string, from: number) {
-  const reqs = server().requests.slice(from).filter((r) => r.who === who);
+  const reqs = server()
+    .requests.slice(from)
+    .filter((r) => r.who === who);
   return {
-    blob: (id: Uint8Array) => reqs.filter((r) => r.method === "GET" && r.path === `/api/v2/blob/${P.b64u(id)}`).length,
-    meta: (id: Uint8Array) => reqs.filter((r) => r.path === `/api/v2/blob/${P.b64u(id)}/meta`).length,
+    blob: (id: Uint8Array) =>
+      reqs.filter((r) => r.method === "GET" && r.path === `/api/v2/blob/${P.b64u(id)}`).length,
+    meta: (id: Uint8Array) =>
+      reqs.filter((r) => r.path === `/api/v2/blob/${P.b64u(id)}/meta`).length,
     keys: (labels: Set<string>) =>
       reqs.flatMap((r) => r.getKeys ?? []).filter((k) => labels.has(P.hex(k.label))),
   };
@@ -89,7 +93,9 @@ function asks(who: string, from: number) {
 /** The epochs of the Js of `convId` in `u`'s inbox, in inbox order. */
 function inboxEpochs(u: TestUser, convId: Uint8Array): number[] {
   const out: number[] = [];
-  for (const E of server().inbox.eraList().sort((a, b) => a - b))
+  for (const E of server()
+    .inbox.eraList()
+    .sort((a, b) => a - b))
     for (const r of server().inbox.rowsOf(E)) {
       const o = P.tryOpenInvite(u.id.kemSk, E, 0, r.eid, r.body);
       if (o?.kind === "join" && P.equalBytes(o.join.conv, convId)) out.push(o.join.e);
@@ -127,7 +133,9 @@ describe("ENDED records and confirmation by claims (§6.6 step 3, §6.7 step 6)"
     const ended = row.find((r) => r.rtype === P.RT.ENDED) as P.EndedRec;
     expect([ended.e, ended.claim]).toEqual([0, { E: w.E, n: w.n }]);
     // carol is neither rootBy (alice) nor bob: her claim confirms G, recorded beside it
-    expect(row.some((r) => r.rtype === P.RT.CONFIRMED && P.equalBytes(r.root, conv(B, id).root))).toBe(true);
+    expect(
+      row.some((r) => r.rtype === P.RT.CONFIRMED && P.equalBytes(r.root, conv(B, id).root)),
+    ).toBe(true);
     expect(row.at(-1)!.rtype).toBe(P.RT.HEADS);
     expect(rows.filter((rs) => rs.some((r) => r.rtype === P.RT.ENDED)).length).toBe(1);
     expect(conv(B, id).confirmed).toBe(true);
@@ -190,14 +198,22 @@ describe("forks of an ended copy (§6.7 step 6)", () => {
     forgeJoin(bob, forgedJ(dave, conv(B, id).conv, 1, [bob, dave]));
     await settle(A, B, C, D);
     expect(warnings(B)).toContain(CONFIRMED_COPY_WARNING);
-    expect(I(B).views().map((v) => v.id)).toEqual([id]);
+    expect(
+      I(B)
+        .views()
+        .map((v) => v.id),
+    ).toEqual([id]);
     // after a reload the copy is still confirmed (its CONFIRMED record), so another fork is rejected too
     const B2 = await engineFor(bob);
     expect(conv(B2, id).confirmed).toBe(true);
     forgeJoin(bob, forgedJ(dave, conv(B2, id).conv, 1, [bob, dave]));
     await settle(A, B2, C, D);
     expect(warnings(B2)).toContain(CONFIRMED_COPY_WARNING);
-    expect(I(B2).views().map((v) => v.id)).toEqual([id]);
+    expect(
+      I(B2)
+        .views()
+        .map((v) => v.id),
+    ).toEqual([id]);
     void alice;
   });
 
@@ -389,11 +405,9 @@ describe("requests and ended requests (§11.5)", () => {
     expect(mustView(B2, r1).request).toBe(false);
     const recs = selfRowsOf(users.bob).flat();
     const rootOf = (k: string) => conv(B2, k).root;
-    expect(
-      recs.some(
-        (r) => r.rtype === P.RT.CONV_JOIN && P.equalBytes(r.root, rootOf(id)),
-      ),
-    ).toBe(false);
+    expect(recs.some((r) => r.rtype === P.RT.CONV_JOIN && P.equalBytes(r.root, rootOf(id)))).toBe(
+      false,
+    );
     expect(
       recs.filter((r) => r.rtype === P.RT.CONFIRMED && P.equalBytes(r.root, rootOf(id))).length,
     ).toBe(1);
@@ -437,10 +451,16 @@ describe("siblings (§11.7)", () => {
     await I(B2).unlock(bob.AK, bob.uid, bob.handle);
     await waitFor(() => !B2.getState().syncing, "bob2's restore");
     await settle(A, B, B2, C);
-    const r = await commitChange(alice, epoch(A, id), [alice, carol], undefined, { hideFrom: ["bob2"] });
+    const r = await commitChange(alice, epoch(A, id), [alice, carol], undefined, {
+      hideFrom: ["bob2"],
+    });
     await settle(A, B, B2, C);
     expect(mustView(B, id).blocked).toBe("removed");
-    expect(selfRowsOf(bob).flat().some((x) => x.rtype === P.RT.ENDED)).toBe(true);
+    expect(
+      selfRowsOf(bob)
+        .flat()
+        .some((x) => x.rtype === P.RT.ENDED),
+    ).toBe(true);
     // bob2 never saw C_0: B1's ENDED record ends its copy, without the claim's bundle or meta
     expect(mustView(B2, id).blocked).toBe("removed");
     const meta = server().requests.filter(
@@ -468,7 +488,10 @@ describe("a CONFLICT with a sibling's CONFIRMED row (§7.3)", () => {
     for (let n = n0; n < n0 + 64; n++) server().shard.hide(E, P.Lself(bob.id.rS, E, n), "bob2");
     const ep = epoch(C, id);
     const j = P.memberIndex(ep.D, carol.uid);
-    const row = buildMessage(carol, ep, { E, n: ep.lanes[j].next.n }, { type: P.MT.TEXT, text: "hi" } as P.MBody);
+    const row = buildMessage(carol, ep, { E, n: ep.lanes[j].next.n }, {
+      type: P.MT.TEXT,
+      text: "hi",
+    } as P.MBody);
     server().shard.hide(row.E, row.label, "bob2");
     postRow(ep, row);
     await settle(A, B, C, M);
@@ -476,7 +499,10 @@ describe("a CONFLICT with a sibling's CONFIRMED row (§7.3)", () => {
     expect(conv(B2, id).confirmed).toBe(false);
     const conflicts = () =>
       server().requests.filter(
-        (r) => r.who === "bob2" && r.path === "/api/v2/put" && r.putResults?.some((x) => x.s === "conflict"),
+        (r) =>
+          r.who === "bob2" &&
+          r.path === "/api/v2/put" &&
+          r.putResults?.some((x) => x.s === "conflict"),
       ).length;
     const before = conflicts();
     forgeJoin(bob, forgedJ(mallory, conv(B, id).conv, 3, [bob, mallory]));
@@ -486,9 +512,18 @@ describe("a CONFLICT with a sibling's CONFIRMED row (§7.3)", () => {
     expect(conflicts()).toBeGreaterThan(before);
     expect(warnings(B2)).toContain(CONFIRMED_COPY_WARNING);
     expect(warnings(B2)).not.toContain(secondCopyWarning("mallory"));
-    for (const X of [B, B2]) expect(I(X).views().map((v) => v.id)).toEqual([id]);
+    for (const X of [B, B2])
+      expect(
+        I(X)
+          .views()
+          .map((v) => v.id),
+      ).toEqual([id]);
     const B3 = await engineFor(bob);
-    expect(I(B3).views().map((v) => v.id)).toEqual([id]);
+    expect(
+      I(B3)
+        .views()
+        .map((v) => v.id),
+    ).toEqual([id]);
   });
 });
 
@@ -507,18 +542,30 @@ describe("a sibling's ENDED record (§11.7)", () => {
     // to it: a device that reads the record while it cannot read the claim keeps the rows stored after it.
     const offline = new Set<string>(["bob"]);
     server().hooks.fail = (_m, _p, who) => (who !== null && offline.has(who) ? "before" : null);
-    const r = await commitChange(alice, epoch(A, id), [alice, carol], undefined, { hideFrom: ["bob2"] });
+    const r = await commitChange(alice, epoch(A, id), [alice, carol], undefined, {
+      hideFrom: ["bob2"],
+    });
     // carol's row of epoch 0 stored after C_0: bob2, which never saw the claim, shows it
     const ep = conv(C, id).epochs.get(0)!;
     const j = P.memberIndex(ep.D, carol.uid);
-    postRow(ep, buildMessage(carol, ep, { E: server().era, n: ep.lanes[j].next.n }, { type: P.MT.TEXT, text: "after" } as P.MBody));
+    postRow(
+      ep,
+      buildMessage(carol, ep, { E: server().era, n: ep.lanes[j].next.n }, {
+        type: P.MT.TEXT,
+        text: "after",
+      } as P.MBody),
+    );
     await settle(A, B2, C);
     expect(chat(B2, id)).toContain("carol: after");
     offline.clear();
     offline.add("bob2");
     await settle(A, B, C);
     expect(chat(B, id)).not.toContain("carol: after");
-    expect(selfRowsOf(bob).flat().some((x) => x.rtype === P.RT.ENDED)).toBe(true);
+    expect(
+      selfRowsOf(bob)
+        .flat()
+        .some((x) => x.rtype === P.RT.ENDED),
+    ).toBe(true);
     offline.clear();
     server().shard.unhide(r.claim.E, r.claim.label, "bob2");
     await settle(A, B, B2, C);

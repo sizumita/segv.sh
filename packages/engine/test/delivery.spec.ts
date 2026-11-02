@@ -21,7 +21,8 @@ describe("the first delivery attempt (§6.12)", () => {
         server().inbox.wrongEraOnce(E + 1);
       }
     };
-    const inboxPosts = () => server().requests.filter((r) => r.method === "POST" && r.path === "/api/v2/inbox");
+    const inboxPosts = () =>
+      server().requests.filter((r) => r.method === "POST" && r.path === "/api/v2/inbox");
     const id = await A.createConversation(["bob", "carol"], "late");
     await settle(A, B, C);
     const sent = inboxPosts();

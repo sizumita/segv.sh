@@ -10,18 +10,13 @@ node_modules
 
 # Cache
 .cache
-.mf
 .rollup.cache
 tsconfig.tsbuildinfo
 
 # Logs
 logs
 *.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
 pnpm-debug.log*
-lerna-debug.log*
 
 # Editor
 .vscode/*
@@ -37,12 +32,7 @@ lerna-debug.log*
 *.sln
 *.sw?
 
-# Yarn
-.yarn/*
-!.yarn/releases
-
 # Cloudflare
-functions/**/*.js
 .wrangler/
 
 # TypeScript incremental output (apps/web/tsconfig.json "outDir": "tmp")
