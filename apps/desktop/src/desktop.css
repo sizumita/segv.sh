@@ -12,9 +12,10 @@
      title bar */
   --lights: 84px;
   --glass: color-mix(in srgb, var(--bg) 55%, transparent);
-  --glass-hi: color-mix(in srgb, var(--fg) 9%, transparent);
-  --rule: color-mix(in srgb, var(--fg) 22%, transparent);
-  --radius: 12px;
+  --glass-hi: color-mix(in srgb, var(--fg) 8%, transparent);
+  --glass-sel: color-mix(in srgb, var(--fg) 14%, transparent);
+  --rule: color-mix(in srgb, var(--fg) 14%, transparent);
+  --radius: var(--r-l);
 }
 html[data-shell="desktop"],
 html[data-shell="desktop"] body {
@@ -42,7 +43,7 @@ html[data-shell="desktop"] body {
   background: var(--glass);
 }
 [data-shell="desktop"] :is(.page, .boot) :is(button:not(.link), .btn):hover:not(:disabled) {
-  background: var(--fg);
+  background: var(--glass-hi);
 }
 
 /* ---- signed in ---- */
@@ -62,7 +63,8 @@ html[data-shell="desktop"] body {
 [data-shell="desktop"] :is(.warnings, .chat > .errors) {
   margin: 0 8px 8px;
   background: var(--bg);
-  border: 1px solid var(--fg);
+  color: var(--fg);
+  border: 1px solid var(--rule);
   border-radius: var(--radius);
 }
 [data-shell="desktop"] .chat > .errors .error {
@@ -80,19 +82,14 @@ html[data-shell="desktop"] body {
   background: var(--glass);
 }
 [data-shell="desktop"] .left :is(button:not(.conv, .link), .btn):hover:not(:disabled) {
-  background: var(--fg);
-}
-[data-shell="desktop"] .conv {
-  border-radius: 8px;
-  margin: 1px 6px;
-  width: calc(100% - 12px);
+  background: var(--glass-hi);
 }
 [data-shell="desktop"] .conv:hover:not(:disabled) {
   background: var(--glass-hi);
 }
 [data-shell="desktop"] .conv.on,
 [data-shell="desktop"] .conv.on:hover:not(:disabled) {
-  background: var(--fg);
+  background: var(--glass-sel);
 }
 /* The conversation is a sheet inset in the glass. */
 [data-shell="desktop"] .right {
