@@ -1,13 +1,14 @@
 // The desktop app on Windows, as it was built and installed: its web view (WebView2) opens a DevTools port when it is
 // started with WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS, and Playwright drives its page over that port as it drives
-// Chromium. The app must be built for the local deployment (SEGV_ORIGIN=http://localhost:<port>,
+// Chromium. WebView2 ignores that variable in an elevated app (CI's, whose runner is elevated, gets the flag from a
+// machine-wide policy instead: .github/workflows/ci.yml). The app must be built for the local deployment (SEGV_ORIGIN=http://localhost:<port>,
 // apps/desktop/scripts/bundle.mjs): it calls the API of `wrangler dev` from https://tauri.localhost, an app origin of
 // wrangler.jsonc.
 //
 // The app's passkeys are the system's (webauthn.dll), which a test cannot answer: the accounts are made on the web,
 // and the app unlocks with a recovery code, as on a new device. macOS has no such port in WKWebView, so the macOS app
 // is not driven here.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { chromium } from "playwright";
 import { kill } from "./lib/server.mjs";
 import { check, problems, step, unwatch, watch } from "./lib/harness.mjs";
@@ -48,7 +49,17 @@ async function launch(exe, port) {
   const until = (what) => {
     if (failed) throw new Error(`the app did not start: ${failed.message}`);
     if (proc.exitCode !== null) throw new Error(`the app exited (${proc.exitCode}) before ${what}`);
-    if (Date.now() - t0 > 60_000) throw new Error(`no ${what} within 60 s`);
+    if (Date.now() - t0 > 60_000) {
+      // Whether the web view started at all, or started without the flag.
+      const views = spawnSync(
+        "tasklist",
+        ["/fo", "csv", "/nh", "/fi", "IMAGENAME eq msedgewebview2.exe"],
+        {
+          encoding: "utf8",
+        },
+      ).stdout?.match(/msedgewebview2/gi)?.length;
+      throw new Error(`no ${what} within 60 s (web view processes: ${views ?? 0})`);
+    }
     return sleep(300);
   };
   try {

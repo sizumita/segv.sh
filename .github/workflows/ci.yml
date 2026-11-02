@@ -223,6 +223,18 @@ jobs:
           if (-not (Test-Path $exe)) { throw "not installed: $exe" }
           "SEGV_APP=$exe" >> $env:GITHUB_ENV
 
+      # The test opens the web view's DevTools port with WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS, which WebView2 ignores
+      # in an elevated app, and every process of the runner is elevated. A machine-wide policy applies to it: for this
+      # app only, named by its AppUserModelID and by its program.
+      - name: Open the app's DevTools port
+        shell: pwsh
+        run: |
+          $key = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments'
+          New-Item -Path $key -Force | Out-Null
+          foreach ($app in 'sh.segv.desktop', (Split-Path $env:SEGV_APP -Leaf)) {
+            New-ItemProperty -Path $key -Name $app -Value '--remote-debugging-port=9222' -PropertyType String -Force | Out-Null
+          }
+
       - name: End-to-end test
         env:
           E2E_SHOTS: ${{ runner.temp }}/e2e-shots

@@ -229,7 +229,9 @@ pnpm run test:e2e --windows-app "$LOCALAPPDATA/segv.sh/segv-desktop.exe"
 ```
 
 Its web view (WebView2) opens a DevTools port for the run (`E2E_CDP_PORT`, 9222), which Playwright drives as it drives
-Chromium. WKWebView has no such port, so the macOS app is not tested this way.
+Chromium. WebView2 takes that flag from the environment only when the app is not elevated: run it from a normal
+terminal (CI, whose processes are elevated, sets a machine-wide policy instead). WKWebView has no such port, so the
+macOS app is not tested this way.
 
 ### Screenshots in pull requests
 
