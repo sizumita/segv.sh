@@ -521,7 +521,7 @@ const Foot = component$<{
 }>((props) => {
   const em = props.preview.value ? props.set?.byForm.get(props.preview.value) : undefined;
   return (
-    <div class="efoot">
+    <div class={["efoot", props.note.value && "noted"]}>
       <p class="enote" role="status">
         {props.note.value}
       </p>

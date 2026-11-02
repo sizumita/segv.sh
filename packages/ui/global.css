@@ -802,12 +802,16 @@ textarea:focus {
 .pmsg {
   padding: 16px 6px;
 }
+/* Above the skin tones (.evars), so that a note about a pick there shows. */
 .efoot {
+  position: relative;
+  z-index: 5;
   display: flex;
   align-items: center;
   min-height: 40px;
   padding: 4px 10px;
   border-top: 1px solid var(--line);
+  background: var(--surface);
   font-size: 12px;
 }
 .enote:empty {
@@ -1205,7 +1209,8 @@ textarea:focus {
     z-index: 19;
     background: rgb(0 0 0 / 0.25);
   }
-  .efoot {
+  /* No pointer to preview with: the footer shows only why a pick did nothing (the limit of 8). */
+  .efoot:not(.noted) {
     display: none;
   }
 }
