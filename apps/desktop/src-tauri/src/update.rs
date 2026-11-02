@@ -175,7 +175,8 @@ pub fn clicked(app: &AppHandle<Wry>) {
         return;
     };
     if updates.ready() {
-        apply(app, if window_shown(app) { After::Shown } else { After::Hidden });
+        let after = if window_shown(app) { After::Shown } else { After::Hidden };
+        apply(app, after, true);
     } else {
         tauri::async_runtime::spawn(check(app.clone(), true));
     }
@@ -184,7 +185,7 @@ pub fn clicked(app: &AppHandle<Wry>) {
 /// The window was closed: a downloaded update is installed now.
 pub fn window_closed(app: &AppHandle<Wry>) {
     if app.try_state::<Updates>().is_some_and(|u| u.ready()) {
-        apply(app, After::Hidden);
+        apply(app, After::Hidden, false);
     }
 }
 
@@ -193,7 +194,7 @@ pub fn window_closed(app: &AppHandle<Wry>) {
 pub fn quit(app: &AppHandle<Wry>) {
     #[cfg(windows)]
     if app.try_state::<Updates>().is_some_and(|u| u.ready()) {
-        apply(app, After::Quit);
+        apply(app, After::Quit, false);
     }
     app.exit(0);
 }
@@ -203,7 +204,7 @@ pub fn quit(app: &AppHandle<Wry>) {
 #[cfg(target_os = "macos")]
 pub fn exiting(app: &AppHandle<Wry>) {
     if app.try_state::<Updates>().is_some_and(|u| u.ready()) {
-        apply(app, After::Quit);
+        apply(app, After::Quit, false);
     }
 }
 
@@ -267,7 +268,7 @@ async fn check(app: AppHandle<Wry>, asked: bool) {
             updates.label(&format!("Restart to Update ({})", ready.0.version), true);
             updates.set(Phase::Ready(Box::new(ready)));
             if !window_shown(&app) {
-                apply(&app, After::Hidden);
+                apply(&app, After::Hidden, false);
             }
         }
         Ok(None) => {
@@ -307,14 +308,17 @@ async fn fetch(app: &AppHandle<Wry>, updates: &Updates) -> tauri_plugin_updater:
     Ok(Some((update, bytes)))
 }
 
-/// Installs the downloaded update, then restarts or lets the app quit.
-fn apply(app: &AppHandle<Wry>, after: After) {
+/// Installs the downloaded update, then restarts or lets the app quit. `asked`: the user picked "Restart to Update",
+/// whether or not the window is shown.
+fn apply(app: &AppHandle<Wry>, after: After, asked: bool) {
     // Where the user cannot replace the app themselves (an app that an administrator installed, or one that runs from
     // its disk image), installing asks for an administrator's password: only the user's own click may do that.
     #[cfg(target_os = "macos")]
-    if after != After::Shown && !replaceable() {
+    if !asked && !replaceable() {
         return;
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = asked;
     let updates = app.state::<Updates>();
     let Some((update, bytes)) = updates.take_ready() else {
         return;
