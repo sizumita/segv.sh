@@ -221,7 +221,7 @@ package's `test/`.
 
 ## Getting started
 
-You need Node.js 22.18+, 24.11+ or 26+, pnpm 12, and a browser whose passkey provider supports the WebAuthn PRF
+You need Node.js 26, pnpm 12, and a browser whose passkey provider supports the WebAuthn PRF
 extension. Without PRF support you can still unlock an account with its recovery code. Use the pnpm release that
 `packageManager` in `package.json` pins: pnpm does not switch to it by itself, and `pnpm self-update <version>`
 installs it.
