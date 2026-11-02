@@ -203,20 +203,36 @@ export async function sendFile(d, name, text, { atMenu } = {}) {
   const item = d.page.locator(".attach .menu").getByRole("button", { name: /^file\b/ });
   await item.waitFor({ timeout: T });
   await atMenu?.();
-  const [chooser] = await Promise.all([d.page.waitForEvent("filechooser", { timeout: T }), item.click()]);
+  const [chooser] = await Promise.all([
+    d.page.waitForEvent("filechooser", { timeout: T }),
+    item.click(),
+  ]);
   check(chooser.isMultiple(), `${d.name}: the file picker takes several files`);
   await chooser.setFiles({ name, mimeType: "text/plain", buffer: Buffer.from(text, "utf8") });
   check(!(await d.page.locator(".attach .menu").isVisible()), `${d.name}: the menu stays open`);
   await d.page.getByRole("button", { name: "send", exact: true }).click();
-  await d.page.locator(".thread").getByRole("button", { name: `save ${name}` }).first().waitFor({ timeout: T });
+  await d.page
+    .locator(".thread")
+    .getByRole("button", { name: `save ${name}` })
+    .first()
+    .waitFor({ timeout: T });
 }
 
 /** Saves the conversation's file `name` (a download) and returns what it holds, as UTF-8. */
 export async function saveFile(d, name) {
-  const save = d.page.locator(".thread").getByRole("button", { name: `save ${name}` }).first();
+  const save = d.page
+    .locator(".thread")
+    .getByRole("button", { name: `save ${name}` })
+    .first();
   await save.waitFor({ timeout: T });
-  const [download] = await Promise.all([d.page.waitForEvent("download", { timeout: T }), save.click()]);
-  check(download.suggestedFilename() === name, `${d.name}: saved as ${download.suggestedFilename()}`);
+  const [download] = await Promise.all([
+    d.page.waitForEvent("download", { timeout: T }),
+    save.click(),
+  ]);
+  check(
+    download.suggestedFilename() === name,
+    `${d.name}: saved as ${download.suggestedFilename()}`,
+  );
   return readFile(await download.path(), "utf8");
 }
 

@@ -67,7 +67,9 @@ describe("files", () => {
     await B.loadFile(f);
     expect(blobGets(f.id)).toBe(1);
     // the sender has the bytes already
-    expect(P.equalBytes((await urlBytes(await A.loadFile(fileOf(A, id)))).bytes, secret)).toBe(true);
+    expect(P.equalBytes((await urlBytes(await A.loadFile(fileOf(A, id)))).bytes, secret)).toBe(
+      true,
+    );
     expect(blobGets(f.id)).toBe(1);
     // The server only ever stored ciphertext, padded as §8.3 says.
     const stored = server().blobs.bytes(f.id)!;
@@ -109,12 +111,16 @@ describe("files", () => {
     await settle(A, B);
     const f = fileOf(B, id);
     await expect(B.loadFile({ ...f, size: f.size + 1 })).rejects.toThrow(/does not match/);
-    expect(P.equalBytes((await urlBytes(await B.loadFile(f))).bytes, P.utf8("twelve bytes"))).toBe(true);
+    expect(P.equalBytes((await urlBytes(await B.loadFile(f))).bytes, P.utf8("twelve bytes"))).toBe(
+      true,
+    );
     const n = blobGets();
     await expect(B.loadFile({ ...f, size: 12 * 1024 * 1024 })).rejects.toThrow(/too large/);
     expect(blobGets()).toBe(n);
     await expect(B.loadFile({ ...f, k: P.b64u(P.random(32)) })).rejects.toThrow();
-    await expect(B.loadFile({ ...f, id: "../../api/v2/params" })).rejects.toThrow(/bad file reference/);
+    await expect(B.loadFile({ ...f, id: "../../api/v2/params" })).rejects.toThrow(
+      /bad file reference/,
+    );
     await expect(B.loadFile({ ...f, size: -1 })).rejects.toThrow(/bad file size/);
   });
 
