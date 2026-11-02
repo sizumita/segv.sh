@@ -181,51 +181,115 @@ Each limit counts requests per IPv4 address or IPv6 /64 over 60 seconds, and the
 contain handles, credential ids and blob ids, together with request metadata. The Worker's own `console.error` lines
 carry none of these. Keep it that way.
 
-## Staging
+## Canary
 
-Run staging as a separate deployment, with its own Worker name, D1 database, R2 bucket, secrets and `E_FIRST`, and its
-own host name in `routes` and `APP_HOSTS`. Passkeys registered on staging work only there.
+<https://canary.segv.sh> is a second deployment of the same code. Every push to `main` deploys it, and a release tag
+then deploys a commit that it has run to segv.sh (the next section). It is the Worker `segv-sh-canary`, configured by
+`env.canary` in `wrangler.jsonc`, with its own D1 database, R2 bucket, secrets, `E_FIRST` and host name, so nothing
+reaches segv.sh: an account, a passkey (its RP ID is `canary.segv.sh`) or a message made there exists only there. Its
+`APPLE_APP_IDS` names segv.sh Canary, the desktop app built from `main` ([DEVELOPMENT.md](DEVELOPMENT.md),
+"Releases").
+
+Set it up as the steps above do, with `--env canary` on every Wrangler command, in `apps/web`:
+
+1. Create its D1 database, and put its id into `env.canary.d1_databases[0].database_id`; then its R2 bucket, and apply
+   the migrations:
+
+   ```bash
+   pnpm exec wrangler d1 create segv-canary
+   pnpm exec wrangler r2 bucket create segv-blobs-canary
+   pnpm exec wrangler d1 migrations apply DB --env canary --remote
+   ```
+
+2. Set `env.canary.vars.E_FIRST` to the current era (step 4 above prints it).
+
+3. Set its own `ROUTE_KEY` and `SRV_KEY`, new values that segv.sh never had (step 5 above generates them), and the push
+   secrets if it should send pushes:
+
+   ```bash
+   pnpm exec wrangler secret put ROUTE_KEY --env canary
+   pnpm exec wrangler secret put SRV_KEY --env canary
+   ```
+
+4. Deploy it once by hand, which attaches `canary.segv.sh` as its Custom Domain, and open
+   `https://canary.segv.sh/api/v2/params`:
+
+   ```bash
+   pnpm run build
+   pnpm exec wrangler deploy --env canary
+   ```
+
+Your own instance can keep a staging deployment the same way: change the names, the ids and the host in `env.canary`.
 
 ## Deploying from GitHub Actions
 
-`.github/workflows/deploy.yml` deploys every push to `main`. One job runs the checks, the tests and the build without
-any secret; a second job, in the `production` environment, deploys what the first one built with Wrangler and then
-checks that `/api/v2/params` answers. Do the first deployment by hand (the steps above); the workflow only updates a
-Worker that already exists. For your own instance, change the URL in the workflow to your domain.
+`.github/workflows/deploy.yml` deploys every push to `main` to canary.segv.sh, and every release tag `vX.Y.Z` to segv.sh.
+A tag deploys only a commit of `main`, which canary.segv.sh has run first. One job runs the checks, the tests and the
+build without any secret; a second job, in the environment of the deployment (`canary` or `production`), deploys what
+the first one built with Wrangler and then checks that `/api/v2/params` answers. Do the first deployment of each by hand
+(the steps above); the workflow only updates a Worker that already exists. For your own instance, change the URLs in the
+workflow to your domains.
 
-1. Create the Cloudflare API token. On the **Account API tokens** page of the Cloudflare dashboard, create a custom
-   token with a single permission: the **Editor** role of **Workers**, scoped to your Worker alone (`segv-sh`). Add no
-   zone permissions and no D1 or R2 permissions, and give the token an expiry date.
+1. Create a Cloudflare API token for each Worker. On the **Account API tokens** page of the Cloudflare dashboard, create
+   a custom token with a single permission: the **Editor** role of **Workers**, scoped to that Worker alone (`segv-sh`,
+   or `segv-sh-canary`). Add no zone permissions and no D1 or R2 permissions, and give the token an expiry date.
 
    Such a token can deploy and roll back that one Worker and change its secrets. It cannot create or delete Workers,
    touch other Workers, read D1 or R2 directly, or add, change or remove routes, Custom Domains or DNS records. It can
    still deploy any code to the Worker, and that code reaches every binding, so treat it as a production credential.
 
-2. In the repository's settings, create the environment `production`. Under **Deployment branches and tags**, choose
-   **Selected branches and tags** and add the branch `main`, so that no other branch can use the environment's
-   secrets. Optionally add yourself as a required reviewer to approve each deployment.
+2. In the repository's settings, create two environments, and under **Deployment branches and tags** choose **Selected
+   branches and tags** for each:
+   - `canary`: the branch `main`, so that no other branch can use its secrets;
+   - `production`: the tag pattern `v*` and no branch, so that only a release tag can use its secrets.
 
-3. Add the token and your account id as secrets of that environment, not of the repository. `gh` asks for each value:
+   Optionally add yourself as a required reviewer of `production` to approve each release. Under **Rules › Rulesets**,
+   restrict the creation, update and deletion of the tags `v*` to yourself: whoever may push such a tag deploys segv.sh.
+
+3. Add each token and your account id as secrets of its environment, not of the repository. `gh` asks for each value:
 
    ```bash
+   gh secret set CLOUDFLARE_API_TOKEN --env canary
+   gh secret set CLOUDFLARE_ACCOUNT_ID --env canary
    gh secret set CLOUDFLARE_API_TOKEN --env production
    gh secret set CLOUDFLARE_ACCOUNT_ID --env production
    ```
+
+   The two environments also hold the signing secrets of the macOS app ([DEVELOPMENT.md](DEVELOPMENT.md), "Releases").
 
 4. Under **Actions › General** in the repository's settings, require actions to be pinned to a full-length commit SHA,
    and allow only actions created by GitHub, plus `pnpm/action-setup@*` in the list of specified actions. The workflows
    use nothing else.
 
-The token cannot apply D1 migrations, and a change to `routes` in `wrangler.jsonc` makes the deployment fail at the
+The tokens cannot apply D1 migrations, and a change to `routes` in `wrangler.jsonc` makes the deployment fail at the
 Custom Domain step after the new version is live. Apply both by hand (the next section).
 
 ## Updating
 
-- A push to `main` deploys it (the previous section). Without the workflow, deploy new code with `pnpm run deploy`.
-- When a change adds a D1 migration, apply it with `pnpm exec wrangler d1 migrations apply DB --remote` in `apps/web`
-  before deploying the code that needs it, that is, before merging the pull request when `main` deploys itself. Changes
-  to Durable Object classes are declared in `migrations` in `wrangler.jsonc`.
-- To change `routes`, deploy the change with `pnpm run deploy` from an account that has Workers Routes Write on the
-  zone, then push it to `main`.
-- Check a change to `wrangler.jsonc` with `pnpm run build` followed by `pnpm exec wrangler deploy --dry-run` in
-  `apps/web` before you deploy it.
+- A push to `main` deploys canary.segv.sh, and a release tag on `main` deploys segv.sh (the previous section). To
+  release, tag a commit of `main` that canary.segv.sh has run, and push the tag:
+
+  ```bash
+  git tag v0.1.0 <commit>
+  git push origin v0.1.0
+  ```
+
+  Without the workflow, deploy new code with `pnpm run deploy` (segv.sh) or `pnpm run build` followed by
+  `pnpm exec wrangler deploy --env canary` (canary.segv.sh).
+
+- When a change adds a D1 migration, apply it to each deployment before deploying the code that needs it: to
+  canary.segv.sh before merging the pull request, and to segv.sh before pushing the release tag. In `apps/web`:
+
+  ```bash
+  pnpm exec wrangler d1 migrations apply DB --env canary --remote
+  pnpm exec wrangler d1 migrations apply DB --remote
+  ```
+
+  segv.sh then runs its release on the newer schema until the next tag, so a migration must keep the code of the last
+  release working. Changes to Durable Object classes are declared in `migrations` in `wrangler.jsonc`, which both
+  deployments share.
+
+- To change `routes`, deploy the change by hand from an account that has Workers Routes Write on the zone
+  (`pnpm run deploy`, or `wrangler deploy --env canary` for canary.segv.sh), then push it to `main`.
+- Check a change to `wrangler.jsonc` with `pnpm run build` followed by `pnpm exec wrangler deploy --dry-run` and
+  `pnpm exec wrangler deploy --dry-run --env canary` in `apps/web` before you deploy it.

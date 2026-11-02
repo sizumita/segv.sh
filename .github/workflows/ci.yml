@@ -81,7 +81,9 @@ jobs:
 
       - name: Check the Wrangler configuration
         working-directory: apps/web
-        run: pnpm exec wrangler deploy --dry-run
+        run: |
+          pnpm exec wrangler deploy --dry-run --env=""
+          pnpm exec wrangler deploy --dry-run --env canary
 
   e2e:
     name: End-to-end test

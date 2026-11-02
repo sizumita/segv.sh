@@ -263,7 +263,8 @@ set up; [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) walks through it. Some choices 
 - **Keep `SRV_KEY` and `ROUTE_KEY` for the life of the deployment.** Every client pins the server's signing key and
   warns if it changes.
 
-Run staging as a separate deployment, with its own Worker name, D1 database, R2 bucket, secrets and host name.
+Run staging as a separate deployment, with its own Worker name, D1 database, R2 bucket, secrets and host name. segv.sh
+does so at canary.segv.sh, which every push to `main` deploys; a release tag `vX.Y.Z` deploys segv.sh.
 
 ## Documentation
 

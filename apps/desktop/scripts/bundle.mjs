@@ -1,10 +1,21 @@
 // Builds the desktop app's bundle for a deployment and signs it (docs/DEVELOPMENT.md, "Desktop app").
 //
 //   node scripts/bundle.mjs [--debug] [tauri build options…]
+//   node scripts/bundle.mjs bundle [--debug] [tauri bundle options…]
+//
+// The first form runs `tauri build`. The second bundles and signs an app that `tauri build --no-bundle` built before,
+// with the same environment and options: CI builds without the signing secrets and gives them to that step alone.
 //
 // Environment:
-//   SEGV_ORIGIN                  the deployment's canonical origin (default https://segv.sh); another one (a local
-//                                `pnpm run dev` at http://localhost:5173, say) is added to the page's CSP
+//   SEGV_CHANNEL                 `release` (default): segv.sh, identifier sh.segv.desktop, links `segv:`.
+//                                `canary`: segv.sh Canary, a separate app (sh.segv.desktop.canary, links `segv-canary:`,
+//                                its own icon and data) for canary.segv.sh; macOS only
+//   SEGV_ORIGIN                  the deployment's canonical origin (default https://segv.sh, https://canary.segv.sh for
+//                                the Canary); another one than segv.sh's (a local `pnpm run dev` at
+//                                http://localhost:5173, say) replaces segv.sh in the page's CSP
+//   SEGV_VERSION                 the app's version, X.Y.Z or X.Y.Z-canary.N, instead of tauri.conf.json's
+//                                (scripts/version.mjs)
+//   SEGV_BUILD                   the build number, digits: CFBundleVersion on macOS (by default the version)
 //   APPLE_TEAM_ID                the team of the signing identity and the profile (macOS)
 //   APPLE_SIGNING_IDENTITY       the codesign identity, its name or SHA-1 (macOS)
 //   APPLE_PROVISIONING_PROFILE   a provisioning profile of the app's bundle id with the Associated Domains capability
@@ -26,9 +37,11 @@ const APP = join(import.meta.dirname, "..");
 const TAURI = join(APP, "src-tauri");
 const OUT = join(APP, "..", "..", "target", "segv-desktop");
 const read = (name) => JSON.parse(readFileSync(join(TAURI, name), "utf8"));
+const conf = read("tauri.conf.json");
 // `pnpm run bundle -- …` passes its `--` on, which Tauri would take as the start of cargo's arguments.
 const args = process.argv.slice(2);
 if (args[0] === "--") args.shift();
+const command = args[0] === "bundle" ? args.shift() : "build";
 
 /** The system that the build is for: the one of `--target <triple>` (a cross build), or else this one. */
 const target = (() => {
@@ -42,7 +55,7 @@ const target = (() => {
 
 /** The page's CSP for that system: tauri.conf.json's, with what tauri.<system>.conf.json changes. */
 const csp = (() => {
-  const base = read("tauri.conf.json").app.security.csp;
+  const base = conf.app.security.csp;
   try {
     return { ...base, ...read(`tauri.${target}.conf.json`).app?.security?.csp };
   } catch {
@@ -50,11 +63,46 @@ const csp = (() => {
   }
 })();
 
-const origin = process.env.SEGV_ORIGIN ?? "https://segv.sh";
+const channel = process.env.SEGV_CHANNEL || "release";
+if (channel !== "release" && channel !== "canary")
+  throw new Error(`SEGV_CHANNEL must be release or canary: ${channel}`);
+const canary = channel === "canary";
+if (canary && target !== "macos")
+  throw new Error("SEGV_CHANNEL=canary: the Canary app is for macOS only");
+
+const origin = process.env.SEGV_ORIGIN || (canary ? "https://canary.segv.sh" : "https://segv.sh");
 const u = new URL(origin);
 if (u.origin !== origin)
   throw new Error(`SEGV_ORIGIN must be an origin, without a path: ${origin}`);
 const overlay = { bundle: { macOS: {}, windows: {} }, app: { security: {} } };
+
+// The Canary is another app, so that it installs next to segv.sh: its own bundle identifier (and with it its own data
+// directory, keychain items and notifications), name, icon and link scheme (§11.14 "Links").
+if (canary) {
+  Object.assign(overlay, {
+    identifier: `${conf.identifier}.canary`,
+    productName: `${conf.productName} Canary`,
+    plugins: { "deep-link": { desktop: { schemes: ["segv-canary"] } } },
+  });
+  overlay.bundle.icon = conf.bundle.icon.map((p) =>
+    join(TAURI, p.replace(/^icons\//, "icons/canary/")),
+  );
+}
+const identifier = overlay.identifier ?? conf.identifier;
+
+const version = process.env.SEGV_VERSION;
+if (version) {
+  if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-canary\.(0|[1-9]\d*))?$/.test(version))
+    throw new Error(`SEGV_VERSION must be X.Y.Z or X.Y.Z-canary.N: ${version}`);
+  overlay.version = version;
+}
+const build = process.env.SEGV_BUILD;
+if (build) {
+  if (!/^[1-9]\d{0,8}$/.test(build))
+    throw new Error(`SEGV_BUILD must be a positive number: ${build}`);
+  overlay.bundle.macOS.bundleVersion = build;
+}
+
 if (origin !== "https://segv.sh") {
   const ws = `${u.protocol === "https:" ? "wss:" : "ws:"}//${u.host}`;
   overlay.app.security.csp = {
@@ -85,7 +133,7 @@ if (target === "macos") {
   if (identity && profile && team) {
     if (!/^[A-Z0-9]{10}$/.test(team))
       throw new Error("APPLE_TEAM_ID must be 10 characters A-Z, 0-9");
-    const appId = `${team}.${conf.identifier}`;
+    const appId = `${team}.${identifier}`;
     writeFileSync(
       path,
       plist([
@@ -111,9 +159,10 @@ if (target === "macos") {
       files: { "embedded.provisionprofile": profile },
     });
   } else {
-    console.warn(
-      "bundle: APPLE_TEAM_ID, APPLE_SIGNING_IDENTITY or APPLE_PROVISIONING_PROFILE unset: signing ad hoc, without passkeys",
-    );
+    if (!args.includes("--no-bundle"))
+      console.warn(
+        "bundle: APPLE_TEAM_ID, APPLE_SIGNING_IDENTITY or APPLE_PROVISIONING_PROFILE unset: signing ad hoc, without passkeys",
+      );
     // No restricted entitlement: without a profile that allows it, the system refuses to launch the app.
     writeFileSync(path, plist([]));
     Object.assign(overlay.bundle.macOS, { signingIdentity: "-", entitlements: path });
@@ -131,7 +180,7 @@ mkdirSync(OUT, { recursive: true });
 writeFileSync(configPath, JSON.stringify(overlay, null, 2));
 // Tauri's CLI through this Node, without a shell, which Windows would need for pnpm's .cmd shim.
 const cli = createRequire(import.meta.url).resolve("@tauri-apps/cli/tauri.js");
-const r = spawnSync(process.execPath, [cli, "build", "--config", configPath, ...args], {
+const r = spawnSync(process.execPath, [cli, command, "--config", configPath, ...args], {
   cwd: APP,
   stdio: "inherit",
   env: { ...process.env, SEGV_ORIGIN: origin },

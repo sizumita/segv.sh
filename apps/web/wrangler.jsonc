@@ -108,4 +108,57 @@
     "traces": { "enabled": false },
   },
   "routes": [{ "pattern": "segv.sh", "custom_domain": true }],
+  // https://canary.segv.sh (docs/DEPLOYMENT.md, "Canary"): another deployment, which every push to main deploys before
+  // a release tag deploys segv.sh. It is the Worker segv-sh-canary with its own storage, secrets and accounts: its
+  // passkeys (RP ID canary.segv.sh) and its data never reach segv.sh. segv.sh Canary, the Canary desktop app, calls it.
+  // Use it with `--env canary`. Wrangler does not inherit bindings or variables into an environment, so each one is
+  // repeated here; the rest (main, assets, compatibility, Durable Object migrations, logs) is the deployment's above.
+  "env": {
+    "canary": {
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "segv-canary",
+          "database_id": "f4e5945a-1acc-4c90-bfda-790e16a861b1",
+          "migrations_dir": "../../packages/server/migrations",
+        },
+      ],
+      "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "segv-blobs-canary" }],
+      "durable_objects": {
+        "bindings": [
+          { "name": "SHARD", "class_name": "ShardDO" },
+          { "name": "BLOBREG", "class_name": "BlobRegDO" },
+          { "name": "INBOX", "class_name": "InboxDO" },
+          { "name": "RT", "class_name": "RealtimeDO" },
+          { "name": "CKPT", "class_name": "CheckpointDO" },
+          { "name": "PUSH", "class_name": "PushDO" },
+        ],
+      },
+      // Ids that no other Worker of the account uses.
+      "ratelimits": [
+        { "name": "RL_WRITE", "namespace_id": "2001", "simple": { "limit": 60, "period": 60 } },
+        { "name": "RL_BLOB", "namespace_id": "2002", "simple": { "limit": 20, "period": 60 } },
+        { "name": "RL_READ", "namespace_id": "2003", "simple": { "limit": 600, "period": 60 } },
+        { "name": "RL_INBOX", "namespace_id": "2004", "simple": { "limit": 10, "period": 60 } },
+        { "name": "RL_RING", "namespace_id": "2005", "simple": { "limit": 60, "period": 60 } },
+        { "name": "RL_SEEN", "namespace_id": "2006", "simple": { "limit": 60, "period": 60 } },
+      ],
+      "vars": {
+        "POW_REGISTER": "20",
+        "POW_WRAP": "18",
+        "POW_PUT": "16",
+        "POW_INBOX": "18",
+        "POW_BLOB": "18",
+        "DELTA_S": "10",
+        "SKEW_S": "2",
+        "INBOX_SLOT_S": "10",
+        "E_FIRST": "42",
+        "APP_HOSTS": "canary.segv.sh",
+        // The desktop apps' pages (segv.sh Canary on macOS); the mobile apps are segv.sh's only.
+        "APP_ORIGINS": "tauri://localhost,https://tauri.localhost",
+        "APPLE_APP_IDS": "NBDP5VK335.sh.segv.desktop.canary",
+      },
+      "routes": [{ "pattern": "canary.segv.sh", "custom_domain": true }],
+    },
+  },
 }
