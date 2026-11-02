@@ -858,4 +858,8 @@ textarea:focus {
   .composer .hint:not(.strong) {
     display: none;
   }
+  /* The message box's font size, so that the "+" is as tall as its two lines. */
+  .plus {
+    font-size: 16px;
+  }
 }
