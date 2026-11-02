@@ -53,7 +53,10 @@ try {
     await windows({
       base: BASE,
       browser,
-      shots: shots(SHOTS, "windows", ["light", "dark"]),
+      // Mica's base colors, approximately: the app's page is transparent over it on Windows 11.
+      shots: shots(SHOTS, "windows", ["light", "dark"], {
+        backdrop: { light: { r: 243, g: 243, b: 243, a: 1 }, dark: { r: 32, g: 32, b: 32, a: 1 } },
+      }),
       exe: opts["windows-app"],
       cdpPort: Number(process.env.E2E_CDP_PORT ?? 9222),
     });

@@ -26,14 +26,21 @@ export const problems = [];
 /** Where a failure's screenshots go: the group of the latest shots(). */
 let failures = null;
 
+/** Console errors that a fresh deployment causes by design, as "<text> @ <url>". */
+const EXPECTED = [
+  // No checkpoint yet (§9.5): /api/v2/ckpt/latest answers 404 until the deployment makes its first one.
+  /^Failed to load resource: .* 404 .* @ https?:\/\/[^/]+\/api\/v2\/ckpt\/latest$/,
+];
+
 /**
- * Watches a page: its console errors (except those of `allow`) and uncaught errors become problems, and a failure
+ * Watches a page: its console errors (except the EXPECTED ones) and uncaught errors become problems, and a failure
  * takes its screenshot.
  */
-export function watch(name, page, allow = /$^/) {
+export function watch(name, page) {
   page.on("console", (m) => {
-    if (m.type() === "error" && !allow.test(m.text()))
-      problems.push(`[${name}] console.error: ${m.text()}`);
+    if (m.type() !== "error") return;
+    const error = `${m.text()} @ ${m.location().url}`;
+    if (!EXPECTED.some((re) => re.test(error))) problems.push(`[${name}] console.error: ${error}`);
   });
   page.on("pageerror", (e) => problems.push(`[${name}] pageerror: ${e.message}`));
   pages.push({ name, page });
@@ -76,27 +83,37 @@ const slug = (title) =>
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "");
 
-/** Waits until the page has its fonts and has painted twice since the last change. */
+/** Waits until the page has its fonts and images decoded, and has painted twice since. */
 async function settle(page) {
   await page.evaluate(async () => {
     await document.fonts.ready;
+    await Promise.all([...document.images].map((i) => i.decode().catch(() => {})));
     await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
   });
 }
 
-/** The screenshots of one group (one app): each screen in each of `variants`. */
-export function shots(dir, group, variants) {
+/**
+ * The screenshots of one group (one app): each screen in each of `variants`. `backdrop` gives, for each color scheme,
+ * the color behind a transparent page: what the window shows there (Mica on Windows), which a capture of the page
+ * leaves white.
+ */
+export function shots(dir, group, variants, { backdrop } = {}) {
   const at = join(dir, group);
   rmSync(at, { recursive: true, force: true });
   mkdirSync(at, { recursive: true });
   let n = 0;
   const take = async (page, name, variant) => {
+    const color = backdrop?.[variant];
+    const cdp = color ? await page.context().newCDPSession(page) : null;
+    await cdp?.send("Emulation.setDefaultBackgroundColorOverride", { color });
     await settle(page);
     await page.screenshot({
       path: join(at, `${name}.${variant}.png`),
       animations: "disabled",
       caret: "hide",
     });
+    await cdp?.send("Emulation.setDefaultBackgroundColorOverride", {});
+    await cdp?.detach();
   };
   failures = (page, who) => page.screenshot({ path: join(at, `99-failed-${slug(who)}.light.png`) });
   return {

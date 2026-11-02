@@ -14,8 +14,7 @@ export async function device(browser, base, name) {
     );
   });
   const page = await ctx.newPage();
-  // Expected: the handle-availability probe 404s during registration.
-  watch(name, page, /Failed to load resource.*404/);
+  watch(name, page);
   const cdp = await ctx.newCDPSession(page);
   await cdp.send("WebAuthn.enable");
   await cdp.send("WebAuthn.addVirtualAuthenticator", {
