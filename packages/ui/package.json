@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@segv/engine": "workspace:*"
+    "@segv/engine": "workspace:*",
+    "emojibase-data": "catalog:"
   },
   "devDependencies": {
     "@qwik.dev/core": "catalog:",

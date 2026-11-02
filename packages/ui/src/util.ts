@@ -19,6 +19,10 @@ export const MAX_TEXT_JSON_BYTES = 15_000;
 export const MAX_IMAGE_INPUT_BYTES = 50 * 1024 * 1024;
 /** Mirror of FILE_MAX (packages/protocol/src/proto.ts, §8.3): the largest file the engine sends. */
 export const MAX_FILE_BYTES = 10 * 1024 * 1024;
+/** Mirror of MAX_EMOJI_BYTES (packages/protocol/src/proto.ts, §3.3): the longest emoji a reaction carries, in UTF-8. */
+export const MAX_EMOJI_BYTES = 32;
+/** `MAX_REACTIONS` of §11.12: at most this many emoji are on per member and message. */
+export const MAX_REACTIONS = 8;
 
 export function errMsg(e: unknown): string {
   let s = "";
