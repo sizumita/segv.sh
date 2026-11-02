@@ -74,7 +74,8 @@ beforeEach(() => {
 /** Successful writes of the directory and the shard (what a failed unlock must never cause). */
 const writes = () =>
   server().requests.filter(
-    (r) => ["/api/v2/register", "/api/v2/wraps", "/api/v2/put"].includes(r.path) && r.status === 200,
+    (r) =>
+      ["/api/v2/register", "/api/v2/wraps", "/api/v2/put"].includes(r.path) && r.status === 200,
   ).length;
 
 describe("protocol-3 / engine-3 / web-1: wraps filed under someone else's public id", () => {
@@ -88,13 +89,26 @@ describe("protocol-3 / engine-3 / web-1: wraps filed under someone else's public
     const guesses = [P.random(32), new Uint8Array(32), attackers[2].rk.auth];
     guesses.forEach((auth, k) => {
       const a = attackers[k];
-      const evil = P.makeWrap(a.uid, "recovery", rec.id, { pk: rec.kemPk, auth }, a.AK, a.id, Date.now());
+      const evil = P.makeWrap(
+        a.uid,
+        "recovery",
+        rec.id,
+        { pk: rec.kemPk, auth },
+        a.AK,
+        a.id,
+        Date.now(),
+      );
       expect(server().dir.postWrap(evil).status).toBe(200);
     });
     // Also re-file the victim's own sealed box under an attacker's uid (the AAD binds the uid).
     const a = attackers[3];
     const reboxed = JSON.stringify({ ...JSON.parse(rec.record), uid: a.uidB, ts: Date.now() });
-    expect(server().dir.postWrap({ record: reboxed, sig: P.b64u(P.sign(P.wrapSigMsg(reboxed), a.id.sigSk)) }).status).toBe(200);
+    expect(
+      server().dir.postWrap({
+        record: reboxed,
+        sig: P.b64u(P.sign(P.wrapSigMsg(reboxed), a.id.sigSk)),
+      }).status,
+    ).toBe(200);
     expect(server().dir.wraps.filter((w) => w.id === P.b64u(rec.id))).toHaveLength(5);
 
     const V = newEngine();
@@ -110,7 +124,9 @@ describe("protocol-3 / engine-3 / web-1: wraps filed under someone else's public
     makeUser("alice");
     const before = writes();
     const V = newEngine();
-    await expect(V.loginWithRecovery(P.formatRecoveryCode(P.newRecoveryCode()), false)).rejects.toThrow(/not recognised/);
+    await expect(
+      V.loginWithRecovery(P.formatRecoveryCode(P.newRecoveryCode()), false),
+    ).rejects.toThrow(/not recognised/);
     expect(V.getState().phase).toBe("signed-out");
     expect(V.getState().me).toBeNull();
     expect(writes()).toBe(before);
@@ -127,10 +143,20 @@ describe("protocol-3 / engine-3 / web-1: wraps filed under someone else's public
     expect(recoveryCode).toMatch(/^([0-9A-Z]{4}-){7}[0-9A-Z]{4}$/);
     const [cred] = [...wa.creds.values()];
     const attacker = makeUser("v1ctim");
-    const vRec = server().dir.wraps.find((w) => w.uid === victimUid && P.parseWrap(w.record, w.sig).kind === "passkey")!;
+    const vRec = server().dir.wraps.find(
+      (w) => w.uid === victimUid && P.parseWrap(w.record, w.sig).kind === "passkey",
+    )!;
     const rec = P.parseWrap(vRec.record, vRec.sig);
     expect(P.equalBytes(rec.id, cred.credId)).toBe(true);
-    const evil = P.makeWrap(attacker.uid, "passkey", rec.id, { pk: rec.kemPk, auth: P.random(32) }, attacker.AK, attacker.id, Date.now());
+    const evil = P.makeWrap(
+      attacker.uid,
+      "passkey",
+      rec.id,
+      { pk: rec.kemPk, auth: P.random(32) },
+      attacker.AK,
+      attacker.id,
+      Date.now(),
+    );
     expect(server().dir.postWrap(evil).status).toBe(200);
 
     for (const withUserHandle of [true, false]) {
@@ -260,7 +286,9 @@ describe("v2: the registration's self row and the account check (§7.3, §11.1)"
     await settle(R);
     // the first row, at Lself(E, 0) with prev NONE, holds only the HEADS record with the registration's cursor
     const id = P.deriveIdentity(I(R).account!.AK);
-    const rows = server().shard.rows().filter((r) => P.equalBytes(r.label, P.Lself(id.rS, server().era, 0)));
+    const rows = server()
+      .shard.rows()
+      .filter((r) => P.equalBytes(r.label, P.Lself(id.rS, server().era, 0)));
     expect(rows).toHaveLength(1);
     const row = P.openSelf(id.kS, server().era, rows[0].label, rows[0].body);
     expect(row.prev).toEqual(P.NONE);
@@ -275,7 +303,9 @@ describe("v2: the registration's self row and the account check (§7.3, §11.1)"
     // later HEADS rows only move the cursor forward (the inbox poll read past it)
     const self = I(R).self!;
     const cursor = self.fold.cursor!;
-    expect(cursor.E > first.Ein || (cursor.E === first.Ein && cursor.rel >= first.relIn)).toBe(true);
+    expect(cursor.E > first.Ein || (cursor.E === first.Ein && cursor.rel >= first.relIn)).toBe(
+      true,
+    );
     const head = { E: self.head!.E, n: self.head!.n };
     await R.logout();
 
@@ -310,7 +340,8 @@ describe("v2: the registration's self row and the account check (§7.3, §11.1)"
   it("a transient failure of the account check is retried, never fatal", async () => {
     const u = makeUser("flaky");
     let fails = 2;
-    server().hooks.fail = (m, p) => (p.startsWith("/api/v2/dir/uid/") && fails-- > 0 ? "before" : null);
+    server().hooks.fail = (m, p) =>
+      p.startsWith("/api/v2/dir/uid/") && fails-- > 0 ? "before" : null;
     const E = await engineFor(u);
     expect(E.getState().phase).toBe("ready");
     expect(E.getState().error).toBe("");
@@ -341,6 +372,10 @@ describe("v2: the registration's self row and the account check (§7.3, §11.1)"
     server().hooks.fail = (m, p) => (m === "POST" && p === "/api/v2/wraps" ? "before" : null);
     await expect(E.addPasskey()).rejects.toThrow(); // never reached the server: not listed
     server().hooks.fail = undefined;
-    expect(server().dir.wraps.filter((w) => w.uid === u.uidB && P.parseWrap(w.record, w.sig).kind === "passkey")).toHaveLength(1);
+    expect(
+      server().dir.wraps.filter(
+        (w) => w.uid === u.uidB && P.parseWrap(w.record, w.sig).kind === "passkey",
+      ),
+    ).toHaveLength(1);
   });
 });

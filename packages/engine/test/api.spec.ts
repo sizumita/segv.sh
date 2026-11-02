@@ -25,7 +25,14 @@ const PARAMS = {
   kcommit: P.b64u(new Uint8Array(32)),
   srvKey: P.b64u(new Uint8Array(32)),
   pow: { register: 20, wrap: 18, put: 16, inbox: 18, blob: 18 },
-  limits: { putRows: 16, putBytes: 263345, getKeys: 256, topics: 256, blobMax: 12582912, textMax: 12000 },
+  limits: {
+    putRows: 16,
+    putBytes: 263345,
+    getKeys: 256,
+    topics: 256,
+    blobMax: 12582912,
+    textMax: 12000,
+  },
 };
 
 type Route = (path: string) => { status?: number; json: unknown } | null;
@@ -39,7 +46,11 @@ function stubFetch(now: () => number, route: Route, seen: string[] = []): typeof
     const r = route(path) ?? { status: 404, json: { error: "not found" } };
     return new Response(JSON.stringify(r.json), {
       status: r.status ?? 200,
-      headers: { "content-type": "application/json", "cache-control": "no-store", "x-segv-now": String(now()) },
+      headers: {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+        "x-segv-now": String(now()),
+      },
     });
   }) as typeof fetch;
 }
@@ -77,7 +88,9 @@ describe("params bounds (§3.1)", () => {
     expect(R.getState().phase).toBe("ready");
     expect(R.getState().error).toBe("");
     expect(bad).toBeLessThan(0);
-    expect(server().requests.filter((r) => r.path === "/api/v2/params").length).toBeGreaterThanOrEqual(3);
+    expect(
+      server().requests.filter((r) => r.path === "/api/v2/params").length,
+    ).toBeGreaterThanOrEqual(3);
   });
 });
 
@@ -149,7 +162,9 @@ describe("the server-time estimate (§10.1)", () => {
     const api = new Api({
       clock: c,
       fetch: (async () =>
-        new Response("{}", { headers: { "cache-control": "public, max-age=10", "x-segv-now": "123" } })) as typeof fetch,
+        new Response("{}", {
+          headers: { "cache-control": "public, max-age=10", "x-segv-now": "123" },
+        })) as typeof fetch,
     });
     await api.request("/api/v2/blob/x");
     expect(api.time.sample).toBeNull();
@@ -164,7 +179,13 @@ describe("proof of work (§10.2)", () => {
     let serverMs = (w + 1) * P.POW_WINDOW_MS - 1; // 1 ms before window w ends
     const api = new Api({
       clock: c,
-      fetch: stubFetch(() => serverMs, (p) => (p === "/api/v2/params" ? { json: { ...PARAMS, pow: { ...PARAMS.pow, register: 12 } } } : null)),
+      fetch: stubFetch(
+        () => serverMs,
+        (p) =>
+          p === "/api/v2/params"
+            ? { json: { ...PARAMS, pow: { ...PARAMS.pow, register: 12 } } }
+            : null,
+      ),
     });
     await api.params();
     // A digest whose first search chunk (nonces 0..4095) fails in window w, so the search must still run when the
@@ -191,7 +212,11 @@ describe("proof of work (§10.2)", () => {
     const c = new TestClock();
     const api = new Api({
       clock: c,
-      fetch: stubFetch(() => PARAMS.now, (p) => (p === "/api/v2/params" ? { json: { ...PARAMS, pow: { ...PARAMS.pow, wrap: 27 } } } : null)),
+      fetch: stubFetch(
+        () => PARAMS.now,
+        (p) =>
+          p === "/api/v2/params" ? { json: { ...PARAMS, pow: { ...PARAMS.pow, wrap: 27 } } } : null,
+      ),
     });
     await expect(api.powHeader("wrap", new Uint8Array(32), 10)).rejects.toThrow(/unreasonable/);
   });
@@ -208,8 +233,10 @@ describe("directory prefix bits (§10.6)", () => {
         () => PARAMS.now,
         (path) => {
           if (path === "/api/v2/params") return { json: PARAMS };
-          if (path.startsWith("/api/v2/dirlog")) return { json: { entries: [], head: { seq: 20_000, h: "" } } };
-          if (path.startsWith("/api/v2/dir/h/2/")) return { status: 409, json: { error: "prefix bits out of range", p: 0 } };
+          if (path.startsWith("/api/v2/dirlog"))
+            return { json: { entries: [], head: { seq: 20_000, h: "" } } };
+          if (path.startsWith("/api/v2/dir/h/2/"))
+            return { status: 409, json: { error: "prefix bits out of range", p: 0 } };
           if (path === "/api/v2/dir/h/0/0") return { json: users(0) };
           return null;
         },
@@ -218,7 +245,10 @@ describe("directory prefix bits (§10.6)", () => {
     });
     expect(await api.userByHandle("bob")).toBeNull();
     const dir = seen.filter((p) => p.startsWith("/api/v2/dir/"));
-    expect(dir.slice(0, 2)).toEqual([`/api/v2/dir/h/2/${P.topBits(P.hpre("bob"), 2)}`, "/api/v2/dir/h/0/0"]);
+    expect(dir.slice(0, 2)).toEqual([
+      `/api/v2/dir/h/2/${P.topBits(P.hpre("bob"), 2)}`,
+      "/api/v2/dir/h/0/0",
+    ]);
     expect(dir.slice(2).every((p) => p === dir[0] || p === dir[1])).toBe(true); // the one fresh re-ask
     expect(seen.filter((p) => p.startsWith("/api/v2/dirlog"))).toHaveLength(1); // read once per session
   });
@@ -230,8 +260,10 @@ describe("directory prefix bits (§10.6)", () => {
         () => PARAMS.now,
         (path) => {
           if (path === "/api/v2/params") return { json: { ...PARAMS, p: 3 } };
-          if (path.startsWith("/api/v2/dirlog")) return { json: { entries: [], head: { seq: 20_000, h: "" } } };
-          if (path.startsWith("/api/v2/dir/h/")) return { status: 409, json: { error: "prefix bits out of range", p: 1 } };
+          if (path.startsWith("/api/v2/dirlog"))
+            return { json: { entries: [], head: { seq: 20_000, h: "" } } };
+          if (path.startsWith("/api/v2/dir/h/"))
+            return { status: 409, json: { error: "prefix bits out of range", p: 1 } };
           return null;
         },
       ),
@@ -250,8 +282,10 @@ describe("directory prefix bits (§10.6)", () => {
         () => PARAMS.now,
         (path) => {
           if (path === "/api/v2/params") return { json: { ...PARAMS, p: 2 } };
-          if (path.startsWith("/api/v2/dirlog")) return { json: { entries: [], head: { seq: 300, h: "" } } };
-          if (path.startsWith("/api/v2/dir/h/1/")) return { json: { p: 1, users: [], more: false } };
+          if (path.startsWith("/api/v2/dirlog"))
+            return { json: { entries: [], head: { seq: 300, h: "" } } };
+          if (path.startsWith("/api/v2/dir/h/1/"))
+            return { json: { p: 1, users: [], more: false } };
           return null;
         },
       ),

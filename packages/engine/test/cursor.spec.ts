@@ -30,7 +30,9 @@ freshWorldPerTest({ skew: 2 });
 function firstCursor(e: Parameters<typeof I>[0]): { E: number; rel: number } {
   const id = P.deriveIdentity(I(e).account!.AK);
   for (let E = I(e).account!.regEra! - 1; E <= server().era; E++) {
-    const row = server().shard.rows().find((r) => r.E === E && P.equalBytes(r.label, P.Lself(id.rS, E, 0)));
+    const row = server()
+      .shard.rows()
+      .find((r) => r.E === E && P.equalBytes(r.label, P.Lself(id.rS, E, 0)));
     if (!row) continue;
     const h = P.openSelf(id.kS, E, row.label, row.body).records[0] as P.HeadsRec;
     return { E: h.Ein, rel: h.relIn };
@@ -53,7 +55,9 @@ describe("the registration's inbox cursor", () => {
     const R = newEngine("early");
     await R.register("early");
     // an invite posted right after the registration lands in E − 1, at the InboxDO's slot
-    const [res] = server().inbox.post(E - 1, [{ eid: P.random(16), body: P.random(P.INBOX_BODY_LEN) }]);
+    const [res] = server().inbox.post(E - 1, [
+      { eid: P.random(16), body: P.random(P.INBOX_BODY_LEN) },
+    ]);
     expect(res).toHaveProperty("rel");
     const rel = (res as { rel: number }).rel;
     await settle(R);
@@ -71,10 +75,14 @@ describe("the registration's inbox cursor", () => {
     server().hooks.beforeRequest = (m, p) => {
       if (m === "POST" && p === "/api/v2/register") regAt = server().now();
     };
-    server().hooks.fail = (m, p) => (m === "POST" && p === "/api/v2/put" && fails-- > 0 ? "before" : null);
+    server().hooks.fail = (m, p) =>
+      m === "POST" && p === "/api/v2/put" && fails-- > 0 ? "before" : null;
     const R = newEngine("retry", { delays: { retryBase: 60_000, retryMax: 60_000 } });
     await R.register("retry");
-    await waitFor(() => fails === 0 && /sync failed/.test(R.getState().error), "the failed HEADS put");
+    await waitFor(
+      () => fails === 0 && /sync failed/.test(R.getState().error),
+      "the failed HEADS put",
+    );
     server().tick(60_000); // the back-off: a minute passes (world and engine) before the retry
     await settle(R);
     const c = firstCursor(R);

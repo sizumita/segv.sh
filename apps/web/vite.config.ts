@@ -35,7 +35,9 @@ async function bundleSw(minify: boolean): Promise<string> {
       lib: { entry: SW_ENTRY, formats: ["iife"], name: "segvSw", fileName: () => "sw.js" },
     },
   });
-  const outputs = (Array.isArray(out) ? out : [out]) as { output: { type: string; code?: string }[] }[];
+  const outputs = (Array.isArray(out) ? out : [out]) as {
+    output: { type: string; code?: string }[];
+  }[];
   const code = outputs.flatMap((o) => o.output).find((o) => o.type === "chunk")?.code;
   if (!code) throw new Error("sw.js: the bundle has no chunk");
   return code;
@@ -114,21 +116,25 @@ export default defineConfig(({ command, mode }) => {
   return {
     environments: dev ? { ssr: { optimizeDeps: { exclude: QWIK_LIBS } } } : undefined,
     // lazyPlugins: factories are skipped by `vp lint` / `vp fmt` / `vp check`.
-    plugins: lazyPlugins(() => mode === "test" ? [] : [
-      swPlugin(),
-      stylesheetPlugin(),
-      qwikRouter(dev ? { devSsrServer: false } : {}),
-      qwikVite(),
-      ...(dev
-        ? [
-            cloudflare({
-              viteEnvironment: { name: "ssr" },
-              // wrangler.jsonc "main" is the built bundle; in dev run the TS source instead.
-              config: { main: "./src/entry.cloudflare-workers.ts" },
-            }),
-          ]
-        : []),
-    ]),
+    plugins: lazyPlugins(() =>
+      mode === "test"
+        ? []
+        : [
+            swPlugin(),
+            stylesheetPlugin(),
+            qwikRouter(dev ? { devSsrServer: false } : {}),
+            qwikVite(),
+            ...(dev
+              ? [
+                  cloudflare({
+                    viteEnvironment: { name: "ssr" },
+                    // wrangler.jsonc "main" is the built bundle; in dev run the TS source instead.
+                    config: { main: "./src/entry.cloudflare-workers.ts" },
+                  }),
+                ]
+              : []),
+          ],
+    ),
     // cors: false: the Worker answers cross-origin requests and preflights itself (APP_ORIGINS, docs/PROTOCOL.md §10.1),
     // as in production; Vite's own CORS handling would answer the native apps' preflights first.
     server: { cors: false, headers: { "Cache-Control": "public, max-age=0" } },

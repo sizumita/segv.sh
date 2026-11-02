@@ -126,7 +126,10 @@ describe("reactions (§11.12)", () => {
     await B.react(id, key, "🎉", true);
     await settle(A, B, B2);
     const want = reactionsOf(B, id, "race");
-    for (const X of [A, B2]) expect(reactionsOf(X, id, "race").map((x) => x.slice(0, 2))).toEqual(want.map((x) => x.slice(0, 2)));
+    for (const X of [A, B2])
+      expect(reactionsOf(X, id, "race").map((x) => x.slice(0, 2))).toEqual(
+        want.map((x) => x.slice(0, 2)),
+      );
     const B3 = await engineFor(bob);
     expect(reactionsOf(B3, id, "race")).toEqual(want);
     void alice;
@@ -230,7 +233,9 @@ describe("reactions (§11.12)", () => {
     // after self's leave: refused
     await B.leave(id);
     await settle(A, B, C);
-    await expect(B.react(id, msgOf(B, id, "hello").key, "😀", true)).rejects.toThrow(YOU_LEFT_REFUSAL);
+    await expect(B.react(id, msgOf(B, id, "hello").key, "😀", true)).rejects.toThrow(
+      YOU_LEFT_REFUSAL,
+    );
     void [alice, carol];
   });
 
@@ -253,7 +258,9 @@ describe("reactions (§11.12)", () => {
     });
     await settle(A, B, C, M);
     expect(mustView(B, id).blocked).toBe("frozen");
-    await expect(B.react(id, msgOf(B, id, "hello").key, "😀", true)).rejects.toThrow(FROZEN_REMOVAL);
+    await expect(B.react(id, msgOf(B, id, "hello").key, "😀", true)).rejects.toThrow(
+      FROZEN_REMOVAL,
+    );
   });
 
   it("9. a valid row: it ends a followed lane, confirms, accepts a request, and makes a 1:1 a WELCOME channel", async () => {
@@ -273,17 +280,25 @@ describe("reactions (§11.12)", () => {
     expect(mustView(B, id).request).toBe(false);
     expect(conv(B, id).confirmed).toBe(true);
     const recs = selfRowsOf(bob).flat();
-    expect(recs.some((r) => r.rtype === P.RT.CONV_JOIN && r.via === P.VIA.REQUEST_ACCEPTED)).toBe(true);
+    expect(recs.some((r) => r.rtype === P.RT.CONV_JOIN && r.via === P.VIA.REQUEST_ACCEPTED)).toBe(
+      true,
+    );
     // CONFIRMED and the via-5 CONV_JOIN ride in a row with a HEADS record (§7.3)
-    const acc = selfRowsOf(bob).find((rs) => rs.some((r) => r.rtype === P.RT.CONV_JOIN && r.via === P.VIA.REQUEST_ACCEPTED))!;
+    const acc = selfRowsOf(bob).find((rs) =>
+      rs.some((r) => r.rtype === P.RT.CONV_JOIN && r.via === P.VIA.REQUEST_ACCEPTED),
+    )!;
     expect(acc.map((r) => r.rtype)).toEqual([P.RT.CONFIRMED, P.RT.CONV_JOIN, P.RT.HEADS]);
     // a third member's row accepts it, but only the user's own act makes carol a contact (§11.5)
-    expect(recs.some((r) => r.rtype === P.RT.CONTACT && P.equalBytes(r.uid, carol.uid))).toBe(false);
+    expect(recs.some((r) => r.rtype === P.RT.CONTACT && P.equalBytes(r.uid, carol.uid))).toBe(
+      false,
+    );
     expect(mustView(B, id).byContact).toBe(false);
     // bob's own REACTION is the user's acceptance: the CONTACT at once, in a row with a HEADS record, before its put
     await B.react(id, msgOf(B, id, "first").key, "🙂", true);
     const rows = selfRowsOf(bob);
-    const row = rows.find((rs) => rs.some((r) => r.rtype === P.RT.CONTACT && P.equalBytes(r.uid, carol.uid)))!;
+    const row = rows.find((rs) =>
+      rs.some((r) => r.rtype === P.RT.CONTACT && P.equalBytes(r.uid, carol.uid)),
+    )!;
     expect(row.some((r) => r.rtype === P.RT.HEADS)).toBe(true);
     expect(mustView(B, id).byContact).toBe(true);
     await settle(A, B, C);
@@ -309,7 +324,9 @@ describe("reactions (§11.12)", () => {
     const C1 = await engineFor(carol);
     expect(chat(C1, id).filter((t) => t.includes("old ")).length).toBeGreaterThan(0);
     await C1.logout();
-    const keys = mustView(B, id).messages.filter((m) => m.text?.startsWith("new ")).map((m) => m.key);
+    const keys = mustView(B, id)
+      .messages.filter((m) => m.text?.startsWith("new "))
+      .map((m) => m.key);
     const emoji = ["a", "b", "c", "d", "e", "f", "g", "h"];
     for (let i = 0; i < 15; i++) await B.react(id, keys[i % keys.length], emoji[i % 8], true);
     await settle(A, B, C);
@@ -331,7 +348,12 @@ describe("accept and contacts (§11.5, §11.11)", () => {
     B.markRead(id);
     await settle(B, C);
     expect(mustView(B, id).request).toBe(true);
-    expect(selfRowsOf(bob).slice(before).flat().some((r) => r.rtype === P.RT.CONTACT)).toBe(false);
+    expect(
+      selfRowsOf(bob)
+        .slice(before)
+        .flat()
+        .some((r) => r.rtype === P.RT.CONTACT),
+    ).toBe(false);
     await B.accept(id);
     const row = selfRowsOf(bob)
       .slice(before)
@@ -340,7 +362,12 @@ describe("accept and contacts (§11.5, §11.11)", () => {
     expect(mustView(B, id).request).toBe(false);
     expect(mustView(B, id).byContact).toBe(true);
     await B.accept(id); // nothing more
-    expect(selfRowsOf(bob).slice(before).flat().filter((r) => r.rtype === P.RT.CONTACT)).toHaveLength(1);
+    expect(
+      selfRowsOf(bob)
+        .slice(before)
+        .flat()
+        .filter((r) => r.rtype === P.RT.CONTACT),
+    ).toHaveLength(1);
   });
 
   it("a post in a copy whose inviter has no MEMBER fails before its put when the lookup fails", async () => {

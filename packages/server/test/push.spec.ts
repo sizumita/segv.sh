@@ -13,7 +13,14 @@ import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as P from "@segv/protocol/proto";
 import * as W from "@segv/protocol/wire";
-import { MAX_RING_BODY, MAX_SEEN_BODY, RING_FRESH, _setRingSleepForTests, ringEraOk, ringRowFresh } from "../src/api";
+import {
+  MAX_RING_BODY,
+  MAX_SEEN_BODY,
+  RING_FRESH,
+  _setRingSleepForTests,
+  ringEraOk,
+  ringRowFresh,
+} from "../src/api";
 import { _resetPushConfigForTests } from "../src/env";
 import {
   JR_BYTES,
@@ -33,7 +40,18 @@ import {
 } from "../src/push-do";
 import { pushStub } from "../src/types";
 import { vapidPublicKey } from "../src/webpush";
-import { DELTA, DIFF2, direct, errorOf, freshIp, inOneRateWindow, makeRow, powHeader, putOk, type Bytes } from "./helpers";
+import {
+  DELTA,
+  DIFF2,
+  direct,
+  errorOf,
+  freshIp,
+  inOneRateWindow,
+  makeRow,
+  powHeader,
+  putOk,
+  type Bytes,
+} from "./helpers";
 
 const ENV = env as unknown as Record<string, string>;
 const PUSH_KEY = P.fromB64u(ENV.PUSH_KEY);
@@ -42,9 +60,19 @@ const DAY = 86_400_000;
 /** Every push waits at least this long after its ring (§9.8 `ring`). */
 const HOLD = PUSH_HOLD * 1000;
 const N = p256.Point.Fn.ORDER;
-const scalarB64 = (x: bigint): string => P.b64u(Uint8Array.from(x.toString(16).padStart(64, "0").match(/../g)!.map((h) => parseInt(h, 16))));
+const scalarB64 = (x: bigint): string =>
+  P.b64u(
+    Uint8Array.from(
+      x
+        .toString(16)
+        .padStart(64, "0")
+        .match(/../g)!
+        .map((h) => parseInt(h, 16)),
+    ),
+  );
 
-const epOf = (endpoint: string): Bytes => P.t16(P.HMAC(PUSH_KEY, P.enc("segv.sh/v2/push/ep", endpoint)));
+const epOf = (endpoint: string): Bytes =>
+  P.t16(P.HMAC(PUSH_KEY, P.enc("segv.sh/v2/push/ep", endpoint)));
 const tkOf = (bell: Bytes): Bytes => P.t16(P.HMAC(PUSH_KEY, P.enc("segv.sh/v2/push/bell", bell)));
 const qkOf = (Q: Bytes): Bytes => P.t16(P.HMAC(PUSH_KEY, P.enc("segv.sh/v2/push/quiet", Q)));
 const bells = (n: number): Bytes[] => Array.from({ length: n }, () => P.random(16));
@@ -61,7 +89,13 @@ let devSeq = 0;
 function dev(host = "fcm.push.test"): Dev {
   const endpoint = `https://${host}/send/${P.hex(P.random(6))}${devSeq++}`;
   const sk = p256.utils.randomSecretKey();
-  return { endpoint, ep: epOf(endpoint), sk, p256dh: p256.getPublicKey(sk, false), auth: P.random(16) };
+  return {
+    endpoint,
+    ep: epOf(endpoint),
+    sk,
+    p256dh: p256.getPublicKey(sk, false),
+    auth: P.random(16),
+  };
 }
 
 /** RFC 8291's receiving side (one record). */
@@ -72,7 +106,10 @@ function decrypt(body: Bytes, d: Dev): Bytes {
   const asPublic = body.subarray(21, 86);
   const ecdh = p256.getSharedSecret(d.sk, asPublic, true).subarray(1);
   const one = Uint8Array.of(1);
-  const ikm = P.HMAC(P.HMAC(d.auth, ecdh), P.concat(P.utf8("WebPush: info\0"), d.p256dh, asPublic, one));
+  const ikm = P.HMAC(
+    P.HMAC(d.auth, ecdh),
+    P.concat(P.utf8("WebPush: info\0"), d.p256dh, asPublic, one),
+  );
   const prk = P.HMAC(salt, ikm);
   const cek = P.HMAC(prk, P.concat(P.utf8("Content-Encoding: aes128gcm\0"), one)).slice(0, 16);
   const nonce = P.HMAC(prk, P.concat(P.utf8("Content-Encoding: nonce\0"), one)).slice(0, 12);
@@ -118,7 +155,9 @@ const fake = {
   now: null as number | null,
   rand: 0,
   calls: [] as Call[],
-  respond: ((): Response => new Response(null, { status: 201 })) as (c: Call) => Response | Promise<Response>,
+  respond: ((): Response => new Response(null, { status: 201 })) as (
+    c: Call,
+  ) => Response | Promise<Response>,
 };
 const nowOf = (): number => fake.now ?? Date.now();
 /** A UTC midnight well after real time. */
@@ -137,7 +176,13 @@ async function install(): Promise<void> {
       if (fake.now !== null) fake.now += ms;
     };
     h.fetcher = async (url, init) => {
-      const call: Call = { url, init, headers: new Headers(init.headers), body: new Uint8Array(init.body as ArrayBuffer), at: nowOf() };
+      const call: Call = {
+        url,
+        init,
+        headers: new Headers(init.headers),
+        body: new Uint8Array(init.body as ArrayBuffer),
+        at: nowOf(),
+      };
       fake.calls.push(call);
       return fake.respond(call);
     };
@@ -155,7 +200,12 @@ async function reset(now: number | null = BASE): Promise<void> {
     await state.storage.deleteAlarm();
   });
   await evictDurableObject(DO());
-  Object.assign(fake, { now, rand: 0, calls: [], respond: () => new Response(null, { status: 201 }) });
+  Object.assign(fake, {
+    now,
+    rand: 0,
+    calls: [],
+    respond: () => new Response(null, { status: 201 }),
+  });
   await install();
 }
 
@@ -168,11 +218,15 @@ async function restart(): Promise<void> {
 const setEnv = (patch: Record<string, unknown>): Promise<void> =>
   inDO((h) => {
     h.env = new Proxy(env, {
-      get: (t, k) => (typeof k === "string" && Object.prototype.hasOwnProperty.call(patch, k) ? patch[k] : Reflect.get(t, k)),
+      get: (t, k) =>
+        typeof k === "string" && Object.prototype.hasOwnProperty.call(patch, k)
+          ? patch[k]
+          : Reflect.get(t, k),
     });
   });
 
-const sub = (d: Dev, bs: Bytes[], quiet: Bytes | null = null) => DO().sub(d.endpoint, d.p256dh, d.auth, bs, quiet);
+const sub = (d: Dev, bs: Bytes[], quiet: Bytes | null = null) =>
+  DO().sub(d.endpoint, d.p256dh, d.auth, bs, quiet);
 const ring = (bs: Bytes[], label: Bytes = P.random(16), E = 1) => DO().ring(E, label, bs);
 async function run(at?: number): Promise<void> {
   if (at !== undefined) fake.now = at;
@@ -191,13 +245,22 @@ async function subRetrying(d: Dev, bs: Bytes[], quiet: Bytes | null = null): Pro
 }
 /** The day of the last completed pass that `meta` holds. */
 const passDay = (): Promise<number | null> =>
-  inDO((_h, state) => state.storage.sql.exec<{ v: number }>("SELECT v FROM meta WHERE k = 'pass'").toArray()[0]?.v ?? null);
-const dueOf = (d: Dev): Promise<number | null> => inDO((h) => h.pushes.get(P.hex(d.ep))?.due ?? null);
-const stateOf = (d: Dev): Promise<PushState> => inDO((h) => ({ ...(h.pushes.get(P.hex(d.ep)) ?? { due: null, last: null, tries: 0 }) }));
+  inDO(
+    (_h, state) =>
+      state.storage.sql.exec<{ v: number }>("SELECT v FROM meta WHERE k = 'pass'").toArray()[0]
+        ?.v ?? null,
+  );
+const dueOf = (d: Dev): Promise<number | null> =>
+  inDO((h) => h.pushes.get(P.hex(d.ep))?.due ?? null);
+const stateOf = (d: Dev): Promise<PushState> =>
+  inDO((h) => ({ ...(h.pushes.get(P.hex(d.ep)) ?? { due: null, last: null, tries: 0 }) }));
 const callsTo = (d: Dev): Call[] => fake.calls.filter((c) => c.url === d.endpoint);
 
 /** The stored tables, as hex. */
-const tables = (): Promise<{ sub: { ep: string; day: number }[]; tok: { tk: string; ep: string }[] }> =>
+const tables = (): Promise<{
+  sub: { ep: string; day: number }[];
+  tok: { tk: string; ep: string }[];
+}> =>
   inDO((_h, state) => ({
     sub: state.storage.sql
       .exec<{ ep: ArrayBuffer; day: number }>("SELECT ep, day FROM sub ORDER BY ep")
@@ -208,7 +271,8 @@ const tables = (): Promise<{ sub: { ep: string; day: number }[]; tok: { tk: stri
       .toArray()
       .map((r) => ({ tk: P.hex(new Uint8Array(r.tk)), ep: P.hex(new Uint8Array(r.ep)) })),
   }));
-const storedDay = async (d: Dev): Promise<number | null> => (await tables()).sub.find((r) => r.ep === P.hex(d.ep))?.day ?? null;
+const storedDay = async (d: Dev): Promise<number | null> =>
+  (await tables()).sub.find((r) => r.ep === P.hex(d.ep))?.day ?? null;
 
 /** Is `d` reached by a ring of `bs` now? (A fresh row each time, so the dedup never interferes.) */
 async function reaches(d: Dev, bs: Bytes[]): Promise<boolean> {
@@ -223,10 +287,15 @@ describe("params and configuration (§9.8, §10.9)", () => {
   beforeEach(() => _resetPushConfigForTests());
 
   it("reports push and pow.push while push is on", async () => {
-    const p = (await (await direct("/api/v2/params")).json()) as { push: unknown; pow: Record<string, number> };
+    const p = (await (await direct("/api/v2/params")).json()) as {
+      push: unknown;
+      pow: Record<string, number>;
+    };
     expect(p.push).toEqual({ vapid: P.b64u(VAPID_PK), window: 60, maxTokens: 256 });
     expect(p.pow).toEqual(DIFF2);
-    const dflt = (await (await direct("/api/v2/params", {}, { POW_PUSH: undefined })).json()) as { pow: Record<string, number> };
+    const dflt = (await (await direct("/api/v2/params", {}, { POW_PUSH: undefined })).json()) as {
+      pow: Record<string, number>;
+    };
     expect(dflt.pow.push).toBe(20);
   });
 
@@ -246,43 +315,61 @@ describe("params and configuration (§9.8, §10.9)", () => {
     ["APP_HOSTS empty", "APP_HOSTS", { APP_HOSTS: "" }],
   ];
 
-  it.each(OFF)("%s: push is off exactly as unconfigured, and the rest of the API works", async (_name, setting, patch) => {
-    const log = vi.spyOn(console, "error").mockImplementation(() => {});
-    try {
-      const params = await direct("/api/v2/params", {}, patch);
-      expect(params.status).toBe(200);
-      const p = (await params.json()) as Record<string, unknown> & { pow: Record<string, number> };
-      expect("push" in p).toBe(false);
-      expect("push" in p.pow).toBe(false);
-      const unknown = await errorOf(await direct("/api/v2/nope", { method: "POST", body: "x" }, patch));
-      for (const path of ["/api/v2/push/sub", "/api/v2/ring", "/api/v2/seen"]) {
-        const r = await direct(path, { method: "POST", body: "x" }, patch);
-        expect(r.status).toBe(404);
-        expect(await errorOf(r)).toBe(unknown);
+  it.each(OFF)(
+    "%s: push is off exactly as unconfigured, and the rest of the API works",
+    async (_name, setting, patch) => {
+      const log = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const params = await direct("/api/v2/params", {}, patch);
+        expect(params.status).toBe(200);
+        const p = (await params.json()) as Record<string, unknown> & {
+          pow: Record<string, number>;
+        };
+        expect("push" in p).toBe(false);
+        expect("push" in p.pow).toBe(false);
+        const unknown = await errorOf(
+          await direct("/api/v2/nope", { method: "POST", body: "x" }, patch),
+        );
+        for (const path of ["/api/v2/push/sub", "/api/v2/ring", "/api/v2/seen"]) {
+          const r = await direct(path, { method: "POST", body: "x" }, patch);
+          expect(r.status).toBe(404);
+          expect(await errorOf(r)).toBe(unknown);
+        }
+        // A put, a get and a directory lookup answer as usual (never 503 "server misconfigured").
+        const row = makeRow();
+        const put = W.encodePutRequest([row]);
+        const putRes = await direct(
+          "/api/v2/put",
+          {
+            method: "POST",
+            headers: { "x-segv-pow": await powHeader("put", P.H(put), { bytes: put.length }) },
+            body: put,
+          },
+          patch,
+        );
+        expect(putRes.status).toBe(200);
+        const get = W.encodeGetRequest([{ E: row.E, label: row.label, mode: 1 }]);
+        expect((await direct("/api/v2/get", { method: "POST", body: get }, patch)).status).toBe(
+          200,
+        );
+        expect((await direct(`/api/v2/dir/uid/${P.b64u(P.random(16))}`, {}, patch)).status).toBe(
+          404,
+        );
+        const lines = log.mock.calls
+          .map((c) => String(c[0]))
+          .filter((l) => l.includes("push is off"));
+        if (setting === null) expect(lines).toEqual([]);
+        else {
+          expect(lines).toHaveLength(1); // once per isolate, however many requests
+          expect(JSON.parse(lines[0])).toEqual({ msg: "push is off: invalid setting", setting });
+          for (const v of Object.values(patch))
+            if (typeof v === "string" && v.length > 0) expect(lines[0]).not.toContain(v);
+        }
+      } finally {
+        log.mockRestore();
       }
-      // A put, a get and a directory lookup answer as usual (never 503 "server misconfigured").
-      const row = makeRow();
-      const put = W.encodePutRequest([row]);
-      const putRes = await direct(
-        "/api/v2/put",
-        { method: "POST", headers: { "x-segv-pow": await powHeader("put", P.H(put), { bytes: put.length }) }, body: put },
-        patch,
-      );
-      expect(putRes.status).toBe(200);
-      const get = W.encodeGetRequest([{ E: row.E, label: row.label, mode: 1 }]);
-      expect((await direct("/api/v2/get", { method: "POST", body: get }, patch)).status).toBe(200);
-      expect((await direct(`/api/v2/dir/uid/${P.b64u(P.random(16))}`, {}, patch)).status).toBe(404);
-      const lines = log.mock.calls.map((c) => String(c[0])).filter((l) => l.includes("push is off"));
-      if (setting === null) expect(lines).toEqual([]);
-      else {
-        expect(lines).toHaveLength(1); // once per isolate, however many requests
-        expect(JSON.parse(lines[0])).toEqual({ msg: "push is off: invalid setting", setting });
-        for (const v of Object.values(patch)) if (typeof v === "string" && v.length > 0) expect(lines[0]).not.toContain(v);
-      }
-    } finally {
-      log.mockRestore();
-    }
-  });
+    },
+  );
 
   it("a PushDO whose push is off sends nothing, and its pass deletes only what expired", async () => {
     await reset(BASE);
@@ -333,17 +420,30 @@ describe("POST /api/v2/push/sub (§10.10)", () => {
   const DEF = { PUSH_HOSTS: undefined };
   const body = (over: Record<string, unknown> = {}): Record<string, unknown> => {
     const d = dev();
-    return { endpoint: "https://fcm.googleapis.com/fcm/send/abc", p256dh: P.b64u(d.p256dh), auth: P.b64u(d.auth), tokens: [P.b64u(P.random(16))], ...over };
+    return {
+      endpoint: "https://fcm.googleapis.com/fcm/send/abc",
+      p256dh: P.b64u(d.p256dh),
+      auth: P.b64u(d.auth),
+      tokens: [P.b64u(P.random(16))],
+      ...over,
+    };
   };
-  async function post(b: unknown, opts: { pow?: boolean; ip?: string; raw?: Bytes } = {}): Promise<Response> {
+  async function post(
+    b: unknown,
+    opts: { pow?: boolean; ip?: string; raw?: Bytes } = {},
+  ): Promise<Response> {
     const bytes = opts.raw ?? P.utf8(JSON.stringify(b));
     const headers: Record<string, string> = { "content-type": "application/json" };
-    if (opts.pow !== false) headers["x-segv-pow"] = await powHeader("push", P.H(bytes), { bytes: bytes.length });
+    if (opts.pow !== false)
+      headers["x-segv-pow"] = await powHeader("push", P.H(bytes), { bytes: bytes.length });
     return direct("/api/v2/push/sub", { method: "POST", headers, body: bytes, ip: opts.ip }, DEF);
   }
 
   it("accepts a valid registration (204, no body), also on a real *.notify.windows.com host", async () => {
-    for (const endpoint of ["https://fcm.googleapis.com/fcm/send/abc", "https://wns2-par02p.notify.windows.com/w/?token=AbC"]) {
+    for (const endpoint of [
+      "https://fcm.googleapis.com/fcm/send/abc",
+      "https://wns2-par02p.notify.windows.com/w/?token=AbC",
+    ]) {
       const r = await post(body({ endpoint }));
       expect(r.status).toBe(204);
       expect(await r.text()).toBe("");
@@ -357,7 +457,10 @@ describe("POST /api/v2/push/sub (§10.10)", () => {
     ["a port", { endpoint: "https://fcm.googleapis.com:8443/fcm/send/abc" }],
     ["userinfo", { endpoint: "https://u:p@fcm.googleapis.com/fcm/send/abc" }],
     ["a host outside PUSH_HOSTS", { endpoint: "https://push.example.com/send/abc" }],
-    ["a host that only resembles *.notify.windows.com", { endpoint: "https://notify.windows.com.example/w/abc" }],
+    [
+      "a host that only resembles *.notify.windows.com",
+      { endpoint: "https://notify.windows.com.example/w/abc" },
+    ],
     ["xnotify.windows.com", { endpoint: "https://xnotify.windows.com/w/abc" }],
     ["the bare notify.windows.com", { endpoint: "https://notify.windows.com/w/abc" }],
     ["a non-canonical URL", { endpoint: "https://FCM.googleapis.com/fcm/send/abc" }],
@@ -470,8 +573,19 @@ describe("PushDO limits (§9.8)", () => {
     await setEnv({ PUSH_MAX_SUBS: "2" });
     const regs = [dev(), dev(), dev()];
     const post = async (d: Dev, tokens: Bytes[]) => {
-      const bytes = P.utf8(JSON.stringify({ endpoint: d.endpoint, p256dh: P.b64u(d.p256dh), auth: P.b64u(d.auth), tokens: tokens.map(P.b64u) }));
-      return direct("/api/v2/push/sub", { method: "POST", headers: { "x-segv-pow": await powHeader("push", P.H(bytes), { bytes: bytes.length }) }, body: bytes });
+      const bytes = P.utf8(
+        JSON.stringify({
+          endpoint: d.endpoint,
+          p256dh: P.b64u(d.p256dh),
+          auth: P.b64u(d.auth),
+          tokens: tokens.map(P.b64u),
+        }),
+      );
+      return direct("/api/v2/push/sub", {
+        method: "POST",
+        headers: { "x-segv-pow": await powHeader("push", P.H(bytes), { bytes: bytes.length }) },
+        body: bytes,
+      });
     };
     expect((await post(regs[0], bells(1))).status).toBe(204);
     expect((await post(regs[1], bells(1))).status).toBe(204);
@@ -575,15 +689,20 @@ describe("POST /api/v2/ring (§10.10)", () => {
   it("400 for ver 2, n 0, n 65 or a length mismatch; 413 above 1044 bytes; 429 from RL_RING; no proof of work", async () => {
     const l = P.random(16);
     expect((await post(ringBody(1, l, [P.random(16)], 2))).status).toBe(400);
-    expect((await post(P.concat(Uint8Array.of(1), P.u16(1), l, Uint8Array.of(0)))).status).toBe(400);
-    expect((await post(P.concat(Uint8Array.of(1), P.u16(1), l, Uint8Array.of(65), ...bells(65)))).status).toBe(413);
+    expect((await post(P.concat(Uint8Array.of(1), P.u16(1), l, Uint8Array.of(0)))).status).toBe(
+      400,
+    );
+    expect(
+      (await post(P.concat(Uint8Array.of(1), P.u16(1), l, Uint8Array.of(65), ...bells(65)))).status,
+    ).toBe(413);
     expect((await post(P.concat(ringBody(1, l, bells(2)), P.random(1)))).status).toBe(400);
     expect((await post(ringBody(1, l, bells(2)).subarray(0, 40))).status).toBe(400);
     expect(MAX_RING_BODY).toBe(20 + 16 * 64);
     const { statuses, over } = await inOneRateWindow(async () => {
       const ip = freshIp();
       const statuses: number[] = [];
-      for (let i = 0; i < 60; i++) statuses.push((await post(ringBody(1, P.random(16), [P.random(16)]), ip)).status);
+      for (let i = 0; i < 60; i++)
+        statuses.push((await post(ringBody(1, P.random(16), [P.random(16)]), ip)).status);
       return { statuses, over: (await post(ringBody(1, P.random(16), [P.random(16)]), ip)).status };
     });
     expect(statuses.every((s) => s === 204)).toBe(true);
@@ -686,17 +805,28 @@ describe("the push request (§9.8)", () => {
     expect(c.headers.get("topic")).toBe("segv");
     expect(c.headers.get("content-encoding")).toBe("aes128gcm");
     expect(c.headers.get("content-type")).toBe("application/octet-stream");
-    const m = /^vapid t=([\w-]+\.[\w-]+\.[\w-]+), k=([\w-]+)$/.exec(c.headers.get("authorization") ?? "");
+    const m = /^vapid t=([\w-]+\.[\w-]+\.[\w-]+), k=([\w-]+)$/.exec(
+      c.headers.get("authorization") ?? "",
+    );
     expect(m).not.toBeNull();
     expect(m![2]).toBe(P.b64u(VAPID_PK));
     const [h, claims, sig] = m![1].split(".");
-    expect(JSON.parse(new TextDecoder().decode(P.fromB64u(h)))).toEqual({ typ: "JWT", alg: "ES256" });
-    const cl = JSON.parse(new TextDecoder().decode(P.fromB64u(claims))) as { aud: string; exp: number; sub: string };
+    expect(JSON.parse(new TextDecoder().decode(P.fromB64u(h)))).toEqual({
+      typ: "JWT",
+      alg: "ES256",
+    });
+    const cl = JSON.parse(new TextDecoder().decode(P.fromB64u(claims))) as {
+      aud: string;
+      exp: number;
+      sub: string;
+    };
     expect(cl.aud).toBe("https://updates.push.test");
     expect(cl.sub).toBe(ENV.VAPID_SUB);
     expect(cl.exp).toBeGreaterThan(Math.floor((BASE + HOLD) / 1000));
     expect(cl.exp).toBeLessThanOrEqual(Math.floor((BASE + HOLD) / 1000) + 12 * 3600);
-    expect(p256.verify(P.fromB64u(sig), P.utf8(`${h}.${claims}`), VAPID_PK, { lowS: false })).toBe(true);
+    expect(p256.verify(P.fromB64u(sig), P.utf8(`${h}.${claims}`), VAPID_PK, { lowS: false })).toBe(
+      true,
+    );
     expect(new TextDecoder().decode(decrypt(c.body, d))).toBe(
       `{"web_push":8030,"mutable":true,"notification":{"title":"segv.sh","body":"new messages","navigate":"https://segv.test/","tag":"segv","data":{"bells":"${P.b64u(P.concat(b, new Uint8Array(48)))}"}}}`,
     );
@@ -708,7 +838,9 @@ describe("the push request (§9.8)", () => {
 describe("the bells a push names (§9.8 `rang`)", () => {
   /** The bells named by the payload of a call, without the zero padding. */
   const named = (c: Call, d: Dev): string[] => {
-    const j = JSON.parse(new TextDecoder().decode(decrypt(c.body, d))) as { notification: { data: { bells: string } } };
+    const j = JSON.parse(new TextDecoder().decode(decrypt(c.body, d))) as {
+      notification: { data: { bells: string } };
+    };
     const raw = P.fromB64u(j.notification.data.bells);
     expect(raw.length).toBe(64);
     const out: string[] = [];
@@ -765,7 +897,9 @@ describe("the bells a push names (§9.8 `rang`)", () => {
     await sub(d, bs);
     await sub(e, [P.random(16)]);
     for (const b of bs) await ring([b]);
-    await inDO((h) => h.pushes.set(P.hex(e.ep), { ep: e.ep, last: null, due: BASE, tries: 0, first: 0, rang: [] }));
+    await inDO((h) =>
+      h.pushes.set(P.hex(e.ep), { ep: e.ep, last: null, due: BASE, tries: 0, first: 0, rang: [] }),
+    );
     await run(BASE + HOLD + DELTA * 1000);
     expect(named(callsTo(d)[0], d)).toHaveLength(4);
     expect(named(callsTo(e)[0], e)).toHaveLength(0);
@@ -776,7 +910,10 @@ describe("the bells a push names (§9.8 `rang`)", () => {
 // ───────────── 9. push service answers ─────────────
 
 describe("push service answers (§9.8)", () => {
-  async function pushed(status: number | "throw", headers: Record<string, string> = {}): Promise<{ d: Dev; b: Bytes }> {
+  async function pushed(
+    status: number | "throw",
+    headers: Record<string, string> = {},
+  ): Promise<{ d: Dev; b: Bytes }> {
     const d = dev();
     const b = P.random(16);
     await sub(d, [b]);
@@ -825,16 +962,22 @@ describe("push service answers (§9.8)", () => {
     expect((await stateOf(d)).due).toBeNull();
   });
 
-  it.each([301, 302, 400, 401, 403, 404, 410, 413])("%d deletes the endpoint (redirects are never followed)", async (status) => {
-    await reset(BASE);
-    const { d, b } = await pushed(status, status < 400 ? { location: "https://elsewhere.push.test/x" } : {});
-    expect(callsTo(d)).toHaveLength(1);
-    expect(callsTo(d)[0].init.redirect).toBe("manual");
-    fake.now! += PUSH_WINDOW * 1000;
-    expect(await reaches(d, [b])).toBe(false);
-    await run(fake.now! + DAY);
-    expect(await storedDay(d)).toBeNull();
-  });
+  it.each([301, 302, 400, 401, 403, 404, 410, 413])(
+    "%d deletes the endpoint (redirects are never followed)",
+    async (status) => {
+      await reset(BASE);
+      const { d, b } = await pushed(
+        status,
+        status < 400 ? { location: "https://elsewhere.push.test/x" } : {},
+      );
+      expect(callsTo(d)).toHaveLength(1);
+      expect(callsTo(d)[0].init.redirect).toBe("manual");
+      fake.now! += PUSH_WINDOW * 1000;
+      expect(await reaches(d, [b])).toBe(false);
+      await run(fake.now! + DAY);
+      expect(await storedDay(d)).toBeNull();
+    },
+  );
 
   it("an endpoint whose host left PUSH_HOSTS is deleted without a request", async () => {
     await reset(BASE);
@@ -887,15 +1030,28 @@ describe("expiry and what is stored (§9.8)", () => {
       await ring(bs);
       await run(BASE + DAY + 2000);
       await run(BASE + DAY + 20_000);
-      const { names, kv, sub: subs, tok, jr, meta } = await inDO(async (_h, state) => ({
+      const {
+        names,
+        kv,
+        sub: subs,
+        tok,
+        jr,
+        meta,
+      } = await inDO(async (_h, state) => ({
         names: state.storage.sql
-          .exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\' AND name NOT LIKE 'sqlite_%'")
+          .exec<{ name: string }>(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\' AND name NOT LIKE 'sqlite_%'",
+          )
           .toArray()
           .map((r) => r.name)
           .sort(),
         kv: (await state.storage.list()).size,
-        sub: state.storage.sql.exec<{ ep: ArrayBuffer; box: ArrayBuffer; day: number }>("SELECT ep, box, day FROM sub").toArray(),
-        tok: state.storage.sql.exec<{ tk: ArrayBuffer; ep: ArrayBuffer }>("SELECT tk, ep FROM tok").toArray(),
+        sub: state.storage.sql
+          .exec<{ ep: ArrayBuffer; box: ArrayBuffer; day: number }>("SELECT ep, box, day FROM sub")
+          .toArray(),
+        tok: state.storage.sql
+          .exec<{ tk: ArrayBuffer; ep: ArrayBuffer }>("SELECT tk, ep FROM tok")
+          .toArray(),
         jr: state.storage.sql.exec<{ box: ArrayBuffer }>("SELECT box FROM jr").toArray(),
         meta: state.storage.sql.exec<{ k: string; v: number }>("SELECT k, v FROM meta").toArray(),
       }));
@@ -906,12 +1062,19 @@ describe("expiry and what is stored (§9.8)", () => {
       expect(meta).toEqual([{ k: "pass", v: dayOf(BASE) + 1 }]);
       expect(subs).toHaveLength(1);
       expect(P.hex(new Uint8Array(subs[0].ep))).toBe(P.hex(d.ep));
-      const [e, k, a] = P.dec(P.aeadOpen(PUSH_KEY, new Uint8Array(subs[0].box), P.enc("segv.sh/v2/push/sub", d.ep)), 3);
+      const [e, k, a] = P.dec(
+        P.aeadOpen(PUSH_KEY, new Uint8Array(subs[0].box), P.enc("segv.sh/v2/push/sub", d.ep)),
+        3,
+      );
       expect(new TextDecoder().decode(e)).toBe(d.endpoint);
       expect(P.hex(k)).toBe(P.hex(d.p256dh));
       expect(P.hex(a)).toBe(P.hex(d.auth));
-      expect(() => P.aeadOpen(P.random(32), new Uint8Array(subs[0].box), P.enc("segv.sh/v2/push/sub", d.ep))).toThrow();
-      expect(tok.map((r) => P.hex(new Uint8Array(r.tk))).sort()).toEqual(bs.map((x) => P.hex(tkOf(x))).sort());
+      expect(() =>
+        P.aeadOpen(P.random(32), new Uint8Array(subs[0].box), P.enc("segv.sh/v2/push/sub", d.ep)),
+      ).toThrow();
+      expect(tok.map((r) => P.hex(new Uint8Array(r.tk))).sort()).toEqual(
+        bs.map((x) => P.hex(tkOf(x))).sort(),
+      );
       const all = P.hex(
         P.concat(
           ...subs.flatMap((r) => [new Uint8Array(r.ep), new Uint8Array(r.box)]),
@@ -922,7 +1085,15 @@ describe("expiry and what is stored (§9.8)", () => {
       for (const x of bs) expect(all).not.toContain(P.hex(x));
       const lines = log.mock.calls.map((c) => c.map(String).join(" ")).join("\n");
       expect(lines).toContain("push results");
-      for (const s of [d.endpoint, P.b64u(d.p256dh), P.b64u(d.auth), ...bs.map(P.b64u), ...bs.map(P.hex), P.hex(d.ep)]) expect(lines).not.toContain(s);
+      for (const s of [
+        d.endpoint,
+        P.b64u(d.p256dh),
+        P.b64u(d.auth),
+        ...bs.map(P.b64u),
+        ...bs.map(P.hex),
+        P.hex(d.ep),
+      ])
+        expect(lines).not.toContain(s);
     } finally {
       log.mockRestore();
     }
@@ -1231,11 +1402,16 @@ describe("the journal keeps the day's changes across a restart (§9.8)", () => {
   const openRow = async (ms: number, key = PUSH_KEY): Promise<Bytes> => {
     const box = await inDO(
       (_h, state) =>
-        new Uint8Array(state.storage.sql.exec<{ box: ArrayBuffer }>("SELECT box FROM jr WHERE slot = ?", minute(ms) % JR_SLOTS).one().box),
+        new Uint8Array(
+          state.storage.sql
+            .exec<{ box: ArrayBuffer }>("SELECT box FROM jr WHERE slot = ?", minute(ms) % JR_SLOTS)
+            .one().box,
+        ),
     );
     return P.aeadOpen(key, box, P.enc("segv.sh/v2/push/jr", P.u32(minute(ms))));
   };
-  const regCount = (): Promise<number> => inDO((h) => (h as unknown as { regCount: number }).regCount);
+  const regCount = (): Promise<number> =>
+    inDO((h) => (h as unknown as { regCount: number }).regCount);
 
   it("(a) one row of one length at the first run of each minute while push is on, whatever changed; nothing else writes it", async () => {
     await reset(BASE);
@@ -1442,7 +1618,9 @@ describe("the daily pass works in bounded parts (§9.8)", () => {
     const end = await tables();
     // The 40 expired. The 10 changes are all written: the journal brought back those the parts before the restart had
     // not reached (and those they had, which the second pass writes again).
-    expect(end.sub.map((r) => r.ep).sort()).toEqual([P.hex(sender.ep), ...changed.map((d) => P.hex(d.ep))].sort());
+    expect(end.sub.map((r) => r.ep).sort()).toEqual(
+      [P.hex(sender.ep), ...changed.map((d) => P.hex(d.ep))].sort(),
+    );
     const secondPass = (await inDO((h) => h.parts)) as PassPart[];
     expect(firstPass).toHaveLength(4);
     expect(secondPass.length).toBeGreaterThan(5);
@@ -1452,7 +1630,9 @@ describe("the daily pass works in bounded parts (§9.8)", () => {
       for (let i = 1; i < pass.length; i++) expect(pass[i].first! > pass[i - 1].last!).toBe(true);
     }
     // After the restart the pass started again from the lowest ep, stored or read back from the journal.
-    expect(secondPass[0].first).toBe([...mid.sub.map((r) => r.ep), ...changed.map((d) => P.hex(d.ep))].sort()[0]);
+    expect(secondPass[0].first).toBe(
+      [...mid.sub.map((r) => r.ep), ...changed.map((d) => P.hex(d.ep))].sort()[0],
+    );
   });
 
   it("writes the day's changes in parts too, in ascending ep whatever the order of the changes", async () => {
@@ -1478,7 +1658,12 @@ describe("the daily pass works in bounded parts (§9.8)", () => {
 
 type RowRef = { E: number; label: Bytes };
 const seenBody = (qS: Bytes, rows: RowRef[], ver = 1): Bytes =>
-  P.concat(Uint8Array.of(ver), qS, Uint8Array.of(rows.length), ...rows.flatMap((r) => [P.u16(r.E), r.label]));
+  P.concat(
+    Uint8Array.of(ver),
+    qS,
+    Uint8Array.of(rows.length),
+    ...rows.flatMap((r) => [P.u16(r.E), r.label]),
+  );
 /** `seen` as the Worker calls it: with the quiet tag, which it computes from the request's secret. */
 const seen = (Q: Bytes, rows: RowRef[]) => DO().seen(Q, rows);
 const rowAt = (label: Bytes, E = 1): RowRef => ({ E, label });
@@ -1533,12 +1718,19 @@ describe("POST /api/v2/seen (§10.10)", () => {
     const { ip, statuses, over } = await inOneRateWindow(async () => {
       const ip = freshIp();
       const statuses: number[] = [];
-      for (let i = 0; i < 60; i++) statuses.push((await post(seenBody(P.random(16), rows(1)), ip)).status);
+      for (let i = 0; i < 60; i++)
+        statuses.push((await post(seenBody(P.random(16), rows(1)), ip)).status);
       return { ip, statuses, over: (await post(seenBody(P.random(16), rows(1)), ip)).status };
     });
     expect(statuses.every((s) => s === 204)).toBe(true);
     expect(over).toBe(429);
-    const ringBody = P.concat(Uint8Array.of(1), P.u16(1), P.random(16), Uint8Array.of(1), P.random(16));
+    const ringBody = P.concat(
+      Uint8Array.of(1),
+      P.u16(1),
+      P.random(16),
+      Uint8Array.of(1),
+      P.random(16),
+    );
     expect((await direct("/api/v2/ring", { method: "POST", body: ringBody, ip })).status).toBe(204);
   });
 });
@@ -1631,8 +1823,14 @@ describe("PushDO holds pushes for marks of rows seen (§9.8 `seen`)", () => {
     const labels = Array.from({ length: PUSH_PENDING + 1 }, () => P.random(16));
     for (const l of labels) await ring([b], l);
     expect((await stateOf(d)).rows).toBeNull();
-    await seen(q, labels.slice(0, 16).map((l) => rowAt(l)));
-    await seen(q, labels.slice(16).map((l) => rowAt(l)));
+    await seen(
+      q,
+      labels.slice(0, 16).map((l) => rowAt(l)),
+    );
+    await seen(
+      q,
+      labels.slice(16).map((l) => rowAt(l)),
+    );
     expect(await dueOf(d)).not.toBeNull();
   });
 
@@ -1656,7 +1854,9 @@ describe("PushDO holds pushes for marks of rows seen (§9.8 `seen`)", () => {
     const q2 = P.random(16);
     await sub(d, [b], q2);
     await run(BASE + 2 * DAY);
-    expect((await tables()).tok.map((r) => r.tk).sort()).toEqual([P.hex(tkOf(b)), P.hex(qkOf(q2))].sort());
+    expect((await tables()).tok.map((r) => r.tk).sort()).toEqual(
+      [P.hex(tkOf(b)), P.hex(qkOf(q2))].sort(),
+    );
   });
 
   it("marks last SEEN_TTL, at most PUSH_SEEN per endpoint (the first to expire goes), and a restart forgets them", async () => {

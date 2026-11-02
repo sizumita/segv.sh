@@ -77,7 +77,9 @@ describe("row immutability (§12.1)", () => {
     const at = epoch(B, id).lanes.find((l) => l.last)!.last!;
     const row = server().shard.row(at.E, at.label)!;
     const body = P.random(row.body.length);
-    server().publish([{ topic: epoch(B, id).topic, E: at.E, label: at.label, t: row.t, cls: row.cls, body }]);
+    server().publish([
+      { topic: epoch(B, id).topic, E: at.E, label: at.label, t: row.t, cls: row.cls, body },
+    ]);
     await settle(A, B);
     expect(crit(B)).toContain(CHANGED_ENTRY);
   });
@@ -109,7 +111,11 @@ describe("lane omission (§12.2)", () => {
     const forged = buildMessage(
       alice,
       ep,
-      { E: lane.next.E, n: lane.next.n, prev: { E: last.E, n: last.n, label: last.label, body: P.random(last.body.length), cls: 0 } },
+      {
+        E: lane.next.E,
+        n: lane.next.n,
+        prev: { E: last.E, n: last.n, label: last.label, body: P.random(last.body.length), cls: 0 },
+      },
       { type: P.MT.TEXT, text: "forked" },
     );
     postRow(ep, forged);
@@ -148,14 +154,21 @@ describe("checkpoints (§12.3)", () => {
     const A2 = await engineFor(alice);
     expect(crit(A2)).toEqual([]);
     expect(A2.getState().head.seq).toBe(server().ckpt.latest()!.q);
-    expect((JSON.parse(localStore.get(CKPT_KEY)!) as { q: number }).q).toBe(server().ckpt.latest()!.q);
+    expect((JSON.parse(localStore.get(CKPT_KEY)!) as { q: number }).q).toBe(
+      server().ckpt.latest()!.q,
+    );
   });
 
   it("a different server key is a critical warning and nothing is verified", async () => {
     mint(1);
     localStore.set(
       CKPT_KEY,
-      JSON.stringify({ k: P.b64u(P.random(32)), q: 1, C: P.b64u(P.random(32)), at: server().now() }),
+      JSON.stringify({
+        k: P.b64u(P.random(32)),
+        q: 1,
+        C: P.b64u(P.random(32)),
+        at: server().now(),
+      }),
     );
     const A = await engineFor(makeUser("alice"));
     expect(crit(A)).toContain(KEY_CHANGED);
@@ -168,7 +181,12 @@ describe("checkpoints (§12.3)", () => {
     const k = (await (await fetch("/api/v2/params")).json()) as { srvKey: string };
     localStore.set(
       CKPT_KEY,
-      JSON.stringify({ k: k.srvKey, q: latest.q + 10, C: P.b64u(P.random(32)), at: server().now() }),
+      JSON.stringify({
+        k: k.srvKey,
+        q: latest.q + 10,
+        C: P.b64u(P.random(32)),
+        at: server().now(),
+      }),
     );
     const alice = makeUser("alice");
     const A = await engineFor(alice);
@@ -212,7 +230,10 @@ describe("checkpoints (§12.3)", () => {
     const c1 = server().ckpt.latest()!;
     mint(62);
     const k = (await (await fetch("/api/v2/params")).json()) as { srvKey: string };
-    localStore.set(CKPT_KEY, JSON.stringify({ k: k.srvKey, q: c1.q, C: P.b64u(c1.C), at: server().now() }));
+    localStore.set(
+      CKPT_KEY,
+      JSON.stringify({ k: k.srvKey, q: c1.q, C: P.b64u(c1.C), at: server().now() }),
+    );
     const alice = makeUser("alice");
     const A = await engineFor(alice);
     expect(crit(A)).toContain(rewritten(c1.q));
@@ -244,12 +265,17 @@ describe("split view (§12.4)", () => {
       const forged = P.concat(P.t16(ck.C).subarray(0, 8), P.random(8));
       postRow(
         ep,
-        buildMessage(bob, ep, { E: server().era, n: n++ }, {
-          type: P.MT.TEXT,
-          text: `x${i}`,
-          ckq: ck.q,
-          ck16: forged,
-        }),
+        buildMessage(
+          bob,
+          ep,
+          { E: server().era, n: n++ },
+          {
+            type: P.MT.TEXT,
+            text: `x${i}`,
+            ckq: ck.q,
+            ck16: forged,
+          },
+        ),
       );
     }
     await settle(A);
@@ -272,17 +298,27 @@ describe("split view (§12.4)", () => {
     const mi = P.memberIndex(ep.D, mallory.uid);
     postRow(
       ep,
-      buildMessage(mallory, ep, { E: server().era, n: 0 }, {
-        type: P.MT.TEXT,
-        text: "forked view",
-        ckq: ck.q,
-        ck16: P.random(16),
-      }),
+      buildMessage(
+        mallory,
+        ep,
+        { E: server().era, n: 0 },
+        {
+          type: P.MT.TEXT,
+          text: "forked view",
+          ckq: ck.q,
+          ck16: P.random(16),
+        },
+      ),
     );
     for (let n = 1; n <= 120; n++) junkRow(server().era, P.Lmsg(ep.keys.rk, mi, server().era, n));
     postRow(
       ep,
-      buildMessage(mallory, ep, { E: server().era, n: 121 }, { type: P.MT.TEXT, text: "after junk" }),
+      buildMessage(
+        mallory,
+        ep,
+        { E: server().era, n: 121 },
+        { type: P.MT.TEXT, text: "after junk" },
+      ),
     );
     await settle(A);
     const w = crit(A);

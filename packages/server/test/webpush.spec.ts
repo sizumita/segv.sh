@@ -13,7 +13,8 @@ import {
 } from "../src/webpush";
 
 const b = (s: string): Uint8Array => P.fromB64u(s.replace(/\s+/g, ""));
-const hexB = (s: string): Uint8Array => Uint8Array.from(s.match(/../g)!.map((x) => parseInt(x, 16)));
+const hexB = (s: string): Uint8Array =>
+  Uint8Array.from(s.match(/../g)!.map((x) => parseInt(x, 16)));
 const N = p256.Point.Fn.ORDER;
 const scalar = (x: bigint): Uint8Array => hexB(x.toString(16).padStart(64, "0"));
 
@@ -51,10 +52,16 @@ const RFC = {
   auth: b("BTBZMqHH6r4Tts7J_aSIgg"),
   salt: b("DGv6ra1nlYgDCS1FRnbzlw"),
   asPrivate: b("yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw"),
-  asPublic: b("BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIg Dll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8"),
+  asPublic: b(
+    "BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIg Dll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8",
+  ),
   uaPrivate: b("q1dXpw3UpT5VOmu_cf_v6ih07Aems3njxI-JWgLcM94"),
-  uaPublic: b("BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcx aOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4"),
-  header: b("DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z 9KsN6nGRTbVYI_c7VJSPQTBtkgcy27ml mlMoZIIgDll6e3vCYLocInmYWAmS6Tlz AC8wEqKK6PBru3jl7A8"),
+  uaPublic: b(
+    "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcx aOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4",
+  ),
+  header: b(
+    "DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z 9KsN6nGRTbVYI_c7VJSPQTBtkgcy27ml mlMoZIIgDll6e3vCYLocInmYWAmS6Tlz AC8wEqKK6PBru3jl7A8",
+  ),
   ciphertext: b("8pfeW0KbunFT06SuDKoJH9Ql87S1QUrd irN6GcG7sFz1y1sqLgVi1VhjVkHsUoEs bI_0LpXMuGvnzQ"),
   body: b(
     "DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27ml" +
@@ -96,7 +103,9 @@ describe("encryptPayload (RFC 8291)", () => {
     const auth = P.random(16);
     await expect(encryptPayload(P.utf8("x"), ua.publicKey.subarray(1), auth)).rejects.toThrow();
     await expect(encryptPayload(P.utf8("x"), ua.publicKey, P.random(15))).rejects.toThrow();
-    await expect(encryptPayload(new Uint8Array(4096 - 17), ua.publicKey, auth)).resolves.toBeInstanceOf(Uint8Array);
+    await expect(
+      encryptPayload(new Uint8Array(4096 - 17), ua.publicKey, auth),
+    ).resolves.toBeInstanceOf(Uint8Array);
     await expect(encryptPayload(new Uint8Array(4096 - 16), ua.publicKey, auth)).rejects.toThrow();
   });
 });
@@ -124,10 +133,18 @@ describe("pushPayload", () => {
   });
 
   it("has the same length for 0 to 4 bells, keeps the first 4 of more, and refuses a bell that is not 16 bytes", () => {
-    const lens = [0, 1, 2, 3, 4, 6].map((n) => pushPayload("segv.sh", Array.from({ length: n }, () => P.random(16))).length);
+    const lens = [0, 1, 2, 3, 4, 6].map(
+      (n) =>
+        pushPayload(
+          "segv.sh",
+          Array.from({ length: n }, () => P.random(16)),
+        ).length,
+    );
     expect(new Set(lens).size).toBe(1);
     const bs = Array.from({ length: 6 }, () => P.random(16));
-    const j = JSON.parse(P.fromUtf8(pushPayload("segv.sh", bs))) as { notification: { data: { bells: string } } };
+    const j = JSON.parse(P.fromUtf8(pushPayload("segv.sh", bs))) as {
+      notification: { data: { bells: string } };
+    };
     expect(j.notification.data.bells).toBe(P.b64u(P.concat(...bs.slice(0, 4))));
     expect(() => pushPayload("segv.sh", [P.random(15)])).toThrow();
   });
@@ -180,7 +197,8 @@ describe("isP256Point", () => {
 
 describe("VapidSigner (RFC 8292)", () => {
   const parse = (h: string) => {
-    const m = /^vapid t=([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+), k=([A-Za-z0-9_-]+)$/.exec(h);
+    const m =
+      /^vapid t=([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+), k=([A-Za-z0-9_-]+)$/.exec(h);
     expect(m).not.toBeNull();
     const [, hd, cl, sg, k] = m!;
     return { hd, cl, sg, k, signing: `${hd}.${cl}` };
@@ -195,7 +213,11 @@ describe("VapidSigner (RFC 8292)", () => {
     const { hd, cl, sg, k, signing } = parse(h);
     expect(P.fromUtf8(P.fromB64u(hd))).toBe('{"typ":"JWT","alg":"ES256"}');
     const claims = JSON.parse(P.fromUtf8(P.fromB64u(cl))) as Record<string, unknown>;
-    expect(claims).toEqual({ aud: "https://web.push.apple.com", exp: Math.floor(now / 1000) + 12 * 3600, sub: "mailto:ops@segv.test" });
+    expect(claims).toEqual({
+      aud: "https://web.push.apple.com",
+      exp: Math.floor(now / 1000) + 12 * 3600,
+      sub: "mailto:ops@segv.test",
+    });
     expect(claims.exp as number).toBeLessThanOrEqual(now / 1000 + 12 * 3600);
     expect(P.fromB64u(k)).toEqual(signer.publicKey);
     const sig = P.fromB64u(sg);
@@ -203,8 +225,21 @@ describe("VapidSigner (RFC 8292)", () => {
     expect(p256.verify(sig, P.utf8(signing), signer.publicKey, { lowS: false })).toBe(true);
     // And by WebCrypto, as a push service would check it.
     const buf = (x: Uint8Array): BufferSource => x as Uint8Array<ArrayBuffer>;
-    const key = await crypto.subtle.importKey("raw", buf(signer.publicKey), { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
-    expect(await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key, buf(sig), buf(P.utf8(signing)))).toBe(true);
+    const key = await crypto.subtle.importKey(
+      "raw",
+      buf(signer.publicKey),
+      { name: "ECDSA", namedCurve: "P-256" },
+      false,
+      ["verify"],
+    );
+    expect(
+      await crypto.subtle.verify(
+        { name: "ECDSA", hash: "SHA-256" },
+        key,
+        buf(sig),
+        buf(P.utf8(signing)),
+      ),
+    ).toBe(true);
   });
 
   it("reuses a JWT per aud until one hour before its exp", async () => {
@@ -212,7 +247,9 @@ describe("VapidSigner (RFC 8292)", () => {
     const t0 = 1_800_000_000_000;
     const a = await signer.authorization("https://fcm.googleapis.com", t0);
     expect(await signer.authorization("https://fcm.googleapis.com", t0 + 3600_000)).toBe(a);
-    expect(await signer.authorization("https://fcm.googleapis.com", t0 + 11 * 3600_000 - 1000)).toBe(a);
+    expect(
+      await signer.authorization("https://fcm.googleapis.com", t0 + 11 * 3600_000 - 1000),
+    ).toBe(a);
     const later = await signer.authorization("https://fcm.googleapis.com", t0 + 11 * 3600_000);
     expect(later).not.toBe(a);
     const exp = (JSON.parse(P.fromUtf8(P.fromB64u(parse(later).cl))) as { exp: number }).exp;
