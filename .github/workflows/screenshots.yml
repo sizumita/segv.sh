@@ -1,0 +1,65 @@
+# Posts the screens of a pull request that changes what the apps show to that pull request, once CI has run on it: the
+# screenshots that the end-to-end tests left as the run's artifacts (screens-web from the web app, screens-windows from
+# the installed Windows app), in one comment that each run updates (.github/scripts/screenshots.mjs). The files are
+# committed to refs/screenshots/pr-<number>, which no clone fetches, and the comment shows them from there.
+#
+# - It runs for pull requests from forks too, with a token that can push and comment, in the context of the default
+#   branch. So it never checks out or runs a pull request's code: the script is the default branch's, the artifacts
+#   are read as data, and the pull request is found through the API by the run's head commit.
+# - Every action is pinned to a full commit SHA.
+#
+# GitHub runs a workflow_run workflow from the default branch only: a change to this file or to the script takes effect
+# once it is merged.
+
+name: Screenshots
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions: {}
+
+# A newer run of the same branch replaces the comment anyway.
+concurrency:
+  group: screenshots-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  post:
+    name: Post the screenshots
+    if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion != 'cancelled'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out the script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Download the screenshots
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          pattern: screens-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/screens
+
+      - name: Post them to the pull request
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: node .github/scripts/screenshots.mjs post "$RUNNER_TEMP/screens"
