@@ -9,13 +9,18 @@
 // Environment:
 //   SEGV_CHANNEL                 `release` (default): segv.sh, identifier sh.segv.desktop, links `segv:`.
 //                                `canary`: segv.sh Canary, a separate app (sh.segv.desktop.canary, links `segv-canary:`,
-//                                its own icon and data) for canary.segv.sh; macOS only
+//                                its own icon and data) for canary.segv.sh
 //   SEGV_ORIGIN                  the deployment's canonical origin (default https://segv.sh, https://canary.segv.sh for
 //                                the Canary); another one than segv.sh's (a local `pnpm run dev` at
 //                                http://localhost:5173, say) replaces segv.sh in the page's CSP
 //   SEGV_VERSION                 the app's version, X.Y.Z or X.Y.Z-canary.N, instead of tauri.conf.json's
 //                                (scripts/version.mjs)
 //   SEGV_BUILD                   the build number, digits: CFBundleVersion on macOS (by default the version)
+//   SEGV_UPDATES                 `1`: the app updates itself from its channel's feed (src/update.rs), and the bundle
+//                                gets the update packages, signed with TAURI_SIGNING_PRIVATE_KEY (the channel's key,
+//                                which only the channel's GitHub environment holds). Only the published builds of
+//                                .github/workflows/desktop.yml set it: any other build would replace itself with the
+//                                published one
 //   APPLE_TEAM_ID                the team of the signing identity and the profile (macOS)
 //   APPLE_SIGNING_IDENTITY       the codesign identity, its name or SHA-1 (macOS)
 //   APPLE_PROVISIONING_PROFILE   a provisioning profile of the app's bundle id with the Associated Domains capability
@@ -67,14 +72,12 @@ const channel = process.env.SEGV_CHANNEL || "release";
 if (channel !== "release" && channel !== "canary")
   throw new Error(`SEGV_CHANNEL must be release or canary: ${channel}`);
 const canary = channel === "canary";
-if (canary && target !== "macos")
-  throw new Error("SEGV_CHANNEL=canary: the Canary app is for macOS only");
 
 const origin = process.env.SEGV_ORIGIN || (canary ? "https://canary.segv.sh" : "https://segv.sh");
 const u = new URL(origin);
 if (u.origin !== origin)
   throw new Error(`SEGV_ORIGIN must be an origin, without a path: ${origin}`);
-const overlay = { bundle: { macOS: {}, windows: {} }, app: { security: {} } };
+const overlay = { bundle: { macOS: {}, windows: {} }, app: { security: {} }, plugins: {} };
 
 // The Canary is another app, so that it installs next to segv.sh: its own bundle identifier (and with it its own data
 // directory, keychain items and notifications), name, icon and link scheme (§11.14 "Links").
@@ -82,11 +85,17 @@ if (canary) {
   Object.assign(overlay, {
     identifier: `${conf.identifier}.canary`,
     productName: `${conf.productName} Canary`,
-    plugins: { "deep-link": { desktop: { schemes: ["segv-canary"] } } },
   });
+  overlay.plugins["deep-link"] = { desktop: { schemes: ["segv-canary"] } };
   overlay.bundle.icon = conf.bundle.icon.map((p) =>
     join(TAURI, p.replace(/^icons\//, "icons/canary/")),
   );
+  // The icon of the Windows notifications (src/notify.rs). null removes segv.sh's from the merged configuration.
+  if (target === "windows")
+    overlay.bundle.resources = {
+      "icons/128x128.png": null,
+      [join(TAURI, "icons/canary/128x128.png")]: "notification.png",
+    };
 }
 const identifier = overlay.identifier ?? conf.identifier;
 
@@ -96,6 +105,37 @@ if (version) {
     throw new Error(`SEGV_VERSION must be X.Y.Z or X.Y.Z-canary.N: ${version}`);
   overlay.version = version;
 }
+// Where each channel's app looks for its updates, and the public key of the channel's update key: the app installs
+// only a package that this key's private half signed for the version that the feed names, and only a newer version
+// than its own (docs/PROTOCOL.md §11.14 "Updates"). The feed is the release's latest.json, which
+// .github/workflows/desktop.yml writes.
+const UPDATES = {
+  release: {
+    endpoint: "https://github.com/sizumita/segv.sh/releases/latest/download/latest.json",
+    // minisign key 9A590B3E98CE5672
+    pubkey:
+      "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDlBNTkwQjNFOThDRTU2NzIKUldSeVZzNllQZ3RabXBGTXREaWV2S1VQZmhsZ21zOWZoUnVJOW5LQ0Rva3hzNUJOR05YSys2eEEK",
+  },
+  canary: {
+    endpoint: "https://github.com/sizumita/segv.sh/releases/download/canary/latest.json",
+    // minisign key C29D59D33460AB4F
+    pubkey:
+      "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEMyOUQ1OUQzMzQ2MEFCNEYKUldSUHEyQTAwMW1kd3RITE5DM3diVmVnWUU1YUVCWkNWaFVtUXE4M1F3WE1FNVR6YXArZm5lQU4K",
+  },
+};
+const updates = process.env.SEGV_UPDATES;
+if (updates && updates !== "1") throw new Error(`SEGV_UPDATES must be 1 or unset: ${updates}`);
+if (updates) {
+  overlay.plugins.updater = {
+    endpoints: [UPDATES[channel].endpoint],
+    pubkey: UPDATES[channel].pubkey,
+    requireSignedVersion: true,
+    // The installer runs without a window, and starts the app again unless it was quitting (src/update.rs).
+    windows: { installMode: "quiet" },
+  };
+  overlay.bundle.createUpdaterArtifacts = true;
+}
+
 const build = process.env.SEGV_BUILD;
 if (build) {
   if (!/^[1-9]\d{0,8}$/.test(build))

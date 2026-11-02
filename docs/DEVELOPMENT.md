@@ -89,16 +89,18 @@ on macOS 15 or later, and on Windows 10 22H2 or Windows 11.
   development profile lists the Macs it runs on). Without them the app is signed ad hoc and signs in with the
   recovery code only. Passkeys of a deployment also need its `/.well-known/apple-app-site-association` to name the app
   (`APPLE_APP_IDS`, see [DEPLOYMENT.md](DEPLOYMENT.md)), and macOS reads it only for an app in `/Applications`.
-  `SEGV_CHANNEL=canary` builds segv.sh Canary instead (`segv.sh Canary.app`, "Releases" below), which calls
-  `https://canary.segv.sh` unless `SEGV_ORIGIN` says otherwise.
+  `SEGV_CHANNEL=canary` builds segv.sh Canary instead (`segv.sh Canary.app`, on Windows too, "Releases" below), which
+  calls `https://canary.segv.sh` unless `SEGV_ORIGIN` says otherwise. A local build never updates itself: only the
+  published builds have a feed ("Updates" below).
 - On Windows, `pnpm --filter @segv/desktop run bundle -- --debug --bundles nsis` builds
   `target/debug/bundle/nsis/segv.sh_0.1.0_x64-setup.exe`, an installer for the current user that needs no administrator.
   It makes the Start menu shortcut with the app's AppUserModelID (`sh.segv.desktop`), under which the app registers
   itself for notifications at every launch (`src/notify.rs`), and registers the `segv:` scheme that a click on a
   notification opens. A development build registers the scheme itself, to its own binary, until the app is installed
-  again. To get the installers without building on Windows, use the workflow "Desktop app for Windows"
+  again. To try a branch without building on Windows, use the workflow "Desktop app for Windows"
   (`.github/workflows/desktop-windows.yml`): it builds unsigned installers for x64 and ARM64 for every pull request that
   changes the desktop app, or when started from the Actions tab, and keeps them as the run's artifacts for 14 days.
+  They do not update themselves. The published installers come from the workflow "Desktop app" ("Releases" below).
   Passkeys need no signing and no association file: the WebAuthn API of Windows takes the RP ID from the app. It reaches
   the passkeys of Windows Hello, security keys, phones and the passkey managers that Windows lists, but not those that a
   browser keeps itself (Chrome's in Google Password Manager, say). Windows Hello evaluates the PRF extension from the
@@ -119,17 +121,26 @@ segv.sh ships from two places. Every push to `main` deploys <https://canary.segv
 release tag `vX.Y.Z` on a commit of `main` deploys <https://segv.sh> and builds segv.sh
 ([DEPLOYMENT.md](DEPLOYMENT.md), "Canary" and "Deploying from GitHub Actions").
 
-|                 | Canary                                                                                                                         | Release                                                                                                     |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
-| Started by      | a push to `main` (the macOS app: one that changes it)                                                                          | a tag `vX.Y.Z` on a commit of `main`                                                                        |
-| Web app and API | <https://canary.segv.sh>, with accounts of its own                                                                             | <https://segv.sh>                                                                                           |
-| macOS app       | segv.sh Canary, `sh.segv.desktop.canary`, links `segv-canary:`                                                                 | segv.sh, `sh.segv.desktop`, links `segv:`                                                                   |
-| App version     | `X.Y.Z-canary.N`                                                                                                               | `X.Y.Z`                                                                                                     |
-| Download        | [segv.sh-Canary.dmg](https://github.com/sizumita/segv.sh/releases/download/canary/segv.sh-Canary.dmg), the prerelease `canary` | [segv.sh.dmg](https://github.com/sizumita/segv.sh/releases/latest/download/segv.sh.dmg), the latest release |
+|                 | Canary                                                          | Release                                                         |
+| --------------- | --------------------------------------------------------------- | --------------------------------------------------------------- |
+| Started by      | a push to `main` (the desktop app: one that changes it)         | a tag `vX.Y.Z` on a commit of `main`                            |
+| Web app and API | <https://canary.segv.sh>, with accounts of its own              | <https://segv.sh>                                               |
+| Desktop app     | segv.sh Canary, `sh.segv.desktop.canary`, links `segv-canary:`  | segv.sh, `sh.segv.desktop`, links `segv:`                       |
+| App version     | `X.Y.Z-canary.N`                                                | `X.Y.Z`                                                         |
+| Downloads       | the prerelease `canary`                                         | the latest release                                              |
+| A file's link   | `https://github.com/sizumita/segv.sh/releases/download/canary/` | `https://github.com/sizumita/segv.sh/releases/latest/download/` |
 
-segv.sh Canary is another app, so that it installs next to segv.sh: its own data, keychain items, notifications and
-login item, its own icon, and the account of canary.segv.sh, which has nothing of segv.sh's. Both are universal apps,
-signed with the team's Developer ID and notarized by Apple, and both keep their passkeys in `/Applications` only.
+| File                         | Canary                           | Release                   |
+| ---------------------------- | -------------------------------- | ------------------------- |
+| macOS (Apple silicon, Intel) | `segv.sh-Canary.dmg`             | `segv.sh.dmg`             |
+| Windows x64                  | `segv.sh-Canary-x64-setup.exe`   | `segv.sh-x64-setup.exe`   |
+| Windows ARM64                | `segv.sh-Canary-arm64-setup.exe` | `segv.sh-arm64-setup.exe` |
+
+segv.sh Canary is another app, so that it installs next to segv.sh: its own data, key store items, notifications and
+login item, its own icon, and the account of canary.segv.sh, which has nothing of segv.sh's. The macOS apps are
+universal, signed with the team's Developer ID and notarized by Apple, and keep their passkeys in `/Applications`
+only. The Windows installers install for the current user and are not signed yet, so SmartScreen warns when one runs
+for the first time. Both systems' apps then update themselves ("Updates" below).
 
 `apps/desktop/scripts/version.mjs` gives the versions. A release has its tag's. A Canary build is a prerelease of the
 next version: the last release tag before it with its patch raised, or `version` in `tauri.conf.json` when that is
@@ -144,14 +155,14 @@ git tag v0.1.0 <commit>
 git push origin v0.1.0
 ```
 
-`.github/workflows/deploy.yml` deploys it to segv.sh, and `.github/workflows/desktop-macos.yml` builds the app and
+`.github/workflows/deploy.yml` deploys it to segv.sh, and `.github/workflows/desktop.yml` builds the desktop app and
 publishes the tag's release, whose notes GitHub writes from the pull requests since the previous tag. Apply the
 release's D1 migrations to segv.sh before pushing the tag ([DEPLOYMENT.md](DEPLOYMENT.md), "Updating").
 
 ### Signing the macOS app
 
-`desktop-macos.yml` compiles the app in a job without secrets, then bundles, signs and notarizes that binary in a job
-of the environment `canary` (for `main`) or `production` (for release tags), which holds these secrets. Set them up once:
+`desktop.yml` compiles the app in a job without secrets, then bundles, signs and notarizes that binary in a job of the
+environment `canary` (for `main`) or `production` (for release tags), which holds these secrets. Set them up once:
 
 1. A **Developer ID Application** certificate of the team, which only the team's Account Holder can create (Apple
    Developer › Certificates). Export it with its private key from Keychain Access as a `.p12` file with a password.
@@ -178,6 +189,43 @@ of the environment `canary` (for `main`) or `production` (for release tags), whi
 
 The Canary's passkeys also need `canary.segv.sh` to name the app (`APPLE_APP_IDS` of `env.canary` in
 `apps/web/wrangler.jsonc`), as segv.sh names `sh.segv.desktop`.
+
+### Updates
+
+The published apps update themselves (`apps/desktop/src-tauri/src/update.rs`, docs/PROTOCOL.md §11.14 "Updates"). A
+minute after launch and then every four hours, an app reads its channel's feed: `latest.json` of the latest release,
+or of the prerelease `canary` for segv.sh Canary, which `desktop.yml` uploads once every file that it names is in
+place. A newer version is downloaded in the background, and Tauri's updater installs it only if its signature verifies
+under the channel's update key and names the version that the feed names. If the app's window is closed, it installs
+the update at once and starts again in the menu bar or the tray, without the window. Otherwise the tray's menu offers
+"Restart to Update", and the update is installed when the window is next closed or the app quits. On macOS the app
+replaces its own bundle; where that would ask for an administrator (an app that another user installed, or one run
+from its disk image), it waits for the menu. On Windows the installer runs without a window once the app has exited,
+and starts it again.
+
+Only builds made with `SEGV_UPDATES=1` have a feed. `desktop.yml` sets it; any other build never looks for updates.
+`UPDATES` in `apps/desktop/scripts/bundle.mjs` holds each channel's feed and the public half of its update key.
+
+Each channel has its own update key, a minisign key pair that Tauri's CLI makes. Only the environment of its channel
+holds the private key, as the secret `TAURI_SIGNING_PRIVATE_KEY`. Make them once:
+
+```bash
+pnpm --filter @segv/desktop exec tauri signer generate -w ~/.tauri/segv-canary.key
+pnpm --filter @segv/desktop exec tauri signer generate -w ~/.tauri/segv-release.key
+gh secret set TAURI_SIGNING_PRIVATE_KEY --env canary < ~/.tauri/segv-canary.key
+gh secret set TAURI_SIGNING_PRIVATE_KEY --env production < ~/.tauri/segv-release.key
+```
+
+A key with a password needs it as `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` in the same environment. The `.pub` files go to
+`UPDATES`. Keep each private key somewhere safe outside GitHub, which never shows a secret again: the installed apps of
+a channel accept only its key, so without it they cannot be updated, and every user has to download the app again. To
+change a key, publish one more version with the old key whose app carries the new public key, then replace the secret.
+
+To try updates locally, make a key for the test, and build two versions with `SEGV_UPDATES=1`, `SEGV_VERSION`,
+`TAURI_SIGNING_PRIVATE_KEY` set to that key, and one more `--config` file that sets `plugins.updater` to the test key's
+public key, an `http://127.0.0.1:…/latest.json` endpoint and `"dangerousInsecureTransportProtocol": true`, and another
+`identifier` (or the build hands off to an installed segv.sh). Serve a `latest.json` that names the newer build's
+`.app.tar.gz` and the contents of its `.sig`, then start the older build.
 
 ## Tests
 

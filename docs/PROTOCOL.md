@@ -4455,7 +4455,8 @@ browser client does, with these differences:
   network, and their Content Security Policy, which the app sets itself (a `<meta>` element that comes first in
   `<head>`, or the shell's own setting), allows scripts only from the app's origin and connections only to the
   deployment's origin and to what the shell's own bridge needs, with the web app's other restrictions. The server thus
-  never chooses the code that a native app runs: new code comes only in a new package, which the platform verifies.
+  never chooses the code that a native app runs: new code comes only in a new package of the app's publisher, which
+  the platform verifies, or which the app verifies itself before installing it ("Updates" below).
 - **Passkeys.** The RP ID is the deployment's canonical host (§2.5), never the host of the app's origin, so the web
   app and the native apps share their passkeys. The app gets the PRF result (§2.3) from its web view's WebAuthn where
   the platform lets the web view of an app associated with that host use it (iOS: Associated Domains with
@@ -4500,6 +4501,21 @@ browser client does, with these differences:
   and MAY start hidden when the user signs in to the system. While it runs it keeps its realtime socket, reconnects when
   the system wakes, notifies as §11.13 says ("Apps without push"), and shows the badge where the system has one (the
   Dock on macOS, the taskbar button's overlay on Windows).
+- **Updates.** A desktop app distributed outside a store MAY update itself. It reads a feed at a fixed `https` URL
+  built into it, which the deployment's server does not serve, and sends with that request and the download no
+  cookie, credential or other value that names the user, the account or the device. The feed names the newest version
+  and, for each system, the URL of its package and the package's signature. The app installs a package only if the
+  signature verifies under a public key built into the app, only if the signed data names the version that the feed
+  names, and only if that version is newer than its own: whoever serves the feed can neither change the app's code nor
+  send it back to an older version, only withhold updates. The private key MUST NOT be held by the deployment's server;
+  only the publisher's release process holds it. Each channel of a deployment's apps (for segv.sh, segv.sh and segv.sh
+  Canary) SHOULD have a feed and a key of its own. The app reads the feed at launch and then every few hours, downloads
+  and verifies a newer package in the background, and installs it when that interrupts nothing: at once while its
+  window is closed, starting again in the menu bar or the system tray without the window; otherwise when the window is
+  next closed, when the app quits, or when the user asks for it. Where installing would ask for an administrator's
+  password, it waits for the user to ask. For segv.sh the feed is `latest.json` of the latest release of the
+  repository (`https://github.com/sizumita/segv.sh/releases/latest/download/latest.json`), and for segv.sh Canary that
+  of its prerelease `canary`.
 - **Notifications** come through APNs (iOS, and macOS when the desktop app uses it) or FCM (Android), with push keys
   and a notification handler of the app's own (§9.8, §11.13). A desktop app on Windows or Linux has no push transport in
   stage 1, nor has one on macOS that does not use APNs (§11.13, "Apps without push").
@@ -4994,7 +5010,11 @@ A native app (§11.14) changes whom a user trusts for the client's code, and add
   code that reads the keys (§0.4). A native app runs only the code of its signed package: the server cannot change it,
   a new version reaches a device only through the developer's signing key, the store and the operating system's
   checks, and every device that installs a version gets that same package. Whoever holds the signing key, and the
-  store, thus decide which code a device runs.
+  store, thus decide which code a device runs. A desktop app that updates itself (§11.14, "Updates") takes the place of
+  the store: whoever holds its update key decides which code it runs, and whoever serves its feed and packages learns,
+  each time the app looks, the address of a device that runs it, its channel, and from the package it downloads its
+  system, and can withhold updates, but cannot make it install any package that the key did not sign for a newer
+  version.
 - **O** learns from the `Origin` header of a native app's requests, as from the User-Agent that every client sends,
   which kind of app sent them; everything else is as for a browser. The association files (§11.14) are public and
   name the apps only, and the platforms fetch them through their own servers, not once per device.
