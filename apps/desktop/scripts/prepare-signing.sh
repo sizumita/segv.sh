@@ -111,7 +111,18 @@ prepare_signing() {
   rm -f "${dir}/profile.plist" "${dir}/certificate.pem"
   export APPLE_PROVISIONING_PROFILE="${dir}/segv.provisionprofile"
 
-  # The App Store Connect API key, for notarization.
+  # The App Store Connect API key, for notarization: a team key, whose issuer ID is a UUID (an individual key has none,
+  # and Tauri notarizes only with an issuer), its 10-character key ID and its .p8 file.
+  local uuid='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' id='^[A-Z0-9]{10}$'
+  if [[ "${APPLE_API_ISSUER}" =~ ${id} && "${APPLE_API_KEY}" =~ ${uuid} ]]; then
+    fail "APPLE_API_KEY and APPLE_API_ISSUER are swapped: the key ID is 10 characters, the issuer ID a UUID." ||
+      return 1
+  fi
+  [[ "${APPLE_API_ISSUER}" =~ ${uuid} ]] ||
+    fail "APPLE_API_ISSUER is not an issuer ID (a UUID): App Store Connect shows it above the team keys under Users" \
+      "and Access › Integrations › App Store Connect API. An individual key has none: make a team key." || return 1
+  [[ "${APPLE_API_KEY}" =~ ${id} ]] ||
+    fail "APPLE_API_KEY is not a key ID (10 letters and digits, as in AuthKey_<key ID>.p8)." || return 1
   (umask 077 && printf '%s\n' "${APPLE_API_PRIVATE_KEY}" >"${dir}/AuthKey_${APPLE_API_KEY}.p8")
   "${openssl}" pkey -in "${dir}/AuthKey_${APPLE_API_KEY}.p8" -noout 2>/dev/null ||
     fail "APPLE_API_PRIVATE_KEY is not the content of an AuthKey_<key ID>.p8 file." || return 1
