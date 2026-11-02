@@ -20,10 +20,10 @@ catalog:
   "@qwik.dev/router": 2.0.0-rc.4
   "@tauri-apps/api": 2.12.4
   "@tauri-apps/cli": 2.12.4
-  "@types/node": 25.6.0
+  "@types/node": 26.6.6
   eslint-plugin-qwik: 2.0.0-rc.4
   playwright: 1.64.1
-  typescript: 5.9.3
+  typescript: 7.0.2
   vite: npm:@voidzero-dev/vite-plus-core@1.4.0
   vite-plus: 1.4.0
   vitest: 5.0.5
@@ -62,14 +62,23 @@ overrides:
   "@eslint/config-array@0.23.5>minimatch": 11.0.3 # GHSA-g3hv-75wg-m249
   "@typescript-eslint/typescript-estree@8.72.1>minimatch": 11.0.3 # GHSA-g3hv-75wg-m249
 
-# vite resolves to @voidzero-dev/vite-plus-core, whose version (1.x) is outside the vite ranges that plugins declare.
 peerDependencyRules:
+  # vite resolves to @voidzero-dev/vite-plus-core, whose version (1.x) is outside the vite ranges that plugins declare.
   allowAny:
     - vite
     - vitest
   allowedVersions:
     vite: "*"
     vitest: "*"
+    # eslint-plugin-qwik loads typescript-eslint, which declares TypeScript below 6.1. TypeScript 7 has no compiler API
+    # (require("typescript") returns only its version), but neither package calls it here: they do so only for rules
+    # with type information, which oxlint's JS plugins never get (so qwik/valid-lexical-scope is off in vite.config.ts).
+    # Each rule names the exact version of its parent, so it stops applying when typescript-eslint is upgraded; delete
+    # them then and run `pnpm peers check -r`.
+    "@typescript-eslint/project-service@8.72.1>typescript": "7"
+    "@typescript-eslint/tsconfig-utils@8.72.1>typescript": "7"
+    "@typescript-eslint/typescript-estree@8.72.1>typescript": "7"
+    "@typescript-eslint/utils@8.72.1>typescript": "7"
 
 # No dependency runs install scripts. esbuild and workerd take their binaries from platform packages instead.
 allowBuilds:

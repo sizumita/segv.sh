@@ -202,7 +202,7 @@ pnpm のワークスペースです。出荷するアプリは `apps/` に、そ
 
 ## はじめかた
 
-Node.js 22.18 以降・24.11 以降・26 以降のどれかと、pnpm 12、パスキーの保存先が WebAuthn PRF 拡張に対応したブラウザが
+Node.js 26 と、pnpm 12、パスキーの保存先が WebAuthn PRF 拡張に対応したブラウザが
 必要です。PRF に対応していなくても、リカバリーコードでなら解錠できます。pnpm は `package.json` の `packageManager` が固定
 する版を使ってください。自動では切り替わらないので、`pnpm self-update <版>` で入れます。
 

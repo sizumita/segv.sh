@@ -5,7 +5,7 @@ This guide sets up a local instance of segv.sh and runs its tests. For the overa
 
 ## Requirements
 
-- Node.js `^22.18.0`, `^24.11.0` or `>=26.0.0`.
+- Node.js 26 (`^26.0.0`).
 - pnpm 12, at the release that `packageManager` in `package.json` pins. pnpm does not switch to that release by itself
   (`pmOnFail` in `pnpm-workspace.yaml`); install it with `pnpm self-update <version>`.
 - To use the app by hand: a browser whose passkey provider supports the WebAuthn PRF extension. Passkeys created on

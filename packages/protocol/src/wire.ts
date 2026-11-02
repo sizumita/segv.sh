@@ -94,7 +94,8 @@ class Writer {
     if (len !== undefined && b.length !== len) fail(`expected ${len} bytes`);
     return this.push(b);
   }
-  done(): Bytes {
+  // A fresh ArrayBuffer, never a SharedArrayBuffer: WebSocket.send() and other DOM APIs take only that (BufferSource).
+  done(): Uint8Array<ArrayBuffer> {
     const out = new Uint8Array(this.n);
     let o = 0;
     for (const p of this.parts) {
@@ -483,7 +484,7 @@ export type ClientFrame =
   | { f: "unsub"; topics: Bytes[] }
   | { f: "resume"; boot: Bytes; since: number; topics: Bytes[] };
 
-export function encodeClientFrame(x: ClientFrame): Bytes {
+export function encodeClientFrame(x: ClientFrame): Uint8Array<ArrayBuffer> {
   const w = new Writer();
   if (x.f === "resume") {
     if (x.topics.length > RT_MAX_TOPICS) fail("bad topic count");
