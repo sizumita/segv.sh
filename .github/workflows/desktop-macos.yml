@@ -171,6 +171,7 @@ jobs:
           SEGV_VERSION: ${{ needs.build.outputs.version }}
           SEGV_BUILD: ${{ needs.build.outputs.build }}
           APPLE_TEAM_ID: NBDP5VK335
+          # Optional: scripts/prepare-signing.sh takes the name from the certificate.
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -182,8 +183,8 @@ jobs:
           IDENTIFIER: ${{ github.ref_type == 'tag' && 'sh.segv.desktop' || 'sh.segv.desktop.canary' }}
         run: |
           missing=()
-          for v in APPLE_SIGNING_IDENTITY APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_API_KEY APPLE_API_ISSUER \
-            APPLE_API_PRIVATE_KEY APPLE_PROVISIONING_PROFILE_BASE64; do
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_API_KEY APPLE_API_ISSUER APPLE_API_PRIVATE_KEY \
+            APPLE_PROVISIONING_PROFILE_BASE64; do
             [[ -n "${!v}" ]] || missing+=("${v}")
           done
           if (( ${#missing[@]} )); then

@@ -167,7 +167,6 @@ of the environment `canary` (for `main`) or `production` (for release tags), whi
    for env in canary production; do
      base64 -i DeveloperID.p12 | gh secret set APPLE_CERTIFICATE --env "$env"
      gh secret set APPLE_CERTIFICATE_PASSWORD --env "$env"
-     gh secret set APPLE_SIGNING_IDENTITY --env "$env"   # Developer ID Application: <name> (NBDP5VK335)
      gh secret set APPLE_API_KEY --env "$env"            # the key ID
      gh secret set APPLE_API_ISSUER --env "$env"         # the issuer ID
      gh secret set APPLE_API_PRIVATE_KEY --env "$env" < AuthKey_<key ID>.p8
@@ -181,7 +180,9 @@ a password that does not open the certificate, a certificate that is not the tea
 profile of another app, a development profile, or one made for another certificate. It prints the SHA-256 of the `.p12`
 it received, which `shasum -a 256 DeveloperID.p12` prints too when the secret holds that file. To check a password
 locally, `openssl pkcs12 -legacy -in DeveloperID.p12 -noout` with OpenSSL 3 (Homebrew's `openssl@3`) prints nothing
-when it opens the file and "Mac verify error" when it does not.
+when it opens the file and "Mac verify error" when it does not. The signing identity is the certificate's name
+(`Developer ID Application: <name> (NBDP5VK335)`), which the job reads from the certificate: an
+`APPLE_SIGNING_IDENTITY` secret is not needed.
 
 The Canary's passkeys also need `canary.segv.sh` to name the app (`APPLE_APP_IDS` of `env.canary` in
 `apps/web/wrangler.jsonc`), as segv.sh names `sh.segv.desktop`.

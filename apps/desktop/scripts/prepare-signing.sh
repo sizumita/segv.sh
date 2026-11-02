@@ -4,12 +4,14 @@
 #
 #   source apps/desktop/scripts/prepare-signing.sh <private directory> <bundle identifier>
 #
-# It reads APPLE_CERTIFICATE (a base64 .p12) with APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
-# APPLE_TEAM_ID, APPLE_PROVISIONING_PROFILE_BASE64, APPLE_API_KEY and APPLE_API_PRIVATE_KEY, and fails with an error
-# that names the secret at fault: Tauri's own import of the certificate says only "The user name or passphrase you
-# entered is not correct", for a wrong password and for a wrong file alike, and a wrong profile is signed into the app
-# without complaint. It exports APPLE_PROVISIONING_PROFILE and APPLE_API_KEY_PATH, files in the directory, which the
-# caller deletes. Tauri imports APPLE_CERTIFICATE itself, as it is.
+# It reads APPLE_CERTIFICATE (a base64 .p12) with APPLE_CERTIFICATE_PASSWORD, APPLE_TEAM_ID,
+# APPLE_PROVISIONING_PROFILE_BASE64, APPLE_API_KEY and APPLE_API_PRIVATE_KEY, and fails with an error that names the
+# secret at fault: Tauri's own import of the certificate says only "The user name or passphrase you entered is not
+# correct", for a wrong password and for a wrong file alike, and a wrong profile is signed into the app without
+# complaint. It exports APPLE_SIGNING_IDENTITY, the name of the certificate, which Tauri requires to be exactly that
+# (an APPLE_SIGNING_IDENTITY secret is needed only when OpenSSL cannot read the certificate), and
+# APPLE_PROVISIONING_PROFILE and APPLE_API_KEY_PATH, files in the directory, which the caller deletes. Tauri imports
+# APPLE_CERTIFICATE itself, as it is.
 
 # The step runs with -e, which would end it at a failing command substitution before its message: every check that
 # may fail is part of an || list.
@@ -62,9 +64,14 @@ prepare_signing() {
     [[ "${name}" == "Developer ID Application: "*"(${APPLE_TEAM_ID})" ]] ||
       fail "APPLE_CERTIFICATE is \"${name}\", not a Developer ID Application certificate of team ${APPLE_TEAM_ID}." ||
       return 1
-    if [[ ! "${APPLE_SIGNING_IDENTITY}" =~ ^[0-9A-Fa-f]{40}$ && "${APPLE_SIGNING_IDENTITY}" != "${name}" ]]; then
-      fail "APPLE_SIGNING_IDENTITY is not the name of APPLE_CERTIFICATE's certificate, \"${name}\"." || return 1
+    if [[ -n "${APPLE_SIGNING_IDENTITY}" && "${APPLE_SIGNING_IDENTITY}" != "${name}" ]]; then
+      echo "::warning::APPLE_SIGNING_IDENTITY is not the certificate's name, which is used instead: \"${name}\"."
     fi
+    export APPLE_SIGNING_IDENTITY="${name}"
+  else
+    [[ -n "${APPLE_SIGNING_IDENTITY}" ]] ||
+      fail "Set APPLE_SIGNING_IDENTITY to the name of APPLE_CERTIFICATE's certificate, which OpenSSL could not read." ||
+      return 1
   fi
   rm -f "${dir}/given.p12" "${dir}/identity.pem" "${dir}/openssl.log"
 
