@@ -74,6 +74,7 @@ import {
   claimRead,
   deriveLines,
   endByRecord,
+  endSwept,
   historyClaim,
   onLeave,
   processWinner,
@@ -431,13 +432,14 @@ export class Messaging {
 
   /**
    * A copy that holds the epoch its ENDED record names (its own or a sibling's) has ended there, latched, without
-   * processing that claim (§6.6 step 3, §7.3); a record for an epoch it does not hold is not applied yet.
+   * processing that claim (§6.6 step 3, §7.3); a record for an epoch it does not hold is not applied yet. A copy
+   * whose sweep there did not finish (a transient failure) ends by the record again (§11.2 "Sweeping").
    */
   private async endByRecordIf(c: Copy, quiet: boolean): Promise<void> {
-    if (c.removed || c.probe) return;
+    if (c.probe) return;
     const rec = this.h.self.fold.ended.get(copyKeyOf(c));
     const ep = c.epochs.get(c.current);
-    if (!rec || !ep || rec.e !== ep.e) return;
+    if (!rec || !ep || rec.e !== ep.e || (c.removed && endSwept(c, ep))) return;
     await endByRecord(this.membershipHost(quiet), c, ep, rec.claim);
     // A device that holds rows of that epoch reads the claim now: rows stored after it are dropped (§6.8, §11.7).
     if (ep.loaded > 0) await this.readEndClaim(c, quiet);
