@@ -45,11 +45,16 @@ const AUMID = "sh.segv.desktop";
  */
 const HIDDEN_MS = Number(process.env.E2E_HIDDEN_MS ?? 6 * 60_000);
 
-/** Runs a Windows PowerShell script and returns what it printed. */
+/** Runs a Windows PowerShell script and returns what it printed (the script goes encoded: no quoting to get wrong). */
 function powershell(script) {
-  const r = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
-    encoding: "utf8",
-  });
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  const r = spawnSync(
+    "powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+    {
+      encoding: "utf8",
+    },
+  );
   if (r.status !== 0) throw new Error(`PowerShell failed: ${(r.stderr || r.stdout).trim()}`);
   return r.stdout.trim();
 }
@@ -250,26 +255,39 @@ export async function windows({ base, browser, shots, exe, cdpPort }) {
       `with its window closed for ${Math.round(HIDDEN_MS / 60_000)} min, the app gets a message and notifies of it`,
       async () => {
         clearToasts();
-        powershell(
-          `if (-not (Get-Process -Id ${app.pid}).CloseMainWindow()) { throw 'no window to close' }`,
-        );
-        check(
-          await until(async () => (await visibility(W)) === "hidden", 10_000),
-          "the page did not go hidden",
-        );
+        // What went wrong, all of it: one run tells whether the window closed, whether the page saw it, and whether
+        // the notification came anyway.
+        const failures = [];
+        // The process's main window is its visible top-level window: 0 once the window is hidden.
+        const mainWindow = () => powershell(`(Get-Process -Id ${app.pid}).MainWindowHandle`);
+        const shown = mainWindow();
+        if (powershell(`(Get-Process -Id ${app.pid}).CloseMainWindow()`) !== "True")
+          failures.push(`no window to close (main window ${shown})`);
+        const closed = await until(() => mainWindow() === "0", 10_000);
+        if (!closed)
+          failures.push(`the window ${shown} did not close (main window ${mainWindow()})`);
+        const hidden = await until(async () => (await visibility(W)) === "hidden", 10_000);
+        const page = () =>
+          W.page.evaluate(
+            () => `${document.visibilityState}, ${document.hasFocus() ? "focused" : "not focused"}`,
+          );
+        if (!hidden) failures.push(`the page did not go hidden (${await page()})`);
+        note(`window ${shown} ${closed ? "closed" : "still shown"}; page ${await page()}`);
         await sleep(HIDDEN_MS);
-        check((await visibility(W)) === "hidden", "the page did not stay hidden");
+        if (hidden && (await visibility(W)) !== "hidden")
+          failures.push("the page did not stay hidden");
         check(app.alive(), "the app quit when its window closed");
         await send(B, t4);
         const sent = Date.now();
         toast = await until(() => toasts().find((n) => n.xml.includes(t4)), 30_000);
         // The page draws nothing while hidden, but keeps its title, which counts the unread messages.
         const title = await W.page.title();
-        check(
-          toast,
-          `no notification of the message (title "${title}"); the app's notifications: ${JSON.stringify(toasts())}`,
-        );
-        note(`notified ${Date.now() - sent} ms after the send (title "${title}")`);
+        if (toast) note(`notified ${Date.now() - sent} ms after the send (title "${title}")`);
+        else
+          failures.push(
+            `no notification of the message (title "${title}"); the app's notifications: ${JSON.stringify(toasts())}`,
+          );
+        check(failures.length === 0, failures.join("; "));
       },
     );
 
