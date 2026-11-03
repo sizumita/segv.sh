@@ -46,14 +46,16 @@
   // The daily expiry of push registrations not refreshed for 30 days (§9.8 "Expiry").
   "triggers": { "crons": ["17 3 * * *"] },
   // docs/PROTOCOL.md §9: SHARD "shard/v2/{E}/{i}" and INBOX "inbox/v2/{E}/{g}" per era, BLOBREG
-  // "blobreg/v2", CONN "conn/v2/{c}" (the realtime WebSockets, RT_CONNS of them) and FEED "feed/v2/{j}" (topic
-  // fan-out to the ConnDOs, RT_FEEDS of them; §9.4), CKPT "ckpt/v2" (signed checkpoints every 60 s), BELL "bell/v2/{j}"
-  // and QUIET "quiet/v2/{k}" (push: the bell index and each account's window, hold and seen marks, memory only,
-  // PUSH_SHARDS of each; addressed only while push is on, §9.8).
+  // "blobreg/v2/{j}" (BLOBREG_SHARDS of them; "blobreg/v2" is the first release's registry, which they import from,
+  // §9.2), DIRSEQ "dirseq/v2" (the only writer of the directory, §9.6), CONN "conn/v2/{c}" (the realtime WebSockets,
+  // RT_CONNS of them) and FEED "feed/v2/{j}" (topic fan-out to the ConnDOs, RT_FEEDS of them; §9.4), CKPT "ckpt/v2"
+  // (signed checkpoints every 60 s), BELL "bell/v2/{j}" and QUIET "quiet/v2/{k}" (push: the bell index and each
+  // account's window, hold and seen marks, memory only, PUSH_SHARDS of each; addressed only while push is on, §9.8).
   "durable_objects": {
     "bindings": [
       { "name": "SHARD", "class_name": "ShardDO" },
       { "name": "BLOBREG", "class_name": "BlobRegDO" },
+      { "name": "DIRSEQ", "class_name": "DirSeqDO" },
       { "name": "INBOX", "class_name": "InboxDO" },
       { "name": "CONN", "class_name": "ConnDO" },
       { "name": "FEED", "class_name": "FeedDO" },
@@ -77,6 +79,8 @@
       "new_sqlite_classes": ["ConnDO", "FeedDO", "BellDO", "QuietDO"],
       "deleted_classes": ["RealtimeDO", "PushDO"],
     },
+    // The directory's single writer (§9.6). The blob registry's shards are more objects of the existing BlobRegDO.
+    { "tag": "v4", "new_sqlite_classes": ["DirSeqDO"] },
   ],
   // Per-IP (IPv6 /64) abuse limits. Keys are never persisted. Period must be 10 or 60 seconds.
   "ratelimits": [
@@ -104,7 +108,9 @@
     // clock differences between server components, INBOX_SLOT_S = Δin, E_FIRST = the era of the first deploy
     // (lower eras are never instantiated). SHARD_MAP (optional, §9.1) = the shard count per era as "E:S" entries
     // (S a power of two), in effect from era E on; unset = one shard per era. Add an entry only for an era that
-    // has not started; never change the count of an era that accepts writes.
+    // has not started; never change the count of an era that accepts writes. BLOBREG_SHARDS (§9.2) = the number
+    // of blob registry objects, a power of two: a constant of the deployment, never changed once a blob is
+    // registered (ids would route to another object).
     // Secrets (wrangler secret put; .dev.vars for vp dev): ROUTE_KEY (32 B b64u), SRV_KEY (Ed25519 seed b64u).
     // Web Push is off unless the secrets VAPID_SK (P-256 scalar, 32 B b64u) and PUSH_KEY (32 B b64u) are set, with
     // VAPID_SUB (mailto: or https: contact). Optional: PUSH_HOSTS, POW_PUSH (20), PUSH_SHARDS (1). An invalid push
@@ -117,6 +123,7 @@
     // FeedDOs (a power of two) fan rows out to them. Both may change at any deploy; sockets live at most an hour.
     "RT_CONNS": "4",
     "RT_FEEDS": "4",
+    "BLOBREG_SHARDS": "64",
     // Push: the number of BellDOs and of QuietDOs (§9.8). May change at any deploy; the store is the truth.
     "PUSH_SHARDS": "4",
     // Hostnames this Worker answers on (comma-separated; the first is canonical). Any other host gets a
@@ -177,6 +184,7 @@
         "bindings": [
           { "name": "SHARD", "class_name": "ShardDO" },
           { "name": "BLOBREG", "class_name": "BlobRegDO" },
+          { "name": "DIRSEQ", "class_name": "DirSeqDO" },
           { "name": "INBOX", "class_name": "InboxDO" },
           { "name": "CONN", "class_name": "ConnDO" },
           { "name": "FEED", "class_name": "FeedDO" },
@@ -206,6 +214,7 @@
         "E_FIRST": "42",
         "RT_CONNS": "4",
         "RT_FEEDS": "4",
+        "BLOBREG_SHARDS": "64",
         "PUSH_SHARDS": "4",
         "APP_HOSTS": "canary.segv.sh",
         // The desktop apps' pages (segv.sh Canary on macOS); the mobile apps are segv.sh's only.

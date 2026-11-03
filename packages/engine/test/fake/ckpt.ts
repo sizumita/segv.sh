@@ -14,6 +14,7 @@
  */
 import {
   BLOBREG_CID,
+  blobregAll,
   DIRLOG_CID,
   H,
   ZERO32,
@@ -163,7 +164,8 @@ export class FakeCheckpoints {
     const hour = Math.floor(now / 3_600_000);
     if (hour > this.blobHour) {
       this.blobHour = hour;
-      this.blobHead = this.src.blobregHead();
+      // One registry shard in the fake world: the hourly value over its head (§9.5).
+      this.blobHead = blobregAll(hour, [this.src.blobregHead()]);
     }
     heads.push({ cid: BLOBREG_CID, head: this.blobHead });
     heads.push({ cid: DIRLOG_CID, head: this.src.dirlogHead() });

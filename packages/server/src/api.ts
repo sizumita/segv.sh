@@ -23,6 +23,7 @@ import {
   INBOX_BODY_LEN,
   MAX_ID_LEN,
   T0_MS,
+  blobShardOf,
   concat,
   eraEnd,
   eraStart,
@@ -102,6 +103,7 @@ import {
   type PushConfig,
   type ServerKeys,
   type V2Params,
+  blobBitsOf,
   shardBitsOf,
   shardsOf,
 } from "./env";
@@ -638,6 +640,20 @@ function sameDigest(obj: R2Object, idBytes: Bytes): boolean {
  * streamed into R2 (which checks it against the id) and registered only after R2 stored it, so a
  * registered id always has its object; re-uploading after a crash in between registers it.
  */
+/** The registry shard of a blob id: blobShard(id) under kblob and the deployment's B (§4.4, §9.2). */
+const blobRegFor = (c: Ctx, idBytes: Bytes) =>
+  blobRegStub(c.env, blobShardOf(c.keys.blobKey, idBytes, blobBitsOf(c.params.blobShards)));
+
+/** A BlobReg call that throws (a shard that found the id routed elsewhere, or is down) is 503 (§10.7). */
+async function blobRegCall<T>(what: string, call: () => Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (e) {
+    console.error(JSON.stringify({ msg: `blobreg ${what} failed`, error: logErr(e) }));
+    throw unavailable();
+  }
+}
+
 async function putBlob(c: Ctx, id: string, idBytes: Bytes): Promise<Response> {
   await rateLimit(rl(c.env, "RL_BLOB"), "blob", c.request);
   const declared = contentLength(c.request);
@@ -646,8 +662,8 @@ async function putBlob(c: Ctx, id: string, idBytes: Bytes): Promise<Response> {
   if (declared < BLOB_MIN) throw new HttpError(400, "blob too small");
   checkPow(c.request, c.env, "blob", idBytes, declared, c.now);
 
-  const reg = blobRegStub(c.env);
-  const meta = (await reg.meta(idBytes)) as BlobMeta;
+  const reg = blobRegFor(c, idBytes);
+  const meta = await blobRegCall("meta", async () => (await reg.meta(idBytes)) as BlobMeta);
   if (meta.hit) {
     await c.request.body?.cancel().catch(() => {});
     return json({ id, size: meta.size, t: meta.t }, 201);
@@ -678,7 +694,7 @@ async function putBlob(c: Ctx, id: string, idBytes: Bytes): Promise<Response> {
       size = now.size;
     }
   }
-  const r = await reg.register(idBytes, size);
+  const r = await blobRegCall("register", () => reg.register(idBytes, size));
   return json({ id, size: r.size, t: r.t }, 201);
 }
 
@@ -732,7 +748,7 @@ async function getBlob(c: Ctx, id: string): Promise<Response> {
 
 async function blobMeta(c: Ctx, idBytes: Bytes): Promise<Response> {
   await readLimit(c);
-  const m = (await blobRegStub(c.env).meta(idBytes)) as BlobMeta;
+  const m = await blobRegCall("meta", async () => (await blobRegFor(c, idBytes).meta(idBytes)) as BlobMeta);
   if (!m.hit) throw new ApiError(404, "unregistered", { now: m.now });
   return json({ t: m.t, size: m.size });
 }

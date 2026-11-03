@@ -937,6 +937,20 @@ export function kfeed(routeKey: Bytes): Bytes {
   if (routeKey.length !== 32) throw new Error("ROUTE_KEY must be 32 bytes");
   return HMAC(routeKey, utf8("segv.sh/v2/feed"));
 }
+/** kblob = HMAC(ROUTE_KEY, "segv.sh/v2/blob"): the key that routes blob ids to the registry shards (§9.2). Server only. */
+export function kblob(routeKey: Bytes): Bytes {
+  if (routeKey.length !== 32) throw new Error("ROUTE_KEY must be 32 bytes");
+  return HMAC(routeKey, utf8("segv.sh/v2/blob"));
+}
+/** blobShard(id) = u32(HMAC(kblob, id)[0..4]) >> (32 − b): the registry shard of a blob id, B = 2^b (b = 0 ⇒ 0). */
+export function blobShardOf(kblobKey: Bytes, id: Bytes, b: number): number {
+  if (id.length !== 32) throw new Error("blob id must be 32 bytes");
+  if (!Number.isInteger(b) || b < 0 || b > 12) throw new Error("bad registry shard bits");
+  if (b === 0) return 0;
+  const h = HMAC(kblobKey, id);
+  return new DataView(h.buffer, h.byteOffset, 4).getUint32(0) >>> (32 - b);
+}
+
 /** h(T) = HMAC(kfeed, T)[0..8]: the feed hash of a topic. */
 export function feedHash(kfeedKey: Bytes, topic: Bytes): Bytes {
   if (topic.length !== 16) throw new Error("topic must be 16 bytes");
@@ -992,7 +1006,16 @@ export const nextHead = (cid: string, head: Bytes, t: number, n: number, root: B
 
 export const shardCid = (E: number, i: number): string => `shard/${E}/${i}`;
 export const inboxCid = (E: number, g: number): string => `inbox/${E}/${g}`;
+/** The checkpoint item that stands for every registry shard (§9.5). */
 export const BLOBREG_CID = "blobreg";
+/** The cid of registry shard j (its own head chain, §9.2). */
+export const blobRegCid = (j: number): string => `blobreg/${j}`;
+/**
+ * The hourly registry value of the checkpoints: H(enc("segv.sh/v2/blobreg/all", u32 hour, head_0, …, head_{B−1})).
+ * The hour is mixed in so that the value changes every hour whether or not anything was registered (§9.5).
+ */
+export const blobregAll = (hour: number, heads: readonly Bytes[]): Bytes =>
+  H(enc("segv.sh/v2/blobreg/all", u32(hour), ...heads));
 export const DIRLOG_CID = "dirlog";
 
 /** hd = H(enc("segv.sh/v2/ckpt/heads", [cid_1, head_1, …])) over heads sorted by cid (byte order). */

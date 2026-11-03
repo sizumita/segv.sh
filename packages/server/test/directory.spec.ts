@@ -2,6 +2,7 @@
  * The v2 D1 directory (docs/PROTOCOL.md §2.4–§2.5, §9.6, §10.6), calling
  * packages/server/src/directory.ts directly inside workerd (the HTTP layer is tested separately).
  */
+import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -14,7 +15,6 @@ import {
   P_CACHE_MS,
   P_RETRY_MS,
   PrefixBitsError,
-  WRITE_ATTEMPTS,
   _resetDirectoryCacheForTests,
   currentP,
   dirAddWrap,
@@ -30,6 +30,8 @@ import {
   type DirUser,
   type DirlogEntry,
 } from "../src/directory";
+import type { DirSeqDO } from "../src/dirseq-do";
+import { dirSeqStub, type DirWrite, type DirWriteResult } from "../src/types";
 import { mixedOrderRegistration } from "./helpers";
 
 // ───────────── accounts (proto) ─────────────
@@ -78,6 +80,13 @@ function makeAccount(handle = freshHandle(), uid = P.random(16), credId = P.rand
   };
 }
 
+/** A signed wrap record as the DirSeqDO takes it (§9.6): the row of the record, with its id. */
+const wrapOf = (a: Account, w: Signed) => ({
+  uid: a.uidB64,
+  id: P.b64u(P.parseWrap(w.record, w.sig).id),
+  record: w.record,
+  sig: w.sig,
+});
 /** A new passkey wrap of `a`'s AK under a fresh credential (id `credId`). */
 const newPasskey = (a: Account, credId = P.random(16)): Signed =>
   P.makeWrap(a.uid, "passkey", credId, P.credKem(P.random(32), credId), a.AK, a.ident, Date.now());
@@ -194,6 +203,27 @@ async function withUsers<T>(n: number, f: () => Promise<T>): Promise<T> {
   } finally {
     await env.DB.prepare("UPDATE dirmeta SET v = ?1 WHERE k = 'users'").bind(before).run();
     _resetDirectoryCacheForTests();
+  }
+}
+
+/** Runs `fn` with the DirSeqDO's bindings replaced by `patched` (its cached head is dropped before and after). */
+async function withDirSeqEnv<T>(patched: Env, fn: () => Promise<T>): Promise<T> {
+  type Self = { env: Env; head: unknown };
+  let real: Env | undefined;
+  await runInDurableObject(dirSeqStub(env), (inst: DirSeqDO) => {
+    const self = inst as unknown as Self;
+    real = self.env;
+    self.env = patched;
+    self.head = null;
+  });
+  try {
+    return await fn();
+  } finally {
+    await runInDurableObject(dirSeqStub(env), (inst: DirSeqDO) => {
+      const self = inst as unknown as Self;
+      self.env = real!;
+      self.head = null;
+    });
   }
 }
 
@@ -1063,26 +1093,7 @@ describe("dirlog", () => {
   it("8 concurrent registrations all land; the chain recomputes without gaps; dirmeta.users = the user count", async () => {
     const accts = Array.from({ length: 8 }, () => makeAccount());
     const s0 = await dirState();
-    // Count the real D1 dirlog.seq conflicts (the retry path, with D1's own error messages).
-    let conflicts = 0;
-    const db = new Proxy(env.DB, {
-      get: (t, k) => {
-        if (k === "batch") {
-          return (stmts: D1PreparedStatement[]) =>
-            t.batch(stmts).catch((e: unknown) => {
-              if (uniqueFailure(e) === "dirlog.seq") conflicts++;
-              throw e;
-            });
-        }
-        const v = Reflect.get(t, k) as unknown;
-        return typeof v === "function" ? (v as (...x: unknown[]) => unknown).bind(t) : v;
-      },
-    });
-    const counted = new Proxy(env, { get: (t, k) => (k === "DB" ? db : Reflect.get(t, k)) });
-    const res = await Promise.all(
-      accts.map((a) => dirRegister(counted, registerBody(a), Date.now())),
-    );
-    expect(conflicts).toBeGreaterThan(0);
+    const res = await Promise.all(accts.map((a) => dirRegister(env, registerBody(a), Date.now())));
     const seqs = res.map((r) => r.dirseq);
     expect(new Set(seqs).size).toBe(8);
     const s1 = await dirState();
@@ -1149,8 +1160,12 @@ describe("D1 failures", () => {
       await register(b);
       const errors = vi.spyOn(console, "error").mockImplementation(() => {});
       const bad = brokenEnv(mode);
-      await rejects(dirRegister(bad, registerBody(a), Date.now()), 503);
-      await rejects(dirAddWrap(bad, { ...newPasskey(b) }), 503);
+      // Writes fail inside the DirSeqDO (its D1), reads in the Worker.
+      await withDirSeqEnv(bad, async () => {
+        await rejects(dirRegister(env, registerBody(a), Date.now()), 503);
+        await rejects(dirAddWrap(env, { ...newPasskey(b) }), 503);
+      });
+      await rejects(dirAddWrap(bad, { ...newPasskey(b) }), 503); // the owner read
       expect(await currentP(bad)).toBe(0); // never throws: no good P yet
       await rejects(dirByPrefix(bad, "h", 0, 0, null), 503); // no P known: 503, never a 409 against P = 0
       _resetDirectoryCacheForTests();
@@ -1225,32 +1240,107 @@ describe("D1 failures", () => {
     });
   });
 
-  it(`a writer that keeps losing the dirlog.seq race gets 503 after ${WRITE_ATTEMPTS} attempts`, async () => {
-    const a = makeAccount();
+  it("the DirSeqDO writes a round of queued writes in one D1 batch, and isolates a conflicting one", async () => {
+    const accts = Array.from({ length: 6 }, () => makeAccount());
     const s0 = await dirState();
+    const write = (a: Account): DirWrite => ({
+      kind: "user",
+      uid: a.uidB64,
+      upre: P.upre(a.uid),
+      handle: a.handle,
+      hpre: P.hpre(a.handle),
+      bundle: a.bundle,
+      sig: a.sig,
+      regEra: P.era(Date.now()),
+      wraps: [a.passkey, a.recovery].map((w, k) => ({
+        uid: a.uidB64,
+        id: P.b64u(k === 0 ? a.credId : a.recId),
+        record: w.record,
+        sig: w.sig,
+      })),
+    });
+    // Count D1 batches; writes queued before the first batch's D1 round trip ends go out together.
     let writes = 0;
     const db = new Proxy(env.DB, {
       get: (t, k) => {
         if (k === "batch") {
           return (stmts: D1PreparedStatement[]) => {
-            // Reads (the head) go through; every write batch loses the race.
-            if (stmts.length === 1) return t.batch(stmts);
-            writes++;
-            return Promise.reject(
-              new Error("D1_ERROR: UNIQUE constraint failed: dirlog.seq: SQLITE_CONSTRAINT"),
-            );
+            if (stmts.length > 1) writes++;
+            return t.batch(stmts);
           };
         }
         const v = Reflect.get(t, k) as unknown;
         return typeof v === "function" ? (v as (...x: unknown[]) => unknown).bind(t) : v;
       },
     });
-    const racing = new Proxy(env, { get: (t, k) => (k === "DB" ? db : Reflect.get(t, k)) });
-    vi.spyOn(Math, "random").mockReturnValue(0); // 5 ms × attempt back-off
-    vi.spyOn(console, "error").mockImplementation(() => {});
-    await rejects(dirRegister(racing, registerBody(a), Date.now()), 503);
-    expect(writes).toBe(WRITE_ATTEMPTS);
-    expect(await dirState()).toEqual(s0);
+    const counted = new Proxy(env, { get: (t, k) => (k === "DB" ? db : Reflect.get(t, k)) });
+    const results = await withDirSeqEnv(counted, () =>
+      runInDurableObject(dirSeqStub(env), (inst: DirSeqDO) => {
+        // The second registration repeats the first one's handle: its batch fails, and it alone answers 409.
+        const dup = makeAccount(accts[0].handle);
+        const all = [accts[0], dup, ...accts.slice(1)];
+        return Promise.all(all.map((a) => inst.append(write(a))));
+      }),
+    );
+    expect(results[0]).toEqual({ ok: true, seqs: [s0.head + 1, s0.head + 2, s0.head + 3] });
+    expect(results[1]).toEqual({ ok: false, status: 409, error: "handle already taken" });
+    for (const r of results.slice(2)) expect(r).toMatchObject({ ok: true });
+    const seqs = results.flatMap((r) => (r.ok ? r.seqs : []));
+    expect(seqs).toEqual(seqs.map((_, i) => s0.head + 1 + i)); // contiguous, in order
+    // The first write went alone (the loop started on it); the other six queued behind its D1 round trip and were
+    // one batch, which the duplicate failed: then one batch each.
+    expect(writes).toBe(1 + 1 + 6);
+    expect(await dirState()).toEqual({
+      users: s0.users + 6,
+      wraps: s0.wraps + 12,
+      head: s0.head + 18,
+      meta: s0.meta + 6,
+    });
+    await verifiedDirlog();
+  });
+
+  it("re-reads the head and retries once when another writer moved it; the cap of wraps per uid is counted in the batch", async () => {
+    const a = makeAccount();
+    await register(a); // the DirSeqDO holds the head in memory now
+    const s0 = await dirState();
+    // Another writer (a Worker of the previous release) appends an entry behind the object's back.
+    const head = await dirlogHead(env);
+    const ref = P.random(32);
+    const h = P.dirlogH(P.fromB64u(head.h), head.seq + 1, P.DIRLOG_WRAP, ref);
+    await env.DB.prepare("INSERT INTO dirlog (seq, kind, ref, h) VALUES (?1, ?2, ?3, ?4)")
+      .bind(head.seq + 1, P.DIRLOG_WRAP, P.b64u(ref), P.b64u(h))
+      .run();
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const r = await dirAddWrap(env, { ...newPasskey(a) });
+    expect(r.dirseq).toBe(head.seq + 2);
+    expect(errors.mock.calls.some((c) => String(c[0]).includes("retrying once"))).toBe(true);
+    expect(await dirState()).toEqual({ ...s0, wraps: s0.wraps + 1, head: s0.head + 2 });
+    // Two wraps of one uid in the same batch count against the cap together.
+    await env.DB.prepare("DELETE FROM dirlog WHERE seq = ?1")
+      .bind(head.seq + 1)
+      .run(); // keep the chain checkable
+    const b = makeAccount();
+    await register(b);
+    const fill = Array.from({ length: MAX_WRAPS_PER_UID - 3 }, () => ({
+      kind: "wrap" as const,
+      wrap: wrapOf(b, newPasskey(b)),
+    }));
+    const results = await runInDurableObject(dirSeqStub(env), (inst: DirSeqDO) =>
+      Promise.all(
+        [
+          ...fill,
+          { kind: "wrap" as const, wrap: wrapOf(b, newPasskey(b)) },
+          { kind: "wrap" as const, wrap: wrapOf(b, newPasskey(b)) },
+        ].map((w) => inst.append(w)),
+      ),
+    );
+    const refused = results.filter((x: DirWriteResult) => !x.ok);
+    expect(refused).toHaveLength(1);
+    expect(refused[0]).toMatchObject({ status: 400 });
+    expect((await dirWrapsById(env, P.b64u(b.credId), b.uidB64)).length).toBe(1);
+    expect(
+      (await all<{ n: number }>("SELECT count(*) AS n FROM wrap WHERE uid = ?1", b.uidB64))[0].n,
+    ).toBe(MAX_WRAPS_PER_UID);
   });
 
   it("classifies D1 constraint errors", () => {

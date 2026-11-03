@@ -73,7 +73,6 @@ import {
   parseEraName,
   type ShardFeedBatch,
   type ShardFeedBatches,
-  type ShardFeedRow,
   type ShardFeedRows,
   type ShardGetKey,
   type ShardGetResult,
@@ -508,34 +507,38 @@ export class ShardDO extends DurableObject<Env> {
     return FEED_BATCH_HDR + r.n * FEED_ROW_HDR + (r.b ?? 0);
   }
 
-  /** Rows of batch t after `after` by label: at least one, then up to `budget` wire bytes (see feedRows). */
+  /**
+   * Rows of batch t after `after` by label: at least one, then up to `budget` wire bytes (see feedRows). Two reads,
+   * each consumed whole: the record headers (length(body) reads no body) decide how many rows fit, then exactly those
+   * rows are read. A cursor left half-read would keep its statement open, and an open statement blocks the DROP
+   * TABLE of paging (§9.1) with SQLITE_LOCKED.
+   */
   private rowsOf(t: number, after: Uint8Array | null, budget: number): ShardFeedRows {
     // Every row has ≥ FEED_ROW_MIN wire bytes, so this LIMIT never cuts a result short; it only bounds the read.
     const limit = Math.floor(budget / FEED_ROW_MIN) + 2;
-    const cur =
-      after === null
-        ? this.sql.exec<{ label: ArrayBuffer; cls: number; body: ArrayBuffer }>(
-            "SELECT label, cls, body FROM row WHERE t = ? ORDER BY label LIMIT ?",
-            t,
-            limit,
-          )
-        : this.sql.exec<{ label: ArrayBuffer; cls: number; body: ArrayBuffer }>(
-            "SELECT label, cls, body FROM row WHERE t = ? AND label > ? ORDER BY label LIMIT ?",
-            t,
-            ab(after),
-            limit,
-          );
-    const rows: ShardFeedRow[] = [];
+    const where = after === null ? "t = ?" : "t = ? AND label > ?";
+    const args = after === null ? [t] : [t, ab(after)];
+    const heads = this.sql
+      .exec<{ len: number }>(`SELECT length(body) AS len FROM row WHERE ${where} ORDER BY label LIMIT ?`, ...args, limit)
+      .toArray();
     let bytes = 0;
-    let read = 0;
-    for (const r of cur) {
-      read++;
-      const size = FEED_ROW_HDR + r.body.byteLength;
-      if (rows.length > 0 && bytes + size > budget) return { rows, done: false };
+    let n = 0;
+    for (const h of heads) {
+      const size = FEED_ROW_HDR + h.len;
+      if (n > 0 && bytes + size > budget) break;
       bytes += size;
-      rows.push({ label: new Uint8Array(r.label), cls: r.cls, body: new Uint8Array(r.body) });
+      n++;
     }
-    return { rows, done: read < limit };
+    if (n === 0) return { rows: [], done: true };
+    const rows = this.sql
+      .exec<{ label: ArrayBuffer; cls: number; body: ArrayBuffer }>(
+        `SELECT label, cls, body FROM row WHERE ${where} ORDER BY label LIMIT ?`,
+        ...args,
+        n,
+      )
+      .toArray()
+      .map((r) => ({ label: new Uint8Array(r.label), cls: r.cls, body: new Uint8Array(r.body) }));
+    return { rows, done: n === heads.length && heads.length < limit };
   }
 
   // ───────────── paging (§9.1 "Paging") ─────────────

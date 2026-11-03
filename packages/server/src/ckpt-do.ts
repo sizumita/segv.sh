@@ -7,8 +7,9 @@
  *    isolate just to wake the object, and ensure() writes nothing while an alarm is scheduled.
  *  - tick() collects (cid, head) from shard/{E_now}/{i} for every i < S_{E_now} (the shard map, §9.1) and
  *    inbox/{E_now}/0; from shard/{E_now−1}/{i} and inbox/{E_now−1}/0 until they are sealed and their final head
- *    appeared once ('final:<cid>'); from the blob registry at most once per UTC hour ('blobreg:hour',
- *    'blobreg:head'); and from the D1 dirlog (ZERO32 when the table is missing or empty). At most 32 component calls
+ *    appeared once ('final:<cid>'); from the B blob registry shards once per UTC hour, as one value that mixes the
+ *    hour in ('blobreg:hour', 'blobreg:head', each shard's last head 'blobreg:head:<j>'); and from the D1 dirlog
+ *    (ZERO32 when the table is missing or empty). At most 32 component calls
  *    are in flight at a time. A component that fails keeps its previous head. The list is sorted by cid,
  *    hd = H(heads), C_q = H(enc("segv.sh/v2/ckpt", C_{q−1}, u32 q, u32 sec, hd)), sig = Sign(SRV_SK, enc(…, q, C_q)).
  *    An unchanged hd makes no new checkpoint.
@@ -24,6 +25,8 @@ import {
   DIRLOG_CID,
   H,
   ZERO32,
+  blobRegCid,
+  blobregAll,
   byteCmp,
   ckptC,
   ckptSigMsg,
@@ -125,6 +128,8 @@ export class CheckpointDO extends DurableObject<Env> {
   /** S_E (§9.1); an instance field so tests can set a count without a deployment variable. */
   protected shardsOf = (E: number): number => shardsOf(v2Params(this.env).shardMap, E);
   protected sweepShards = SWEEP_SHARDS;
+  /** B, the registry shard count (§9.2); an instance field so tests can set it without a deployment variable. */
+  protected blobShards = (): number => v2Params(this.env).blobShards;
 
   private readonly sql: SqlStorage;
   private readonly kv: Meta;
@@ -266,19 +271,31 @@ export class CheckpointDO extends DurableObject<Env> {
         keep(cid, e);
       }
     };
-    // At most one registry read per UTC hour: P learns at most whether any blob was registered in an hour.
+    // The registry once per UTC hour, as one value over every shard's head with the hour mixed in (§9.5): it
+    // changes every hour whether or not anything was registered, so P learns nothing from it.
     const blobreg = async (): Promise<void> => {
       const hour = Math.floor(now / HOUR_MS);
       const storedHour = this.kv.num("blobreg:hour");
       let head = this.kv.bytes("blobreg:head");
       if (storedHour === null || hour > storedHour) {
-        try {
-          head = new Uint8Array((await this.timed(Promise.resolve(blobRegStub(this.env).head()))).head);
-          metaWrites.set("blobreg:hour", hour);
-          metaWrites.set("blobreg:head", head);
-        } catch (e) {
-          console.error(JSON.stringify({ msg: "checkpoint: component did not answer", cid: BLOBREG_CID, error: logErr(e) }));
+        const B = this.blobShards();
+        const shardHeads: Uint8Array[] = Array.from({ length: B }, (_, j) => this.kv.bytes(`blobreg:head:${j}`) ?? ZERO32);
+        const jobs: (() => Promise<void>)[] = [];
+        for (let j = 0; j < B; j++) {
+          jobs.push(async () => {
+            try {
+              const h = new Uint8Array((await this.timed(Promise.resolve(blobRegStub(this.env, j).head()))).head);
+              shardHeads[j] = h;
+              metaWrites.set(`blobreg:head:${j}`, h);
+            } catch (e) {
+              console.error(JSON.stringify({ msg: "checkpoint: component did not answer", cid: blobRegCid(j), error: logErr(e) }));
+            }
+          });
         }
+        await pool(jobs, COLLECT_CONCURRENCY);
+        head = blobregAll(hour, shardHeads);
+        metaWrites.set("blobreg:hour", hour);
+        metaWrites.set("blobreg:head", head);
       }
       head ??= prevHeads.get(BLOBREG_CID) ?? null;
       if (head) heads.set(BLOBREG_CID, head);

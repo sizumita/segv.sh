@@ -18,8 +18,9 @@ import {
 } from "../src/api";
 import type { CheckpointDO } from "../src/ckpt-do";
 import type { ConnDO, RtLimits } from "../src/conn-do";
+import type { BlobRegDO } from "../src/blobreg-do";
 import type { ShardDO } from "../src/shard-do";
-import { connName, shardStub, type ShardPutRow } from "../src/types";
+import { blobRegStub, connName, shardStub, type ShardPutRow } from "../src/types";
 import {
   DIFF2,
   E_FIRST,
@@ -3360,4 +3361,70 @@ describe('paged shards (§9.1 "Paging", §10.4, §10.9)', () => {
       now.mockRestore();
     }
   }, 60_000);
+});
+describe("blob registry shards (§9.2, §10.7)", () => {
+  it("registers and looks a blob up in the shard of its id, and refuses a shard count that moved the id", async () => {
+    const blobKey = P.kblob(P.fromB64u((env as unknown as { ROUTE_KEY: string }).ROUTE_KEY));
+    /** Random content whose id routes to registry shard j under the two shards of the test deployment. */
+    const contentFor = (j: number): { bytes: Bytes; id: Bytes } => {
+      for (;;) {
+        const bytes = bigRandom(64);
+        const id = P.H(bytes);
+        if (P.blobShardOf(blobKey, id, 1) === j) return { bytes, id };
+      }
+    };
+    const upload = async ({ bytes, id }: { bytes: Bytes; id: Bytes }): Promise<string> => {
+      const idB = P.b64u(id);
+      const res = await api(`/api/v2/blob/${idB}`, {
+        method: "PUT",
+        headers: {
+          "content-type": "application/octet-stream",
+          "x-segv-pow": await powHeader("blob", id, { bytes: bytes.length }),
+        },
+        body: bytes,
+      });
+      expect(res.status, await res.clone().text()).toBe(201);
+      return idB;
+    };
+    const c0 = contentFor(0);
+    const c1 = contentFor(1);
+    const id0 = await upload(c0);
+    const id1 = await upload(c1);
+    for (const idB of [id0, id1]) expect((await api(`/api/v2/blob/${idB}/meta`)).status).toBe(200);
+    // Each id sits in its own shard, and the other shard would not even answer for it.
+    expect((await blobRegStub(env, 0).meta(c0.id)).hit).toBe(true);
+    expect((await blobRegStub(env, 1).meta(c1.id)).hit).toBe(true);
+    await runInDurableObject(blobRegStub(env, 0), (inst: BlobRegDO) =>
+      expect(() => inst.meta(c1.id)).toThrow(/another shard/),
+    );
+    await runInDurableObject(blobRegStub(env, 1), (inst: BlobRegDO) =>
+      expect(() => inst.meta(c0.id)).toThrow(/another shard/),
+    );
+    // A deployment whose BLOBREG_SHARDS changed routes id1 to shard 0, which pinned b = 1: 503, never a wrong answer.
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const res = await direct(`/api/v2/blob/${id1}/meta`, {}, { BLOBREG_SHARDS: "1" });
+      expect(res.status).toBe(503);
+      expect(await errorOf(res)).toBe("storage unavailable");
+      const putAgain = await direct(
+        `/api/v2/blob/${id1}`,
+        {
+          method: "PUT",
+          headers: {
+            "content-type": "application/octet-stream",
+            "content-length": String(c1.bytes.length), // handleApi is called directly: nothing sets it for us
+            "x-segv-pow": await powHeader("blob", c1.id, { bytes: c1.bytes.length }),
+          },
+          body: c1.bytes,
+        },
+        { BLOBREG_SHARDS: "1" },
+      );
+      expect(putAgain.status).toBe(503);
+    } finally {
+      errors.mockRestore();
+    }
+    expect((await direct(`/api/v2/blob/${id0}/meta`, {}, { BLOBREG_SHARDS: "1" })).status).toBe(
+      200,
+    ); // still shard 0
+  });
 });

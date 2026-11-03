@@ -5,7 +5,9 @@
  * Object names (the DO derives (E, i) from ctx.id.name, §9):
  *   ShardDO      "shard/v2/{E}/{i}"   (stage 1: i = 0)
  *   InboxDO      "inbox/v2/{E}/{g}"   (stage 1: g = 0)
- *   BlobRegDO    "blobreg/v2"
+ *   BlobRegDO    "blobreg/v2/{j}"     (j = blobShard(id) of the blob id, §4.4; B of them; "blobreg/v2" is the first
+ *                                     release's single registry, read-only, which the shards import from, §9.2)
+ *   DirSeqDO     "dirseq/v2"          (the only writer of the directory, §9.6)
  *   ConnDO       "conn/v2/{c}"        (c = conn(ck) of the client, §4.4; C of them)
  *   FeedDO       "feed/v2/{j}"        (j = feed(T) of the topic, §4.4; F of them)
  *   CheckpointDO "ckpt/v2"
@@ -16,6 +18,7 @@ import type { BellDO } from "./bell-do";
 import type { BlobRegDO } from "./blobreg-do";
 import type { CheckpointDO } from "./ckpt-do";
 import type { ConnDO } from "./conn-do";
+import type { DirSeqDO } from "./dirseq-do";
 import type { FeedDO } from "./feed-do";
 import type { InboxDO } from "./inbox-do";
 import type { QuietDO } from "./quiet-do";
@@ -109,6 +112,16 @@ export interface BlobRegistration {
 /** HIT {t, size} or MISS {now = BlobReg clock in seconds since T0}. */
 export type BlobMeta = { hit: true; t: number; size: number } | { hit: false; now: number };
 
+/** One page of the first release's registry, as a shard imports it (§9.2 "Import"): the rows that route to it. */
+export interface BlobExport {
+  rows: { id: Bytes; size: number; t: number }[];
+  /** the last id scanned (the next page starts after it), or null when the scan is complete */
+  next: Bytes | null;
+  /** the legacy registry's high-water mark and last_t (null when it never wrote them) */
+  hw: number | null;
+  lastT: number | null;
+}
+
 export interface ComponentHead {
   head: Bytes;
   tLast: number;
@@ -144,6 +157,36 @@ export interface RtPublishRow {
   body: Bytes;
 }
 
+// ───────────── DirSeqDO (§9.6) ─────────────
+
+/** A registration as the DirSeqDO writes it: the validated user row and its wrap rows (§10.6). */
+export interface DirUserWrite {
+  kind: "user";
+  uid: string;
+  upre: number;
+  handle: string;
+  hpre: number;
+  bundle: string;
+  sig: string;
+  regEra: number;
+  wraps: DirWrapRow[];
+}
+export interface DirWrapRow {
+  uid: string;
+  id: string;
+  record: string;
+  sig: string;
+}
+/** One wrap record added to a registered uid (§10.6). */
+export interface DirWrapWrite {
+  kind: "wrap";
+  wrap: DirWrapRow;
+}
+export type DirWrite = DirUserWrite | DirWrapWrite;
+
+/** The write landed with these dirlog seqs (the user's first, then its wraps), or it was refused (400 / 409). */
+export type DirWriteResult = { ok: true; seqs: number[] } | { ok: false; status: 400 | 409; error: string };
+
 // ───────────── CheckpointDO (§9.5) ─────────────
 
 export interface CkptRecord {
@@ -170,7 +213,10 @@ const ns = <T extends Rpc.DurableObjectBranded | undefined>(env: Env, name: stri
 
 export const shardName = (E: number, i: number): string => `shard/v2/${E}/${i}`;
 export const inboxName = (E: number, g: number): string => `inbox/v2/${E}/${g}`;
-export const BLOBREG_NAME = "blobreg/v2";
+export const blobRegName = (j: number): string => `blobreg/v2/${j}`;
+/** The first release's single registry: read-only, the source of each shard's import (§9.2). */
+export const BLOBREG_LEGACY_NAME = "blobreg/v2";
+export const DIRSEQ_NAME = "dirseq/v2";
 export const connName = (c: number): string => `conn/v2/${c}`;
 export const feedName = (j: number): string => `feed/v2/${j}`;
 export const CKPT_NAME = "ckpt/v2";
@@ -181,12 +227,24 @@ export const shardStub = (env: Env, E: number, i: number): DurableObjectStub<Sha
   ns<ShardDO>(env, "SHARD").getByName(shardName(E, i));
 export const inboxStub = (env: Env, E: number, g: number): DurableObjectStub<InboxDO> =>
   ns<InboxDO>(env, "INBOX").getByName(inboxName(E, g));
-export const blobRegStub = (env: Env): DurableObjectStub<BlobRegDO> => ns<BlobRegDO>(env, "BLOBREG").getByName(BLOBREG_NAME);
+export const blobRegStub = (env: Env, j: number): DurableObjectStub<BlobRegDO> =>
+  ns<BlobRegDO>(env, "BLOBREG").getByName(blobRegName(j));
+export const blobRegLegacyStub = (env: Env): DurableObjectStub<BlobRegDO> =>
+  ns<BlobRegDO>(env, "BLOBREG").getByName(BLOBREG_LEGACY_NAME);
+export const dirSeqStub = (env: Env): DurableObjectStub<DirSeqDO> => ns<DirSeqDO>(env, "DIRSEQ").getByName(DIRSEQ_NAME);
 export const connStub = (env: Env, c: number): DurableObjectStub<ConnDO> => ns<ConnDO>(env, "CONN").getByName(connName(c));
 export const feedStub = (env: Env, j: number): DurableObjectStub<FeedDO> => ns<FeedDO>(env, "FEED").getByName(feedName(j));
 export const ckptStub = (env: Env): DurableObjectStub<CheckpointDO> => ns<CheckpointDO>(env, "CKPT").getByName(CKPT_NAME);
 export const bellStub = (env: Env, j: number): DurableObjectStub<BellDO> => ns<BellDO>(env, "BELL").getByName(bellName(j));
 export const quietStub = (env: Env, k: number): DurableObjectStub<QuietDO> => ns<QuietDO>(env, "QUIET").getByName(quietName(k));
+
+/** Parses "blobreg/v2/{j}" (decimal, no padding, j ≤ 4095) to j, and the legacy "blobreg/v2" to null (§9.2). */
+export function parseBlobRegName(name: string | undefined): number | null {
+  if (name === BLOBREG_LEGACY_NAME) return null;
+  const m = name ? /^blobreg\/v2\/(0|[1-9]\d{0,3})$/.exec(name) : null;
+  if (!m || Number(m[1]) > 4095) throw new Error("blobreg DO: unexpected name");
+  return Number(m[1]);
+}
 
 /** Parses "conn/v2/{c}" / "feed/v2/{j}" / "bell/v2/{j}" / "quiet/v2/{k}" (decimal, no padding, below 2^31). */
 export function parseIndexName(name: string | undefined, kind: "conn" | "feed" | "bell" | "quiet"): number {

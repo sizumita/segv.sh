@@ -18,6 +18,7 @@ import render from "./entry.ssr";
 export {
   ShardDO,
   BlobRegDO,
+  DirSeqDO,
   InboxDO,
   ConnDO,
   FeedDO,

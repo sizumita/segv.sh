@@ -9,19 +9,14 @@
  * the fields to merge into the error JSON: the HTTP layer answers `{error: e.message, ...e.extra}`, i.e.
  * `{error, p: P}` (§10.6).
  *
- * D1 is authoritative: there is no outbox and no log fallback. Every write is one atomic D1 `batch()` that
- * appends to the hash-chained `dirlog` with explicit, contiguous seqs (optimistic concurrency: a concurrent
- * writer makes the `dirlog.seq` insert fail, and the write is retried on the new head).
+ * D1 is authoritative: there is no outbox and no log fallback. Every write goes through the DirSeqDO (dirseq-do.ts),
+ * the only writer, which appends to the hash-chained `dirlog` with contiguous seqs in one atomic D1 `batch()` per
+ * round of writes; reads go to D1 from here.
  */
 import {
-  DIRLOG_USER,
-  DIRLOG_WRAP,
   MAX_ID_LEN,
   ZERO32,
   checkUserKeys,
-  dirlogH,
-  dirlogRefUser,
-  dirlogRefWrap,
   era,
   fromB64u,
   hpre,
@@ -33,6 +28,7 @@ import {
 } from "@segv/protocol/proto";
 import { b64Len, dec64, enc64 } from "./b64";
 import { HttpError, exactKeys, logErr } from "./http";
+import { dirSeqStub, type DirWrite, type DirWriteResult } from "./types";
 import { checkBundleShape, checkRecordShape, verifyBundleSig, verifyRecordSig } from "./validate";
 
 export interface DirUser {
@@ -70,8 +66,6 @@ export const MAX_WRAPS_PER_ID = 64;
 export const PREFIX_PAGE = 256;
 /** Largest dirlog page (§10.6). */
 export const DIRLOG_PAGE_MAX = 1000;
-/** Optimistic write attempts before 503 (§9.6). */
-export const WRITE_ATTEMPTS = 16;
 /** currentP() cache lifetime per isolate. */
 export const P_CACHE_MS = 60_000;
 /** After a failed dirmeta read, currentP() serves the last good P (0 if none) without asking D1 for this long. */
@@ -124,69 +118,30 @@ export function uniqueFailure(e: unknown): string | null {
   return null;
 }
 
-const CONFLICTS: Readonly<Record<string, string>> = {
+/** The 409 of each UNIQUE key a directory write can hit (§9.6); the DirSeqDO maps D1's failures through it. */
+export const CONFLICTS: Readonly<Record<string, string>> = {
   "user.handle": "handle already taken",
   "user.uid": "uid already registered",
   "wrap.uid": "duplicate wrap record",
   "wrap.id": "duplicate wrap record",
 };
 
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-
-const HEAD_SQL = "SELECT seq, h FROM dirlog ORDER BY seq DESC LIMIT 1";
-const DIRLOG_INSERT_SQL = "INSERT INTO dirlog (seq, kind, ref, h) VALUES (?1, ?2, ?3, ?4)";
-
-interface Entry {
-  kind: number;
-  ref: Uint8Array;
-}
-
-interface AppendOpts {
-  /** Statements that need the seqs: the user / wrap inserts (dirseq = their dirlog seq). */
-  rows: (seqs: number[]) => D1PreparedStatement[];
-  /** Statements run after the dirlog inserts in the same batch (the dirmeta increment). */
-  tail?: () => D1PreparedStatement[];
-  /** Reads taken in the same snapshot as the head, checked by `check` before writing. */
-  reads?: () => D1PreparedStatement[];
-  check?: (results: D1Result[]) => void;
-}
+export const HEAD_SQL = "SELECT seq, h FROM dirlog ORDER BY seq DESC LIMIT 1";
 
 /**
- * §9.6 writes: read the head, chain `entries` after it, and run one atomic batch (rows, dirlog inserts with
- * explicit seqs, tail). Seqs stay contiguous: a committed batch always takes head + 1, so a writer that read
- * an older head fails on the `dirlog.seq` UNIQUE key; it then waits 5–50 ms × attempt and retries on the new
- * head (16 attempts, then 503). For the same reason, `reads` taken together with the head are still current
- * when the batch commits. Other UNIQUE failures are 409; anything else is 503.
+ * §9.6 writes: the DirSeqDO appends the write to the dirlog in one atomic D1 batch (with every other write of its
+ * round). A refusal (400 over the wrap cap, 409 on a taken handle, uid or wrap) comes back as a result; a failure of
+ * the object or of D1 is 503 "directory unavailable".
  */
-async function appendDir(env: Env, entries: Entry[], opts: AppendOpts): Promise<number[]> {
-  const db = env.DB;
-  for (let attempt = 1; ; attempt++) {
-    const [headRes, ...reads] = await d1("head read", () =>
-      db.batch([db.prepare(HEAD_SQL), ...(opts.reads?.() ?? [])]),
-    );
-    opts.check?.(reads);
-    const head = (headRes.results as { seq: number; h: string }[])[0];
-    const base = head?.seq ?? 0;
-    let prev = head ? dec64(head.h) : ZERO32;
-    const seqs = entries.map((_, i) => base + 1 + i);
-    const hs = entries.map((en, i) => (prev = dirlogH(prev, seqs[i], en.kind, en.ref)));
-    try {
-      const log = entries.map((en, i) =>
-        db.prepare(DIRLOG_INSERT_SQL).bind(seqs[i], en.kind, enc64(en.ref), enc64(hs[i])),
-      );
-      await db.batch([...opts.rows(seqs), ...log, ...(opts.tail?.() ?? [])]);
-      return seqs;
-    } catch (e) {
-      const col = uniqueFailure(e);
-      if (col === "dirlog.seq") {
-        if (attempt >= WRITE_ATTEMPTS) throw unavailable(`write (${WRITE_ATTEMPTS} attempts)`, e);
-        await sleep((5 + Math.random() * 45) * attempt);
-        continue;
-      }
-      if (col !== null && CONFLICTS[col]) throw new HttpError(409, CONFLICTS[col]);
-      throw unavailable("write", e);
-    }
+async function dirWrite(env: Env, write: DirWrite): Promise<number[]> {
+  let r: DirWriteResult;
+  try {
+    r = (await dirSeqStub(env).append(write)) as DirWriteResult;
+  } catch (e) {
+    throw unavailable("write", e);
   }
+  if (!r.ok) throw new HttpError(r.status, r.error);
+  return r.seqs;
 }
 
 // ───────────── parameter checks ─────────────
@@ -219,13 +174,6 @@ function checkWrapId(id: unknown): string {
 }
 
 // ───────────── writes ─────────────
-
-const USER_INSERT_SQL =
-  "INSERT INTO user (uid, upre, handle, hpre, bundle, sig, reg_era, dirseq) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
-const WRAP_INSERT_SQL = "INSERT INTO wrap (uid, id, record, sig, dirseq) VALUES (?1, ?2, ?3, ?4, ?5)";
-const USERS_INC_SQL = "UPDATE dirmeta SET v = v + 1 WHERE k = 'users'";
-
-const wrapEntry = (r: WrapRecord): Entry => ({ kind: DIRLOG_WRAP, ref: dirlogRefWrap(r.record, fromB64u(r.sig)) });
 
 /**
  * POST /api/v2/register: body `{bundle, sig, wraps: [{record, sig}, …1..4]}` (§10.6). Checks the canonical
@@ -263,29 +211,24 @@ export async function dirRegister(env: Env, body: Record<string, unknown>, nowMs
     throw new HttpError(400, `invalid bundle (${e instanceof Error ? e.message : "unusable keys"})`);
   }
 
-  const regEra = era(nowMs);
-  const uidHash = upre(fromB64u(user.uid));
-  const handleHash = hpre(user.handle);
-  const db = env.DB;
-  const entries: Entry[] = [
-    { kind: DIRLOG_USER, ref: dirlogRefUser(user.bundle, fromB64u(user.bundleSig)) },
-    ...records.map(wrapEntry),
-  ];
-  const seqs = await appendDir(env, entries, {
-    rows: (s) => [
-      db
-        .prepare(USER_INSERT_SQL)
-        .bind(user.uid, uidHash, user.handle, handleHash, user.bundle, user.bundleSig, regEra, s[0]),
-      ...records.map((r, i) => db.prepare(WRAP_INSERT_SQL).bind(r.uid, enc64(r.id), r.record, r.sig, s[1 + i])),
-    ],
-    tail: () => [db.prepare(USERS_INC_SQL)],
+  const seqs = await dirWrite(env, {
+    kind: "user",
+    uid: user.uid,
+    upre: upre(fromB64u(user.uid)),
+    handle: user.handle,
+    hpre: hpre(user.handle),
+    bundle: user.bundle,
+    sig: user.bundleSig,
+    regEra: era(nowMs),
+    wraps: records.map((r) => ({ uid: r.uid, id: enc64(r.id), record: r.record, sig: r.sig })),
   });
   return { dirseq: seqs[0] };
 }
 
 /**
  * POST /api/v2/wraps: body `{record, sig}` (§10.6). 404 for an unknown uid, 400 for a bad signature or more
- * than 64 wraps for the uid, 409 for a duplicate (uid, id). Returns the record's dirseq.
+ * than 64 wraps for the uid (the DirSeqDO counts them, §9.6), 409 for a duplicate (uid, id). Returns the record's
+ * dirseq.
  */
 export async function dirAddWrap(env: Env, body: Record<string, unknown>): Promise<{ dirseq: number }> {
   const o = exactKeys(body, ["record", "sig"], "wrap");
@@ -298,14 +241,7 @@ export async function dirAddWrap(env: Env, body: Record<string, unknown>): Promi
   const owner = parseBundle(row.bundle, row.sig); // validated at registration
   if (!(await verifyRecordSig(rec, owner.sigPk))) throw new HttpError(400, "bad wrap signature");
 
-  const seqs = await appendDir(env, [wrapEntry(rec)], {
-    reads: () => [db.prepare("SELECT count(*) AS n FROM wrap WHERE uid = ?1").bind(rec.uid)],
-    check: ([count]) => {
-      const n = (count.results as { n: number }[])[0]?.n ?? 0;
-      if (n >= MAX_WRAPS_PER_UID) throw new HttpError(400, `too many wraps (at most ${MAX_WRAPS_PER_UID} per uid)`);
-    },
-    rows: (s) => [db.prepare(WRAP_INSERT_SQL).bind(rec.uid, enc64(rec.id), rec.record, rec.sig, s[0])],
-  });
+  const seqs = await dirWrite(env, { kind: "wrap", wrap: { uid: rec.uid, id: enc64(rec.id), record: rec.record, sig: rec.sig } });
   return { dirseq: seqs[0] };
 }
 

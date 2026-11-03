@@ -27,6 +27,15 @@ const freshEras = (): [number, number] => {
 };
 const ck = () => ckptStub(env);
 const SRV_PK = P.sigPub(P.fromB64u((env as unknown as { SRV_KEY: string }).SRV_KEY));
+const BLOB_KEY = P.kblob(P.fromB64u((env as unknown as { ROUTE_KEY: string }).ROUTE_KEY));
+/** A random blob id that routes to registry shard j under the two shards of ../wrangler.test.jsonc (§4.4). */
+function blobIdFor(j: number): Uint8Array {
+  for (;;) {
+    const id = P.random(32);
+    if (P.blobShardOf(BLOB_KEY, id, 1) === j) return id;
+  }
+}
+const hourOf = (ms: number): number => Math.floor(ms / 3_600_000);
 
 type CkInternals = {
   clock: () => number;
@@ -331,39 +340,53 @@ describe("CheckpointDO", () => {
     expect(r3.sec).toBe(P.secOf(base + 60_000));
   });
 
-  it("takes the blob registry head at most once per UTC hour", async () => {
+  it("takes the blob registry once per UTC hour: one value over every shard's head that changes every hour", async () => {
     const [, F] = freshEras();
     const h0 = P.eraStart(F); // eras start on a whole UTC hour
     expect(h0 % 3_600_000).toBe(0);
+    const shard0 = blobRegStub(env, 0);
     const blobClock = (ms: number) =>
-      runInDurableObject(blobRegStub(env), (inst: BlobRegDO) => {
+      runInDurableObject(shard0, (inst: BlobRegDO) => {
         (inst as unknown as { clock: () => number }).clock = () => ms;
       });
+    /** The §9.5 value of the hour of `ms` over the two shards' current heads. */
+    const expected = async (ms: number): Promise<Uint8Array> =>
+      P.blobregAll(hourOf(ms), [
+        (await shard0.head()).head,
+        (await blobRegStub(env, 1).head()).head,
+      ]);
     await blobClock(h0);
     await ckClock(h0 + 30_000);
     const first = await tick();
     const b0 = headOf(first, P.BLOBREG_CID)!;
-    expect(b0).toEqual((await blobRegStub(env).head()).head);
+    expect(b0).toEqual(await expected(h0 + 30_000));
 
     const seen = new Set<string>([P.b64u(b0)]);
     for (const m of [1, 2, 3, 4, 5, 30, 58, 59]) {
       await blobClock(h0 + m * 60_000);
-      expect((await blobRegStub(env).register(P.random(32), 100)).created).toBe(true); // closes last minute's batch
+      expect((await shard0.register(blobIdFor(0), 100)).created).toBe(true); // closes last minute's batch
       await ckClock(h0 + m * 60_000 + 30_000);
       const r = await tick();
       expect(headOf(r, P.BLOBREG_CID)).toEqual(b0);
       seen.add(P.b64u(headOf(r, P.BLOBREG_CID)!));
     }
-    const moved = (await blobRegStub(env).head()).head;
-    expect(moved).not.toEqual(b0); // the registry did change during the hour
+    expect((await shard0.head()).head).not.toEqual(P.ZERO32); // the registry did change during the hour
 
-    await ckClock(h0 + 3_600_000 + 30_000);
+    const t1 = h0 + 3_600_000 + 30_000;
+    await ckClock(t1);
     const next = await tick();
-    expect(headOf(next, P.BLOBREG_CID)).toEqual(moved);
+    expect(headOf(next, P.BLOBREG_CID)).toEqual(await expected(t1));
     seen.add(P.b64u(headOf(next, P.BLOBREG_CID)!));
     expect(seen.size).toBe(2);
-    await ckClock(h0 + 3_600_000 + 90_000);
-    expect(headOf(await tick(), P.BLOBREG_CID)).toEqual(moved);
+    await ckClock(t1 + 60_000);
+    expect(headOf(await tick(), P.BLOBREG_CID)).toEqual(headOf(next, P.BLOBREG_CID));
+    // An hour in which nothing was registered still changes the value: the hour is mixed in.
+    const t2 = h0 + 2 * 3_600_000 + 30_000;
+    await ckClock(t2);
+    const third = await tick();
+    expect(headOf(third, P.BLOBREG_CID)).toEqual(await expected(t2));
+    seen.add(P.b64u(headOf(third, P.BLOBREG_CID)!));
+    expect(seen.size).toBe(3);
   });
 
   it("logs a shard above 2 GiB", async () => {

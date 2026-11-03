@@ -2599,3 +2599,29 @@ describe("sealed shards (§9.1 \"Paging\")", () => {
     expect(f[17]).toEqual(P.H(sha(4)));
   });
 });
+describe("blob registry routing and the hourly value (§4.4, §9.2, §9.5)", () => {
+  const ROUTE_KEY = seqBytes(32, 0xb0);
+
+  it("kblob and blobShard follow the spec", () => {
+    const k = P.kblob(ROUTE_KEY);
+    expect(toHex(k)).toBe(toHex(hmacN(ROUTE_KEY, new TextEncoder().encode("segv.sh/v2/blob"))));
+    const id = seqBytes(32, 0x10);
+    const h = hmacN(k, id);
+    const top = ((h[0] << 24) | (h[1] << 16) | (h[2] << 8) | h[3]) >>> 0;
+    expect(P.blobShardOf(k, id, 0)).toBe(0);
+    for (const b of [1, 3, 6, 12]) expect(P.blobShardOf(k, id, b)).toBe(top >>> (32 - b));
+    expect(() => P.blobShardOf(k, id, 13)).toThrow();
+    expect(() => P.blobShardOf(k, new Uint8Array(31), 1)).toThrow();
+    expect(() => P.kblob(new Uint8Array(31))).toThrow();
+  });
+
+  it("blobregAll mixes the hour into the shards' heads", () => {
+    const heads = [seqBytes(32, 1), seqBytes(32, 2)];
+    const v = P.blobregAll(500_000, heads);
+    expect(toHex(v)).toBe(toHex(sha(refEnc("segv.sh/v2/blobreg/all", be32(500_000), heads[0], heads[1]))));
+    expect(toHex(P.blobregAll(500_001, heads))).not.toBe(toHex(v));
+    expect(toHex(P.blobregAll(500_000, [heads[1], heads[0]]))).not.toBe(toHex(v));
+    expect(P.blobRegCid(3)).toBe("blobreg/3");
+    expect(P.BLOBREG_CID).toBe("blobreg");
+  });
+});

@@ -54,7 +54,9 @@ texts.
   - `S_E` **ShardDOs** per era, a power of two the deployment sets per era (`SHARD_MAP`, §9.1; 1 until it is
     raised);
   - one **InboxDO** per era;
-  - one **BlobRegDO**, which registers R2 blobs and their registration time;
+  - `B` **BlobRegDOs** (`BLOBREG_SHARDS`, a power of two fixed for the deployment, §9.2), which register R2 blobs
+    and their registration time, each for the blob ids routed to it;
+  - one **DirSeqDO**, the only writer of the directory (§9.6);
   - `C` **ConnDOs**, which hold the WebSocket connections, and `F` **FeedDOs**, which keep which ConnDOs' sockets
     subscribed to each topic and forward published rows to them (`C` and `F` are deployment parameters, §9.4);
   - one **CheckpointDO**, which signs the heads of the public data every 60 s;
@@ -657,6 +659,8 @@ conn(ck) = u32(tag(ck)[0..4]) mod C                                       the cl
 kfeed = HMAC(ROUTE_KEY, utf8("segv.sh/v2/feed"))
 h(T) = HMAC(kfeed, T)[0..8]                                               the feed hash of topic T
 feed(T) = u64(h(T)) >> (64 − f)                                           the topic's FeedDO "feed/v2/{j}", F = 2^f (f = 0 ⇒ j = 0)
+kblob = HMAC(ROUTE_KEY, utf8("segv.sh/v2/blob"))
+blobShard(id) = u32(HMAC(kblob, id)[0..4]) >> (32 − b)                   the blob id's BlobRegDO "blobreg/v2/{j}", B = 2^b (b = 0 ⇒ j = 0)
 ```
 
 ## 5. Descriptors, joins and key bundles
@@ -1929,8 +1933,9 @@ as `(id, size, t_reg)`, where `t_reg = tpub(BlobReg clock at the first registrat
   it.
 - **Who can see it.** `t_reg` and `size` are readable by anyone who knows the id (`GET …/meta`). There is no
   enumeration API in stage 1, so P cannot list blob ids: they appear only inside encrypted rows and inside key bundles
-  that are referenced by encrypted claims. The registry's head enters the public checkpoints at most once per hour
-  (§9.5), so P learns at most, per hour, whether any blob (image, file, snapshot or bundle) was registered.
+  that are referenced by encrypted claims. The registry enters the public checkpoints as one value per hour that
+  changes every hour whether or not anything was registered (§9.5), so the checkpoints tell P nothing about
+  registrations.
 - **Same mechanism for every blob.** SGB2 bundles, snapshots, images and files all use it. Only SGB2 bundles rely on
   `t_reg` (§6.4(g)).
 
@@ -1991,7 +1996,7 @@ head'       = H(enc("segv.sh/v2/head", cid, head, u32 t, u32 n, root))         h
 | --------- | --- |
 | shard | `"shard/{E}/{i}"` |
 | inbox | `"inbox/{E}/{g}"` |
-| blob registry | `"blobreg"` |
+| blob registry | `"blobreg/{j}"` (shard j, §9.2); `"blobreg"` is the hourly value over every shard in the checkpoint list (§9.5) |
 | directory log | `"dirlog"` (a separate chain, §9.6) |
 
 In every cid, numbers are decimal without padding.
@@ -2180,16 +2185,35 @@ that (§13.2 item 13), set before the era starts. The CheckpointDO logs (§9.7) 
 cue to raise the count for the next era ("Shard map" above). Paging keeps the objects' storage to about two eras of
 rows.
 
-### 9.2 BlobRegDO (`blobreg/v2`, SQLite, one instance)
+### 9.2 BlobRegDO (`blobreg/v2/{j}`, SQLite; B shards, 0 ≤ j < B)
 
 ```sql
 CREATE TABLE meta  (k TEXT PRIMARY KEY, v BLOB NOT NULL) WITHOUT ROWID;   -- 'last_t', 'open_t', 'closed_t', 'head', 'hw',
                                                                           -- 'delta' (u16 Δ, pinned by the first write:
-                                                                          -- a registration or a 'hw' raise; §3.1)
+                                                                          -- a registration or a 'hw' raise; §3.1),
+                                                                          -- 'bbits' (u8 b, pinned by the same write or the
+                                                                          -- import), 'imported' (the import ran; below)
 CREATE TABLE blob  (id BLOB PRIMARY KEY CHECK (length(id) = 32), size INTEGER NOT NULL, t INTEGER NOT NULL) WITHOUT ROWID;
 CREATE INDEX blob_t ON blob (t);
 CREATE TABLE batch (t INTEGER PRIMARY KEY, n INTEGER NOT NULL, root BLOB NOT NULL, head BLOB NOT NULL);
 ```
+
+**Shards.** A blob id is registered and looked up in shard `j = blobShard(id)` (§4.4: a keyed hash, so nobody can
+aim ids at one shard, and the same id always meets the same `hw`, which is what §6.4(g) needs). `B = 2^b` is the
+deployment variable `BLOBREG_SHARDS`, a power of two in 1..4096 (default 1; §3.1: a present but malformed value is a
+misconfiguration). It is a constant of the deployment: it MUST NOT change once any shard holds a registration, since
+ids would route to another shard, whose MISS would then contradict a registration. As a tripwire, the first write of
+a shard (a registration, a `hw` raise, or the import below) pins `b` in `meta 'bbits'`, and a `register` or `meta` of
+an id whose `blobShard(id)` under the pinned `b` is not this shard's `j` throws: the Worker answers 503
+`storage unavailable` (§10.7) instead of registering or missing the id in the wrong place.
+
+**Import.** `blobreg/v2`, the single registry of the first release, is read-only from this version on, and keeps its
+rows, batches and head (its chain is final; its head stands in the checkpoints made before the change). A shard that
+runs for the first time (no `imported`) copies, before it answers anything, the rows of `blobreg/v2` whose
+`blobShard(id)` is its `j` (`exportShard(j, b, after, limit)`, which the legacy object alone answers: the rows in id
+order after `after`, their `t` unchanged, with its `hw` and `last_t`), raises its own `hw` and `last_t` to the legacy
+values, pins `b`, and persists `imported`. Imported rows keep their `t` and join no batch of the shard: the legacy
+chain committed them. A deployment that never had the first release imports an empty page.
 
 **`register(id, size)`** returns `{t, size, created}`:
 
@@ -2202,7 +2226,8 @@ high-water mark: if `⌊sec(now)/Δ⌋ > ⌊hw/Δ⌋`, persist `hw = sec(now)`. 
 that every later registration gets `t ≥ tpub(every now ever reported)`, even if the clock steps back, which is what
 makes §6.4(g) final.
 
-**Batches.** Each leaf is `leaf(enc("segv.sh/v2/leaf/blob", H(id), u32 size, u32 t))`, ordered by `H(id)`.
+**Batches.** Each leaf is `leaf(enc("segv.sh/v2/leaf/blob", H(id), u32 size, u32 t))`, ordered by `H(id)`, under the
+shard's cid `blobreg/{j}`.
 
 **`head()`** works as for the shard. There is no enumeration RPC.
 
@@ -2439,7 +2464,8 @@ stays near 1 000 000 or below.
 ```sql
 CREATE TABLE cp   (q INTEGER PRIMARY KEY, sec INTEGER NOT NULL, hd BLOB NOT NULL, heads BLOB NOT NULL,
                    C BLOB NOT NULL, sig BLOB NOT NULL);
-CREATE TABLE meta (k TEXT PRIMARY KEY, v BLOB NOT NULL) WITHOUT ROWID;   -- 'final:<cid>', 'blobreg:hour', 'blobreg:head'
+CREATE TABLE meta (k TEXT PRIMARY KEY, v BLOB NOT NULL) WITHOUT ROWID;   -- 'final:<cid>', 'blobreg:hour', 'blobreg:head',
+                                                                        -- 'blobreg:head:<j>', 'page:hour', 'page:era', 'paged:<E>'
 ```
 
 An alarm runs every 60 s and is re-armed in the same commit. When no alarm is set, the constructor (inside
@@ -2457,12 +2483,20 @@ Worker calls the DO's `ensure()` at most once per isolate (a module-level flag),
     same transaction as that checkpoint (alone when `hd` is unchanged) and the cid is no longer collected. Eras before
     `E_now − 1` are never collected: if no checkpoint succeeds between `end(E) + SKEW·1000` and `end(E+1)`, era E's
     final head never appears (accepted in stage 1);
-  - `blobreg`, **at most once per hour**: with `hour = ⌊now / 3 600 000⌋` (Unix ms, so UTC hours), the first alarm
-    whose `hour` exceeds the stored `blobreg:hour` reads the registry head; on success it persists
-    `blobreg:hour = hour` and `blobreg:head` in the same transaction as the checkpoint (alone when `hd` is unchanged).
-    A failed read changes nothing, so the next alarm retries within the same hour. Every other checkpoint reuses
-    `blobreg:head` (before any successful read, the previous checkpoint's head, else blobreg is left out). P therefore
-    learns at most, per hour, whether any blob was registered;
+  - `blobreg`, **once per hour**: with `hour = ⌊now / 3 600 000⌋` (Unix ms, so UTC hours), the first alarm whose
+    `hour` exceeds the stored `blobreg:hour` reads `head()` of every registry shard `j < B` (§9.2; at most 32 calls in
+    flight) and persists, in the same transaction as the checkpoint (alone when `hd` is unchanged),
+    `blobreg:hour = hour`, each head that answered as `blobreg:head:<j>`, and the item
+
+    ```
+    blobreg = H(enc("segv.sh/v2/blobreg/all", u32 hour, head_0, …, head_{B−1}))
+    ```
+
+    where a shard that did not answer keeps its `blobreg:head:<j>` (ZERO32 if it never answered: an empty shard's
+    head). Every other checkpoint reuses `blobreg:head` (before the first hour's value, the previous checkpoint's,
+    else blobreg is left out). The hour is mixed in so that the value changes every hour whether or not anything was
+    registered: P learns nothing about registrations from the checkpoints. The per-shard heads are kept for a later
+    stage's mirror feed (§14), not published;
   - `dirlog`, read from D1 (`SELECT seq, h FROM dirlog ORDER BY seq DESC LIMIT 1`), or ZERO32 while the dirlog is
     empty (a table that does not exist yet counts as empty); any other D1 error is a failure.
 - Each component call has 10 s to answer, and at most 32 calls are in flight at a time. A component that fails (an
@@ -2536,19 +2570,23 @@ h_seq    = H(enc("segv.sh/v2/dirlog", h_{seq−1}, u64 seq, u8 kind, ref))      
 
 Each `ref` and `h` is stored as b64u text, and `dirseq` = the dirlog `seq` of the row.
 
-**Writes.**
+**Writes: the DirSeqDO (`dirseq/v2`, one instance, no storage).** The Worker validates a registration or a wrap
+record (§10.6) and hands it to the DirSeqDO, the only writer of the directory:
 
-1. Read the dirlog head.
-2. Compute the new entries.
-3. Run one D1 `batch()`, which is atomic: `INSERT user`, `INSERT wrap…`, `INSERT dirlog…` with explicit seqs, and, for
-   a registration, `UPDATE dirmeta SET v = v + 1 WHERE k = 'users'`.
-4. Handle failures:
-   - a `UNIQUE` failure on `dirlog.seq` (a concurrent writer) means: wait a random 5–50 ms times the attempt number,
-     re-read the head and retry, up to 16 attempts, then answer 503;
-   - a failure on `user.handle` or `user.uid` means 409;
-   - a failure on `wrap (uid, id)` means 409.
+1. It keeps the dirlog head in memory, read from D1 when it starts and again after any failed write.
+2. For every write that arrived since the previous batch started (a burst is a few batches, with no fixed wait), it
+   first counts, for each wrap write, the uid's wrap records (a D1 read: there is no other writer, so the count holds
+   until the batch commits) and refuses the writes that would exceed 64 (400); then it assigns the next contiguous
+   seqs, computes `h`, and runs one atomic D1 `batch()`: `INSERT user`, `INSERT wrap…`, `INSERT dirlog…` with explicit
+   seqs, and, for a registration, `UPDATE dirmeta SET v = v + 1 WHERE k = 'users'`, for all of them.
+3. Failures:
+   - a `UNIQUE` failure on `user.handle`, `user.uid` or `wrap (uid, id)` with several writes in the batch means that
+     nothing was written: each write is retried alone, so the conflicting one answers 409 and the others land;
+   - a `UNIQUE` failure on `dirlog.seq` (another writer: only a Worker of the previous release, during a deploy) makes
+     it re-read the head and retry the batch once, then answer 503 for the batch;
+   - any other failure answers 503 for the batch's writes, and the head is re-read before the next one.
 
-At most 64 wraps per uid (400 beyond that). D1 is authoritative: there is no outbox and no log fallback. If D1 is
+D1 is authoritative: there is no outbox and no log fallback, and reads go to D1 from the Worker. If D1 is
 unavailable, directory writes and directory reads (register, wraps, prefix, uid and wraps lookups, dirlog) answer 503
 `{error: "directory unavailable"}`. The one exception is `p` in `/api/v2/params` (§10.9), which MUST NOT fail or wait
 because of D1. `users` (and so `P`) is read from `dirmeta` and cached per isolate for at most 60 s while D1 answers.
@@ -3313,6 +3351,8 @@ value out of range → 400. While the dirlog is empty, `head` is `{"seq": 0, "h"
 
 - The Worker checks, in this order (§10.1): the rate limit; Content-Length (411 without it, 400 when malformed, 413
   over 12 MiB, 400 below 41 bytes); the PoW, priced by the declared Content-Length.
+- The registry of the id is shard `blobShard(id)` (§4.4, §9.2); every BlobReg call below goes to it, and a call that
+  throws (the shard found the id routed elsewhere: `BLOBREG_SHARDS` changed) is 503 `storage unavailable`.
 - If BlobReg already has the id, respond `201 {"id", "size", "t"}` with the registered values, without reading the
   body (the Worker cancels it).
 - Otherwise, if R2 already holds `b/{id}` with a stored SHA-256 equal to the id (an earlier upload was stored but never
@@ -4039,7 +4079,7 @@ keys (8 `get` requests) plus at most 4 800 history rows (about 1.4 MB at class 0
 and no `blob/meta` request when no epoch changed since HEADS, no request has moved past its root epoch (its later epochs
 are re-derived on every restore, above), a TREG, REQUEST or EPOCH_PENDING names every copy's bundle, and every copy that
 has ended has its ENDED record, as from the first snapshot written after the upgrade on (before it, one per copy joined
-by an earlier version, up to 100 here, all to the single BlobRegDO, on each restore until that snapshot, normally only
+by an earlier version, up to 100 here, each to its id's registry shard, on each restore until that snapshot, normally only
 the first one, whose step 10 writes it). With ENDED records an ended copy costs its lanes' probe keys, and one claim row
 when its history is loaded; a copy that ended before the upgrade from the first release costs the claim once more, on
 each restore until a HEADS row or snapshot holds its ENDED record, normally only the first.
@@ -4851,7 +4891,7 @@ Stage 1 defines no client UI for them.
 
 ### 12.6 Not detected in stage 1 (see §13.2)
 
-The checkpoint chain commits to shard batch heads, inbox slots, blob registrations (hourly) and the directory log. But
+The checkpoint chain commits to shard batch heads, inbox slots, the registry's hourly value and the directory log. But
 clients verify **no inclusion proofs**, so:
 
 - O can omit rows from some clients;
@@ -4882,7 +4922,7 @@ are kept. Critical warnings are kept until sign-out.
 | user ↔ user | None. Global inbox counts per slot are public. | The whole social graph, including a p-bit prefix of every handle and co-member lookup (§13.2 item 10). | Co-members only. | — |
 | activity of a user | Directory events (registration, wrap additions); the size of the global inbox; self rows (one after each own creation, commit, join or leave, and at most one HEADS row per 30 minutes while active), which P cannot tell from other rows except by timing. Per-user send volume is not visible. | Per-IP read and write volume and times; online time; topic sets; with a `message` preview, when each such device receives a push, also while the app is closed (§13.4); from sync notes, when a device of the account changes its read state or a setting (§13.4). | Send times in shared conversations. | When each of its devices that turned notifications on is notified (§11.13), and when a native device that takes notes gets a quiet push, that is, when another device of its account changed its read state. |
 | activity of a conversation | Not directly: rows have uniform labels. | Exact per-topic volume and times. | Everything. After removal: only that a claim happened, its `rm` bits and its cuts; with push, also, through the old bells, when messages are sent in the new epoch and which of the members silent there sends them, until they all post there or the epoch changes again (§13.4). | — |
-| membership changes and creations | Both show the same row pattern: a class-1 self row, one class-1 row at least Δ+SKEW later (claim or decoy, which P cannot tell from a medium text), then J deliveries and one class-1 self row (DELIVERED, padded for any number of recipients, §6.12); at most hourly, that some blob was registered. Members who receive J by inbox add that many inbox rows within seconds, while a removal or rotation adds none, so P can tell "someone was invited by inbox" from "nobody was" (§13.2 item 12). Not the member count, not who. No self rows follow a claim observed by other members, and a freeze writes nothing. | Which IPs fetch the bundle blob, so the members. | The members of e+1 see D′. Every member of e, removed ones included, sees `rm` (who of the old members was dropped). | — |
+| membership changes and creations | Both show the same row pattern: a class-1 self row, one class-1 row at least Δ+SKEW later (claim or decoy, which P cannot tell from a medium text), then J deliveries and one class-1 self row (DELIVERED, padded for any number of recipients, §6.12). Members who receive J by inbox add that many inbox rows within seconds, while a removal or rotation adds none, so P can tell "someone was invited by inbox" from "nobody was" (§13.2 item 12). Not the member count, not who. No self rows follow a claim observed by other members, and a freeze writes nothing. | Which IPs fetch the bundle blob, so the members. | The members of e+1 see D′. Every member of e, removed ones included, sees `rm` (who of the old members was dropped). | — |
 | content | The size class only (a reaction is a class-0 row, like a short text). Safe against a quantum P. | Same, plus blob uploads and fetches per IP with the blob's padded length (§3.2), which bounds the size of the image or file in it (fetches: image recipients, and the members who save a file, §8.3); with push, which puts are texts, images or files, since a ring follows them (§13.4). | Everything in epochs held. | Nothing: every push has the same length and fixed text, and the bells in it are encrypted to the device (§9.8). |
 | directory | handle ↔ uid ↔ keys, registration time, every wrap (credential ids, recovery ids). | The same, plus a p-bit prefix of every lookup, and the exact wrap id and own uid at every login. | — | — |
 | device ↔ notifications (§9.8, §11.13) | None: push data is not public. | At each `push/sub`: the IP ↔ the endpoint ↔ its bells. Stored: the endpoint ↔ keyed hashes of its bells ↔ the day of its last registration, in a store that keeps no history of earlier values (§13.4); the number of bells is about the number of conversations it is notified for. With a `message` preview, each push is followed by a `get` of the conversation's lanes from the device's IP, which links the endpoint to that IP and dates the push's arrival (§13.4). | — | That the device uses this server (the VAPID key), linked to its subscription and often to an account with the browser's vendor. |
@@ -5283,6 +5323,6 @@ A native app (§11.14) changes whom a user trusts for the client's code, and add
 | Notifications | none | optional push (Web Push, and APNs and FCM for native apps): devices register bells derived from the epoch key, a sender rings the other lanes' bells after a text, image or file, and the Worker sends a contentless push, coalesced per device; it stores no uid, conversation or IP; a device may show a preview that it decrypts itself; a device in use marks the rows it shows seen, and the account's devices get no push for them (§9.8, §10.10, §11.13, §13.4) |
 | Integrity | client-verified global chain (fatal on gaps); `head` in messages; local checkpoint | signed checkpoint chain (local persistence, range verification), `ck` in messages, `prevh`, immutability, receipts, public feed for auditors |
 | Abuse | PoW `register/wrap/append/blob`; RL write/blob/read | PoW `register/wrap/put/inbox/blob` (and `push`); RL write/inbox/blob/read (and ring) |
-| Blobs | `/api/blob`; D1 ledger (day precision, private) | `/api/v2/blob` + `meta`; BlobRegDO create-only with Δ-precise `t_reg`, readable by id only; its head enters checkpoints hourly |
+| Blobs | `/api/blob`; D1 ledger (day precision, private) | `/api/v2/blob` + `meta`; BlobRegDO shards, create-only with Δ-precise `t_reg`, readable by id only; one hourly value over their heads enters the checkpoints |
 | Time | `ts` = server ms floored to the second, in the chain | era (week) + `t = tpub` (Δ seconds) |
 | AK rotation | not supported | not supported (deferred) |

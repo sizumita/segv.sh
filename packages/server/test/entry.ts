@@ -9,6 +9,7 @@ import { wellKnown } from "../src/well-known";
 
 export { ShardDO } from "../src/shard-do";
 export { BlobRegDO } from "../src/blobreg-do";
+export { DirSeqDO } from "../src/dirseq-do";
 export { InboxDO } from "../src/inbox-do";
 export { ConnDO } from "../src/conn-do";
 export { FeedDO } from "../src/feed-do";

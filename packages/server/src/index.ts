@@ -8,6 +8,7 @@ export { pinHost } from "./hosts";
 export { wellKnown } from "./well-known";
 export { ShardDO } from "./shard-do";
 export { BlobRegDO } from "./blobreg-do";
+export { DirSeqDO } from "./dirseq-do";
 export { InboxDO } from "./inbox-do";
 export { ConnDO } from "./conn-do";
 export { FeedDO } from "./feed-do";
