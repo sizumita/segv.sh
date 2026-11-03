@@ -11,6 +11,9 @@
  *    share the one DO alarm; the earliest due is always armed, in the same synchronous block as the commit.
  *  - prepare() seals once now ≥ end(E) + SKEW: closes the open batch and persists state = sealed. MISS(sealed)
  *    is only answered once that is persisted.
+ *  - s_E (the shard map, §9.1) is pinned in meta 'sbits' by the first put that inserts a row; a put or get of a
+ *    well-formed key that routes to another shard under it throws, so a SHARD_MAP changed within an era fails loudly
+ *    (the Worker answers 503) instead of storing or missing rows.
  *  - Δ is pinned in meta 'delta' by the first put that inserts a row (§3.1); a deployment Δ that differs later is
  *    logged once per instance and ignored for this era.
  *  - get / head / feedBatches / feedRows are the reads. The feed (public enumeration, closed batches only) is two
@@ -21,10 +24,19 @@
  * Time is read through the protected `clock` field and Δ / SKEW through `params`, so tests can override them.
  */
 import { DurableObject } from "cloudflare:workers";
-import { BODY_LENS, era, eraEnd, eraStart, secOf, shardCid, tpub } from "@segv/protocol/proto";
+import {
+  BODY_LENS,
+  era,
+  eraEnd,
+  eraStart,
+  secOf,
+  shardCid,
+  shardOf,
+  tpub,
+} from "@segv/protocol/proto";
 import { AlarmSlot, BATCH_SCHEMA, BatchChain, Meta, ab, leafShardFromHash } from "./batch";
 import { sha256 } from "./http";
-import { v2Params } from "./env";
+import { v2Params, shardBitsOf } from "./env";
 import {
   parseEraName,
   type ShardFeedBatch,
@@ -87,6 +99,9 @@ export class ShardDO extends DurableObject<Env> {
   /** Instance fields (not constants) so tests can override them with runInDurableObject. */
   protected clock = (): number => Date.now();
   protected params: { delta: number; skew: number };
+  /** s_E of the deployment for this era (§9.1); the pin in meta 'sbits' wins once it exists. */
+  protected shardBits: number;
+  private sbitsLogged = false;
   protected fullBytes = FULL_BYTES;
 
   private readonly E: number;
@@ -107,6 +122,7 @@ export class ShardDO extends DurableObject<Env> {
     this.cid = shardCid(E, i);
     const p = v2Params(env);
     this.params = { delta: p.delta, skew: p.skew };
+    this.shardBits = shardBitsOf(p.shardMap, E);
     this.sql = ctx.storage.sql;
     this.sql.exec(SCHEMA);
     this.meta = new Meta(this.sql);
@@ -141,6 +157,8 @@ export class ShardDO extends DurableObject<Env> {
       }
       if (this.sql.databaseSize > this.fullBytes) return rows.map(() => ({ s: "full" }));
       const delta = this.delta();
+      const sbits = this.sbits();
+      for (const r of rows) if (wellFormed(r)) this.checkRoute(r.v, sbits);
       const t = this.chain.nextT(Math.max(tpub(now, delta), secOf(eraStart(this.E))), delta);
       this.chain.rollTo(t);
       const res = rows.map((r, k): ShardPutResult => {
@@ -168,8 +186,9 @@ export class ShardDO extends DurableObject<Env> {
       });
       if (wrote) {
         this.chain.noteWrite(t);
-        // Δ MUST NOT change within an era: the first write pins it.
+        // Δ and s_E MUST NOT change within an era: the first write pins them.
         if (this.meta.num("delta") === null) this.meta.set("delta", delta);
+        if (this.meta.num("sbits") === null) this.meta.set("sbits", sbits);
       }
       return res;
     });
@@ -184,8 +203,10 @@ export class ShardDO extends DurableObject<Env> {
     const now = this.clock();
     this.ctx.storage.transactionSync(() => this.prepare(now));
     const sealed = this.sealed();
+    const sbits = this.sbits();
     return keys.map((k): ShardGetResult => {
       if (typeof k !== "object" || k === null || !isBytes(k.v, 8) || !isBytes(k.label, 16)) return { s: "miss", sealed };
+      this.checkRoute(k.v, sbits);
       if (k.mode === 0) {
         const o = this.sql
           .exec<{ t: number; cls: number; body: ArrayBuffer }>(
@@ -295,6 +316,23 @@ export class ShardDO extends DurableObject<Env> {
    * Δ of this era: pinned by the first write, the deployment parameter before that. A deployment Δ that differs
    * from the pinned one is logged once per instance (§3.1); the pinned value always wins.
    */
+  /** s_E of this era: the pinned value, or the deployment's until the first write pins it (§9.1 "Shard map"). */
+  private sbits(): number {
+    const pinned = this.meta.num("sbits");
+    if (pinned === null) return this.shardBits;
+    if (pinned !== this.shardBits && !this.sbitsLogged) {
+      this.sbitsLogged = true;
+      const msg = "shard: SHARD_MAP differs from the shard count pinned for this era; keeping the pinned value";
+      console.error(JSON.stringify({ msg, E: this.E, pinned, env: this.shardBits }));
+    }
+    return pinned;
+  }
+
+  /** §9.1 "Shard map": a well-formed key that routes to another shard is a configuration error, never served. */
+  private checkRoute(v: Uint8Array, sbits: number): void {
+    if (shardOf(v, sbits) !== this.i) throw new Error("shard: key routed to another shard (SHARD_MAP changed within the era?)");
+  }
+
   private delta(): number {
     const pinned = this.meta.num("delta");
     if (pinned === null) return this.params.delta;

@@ -1,5 +1,6 @@
 /**
- * ShardDO fake (docs/PROTOCOL.md §9.1): one in-memory shard per era, keyed by (E, label).
+ * ShardDO fake (docs/PROTOCOL.md §9.1): the S_E in-memory shards of every era (`params.shards`, the same count for
+ * every era), rows keyed by (E, label) and routed to shard(E, label) (§4.4) through the world.
  *
  * Mirrors the DO's rules: create-only rows, the accept window `start(E) − SKEW ≤ now < end(E)`, sealing at
  * `end(E) + SKEW` (plus the test knob `sealDelayMs`, or `sealPrevious()`), `t = max(tpub(now), last_t,
@@ -70,11 +71,15 @@ class ShardEra {
   /** rows not yet in a closed batch, by t */
   readonly open = new Map<number, ShardRow[]>();
   bytes = 0;
-  constructor(readonly E: number) {}
+  constructor(
+    readonly E: number,
+    readonly i: number,
+  ) {}
 }
 
 export class FakeShard {
-  private readonly eras = new Map<number, ShardEra>();
+  /** "E/i" → the shard's state */
+  private readonly eras = new Map<string, ShardEra>();
   private readonly byKey = new Map<string, ShardRow>();
   /** row key → clients the row is hidden from */
   private readonly hidden = new Map<string, Set<string>>();
@@ -85,29 +90,50 @@ export class FakeShard {
 
   // ───────────── DO semantics ─────────────
 
-  /** ShardDO.put for one era (one DO call): one result per row, in order. */
+  /**
+   * ShardDO.put of one era: the Worker's rows grouped by their shard (one DO call each), one result per row, in
+   * order. Shards are independent: each assigns its own t.
+   */
   put(E: number, rows: readonly { label: Bytes; cls: number; body: Bytes }[]): ShardPutResult[] {
-    const s = this.prepare(E);
     const now = this.w.shardNow();
-    if (s.sealed || now >= eraEnd(E) || now < eraStart(E) - this.w.params.skew * 1000) {
-      const cur = era(now);
-      return rows.map(() => ({ s: "wrong_era", era: cur }));
-    }
-    const t = this.nextT(s, now);
-    this.closeBefore(s, t); // "if open_t exists and t > open_t: closeBatch(open_t)"
-    return rows.map((r): ShardPutResult => {
+    const out = Array.from({ length: rows.length }) as ShardPutResult[];
+    const groups = new Map<number, number[]>();
+    rows.forEach((r, k) => {
       if (
         r.label.length !== 16 ||
         BODY_LENS[r.cls] === undefined ||
         r.body.length !== BODY_LENS[r.cls]
-      )
-        return { s: "bad" };
-      const o = this.byKey.get(rowKey(E, b64u(r.label)));
-      if (o) return { s: "conflict", t: o.t, cls: o.cls, body: o.body };
-      this.insert(s, r.label, t, r.cls, r.body);
-      s.lastT = t;
-      return { s: "ok", t };
+      ) {
+        out[k] = { s: "bad" };
+        return;
+      }
+      const i = this.w.shardOf(E, r.label);
+      const g = groups.get(i);
+      if (g) g.push(k);
+      else groups.set(i, [k]);
     });
+    for (const [i, idx] of groups) {
+      const s = this.prepare(E, i);
+      if (s.sealed || now >= eraEnd(E) || now < eraStart(E) - this.w.params.skew * 1000) {
+        const cur = era(now);
+        for (const k of idx) out[k] = { s: "wrong_era", era: cur };
+        continue;
+      }
+      const t = this.nextT(s, now);
+      this.closeBefore(s, t); // "if open_t exists and t > open_t: closeBatch(open_t)"
+      for (const k of idx) {
+        const r = rows[k];
+        const o = this.byKey.get(rowKey(E, b64u(r.label)));
+        if (o) {
+          out[k] = { s: "conflict", t: o.t, cls: o.cls, body: o.body };
+          continue;
+        }
+        this.insert(s, r.label, t, r.cls, r.body);
+        s.lastT = t;
+        out[k] = { s: "ok", t };
+      }
+    }
+    return out;
   }
 
   /** ShardDO.get for one era. `who` is the requesting client (rows hidden from it answer MISS). */
@@ -116,8 +142,8 @@ export class FakeShard {
     keys: readonly { label: Bytes; mode: 0 | 1 }[],
     who: string | null = null,
   ): ShardGetResult[] {
-    const s = this.prepare(E);
     return keys.map((k): ShardGetResult => {
+      const s = this.prepare(E, this.w.shardOf(E, k.label));
       const key = rowKey(E, b64u(k.label));
       const o = this.byKey.get(key);
       if (!o || this.isHiddenKey(key, who)) return { s: "miss", sealed: s.sealed };
@@ -128,19 +154,20 @@ export class FakeShard {
     });
   }
 
-  /** ShardDO.head: closes due batches, then `{head, tLast, sealed, size}`. */
-  head(E: number): { head: Bytes; tLast: number; sealed: boolean; size: number } {
-    const s = this.prepare(E);
+  /** ShardDO.head of shard (E, i): closes due batches, then `{head, tLast, sealed, size}`. */
+  head(E: number, i = 0): { head: Bytes; tLast: number; sealed: boolean; size: number } {
+    const s = this.prepare(E, i);
     return { head: s.head, tLast: s.closedT ?? 0, sealed: s.sealed, size: s.bytes };
   }
 
-  /** ShardDO.feed: closed batches with t > after, ascending; stops before the batch that would exceed `budget` (≥ 1 batch). */
+  /** ShardDO.feed of shard (E, i): closed batches with t > after, ascending; stops before the batch that would exceed `budget` (≥ 1 batch). */
   feed(
     E: number,
+    i: number,
     after: number,
     budget = 4 * 1024 * 1024,
   ): { batches: ShardBatch[]; more: boolean; sealed: boolean } {
-    const s = this.prepare(E);
+    const s = this.prepare(E, i);
     const all = s.batches.filter((b) => b.t > after);
     const out: ShardBatch[] = [];
     let bytes = 0;
@@ -153,9 +180,11 @@ export class FakeShard {
     return { batches: out, more: out.length < all.length, sealed: s.sealed };
   }
 
-  /** Whether era E is sealed now (runs the DO's prepare()). */
+  /** Whether era E is sealed now (runs the DO's prepare() on its shards; they share the clock). */
   sealed(E: number): boolean {
-    return this.prepare(E).sealed;
+    let sealed = true;
+    for (let i = 0; i < this.w.params.shards; i++) sealed = this.prepare(E, i).sealed && sealed;
+    return sealed;
   }
 
   // ───────────── test / attacker controls ─────────────
@@ -191,7 +220,7 @@ export class FakeShard {
     body: Bytes,
     opts: { t?: number; topic?: Bytes } = {},
   ): ShardRow | null {
-    const s = this.prepare(E);
+    const s = this.prepare(E, this.w.shardOf(E, label));
     if (this.byKey.has(rowKey(E, b64u(label)))) return null;
     let t = opts.t;
     if (t === undefined) {
@@ -255,15 +284,16 @@ export class FakeShard {
     return who !== null && (this.hidden.get(key)?.has(who) ?? false);
   }
 
-  private eraState(E: number): ShardEra {
-    let s = this.eras.get(E);
-    if (!s) this.eras.set(E, (s = new ShardEra(E)));
+  private eraState(E: number, i: number): ShardEra {
+    const key = `${E}/${i}`;
+    let s = this.eras.get(key);
+    if (!s) this.eras.set(key, (s = new ShardEra(E, i)));
     return s;
   }
 
   /** The DO's prepare(): seal once the era is over (+ SKEW + sealDelayMs), else close every batch with t < tpub(now). */
-  private prepare(E: number): ShardEra {
-    const s = this.eraState(E);
+  private prepare(E: number, i: number): ShardEra {
+    const s = this.eraState(E, i);
     if (s.sealed) return s;
     const now = this.w.shardNow();
     if (E < this.sealBelow || now >= eraEnd(E) + this.w.params.skew * 1000 + this.w.sealDelayMs) {
@@ -301,7 +331,7 @@ export class FakeShard {
     if (rows.length === 0 || (s.closedT !== null && t0 <= s.closedT)) return;
     rows.sort((a, b) => byteCmp(a.label, b.label));
     const root = mth(rows.map((r) => leafShard(s.E, r.label, t0, r.cls, r.body)));
-    s.head = nextHead(shardCid(s.E, 0), s.head, t0, rows.length, root);
+    s.head = nextHead(shardCid(s.E, s.i), s.head, t0, rows.length, root);
     s.batches.push({ t: t0, n: rows.length, root, head: s.head, rows });
     s.closedT = t0;
   }

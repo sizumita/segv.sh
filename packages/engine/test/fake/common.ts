@@ -16,6 +16,8 @@ export interface FakeParams {
   inboxSlot: number;
   /** E_FIRST: reads of lower eras are "sealed" / 404 without touching a component. */
   efirst: number;
+  /** S_E, the shard count of every era of this world: a power of two in 1..65536 (§9.1). Tests: 1. */
+  shards: number;
 }
 
 /** A row the Worker hands to the ConnDO after a successful put (spec §10.3 step 6). */
@@ -45,6 +47,8 @@ export interface WorldCtx {
   publish(rows: PublishRow[]): void;
   /** InboxDO alarm → FeedDO.inbox → ConnDO.deliverInbox: an INBOX notice to every socket subscribed to Tinbox(E, g). */
   notice(E: number, g: number, rel: number): void;
+  /** shard(E, label) (§4.4) under the world's ROUTE_KEY and `params.shards`. */
+  shardOf(E: number, label: Bytes): number;
 }
 
 /** A fake HTTP response before the world adds the common headers. */

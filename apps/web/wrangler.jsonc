@@ -100,7 +100,9 @@
     // deployment (the Durable Objects pin Δ and Δin at their first write).
     // DELTA_S = Δ (row time granularity; must divide 604800, else the API answers 503), SKEW_S = bound on
     // clock differences between server components, INBOX_SLOT_S = Δin, E_FIRST = the era of the first deploy
-    // (lower eras are never instantiated).
+    // (lower eras are never instantiated). SHARD_MAP (optional, §9.1) = the shard count per era as "E:S" entries
+    // (S a power of two), in effect from era E on; unset = one shard per era. Add an entry only for an era that
+    // has not started; never change the count of an era that accepts writes.
     // Secrets (wrangler secret put; .dev.vars for vp dev): ROUTE_KEY (32 B b64u), SRV_KEY (Ed25519 seed b64u).
     // Web Push is off unless the secrets VAPID_SK (P-256 scalar, 32 B b64u) and PUSH_KEY (32 B b64u) are set, with
     // VAPID_SUB (mailto: or https: contact). Optional: PUSH_HOSTS, POW_PUSH (20), PUSH_SHARDS (1). An invalid push

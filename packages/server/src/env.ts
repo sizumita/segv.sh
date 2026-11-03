@@ -1,10 +1,11 @@
 /**
  * Deployment parameters and server secrets for the v2 API (docs/PROTOCOL.md §3.1, §4.4, §9.5, §9.7).
  *
- * Vars (wrangler.jsonc "vars", strings): DELTA_S (Δ), SKEW_S (SKEW), INBOX_SLOT_S (Δin), E_FIRST, RT_CONNS (C) and
- * RT_FEEDS (F, a power of two; §9.4). A var that is
- * present but invalid (not decimal, out of range, or a Δ that does not divide 604 800) makes the Worker answer
- * 503 "server misconfigured" on /api/v2/* (v2ParamsValid() is false); v2Params() falls back to the default.
+ * Vars (wrangler.jsonc "vars", strings): DELTA_S (Δ), SKEW_S (SKEW), INBOX_SLOT_S (Δin), E_FIRST, RT_CONNS (C),
+ * RT_FEEDS (F, a power of two; §9.4) and SHARD_MAP (the shard count per era, "E:S" entries; §9.1). A var that is
+ * present but invalid (not decimal, out of range, a Δ that does not divide 604 800, a malformed shard map) makes the
+ * Worker answer 503 "server misconfigured" on /api/v2/* (v2ParamsValid() is false); v2Params() falls back to the
+ * default.
  * Secrets: ROUTE_KEY (32 bytes, b64u) and SRV_KEY (32-byte Ed25519 seed, b64u). When either is missing or
  * malformed the Worker answers 503 "server misconfigured" on /api/v2/* (serverKeys() returns null).
  * Shared by the Worker and every v2 Durable Object (they must agree on Δ and SKEW).
@@ -26,7 +27,54 @@ export interface V2Params {
   rtConns: number;
   /** F: the number of FeedDOs, a power of two (§9.4). Default 1. */
   rtFeeds: number;
+  /** The shard map (§9.1): entries ascending by `from`; s_E is the `bits` of the last entry at or below E, 0 without one. */
+  shardMap: ShardMapEntry[];
 }
+
+/** One SHARD_MAP entry: from era `from` on, 2^bits shards per era. */
+export interface ShardMapEntry {
+  from: number;
+  bits: number;
+}
+
+/** The largest shard count (2^16; shardOf() takes at most 16 bits). */
+const SHARDS_MAX = 65536;
+
+/**
+ * Parses SHARD_MAP ("E:S,E:S,…", §9.1 "Shard map"): [] when the var is absent or empty, null when it is malformed
+ * (an entry that is not `E:S`, an E above 0xFFFE or not strictly ascending, an S that is not a power of two in
+ * 1..65536).
+ */
+export function parseShardMap(raw: unknown): ShardMapEntry[] | null {
+  if (raw === undefined || raw === null) return [];
+  if (typeof raw !== "string") return null;
+  const s = raw.trim();
+  if (s === "") return [];
+  const out: ShardMapEntry[] = [];
+  for (const part of s.split(",")) {
+    const m = /^\s*(\d{1,5}):(\d{1,5})\s*$/.exec(part);
+    if (!m) return null;
+    const from = Number(m[1]);
+    const S = Number(m[2]);
+    if (from > ERA_NONE - 1 || S < 1 || S > SHARDS_MAX || (S & (S - 1)) !== 0) return null;
+    if (out.length > 0 && from <= out[out.length - 1].from) return null;
+    out.push({ from, bits: 31 - Math.clz32(S) });
+  }
+  return out;
+}
+
+/** s_E: the bits of the last entry at or below E (0 when there is none). */
+export function shardBitsOf(map: readonly ShardMapEntry[], E: number): number {
+  let bits = 0;
+  for (const e of map) {
+    if (e.from > E) break;
+    bits = e.bits;
+  }
+  return bits;
+}
+
+/** S_E = 2^s_E. */
+export const shardsOf = (map: readonly ShardMapEntry[], E: number): number => 2 ** shardBitsOf(map, E);
 
 /** Inbox constants (§9.3, §10.9). */
 export const INBOX_DAY_CAP = 2000;
@@ -44,7 +92,7 @@ interface VarSpec {
 /** Seconds per era. */
 const ERA_S = ERA_MS / 1000;
 
-const VARS: Readonly<Record<keyof V2Params, VarSpec>> = {
+const VARS: Readonly<Record<Exclude<keyof V2Params, "shardMap">, VarSpec>> = {
   // Δ must divide 604 800: the first rows of an era get t = sec(start(E)), and a BlobReg MISS at now ≥ t_row is
   // final (§6.4(g)) only if tpub(now) ≥ t_row, i.e. only if every sec(start(E)) is a multiple of Δ.
   delta: { name: "DELTA_S", dflt: 10, min: 1, max: 3600, ok: (n) => ERA_S % n === 0 },
@@ -75,16 +123,20 @@ export function v2Params(env: Env): V2Params {
     eFirst: get(VARS.eFirst),
     rtConns: get(VARS.rtConns),
     rtFeeds: get(VARS.rtFeeds),
+    shardMap: parseShardMap((env as unknown as Record<string, unknown>).SHARD_MAP) ?? [],
   };
 }
 
 /**
  * False when a deployment var is present but invalid (not decimal, out of range, a DELTA_S that does not divide
- * 604 800, or an RT_FEEDS that is not a power of two): the Worker then answers 503 "server misconfigured" on /api/v2/*
- * instead of running on a fallback.
+ * 604 800, an RT_FEEDS that is not a power of two, or a malformed SHARD_MAP): the Worker then answers 503 "server
+ * misconfigured" on /api/v2/* instead of running on a fallback.
  */
 export function v2ParamsValid(env: Env): boolean {
-  return Object.values(VARS).every((v) => intVar(env, v) !== null);
+  return (
+    Object.values(VARS).every((v) => intVar(env, v) !== null) &&
+    parseShardMap((env as unknown as Record<string, unknown>).SHARD_MAP) !== null
+  );
 }
 
 /**

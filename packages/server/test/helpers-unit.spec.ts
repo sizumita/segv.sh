@@ -3,12 +3,44 @@ import { describe, expect, it } from "vitest";
 import * as P from "@segv/protocol/proto";
 import { clientKey, clientTag } from "../src/abuse";
 import { inboxCacheControl } from "../src/api";
+import { parseShardMap, shardBitsOf, shardsOf } from "../src/env";
 import { dec64, enc64 } from "../src/b64";
 import { logErr } from "../src/http";
 import { appHosts } from "../src/hosts";
 
 const req = (ip?: string) =>
   new Request("https://x/", { headers: ip === undefined ? {} : { "cf-connecting-ip": ip } });
+
+describe("SHARD_MAP (§9.1)", () => {
+  it("parses E:S entries, applies the last entry at or below the era, and rejects malformed maps", () => {
+    expect(parseShardMap(undefined)).toEqual([]);
+    expect(parseShardMap(null)).toEqual([]);
+    expect(parseShardMap("")).toEqual([]);
+    expect(parseShardMap(" 42:1, 60:4 ,70:256")).toEqual([
+      { from: 42, bits: 0 },
+      { from: 60, bits: 2 },
+      { from: 70, bits: 8 },
+    ]);
+    const map = parseShardMap("60:4,70:256")!;
+    expect([59, 60, 69, 70, 1000].map((E) => shardsOf(map, E))).toEqual([1, 4, 4, 256, 256]);
+    expect(shardBitsOf(map, 65)).toBe(2);
+    expect(shardsOf([], 5)).toBe(1);
+    expect(parseShardMap("0:65536")).toEqual([{ from: 0, bits: 16 }]);
+    for (const bad of [
+      "60",
+      "60:3",
+      "60:0",
+      "60:131072",
+      "70:2,60:4",
+      "60:2,60:4",
+      "65535:2",
+      "a:2",
+      "60:2,",
+      42,
+    ])
+      expect(parseShardMap(bad), String(bad)).toBeNull();
+  });
+});
 
 describe("inboxCacheControl (§10.5)", () => {
   it("expires with the slot it reports: whole seconds, at least 1, at most Δin", () => {

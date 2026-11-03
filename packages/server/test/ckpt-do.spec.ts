@@ -27,7 +27,12 @@ const freshEras = (): [number, number] => {
 const ck = () => ckptStub(env);
 const SRV_PK = P.sigPub(P.fromB64u((env as unknown as { SRV_KEY: string }).SRV_KEY));
 
-type CkInternals = { clock: () => number; env: Env; sizeWarnBytes: number };
+type CkInternals = {
+  clock: () => number;
+  env: Env;
+  sizeWarnBytes: number;
+  shardsOf: (E: number) => number;
+};
 async function ckClock(ms: number): Promise<void> {
   await runInDurableObject(ck(), (inst: CheckpointDO) => {
     (inst as unknown as CkInternals).clock = () => ms;
@@ -92,6 +97,53 @@ function checkRecord(r: CkptRecord, prevC: Uint8Array): void {
   expect(r.C).toEqual(P.ckptC(prevC, r.q, r.sec, r.hd));
   expect(P.verify(r.sig, P.ckptSigMsg(r.q, r.C), SRV_PK)).toBe(true);
 }
+
+/** A routing value whose top `bits` bits (below the clear top bit) name shard `i` (§4.4, bits ≤ 7). */
+function vFor(i: number, bits: number): Uint8Array {
+  const v = P.random(8);
+  v[0] = (v[0] & (0x7f >> bits)) | (i << (7 - bits));
+  return v;
+}
+
+describe("CheckpointDO shard map (§9.1, §9.5)", () => {
+  it("collects every shard of each era's count, under its own cid", async () => {
+    const [Pe, F] = freshEras();
+    const base = P.eraStart(F) + 10 * 60_000;
+    await ckClock(base);
+    await runInDurableObject(ck(), (inst: CheckpointDO) => {
+      (inst as unknown as CkInternals).shardsOf = (E) => (E === F ? 4 : E === Pe ? 2 : 1);
+    });
+    try {
+      const r1 = await tick();
+      for (let i = 0; i < 4; i++) expect(headOf(r1, P.shardCid(F, i))).toEqual(P.ZERO32);
+      expect(headOf(r1, P.shardCid(F, 4))).toBeUndefined();
+      for (let i = 0; i < 2; i++) expect(headOf(r1, P.shardCid(Pe, i))).toBeDefined();
+      expect(headOf(r1, P.shardCid(Pe, 2))).toBeUndefined();
+      // A row in shard 3 of F (its own deployment count is 4 here) moves that cid's head only.
+      const s3 = shardStub(env, F, 3);
+      await runInDurableObject(s3, (inst: ShardDO) => {
+        const x = inst as unknown as { clock: () => number; shardBits: number };
+        x.clock = () => base;
+        x.shardBits = 2;
+      });
+      expect((await s3.put(F, 3, [{ ...shardRow(), v: vFor(3, 2) }]))[0].s).toBe("ok");
+      await runInDurableObject(s3, (inst: ShardDO) => {
+        (inst as unknown as { clock: () => number }).clock = () => base + 3000;
+      });
+      await ckClock(base + 60_000);
+      const r2 = await tick();
+      expect(r2.q).toBe(r1.q + 1);
+      expect(headOf(r2, P.shardCid(F, 3))).toEqual((await s3.head(F, 3)).head);
+      expect(headOf(r2, P.shardCid(F, 3))).not.toEqual(P.ZERO32);
+      for (const i of [0, 1, 2]) expect(headOf(r2, P.shardCid(F, i))).toEqual(P.ZERO32);
+      checkRecord(r2, r1.C);
+    } finally {
+      await runInDurableObject(ck(), (inst: CheckpointDO) => {
+        (inst as unknown as CkInternals).shardsOf = () => 1;
+      });
+    }
+  });
+});
 
 describe("CheckpointDO", () => {
   it("chains C_q, makes no new q for unchanged heads, and signs under SRV_KEY", async () => {
@@ -314,7 +366,7 @@ describe("CheckpointDO", () => {
     expect(headOf(await tick(), P.BLOBREG_CID)).toEqual(moved);
   });
 
-  it("logs a shard above 4 GiB", async () => {
+  it("logs a shard above 2 GiB", async () => {
     const [, F] = freshEras();
     await ckClock(P.eraStart(F) + 60_000);
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -323,11 +375,11 @@ describe("CheckpointDO", () => {
         (inst as unknown as CkInternals).sizeWarnBytes = 0;
       });
       await tick();
-      expect(errors.mock.calls.some((c) => String(c[0]).includes("above 4 GiB"))).toBe(true);
+      expect(errors.mock.calls.some((c) => String(c[0]).includes("above 2 GiB"))).toBe(true);
     } finally {
       errors.mockRestore();
       await runInDurableObject(ck(), (inst: CheckpointDO) => {
-        (inst as unknown as CkInternals).sizeWarnBytes = 4 * 2 ** 30;
+        (inst as unknown as CkInternals).sizeWarnBytes = 2 * 2 ** 30;
       });
     }
   });

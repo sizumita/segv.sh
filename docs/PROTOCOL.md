@@ -51,7 +51,8 @@ texts.
   scans data that is not addressed to it, with one exception: first-contact invites in the global inbox (β = 0,
   §5.3).
 - Server components:
-  - one **ShardDO** per era (stage 1: one shard, S = 1);
+  - `S_E` **ShardDOs** per era, a power of two the deployment sets per era (`SHARD_MAP`, §9.1; 1 until it is
+    raised);
   - one **InboxDO** per era;
   - one **BlobRegDO**, which registers R2 blobs and their registration time;
   - `C` **ConnDOs**, which hold the WebSocket connections, and `F` **FeedDOs**, which keep which ConnDOs' sockets
@@ -649,7 +650,7 @@ These derivations are the server's only (§9.1).
 kroute_E = HMAC(ROUTE_KEY, enc("segv.sh/v2/route", u16 E))                ROUTE_KEY: 32-byte Worker secret
 kcommit_E = H(enc("segv.sh/v2/kroute", kroute_E))                         published in params / era info
 v(E, label) = u64(HMAC(kroute_E, label)[0..8]) >> 1                       63-bit routing value; stored as 8-byte big-endian
-shard(E, label) = v >> (63 − s_E)                                         stage 1: s_E = 0 ⇒ shard 0
+shard(E, label) = v >> (63 − s_E)                                         S_E = 2^s_E shards per era (SHARD_MAP, §9.1); s_E = 0 ⇒ shard 0
 ktag = HMAC(ROUTE_KEY, utf8("segv.sh/v2/ws-tag"))
 tag(ck) = HMAC(ktag, utf8("ws|" ‖ ck))[0..16]                              the opaque client tag; ck = the client's rate-limit key (§10.2)
 conn(ck) = u32(tag(ck)[0..4]) mod C                                       the client's ConnDO "conn/v2/{c}" (§9.4)
@@ -2005,13 +2006,14 @@ synchronously in `prepare()`. Every write that opens a batch arms `min(current a
 synchronous block as the commit. An alarm handler that still has work due re-arms at `max(due, now + 1000)` ms; it
 never arms a time in the past, so an early alarm or a clock that steps back cannot make it fire in a loop.
 
-### 9.1 ShardDO (`shard/v2/{E}/{i}`, SQLite; stage 1 has one per era, i = 0)
+### 9.1 ShardDO (`shard/v2/{E}/{i}`, SQLite; S_E per era, 0 ≤ i < S_E)
 
 ```sql
 CREATE TABLE meta  (k TEXT PRIMARY KEY, v BLOB NOT NULL) WITHOUT ROWID;
   -- 'state' 'open'|'sealed' | 'last_t' u32 | 'open_t' u32 (absent = no open batch)
   -- 'closed_t' u32 (t of the newest closed batch; absent = none) | 'head' 32 B (ZERO32 initially)
   -- 'delta' u16 (Δ, pinned by the first put that inserts a row; the deployment Δ applies until then; §3.1)
+  -- 'sbits' u8 (s_E, pinned by the same put; "Shard map" below)
 CREATE TABLE row   (id INTEGER PRIMARY KEY,
                     v BLOB NOT NULL CHECK (length(v) = 8), label BLOB NOT NULL CHECK (length(label) = 16),
                     t INTEGER NOT NULL, cls INTEGER NOT NULL CHECK (cls BETWEEN 0 AND 3),
@@ -2024,6 +2026,21 @@ CREATE TABLE batch (t INTEGER PRIMARY KEY, n INTEGER NOT NULL, root BLOB NOT NUL
 Bodies (296–16 424 B) live in a rowid table: SQLite advises against WITHOUT ROWID for rows this large. The rowid is
 internal and never exposed; feed and batches order by `(t, label)`. `bh` MUST equal `H(body)`. It is written with the
 row and is internal (no RPC returns it); it exists so that closing a batch never reads, hashes or holds a body.
+
+**Shard map.** An era has `S_E = 2^{s_E}` shards, `0 ≤ s_E ≤ 16`, and a row lives in shard `i = shard(E, label)`
+(§4.4). `S_E` comes from the deployment variable `SHARD_MAP`: a comma-separated list of `E:S` entries, `E` the first
+era the count applies to (0..0xFFFE, strictly ascending) and `S` a power of two in 1..65536; the count of era E is
+the `S` of the last entry whose `E` is at most E, and 1 when there is none (or no variable). A present but malformed
+value is a misconfiguration (§3.1: every `/api/v2/*` request answers 503). An entry MAY be added or changed only for
+eras that accept no writes yet, that is with `E > era(now + SKEW·1000)` at the deploy; the count of an era MUST NOT
+change once the era accepts writes, since rows already routed would no longer be found. As a tripwire, the first put
+that inserts a row pins `s_E` in `meta 'sbits'` (like Δ), and a `put` or `get` of a well-formed key whose
+`shard(E, label)` under the pinned `s_E` (the deployment's until the pin exists) is not this object's `i` throws:
+the Worker answers 503 `storage unavailable` (§10.3, §10.4) instead of silently storing or missing the row. A shard
+count is chosen once per era, before the era starts: at least four times the previous era's measured need
+(`S_E ≥ 4·bytes_{E−1} / 4 GiB` and `S_E ≥ 4·peak_rps_{E−1} / 1 000`, rounded up to a power of two). Empty shards
+cost nothing. There is no split within an era: `v` is a keyed PRF of the label, so nobody can aim rows at one shard,
+and filling every shard of an era costs `S_E` times the proof of work.
 
 **Era state.**
 
@@ -2097,9 +2114,9 @@ result carries more than the caller's `budget` of row bytes, because Workers RPC
 This is the public enumeration of the database.
 
 **Retention and capacity.** Old era DOs are kept and stay readable. Paging into R2 and deletion come in stage 2. A DO
-stores at most 10 GB, and one object handles about 1 000 requests/s, so a single shard per era bounds stage 1 (§13.2
-item 13). The CheckpointDO logs (§9.7) when a shard's `size` passes 4 GiB. The emergency path is S = 2 by
-parameter for the next era, since routing by `v` already exists (stage-2 work).
+stores at most 10 GB, and one object handles about 1 000 requests/s, so an era holds `S_E` times that (§13.2 item
+13), set before the era starts. The CheckpointDO logs (§9.7) when a shard's `size` passes 2 GiB: the cue to raise the
+count for the next era ("Shard map" above).
 
 ### 9.2 BlobRegDO (`blobreg/v2`, SQLite, one instance)
 
@@ -2371,8 +2388,9 @@ Worker calls the DO's `ensure()` at most once per isolate (a module-level flag),
 **Collecting heads.**
 
 - Collect `(cid, head)` from:
-  - `shard/{E_now}/0` and `inbox/{E_now}/0`;
-  - `shard/{E_now−1}/0` and `inbox/{E_now−1}/0`, when `E_now − 1 ≥ max(E_FIRST, 0)`, until the component reports
+  - `shard/{E_now}/{i}` for every `i < S_{E_now}` (§9.1) and `inbox/{E_now}/0`;
+  - `shard/{E_now−1}/{i}` for every `i < S_{E_now−1}` and `inbox/{E_now−1}/0`, when `E_now − 1 ≥ max(E_FIRST, 0)`,
+    until the component reports
     `sealed` (shard) or `ended` (inbox) and that final head has appeared once; then `final:<cid>` is persisted in the
     same transaction as that checkpoint (alone when `hd` is unchanged) and the cid is no longer collected. Eras before
     `E_now − 1` are never collected: if no checkpoint succeeds between `end(E) + SKEW·1000` and `end(E+1)`, era E's
@@ -2385,16 +2403,17 @@ Worker calls the DO's `ensure()` at most once per isolate (a module-level flag),
     learns at most, per hour, whether any blob was registered;
   - `dirlog`, read from D1 (`SELECT seq, h FROM dirlog ORDER BY seq DESC LIMIT 1`), or ZERO32 while the dirlog is
     empty (a table that does not exist yet counts as empty); any other D1 error is a failure.
-- Each component call has 10 s to answer. A component that fails (an error or no answer in time) keeps its head from
-  the previous checkpoint's list; one that has no head there (it has never answered) is left out of the list, never
-  listed as ZERO32. A failing component never delays or blocks the checkpoint.
+- Each component call has 10 s to answer, and at most 32 calls are in flight at a time. A component that fails (an
+  error or no answer in time) keeps its head from the previous checkpoint's list; one that has no head there (it has
+  never answered) is left out of the list, never listed as ZERO32. A failing component never delays or blocks the
+  checkpoint.
 - A component with no closed batch (shard) or slot (inbox) reports `head = ZERO32` and is listed with it, in the
   current and the previous era alike.
 - A previous-era component's final head (its head once it reports `sealed` or `ended`) has *appeared* once it is in
   the list of a checkpoint: the one built from this collection, or, when `hd` equals the previous `hd` and no
   checkpoint is made, checkpoint q−1, whose list is identical.
 - Sort the list by cid (byte order).
-- Log (§9.7) when a shard reports `size` above 4 GiB.
+- Log (§9.7) when a shard reports `size` above 2 GiB.
 
 **Building and signing.**
 
@@ -3329,14 +3348,15 @@ costs a catch-up (§11.6), never a lost row.
 
 ```json
 {"v":2, "now":<ms>, "T0":1767639600000, "eraMs":604800000, "era":<E_now>, "delta":Δ, "skew":SKEW,
- "inboxSlot":Δin, "inboxRetention":4, "inboxDayCap":2000, "inboxBatch":32, "shards":1, "p":P, "efirst":E_FIRST,
+ "inboxSlot":Δin, "inboxRetention":4, "inboxDayCap":2000, "inboxBatch":32, "shards":S_E_now, "p":P, "efirst":E_FIRST,
  "kcommit":"<b64u kcommit_E_now>", "srvKey":"<b64u Ed25519 pk>",
  "pow":{"register":20,"wrap":18,"put":16,"inbox":18,"blob":18},
  "limits":{"putRows":16,"putBytes":263345,"getKeys":256,"topics":256,"blobMax":12582912,"textMax":12000}}
 ```
 
 `p` is `P` as §9.6 says; during a D1 outage it may be a stale value or 0, and params never fails because of D1.
-Clients bound it from below by the dirlog size (`P*`, §10.6).
+Clients bound it from below by the dirlog size (`P*`, §10.6). `shards` is `S_{E_now}` (§9.1): a client needs it for
+nothing and accepts any value in 1..65536.
 
 A deployment whose push is on (§9.8) also reports `"push":{"window":60,"maxTokens":256}` and `pow.push`, and in `push`
 the transports that are on: `"vapid":"<b64u 65-byte P-256 public key>"` while Web Push is on, `"apns":["<topic>", …]`
@@ -3348,7 +3368,7 @@ integer, or that comes without `pow.push`, as no push; a native app does the sam
 does not list its bundle ID, or an `fcm` that is not its project.
 
 **`GET /api/v2/era/{E}`** (JSON; `RL_READ`) returns `{"era": E, "start": start(E), "end": end(E), "delta": Δ,
-"shards": 1, "kcommit": b64u(kcommit_E), "sealed": bool}`. `start` and `end` (§3.1) are Unix milliseconds, the unit of
+"shards": S_E, "kcommit": b64u(kcommit_E), "sealed": bool}`. `start` and `end` (§3.1) are Unix milliseconds, the unit of
 params `T0` and `now`; `delta` is in seconds. The Worker answers it alone and MUST NOT address any Durable Object for
 it. `E > era(now + SKEW·1000)` or `E < E_FIRST` → 404 (§9.7); a malformed E → 400. `sealed = (now ≥ end(E) +
 SKEW·1000)` by the Worker's clock: by the SKEW bound no component of era E accepts a write from then on, so every field
@@ -3382,7 +3402,8 @@ response = u8 more | u32 nb | batch × nb
 batch    = u32 t | u32 n | root[32] | head[32] | (label[16] | u8 cls | body[CLASSES[cls]+40]) × n     rows ordered by label
 ```
 
-A page holds the closed batches with `t > after`, ascending: whole batches while the sum of their encodings stays
+An `i` at or above `S_E` (§9.1) is 404, like an era outside `E_FIRST..era(now + SKEW·1000)`. A page holds the closed
+batches with `t > after`, ascending: whole batches while the sum of their encodings stays
 ≤ 4 MiB (4 194 304 B), and always at least one when one exists. An empty page is `more = 0, nb = 0`. `more = 1` iff
 another closed batch follows the page. Batches are never split, so a page whose first batch alone exceeds 4 MiB holds
 only that batch and is as large as it; the Worker streams such a page, pulling the batch's rows from the DO in
@@ -4764,7 +4785,7 @@ are kept. Critical warnings are kept until sign-out.
 | ------- | ------------------------------------ | ------------------------ | ---------- | ---------------- |
 | message ↔ sender | None: no sender column, the signature is inside the AEAD, writes are anonymous. Only Δ-rounded `t` and the class. | The writer's IP for every put, which with an IP-to-account match (unlock, own-bundle lookup) gives the account. | Verifiable, not deniable. | — |
 | message ↔ recipients | None for rows. Inbox invite: one of all users (β = 0), even against a quantum P. | Exactly, through the socket's topic set and the labels each client fetches. | The member list. | — |
-| message ↔ message (same conversation) | No identifiers. Rows in the same Δ batch and rare classes are visible. With S = 1 and low traffic, timing correlation is strong. | Exactly: same topic, same IP. | Everything. | — |
+| message ↔ message (same conversation) | No identifiers. Rows in the same Δ batch and rare classes are visible. With few shards and low traffic, timing correlation is strong. | Exactly: same topic, same IP. | Everything. | — |
 | user ↔ conversation | None. The directory reveals that the account exists and when it registered (the client's `ts`, and the minute through the dirlog head in checkpoints). | The topic set and fetch pattern per socket / IP, linked to the uid at unlock. | Co-members of shared conversations. | — |
 | user ↔ user | None. Global inbox counts per slot are public. | The whole social graph, including a p-bit prefix of every handle and co-member lookup (§13.2 item 10). | Co-members only. | — |
 | activity of a user | Directory events (registration, wrap additions); the size of the global inbox; self rows (one after each own creation, commit, join or leave, and at most one HEADS row per 30 minutes while active), which P cannot tell from other rows except by timing. Per-user send volume is not visible. | Per-IP read and write volume and times; online time; topic sets; with a `message` preview, when each such device receives a push, also while the app is closed (§13.4); from sync notes, when a device of the account changes its read state or a setting (§13.4). | Send times in shared conversations. | When each of its devices that turned notifications on is notified (§11.13), and when a native device that takes notes gets a quiet push, that is, when another device of its account changed its read state. |
@@ -4871,11 +4892,11 @@ Each item is a deliberate trade-off that stage 2 or 3 addresses. None is silent.
     the same `[4, 3×N]` shape, revealing N but nothing else. Stage 1 hides N, but invites by inbox are public rows: a
     change or creation followed within seconds by inbox rows probably invited someone without a 1:1, and one followed
     by none probably did not.
-13. **Capacity.** One ShardDO per era stores at most 10 GB (about 25 000 active users at the stage-1 estimate) and
-    handles about 1 000 requests/s, and one current InboxDO takes every client (the realtime path is spread over the
-    `C` ConnDOs and `F` FeedDOs of the deployment, §9.4). When a shard fills,
-    writes fail with FULL until the next era (§9.1). These are stage-1 bounds, not protocol limits: S > 1 is a
-    parameter change because routing by `v` already exists.
+13. **Capacity.** A ShardDO stores at most 10 GB (about 25 000 active users at the stage-1 estimate) and handles
+    about 1 000 requests/s; an era has `S_E` of them (§9.1), chosen before it starts, so its capacity cannot grow
+    within the week, and one current InboxDO takes every client (the realtime path is spread over the `C` ConnDOs and
+    `F` FeedDOs of the deployment, §9.4). When every shard of an era fills, writes fail with FULL until the next era
+    (§9.1).
 14. **A wrong key entry freezes everyone, and a freeze with a removal stops messaging.** Two deliberate changes to v1's
     freezes (§6.6, §6.10):
     - v1 froze only the members whose invite was missing, and the others kept changing membership. Stage 1 derives
@@ -5102,7 +5123,7 @@ A native app (§11.14) changes whom a user trusts for the client's code, and add
 - paging sealed eras into R2 (`.idx`/`.dat`), `seal/{E}` objects, manifests, publishing `kroute_E` of sealed eras,
   deleting old ShardDOs;
 - the public label-ordered page reads;
-- shard maps with S > 1 (routing by `v` is already in place) and emergency splitting (`MOVED`, frozen ranges);
+- emergency splitting of a shard within an era (`MOVED`, frozen ranges);
 - R2 Range reads of bundle entries.
 
 **Abuse control and transport:**

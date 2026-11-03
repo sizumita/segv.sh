@@ -40,6 +40,8 @@ import {
   kcommit,
   kroute,
   receiptMsg,
+  routeV,
+  shardOf as shardIndex,
   sigPub,
   sign,
   utf8,
@@ -155,6 +157,8 @@ export interface FakeWorldOptions {
   skew?: number;
   inboxSlot?: number;
   efirst?: number;
+  /** S_E for every era: a power of two in 1..65536 (§9.1); 1 by default */
+  shards?: number;
   /** offer Web Push: params `push` and `pow.push`, and the two endpoints of §10.10 (FakePush) */
   push?: boolean;
 }
@@ -332,11 +336,15 @@ export class FakeWorld implements WorldCtx, RtHost {
   private readonly routes: Route[];
 
   constructor(opts: FakeWorldOptions = {}) {
+    const shards = opts.shards ?? 1;
+    if (!Number.isInteger(shards) || shards < 1 || shards > 65536 || (shards & (shards - 1)) !== 0)
+      throw new RangeError("shards must be a power of two in 1..65536");
     this.params = {
       delta: opts.delta ?? 1,
       skew: opts.skew ?? 0,
       inboxSlot: opts.inboxSlot ?? 1,
       efirst: opts.efirst ?? 0,
+      shards,
     };
     this.pushOn = opts.push ?? false;
     this.shard = new FakeShard(this);
@@ -348,7 +356,8 @@ export class FakeWorld implements WorldCtx, RtHost {
       {
         now: () => this.now(),
         efirst: () => this.params.efirst,
-        shardHead: (E) => this.shard.head(E),
+        shards: () => this.params.shards,
+        shardHead: (E, i) => this.shard.head(E, i),
         inboxHead: (E) => this.inbox.head(E),
         blobregHead: () => this.blobreg.head().head,
         dirlogHead: () => this.dir.head().h,
@@ -465,6 +474,11 @@ export class FakeWorld implements WorldCtx, RtHost {
 
   kcommitOf(E: number): Bytes {
     return kcommit(kroute(this.routeKey, E));
+  }
+
+  /** (internal) WorldCtx: shard(E, label) (§4.4) with s_E from `params.shards`. */
+  shardOf(E: number, label: Bytes): number {
+    return shardIndex(routeV(kroute(this.routeKey, E), label), 31 - Math.clz32(this.params.shards));
   }
 
   /** Closes every socket (end of a test). */
@@ -788,7 +802,7 @@ export class FakeWorld implements WorldCtx, RtHost {
       inboxRetention: 4,
       inboxDayCap: this.inbox.dayCap,
       inboxBatch: INBOX_MAX_ROWS,
-      shards: 1,
+      shards: this.params.shards,
       p: this.dir.P,
       efirst: p.efirst,
       kcommit: b64u(this.kcommitOf(E)),
@@ -873,7 +887,7 @@ export class FakeWorld implements WorldCtx, RtHost {
         start: eraStart(E),
         end: eraEnd(E),
         delta: this.params.delta,
-        shards: 1,
+        shards: this.params.shards,
         kcommit: b64u(this.kcommitOf(E)),
         sealed,
       },
@@ -1126,7 +1140,8 @@ export class FakeWorld implements WorldCtx, RtHost {
     const E = eraParam(eS);
     const i = decimal(iS);
     if (E === null || i === null || i > 0xffff) return err(400, "bad era or shard");
-    if (i !== 0 || E > this.bounds().hi || E < this.params.efirst) return err(404, "unknown shard");
+    if (i >= this.params.shards || E > this.bounds().hi || E < this.params.efirst)
+      return err(404, "unknown shard");
     const after = queryInt(req.url, "after", 0, 0, 0xffffffff);
     if (after === undefined) return err(400, "bad after");
     const key = `${req.url.origin}/api/v2/feed/${E}/${i}?after=${after}`;
@@ -1135,7 +1150,7 @@ export class FakeWorld implements WorldCtx, RtHost {
       log,
       key,
       () => {
-        const page = this.shard.feed(E, after);
+        const page = this.shard.feed(E, i, after);
         const bytes = encodeFeed({
           more: page.more,
           batches: page.batches.map((b) => ({

@@ -720,6 +720,62 @@ describe("ShardDO identity and alarms", () => {
   });
 });
 
+/** A routing value whose top `bits` bits (below the clear top bit) name shard `i` (§4.4, bits ≤ 7). */
+function vFor(i: number, bits: number): Uint8Array {
+  const v = P.random(8);
+  v[0] = (v[0] & (0x7f >> bits)) | (i << (7 - bits));
+  return v;
+}
+
+describe("ShardDO shard map (§9.1)", () => {
+  it("pins s_E at the first write and refuses keys that route to another shard; a changed SHARD_MAP cannot move the pin", async () => {
+    const E = freshEra();
+    const i = 2;
+    const s = shardStub(env, E, i);
+    const set = (bits: number, ms: number) =>
+      runInDurableObject(s, (inst: ShardDO) => {
+        const x = inst as unknown as Internals & { shardBits: number };
+        x.clock = () => ms;
+        x.shardBits = bits;
+      });
+    const mine = (): ShardPutRow => ({ ...row(), v: vFor(2, 2) });
+    const other: ShardPutRow = { ...row(), v: vFor(1, 2) };
+    await set(2, at(E, 100));
+    expect(
+      await runInDurableObject(s, (_inst: ShardDO, state) => metaOf(state, "sbits")),
+    ).toBeNull();
+    expect((await s.put(E, i, [mine()]))[0].s).toBe("ok");
+    expect(await runInDurableObject(s, (_inst: ShardDO, state) => metaOf(state, "sbits"))).toBe(2);
+    await runInDurableObject(s, async (inst: ShardDO) => {
+      await expect(inst.put(E, i, [other])).rejects.toThrow(/another shard/);
+      expect(() => inst.get(E, i, [{ v: other.v, label: other.label, mode: 1 }])).toThrow(
+        /another shard/,
+      );
+      // A malformed key is BAD / MISS, never a routing error; a refused put stores nothing.
+      expect((await inst.put(E, i, [{ ...mine(), v: P.random(7) }]))[0].s).toBe("bad");
+      expect(inst.get(E, i, [{ v: P.random(7), label: P.random(16), mode: 1 }])[0].s).toBe("miss");
+    });
+    expect((await s.get(E, i, [{ v: mine().v, label: P.random(16), mode: 1 }]))[0].s).toBe("miss");
+    // The deployment raises the count mid-era (an operator error): the pin wins, logged once per instance.
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await evictDurableObject(s);
+      await set(3, at(E, 200));
+      expect((await s.put(E, i, [mine()]))[0].s).toBe("ok"); // routes to 2 under the pinned 2 bits
+      await runInDurableObject(s, async (inst: ShardDO) => {
+        // Shard 2 under 3 bits is shard 1 under the pinned 2 bits: refused.
+        expect(() => inst.get(E, i, [{ v: vFor(2, 3), label: P.random(16), mode: 1 }])).toThrow(
+          /another shard/,
+        );
+      });
+      const logged = errors.mock.calls.filter((c) => String(c[0]).includes("SHARD_MAP"));
+      expect(logged).toHaveLength(1);
+    } finally {
+      errors.mockRestore();
+    }
+  });
+});
+
 describe("ShardDO batches of thousands of rows", () => {
   it("leafShardFromHash over H(body) is byte-identical to proto.leafShard", () => {
     for (const cls of [0, 1, 2, 3]) {

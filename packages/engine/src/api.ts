@@ -111,7 +111,11 @@ export function checkParams(x: unknown): Params {
   if (!isInt(x.inboxSlot, 1, 3600)) bad("inboxSlot");
   if (!isInt(x.p, 0, 32)) bad("p");
   if (!isInt(x.efirst, 0, 0xfffe)) bad("efirst");
-  if (!isInt(x.shards, 1, 1) || !isInt(x.inboxBatch, 1, 32) || !isInt(x.inboxRetention, 0, 0xfffe))
+  if (
+    !isInt(x.shards, 1, 65536) ||
+    !isInt(x.inboxBatch, 1, 32) ||
+    !isInt(x.inboxRetention, 0, 0xfffe)
+  )
     bad("layout");
   if (!isInt(x.inboxDayCap, 0, Number.MAX_SAFE_INTEGER)) bad("inboxDayCap");
   if (!isB64u(x.srvKey, 32) || typeof x.kcommit !== "string") bad("keys");

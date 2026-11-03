@@ -51,7 +51,7 @@ PROTOCOL.md §0.3 と §13.1 を基準にして、増やしてはいけないも
 
 ### 4.1 行ストア：`shard/v2/{E}/{i}` × S_E、封印後は R2
 
-**シャード数。** `S_E = 2^{s_E}`、`i = v >> (63 − s_E)`（§4.4 のまま。`shardOf` は実装済み）。`s_E` は配備変数 `SHARD_MAP`（`E_from:s` の列。era E に効くのは `E_from ≤ E` の最後の項）で決め、`/api/v2/era/{E}` と params の `shards` に出す。目安は前の era の実績の 4 倍：`S_E ≥ 4 · bytes_{E−1} / 4 GiB` かつ `S_E ≥ 4 · peak_rps_{E−1} / 1 000` を 2 の冪に切り上げる。空のシャードは費用ゼロなので多めでよい。各 ShardDO は最初の書き込みで `s_E` を `meta` に固定する。
+**シャード数。** `S_E = 2^{s_E}`、`i = v >> (63 − s_E)`（§4.4 のまま。`shardOf` は実装済み）。`S_E` は配備変数 `SHARD_MAP`（`E_from:S` の列、S は 2 の冪。era E に効くのは `E_from ≤ E` の最後の項、無ければ 1）で決め、`/api/v2/era/{E}` と params の `shards` に出す。目安は前の era の実績の 4 倍：`S_E ≥ 4 · bytes_{E−1} / 4 GiB` かつ `S_E ≥ 4 · peak_rps_{E−1} / 1 000` を 2 の冪に切り上げる。空のシャードは費用ゼロなので多めでよい。各 ShardDO は最初の書き込みで `s_E` を `meta` に固定する。
 
 **Worker。** put / get はすでに `(E, shard)` でまとめて RPC している（§10.3 手順 4、§10.4）。変わるのは `SHARD_BITS` が era の関数になることだけ。1 つの get（最大 256 鍵）は最大 `min(256, S_E)` 個の RPC に並列で分かれる。
 
@@ -205,7 +205,7 @@ DO の保存量は、封印した era を R2 に移すことで「現在と直�
 
 1. **リアルタイムの分割**（ConnDO / FeedDO。PROTOCOL.md §9.4 に規範を書いた）：最初に当たる上限（約 1 万タブ）。状態がないので無停止で切り替わる。
 2. **受信箱の通知トピック**（PROTOCOL.md §9.3・§10.8・§11.5 に規範を書いた）：ポーリングの費用が最大の固定費。クライアントは購読と、追いつき時だけの読み取りに変わった。
-3. **S_E > 1**：次の era から。`SHARD_MAP` と era 情報、チェックポイントの収集、feed の i。
+3. **S_E > 1**（PROTOCOL.md §9.1「Shard map」・§9.5・§10.9 に規範を書いた）：次の era から。`SHARD_MAP`（`E:S` の列）、era 情報と params の `shards`、チェックポイントの収集（並列 32）、feed の i、ShardDO の `sbits` ピンと経路の検査。
 4. **封印 era の R2 化**と DO の削除：費用。過去の era にも適用。
 5. **BlobReg と dirseq**：コピー 1 回と、D1 への書き手の一本化。
 6. **Push を KV + メモリだけの DO + Worker 送信に**（案 B-1。PROTOCOL.md §9.8 に規範を書いた）：固定費も消える。

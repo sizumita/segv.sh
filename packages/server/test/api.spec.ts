@@ -2703,6 +2703,79 @@ function countingLimiter(left = Number.POSITIVE_INFINITY) {
 }
 
 describe("Worker logic (fake Durable Objects)", () => {
+  it("routes rows and keys by the era's shard count (SHARD_MAP, §9.1), reports it in params and era info, and refuses a malformed map", async () => {
+    const E = eraNow();
+    const map = `${E}:4`; // four shards from this era on, one before it
+    const prm = (await (await direct("/api/v2/params", {}, { SHARD_MAP: map })).json()) as {
+      shards: number;
+    };
+    expect(prm.shards).toBe(4);
+    const shardsOf = async (e: number) =>
+      (
+        (await (await direct(`/api/v2/era/${e}`, {}, { SHARD_MAP: map })).json()) as {
+          shards: number;
+        }
+      ).shards;
+    expect(await shardsOf(E)).toBe(4);
+    expect(await shardsOf(E - 1)).toBe(1);
+    // Every row and key goes to shard(E, label) under s_E = 2, one DO call per shard.
+    const kr = P.kroute(P.fromB64u((env as unknown as { ROUTE_KEY: string }).ROUTE_KEY), E);
+    const shardOfLabel = (label: Uint8Array) => P.shardOf(P.routeV(kr, label), 2);
+    const rows = Array.from({ length: 12 }, () => makeRow({ E }));
+    const names: string[] = [];
+    let routed = 0;
+    const SHARD = {
+      getByName: (n: string) => {
+        names.push(n);
+        const i = Number(n.split("/").pop());
+        const check = (ii: number, items: { label: Uint8Array }[]) => {
+          expect(ii).toBe(i);
+          for (const it of items) expect(shardOfLabel(it.label)).toBe(i);
+          routed += items.length;
+        };
+        return {
+          put: async (_E: number, ii: number, items: { label: Uint8Array }[]) => {
+            check(ii, items);
+            return items.map(() => ({ s: "ok", t: 1 }));
+          },
+          get: async (_E: number, ii: number, keys: { label: Uint8Array }[]) => {
+            check(ii, keys);
+            return keys.map(() => ({ s: "miss", sealed: false }));
+          },
+          feedBatches: async () => ({ batches: [], more: false, sealed: false }),
+        };
+      },
+    };
+    const bytes = W.encodePutRequest(rows);
+    const res = await direct("/api/v2/put", await powInit("put", bytes), { SHARD, SHARD_MAP: map });
+    expect(res.status, await res.clone().text()).toBe(200);
+    expect(W.decodePutResponse(await bytesOf(res)).every((r) => r.s === "ok")).toBe(true);
+    expect(routed).toBe(12);
+    expect(new Set(names).size).toBe(names.length);
+    expect(names.length).toBeGreaterThanOrEqual(2);
+    for (const n of names) expect(n).toMatch(new RegExp(`^shard/v2/${E}/[0-3]$`));
+    routed = 0;
+    const got = await direct(
+      "/api/v2/get",
+      {
+        method: "POST",
+        body: W.encodeGetRequest(rows.map((r) => ({ E, label: r.label, mode: 1 as const }))),
+      },
+      { SHARD, SHARD_MAP: map },
+    );
+    expect(got.status).toBe(200);
+    expect(routed).toBe(12);
+    // The feed of shard 3 exists; shard 4 does not.
+    expect(
+      (await direct(`/api/v2/feed/${E}/3?after=4294967295`, {}, { SHARD, SHARD_MAP: map })).status,
+    ).toBe(200);
+    expect((await direct(`/api/v2/feed/${E}/4`, {}, { SHARD, SHARD_MAP: map })).status).toBe(404);
+    // A malformed map is a misconfiguration: 503 before any work.
+    const bad = await direct("/api/v2/params", {}, { SHARD_MAP: "60:3" });
+    expect(bad.status).toBe(503);
+    expect(((await bad.json()) as { error: string }).error).toBe("server misconfigured");
+  });
+
   it("publishes OK rows that carry a topic in one publish call per FeedDO (one retry), never delaying or changing the response", async () => {
     const shardRows: unknown[] = [];
     const SHARD = fakeNs({

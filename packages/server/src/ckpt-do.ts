@@ -5,10 +5,11 @@
  *  - An alarm runs tick() every 60 s and is re-armed in the same synchronous block as the tick's commit. The
  *    constructor arms it (inside blockConcurrencyWhile) when no alarm is set; the Worker calls ensure() once per
  *    isolate just to wake the object, and ensure() writes nothing while an alarm is scheduled.
- *  - tick() collects (cid, head) from shard/{E_now}/0 and inbox/{E_now}/0; from shard/{E_now−1}/0 and
- *    inbox/{E_now−1}/0 until they are sealed and their final head appeared once ('final:<cid>'); from the blob
- *    registry at most once per UTC hour ('blobreg:hour', 'blobreg:head'); and from the D1 dirlog (ZERO32 when the
- *    table is missing or empty). A component that fails keeps its previous head. The list is sorted by cid,
+ *  - tick() collects (cid, head) from shard/{E_now}/{i} for every i < S_{E_now} (the shard map, §9.1) and
+ *    inbox/{E_now}/0; from shard/{E_now−1}/{i} and inbox/{E_now−1}/0 until they are sealed and their final head
+ *    appeared once ('final:<cid>'); from the blob registry at most once per UTC hour ('blobreg:hour',
+ *    'blobreg:head'); and from the D1 dirlog (ZERO32 when the table is missing or empty). At most 32 component calls
+ *    are in flight at a time. A component that fails keeps its previous head. The list is sorted by cid,
  *    hd = H(heads), C_q = H(enc("segv.sh/v2/ckpt", C_{q−1}, u32 q, u32 sec, hd)), sig = Sign(SRV_SK, enc(…, q, C_q)).
  *    An unchanged hd makes no new checkpoint.
  *  - latest() / get(q) / range(after, limit) are the §10.9 reads.
@@ -36,15 +37,26 @@ import {
 } from "@segv/protocol/proto";
 import { errMsg, logErr } from "./http";
 import { Meta, ab } from "./batch";
-import { serverKeys, srvSign, v2Params } from "./env";
+import { serverKeys, shardsOf, srvSign, v2Params } from "./env";
 import { blobRegStub, inboxStub, shardStub, type CkptRange, type CkptRecord } from "./types";
 
 const PERIOD_MS = 60_000;
 const HOUR_MS = 3_600_000;
-/** Log when a shard reports a databaseSize above this (§9.1 "Retention and capacity"). */
-const SIZE_WARN_BYTES = 4 * 2 ** 30;
+/** Log when a shard reports a databaseSize above this (§9.1 "Retention and capacity"): raise S for the next era. */
+const SIZE_WARN_BYTES = 2 * 2 ** 30;
 /** A component that has not answered after this long counts as failed (it keeps its previous head). */
 const COMPONENT_TIMEOUT_MS = 10_000;
+/** Component calls in flight at a time (§9.5). */
+const COLLECT_CONCURRENCY = 32;
+
+/** Runs the jobs with at most `n` in flight. The jobs never throw (each catches its own failure). */
+async function pool(jobs: readonly (() => Promise<void>)[], n: number): Promise<void> {
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < jobs.length) await jobs[next++]();
+  };
+  await Promise.all(Array.from({ length: Math.min(n, jobs.length) }, worker));
+}
 const RANGE_MAX = 1440;
 const HEADS_LABEL = "segv.sh/v2/ckpt/heads";
 
@@ -106,6 +118,8 @@ export class CheckpointDO extends DurableObject<Env> {
   protected clock = (): number => Date.now();
   protected sizeWarnBytes = SIZE_WARN_BYTES;
   protected componentTimeoutMs = COMPONENT_TIMEOUT_MS;
+  /** S_E (§9.1); an instance field so tests can set a count without a deployment variable. */
+  protected shardsOf = (E: number): number => shardsOf(v2Params(this.env).shardMap, E);
 
   private readonly sql: SqlStorage;
   private readonly kv: Meta;
@@ -222,13 +236,13 @@ export class CheckpointDO extends DurableObject<Env> {
     };
 
     // A previous-era component stays until it is sealed and that final head appeared once.
-    const shard = async (Ec: number, previous: boolean): Promise<void> => {
-      const cid = shardCid(Ec, 0);
+    const shard = async (Ec: number, i: number, previous: boolean): Promise<void> => {
+      const cid = shardCid(Ec, i);
       if (previous && this.kv.num(`final:${cid}`) !== null) return;
       try {
-        const h = await this.timed(Promise.resolve(shardStub(this.env, Ec, 0).head(Ec, 0)));
+        const h = await this.timed(Promise.resolve(shardStub(this.env, Ec, i).head(Ec, i)));
         if (h.size > this.sizeWarnBytes) {
-          console.error(JSON.stringify({ msg: logErr(`shard ${cid} databaseSize ${h.size} B is above 4 GiB`) }));
+          console.error(JSON.stringify({ msg: logErr(`shard ${cid} databaseSize ${h.size} B is above 2 GiB`) }));
         }
         heads.set(cid, new Uint8Array(h.head));
         if (previous && h.sealed) metaWrites.set(`final:${cid}`, 1);
@@ -278,9 +292,14 @@ export class CheckpointDO extends DurableObject<Env> {
       }
     };
 
-    const jobs = [shard(E, false), inbox(E, false), blobreg(), dirlog()];
-    if (E - 1 >= Math.max(eFirst, 0)) jobs.push(shard(E - 1, true), inbox(E - 1, true));
-    await Promise.all(jobs);
+    const jobs: (() => Promise<void>)[] = [];
+    for (let i = 0; i < this.shardsOf(E); i++) jobs.push(() => shard(E, i, false));
+    jobs.push(() => inbox(E, false), blobreg, dirlog);
+    if (E - 1 >= Math.max(eFirst, 0)) {
+      for (let i = 0; i < this.shardsOf(E - 1); i++) jobs.push(() => shard(E - 1, i, true));
+      jobs.push(() => inbox(E - 1, true));
+    }
+    await pool(jobs, COLLECT_CONCURRENCY);
 
     const list = [...heads]
       .map(([cid, head]): Head => ({ cid, head }))

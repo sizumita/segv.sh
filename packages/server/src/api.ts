@@ -100,6 +100,8 @@ import {
   type PushConfig,
   type ServerKeys,
   type V2Params,
+  shardBitsOf,
+  shardsOf,
 } from "./env";
 import { CORS_HEADERS, appOriginOf, isPreflight, preflightResponse, setCorsHeaders } from "./origins";
 import { PUSH_TOKENS, PUSH_WINDOW, epOf, ownerOf, pushRing, qkOf, quietShard } from "./push";
@@ -142,9 +144,6 @@ export function feedTokens(bytes: number): number {
   return Math.min(Math.max(1, Math.ceil(bytes / FEED_BUDGET)), FEED_MAX_TOKENS);
 }
 const TEXT_MAX = 12_000;
-/** Stage 1 runs one shard per era (s_E = 0). */
-const SHARD_BITS = 0;
-const SHARDS = 1;
 
 const IMMUTABLE = "public, max-age=31536000, immutable";
 const OCTET = "application/octet-stream";
@@ -285,7 +284,7 @@ async function params(c: Ctx): Promise<Response> {
     inboxRetention: INBOX_RETENTION,
     inboxDayCap: INBOX_DAY_CAP,
     inboxBatch: INBOX_BATCH,
-    shards: SHARDS,
+    shards: shardsOf(c.params.shardMap, E),
     p,
     efirst: c.params.eFirst,
     kcommit: enc64(kcommitFor(c.keys, E)),
@@ -319,7 +318,7 @@ async function eraInfo(c: Ctx, E: number): Promise<Response> {
       start: eraStart(E),
       end: eraEnd(E),
       delta: c.params.delta,
-      shards: SHARDS,
+      shards: shardsOf(c.params.shardMap, E),
       kcommit: enc64(kcommitFor(c.keys, E)),
       sealed,
     },
@@ -390,7 +389,8 @@ async function put(c: Ctx): Promise<Response> {
     rows.flatMap((r, idx) => {
       if (results[idx] !== null) return [];
       const v = routeV(krouteFor(c.keys, r.E), r.label);
-      return [{ E: r.E, i: shardOf(v, SHARD_BITS), idx, item: { v, label: r.label, cls: r.cls, body: r.body } as ShardPutRow }];
+      const i = shardOf(v, shardBitsOf(c.params.shardMap, r.E));
+      return [{ E: r.E, i, idx, item: { v, label: r.label, cls: r.cls, body: r.body } as ShardPutRow }];
     }),
   );
   await Promise.all(
@@ -442,7 +442,8 @@ async function get(c: Ctx): Promise<Response> {
     keys.flatMap((k, idx) => {
       if (out[idx] !== null) return [];
       const v = routeV(krouteFor(c.keys, k.E), k.label);
-      return [{ E: k.E, i: shardOf(v, SHARD_BITS), idx, item: { v, label: k.label, mode: k.mode } as ShardGetKey }];
+      const i = shardOf(v, shardBitsOf(c.params.shardMap, k.E));
+      return [{ E: k.E, i, idx, item: { v, label: k.label, mode: k.mode } as ShardGetKey }];
     }),
   );
   await Promise.all(
@@ -758,7 +759,7 @@ async function ckptRange(c: Ctx): Promise<Response> {
 
 async function feed(c: Ctx, E: number, i: number): Promise<Response> {
   const { hi } = eraBounds(c.now, c.params.skew);
-  if (E > hi || E < c.params.eFirst || i >= SHARDS) throw new HttpError(404, "no such shard");
+  if (E > hi || E < c.params.eFirst || i >= shardsOf(c.params.shardMap, E)) throw new HttpError(404, "no such shard");
   const after = intParam(c.url.searchParams.get("after"), 0, 0, 0xffffffff, "after");
   const key = `${c.url.origin}/api/v2/feed/${E}/${i}?after=${after}`;
   const hit = await cacheGet(key);
@@ -1042,7 +1043,8 @@ async function ringAfter(c: Ctx, E: number, label: Bytes, tokens: Bytes[]): Prom
   try {
     if (!ringEraOk(E, c.now, c.params)) return;
     const v = routeV(krouteFor(c.keys, E), label);
-    const [r] = (await shardStub(c.env, E, 0).get(E, 0, [{ v, label, mode: 1 } as ShardGetKey])) as ShardGetResult[];
+    const i = shardOf(v, shardBitsOf(c.params.shardMap, E));
+    const [r] = (await shardStub(c.env, E, i).get(E, i, [{ v, label, mode: 1 } as ShardGetKey])) as ShardGetResult[];
     if (!r || r.s !== "hit" || !ringRowFresh(r.t, c.now, c.params.delta)) return;
     const cfg = pushConfig(c.env);
     if (!cfg) return;
