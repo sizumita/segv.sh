@@ -4415,8 +4415,8 @@ decrypts itself.
      notification with the payload's `title`, `body` and `tag` that opens `navigate`, or with the same fixed values
      when the payload is not that JSON. It does nothing else.
   2. Otherwise one notification per distinct copy that the bells name and that is not muted in the cache, in their
-     order. With `name` its title is the copy's name and its body the payload's `body`; its `tag` is the copy's `ref`,
-     and it opens the copy's URL (below).
+     order. With `name` its title is the copy's name and its body the fixed `body` of §9.8 (`new messages`), whatever
+     the payload's `body` is; its `tag` is the copy's `ref`, and it opens the copy's URL (below).
   3. With `message` it first makes one `POST /api/v2/get` (§10.4) for those copies: for each lane of each copy's cached
      epoch other than self's, the slot before the lane's next slot when it is in the same era, and the slots from the
      next slot on, at most `W` of those per lane and at most 256 keys in all, with slot 0 of `E_now` in place of the
@@ -4427,16 +4427,17 @@ decrypts itself.
      comes), only when it was stored in the last 5 minutes. A copy's notification is then that of step 2 with, as its
      body, the copy's newest such row by clamped `ts` (§11.8): `@handle: ` and its text, cut to 200 characters, or
      `@handle sent an image` or `@handle sent a file`, followed by ` (+k)` when it found k more. A copy whose answer has
-     not come 8 s after the push event gets the notification of step 2 as it is, and so does a copy without such a row,
-     unless every row found lies before its read positions: that copy gets none. Then it moves each lane's next slot
-     past the dense prefix it found from that slot on, keeping the later of the stored one and its own.
+     not come 8 s after the push event gets the notification of step 2, with its fixed body, and so does a copy without
+     such a row, unless every row found lies before its read positions: that copy gets none. Then it moves each lane's
+     next slot past the dense prefix it found from that slot on, keeping the later of the stored one and its own.
   4. When steps 2 and 3 leave no notification (every copy muted, or read according to the notes), the notification of
      step 1, or none from a handler whose endpoint takes notes.
 
-  It takes the text of these notifications from the cache and from rows that verify only, never from the payload,
-  which O composes. It reads no key but the cache's device key (and a native app's push keys), makes no request but that
-  `get`, and stores nothing but the next slots and what notes change in the cache. It checks no checkpoint, receipt or
-  `prev` chain (§12) and reads no control lane, so a preview may miss rows, or show a row that the app later drops
+  It takes the text of the notifications of steps 2 and 3 from the cache, from rows that verify and from the fixed text
+  of §9.8 only, never from the payload, which O composes: O can choose the text of step 1's notification alone, which
+  names no conversation. It reads no key but the cache's device key (and a native app's push keys), makes no request but
+  that `get`, and stores nothing but the next slots and what notes change in the cache. It checks no checkpoint, receipt
+  or `prev` chain (§12) and reads no control lane, so a preview may miss rows, or show a row that the app later drops
   (§6.8). A tap on a notification opens its URL: the Service Worker's `notificationclick` handler focuses an open window
   of the app and moves it to that URL, or opens it; a native app opens itself at that URL.
 - **Closing and the badge.** A device closes a copy's notifications once its read positions cover them: when it shows
