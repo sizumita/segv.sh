@@ -9,6 +9,7 @@ import {
   W_SLOTS,
   acceptedOld,
   clampTs,
+  ctlTail,
   insertMessage,
   removeMessage,
   rowKey,
@@ -138,7 +139,10 @@ class LaneWalk {
       if (s.s === "hit" && s.body) {
         rows.push({ E: this.tail.E, n: this.tail.n, label: keys[o].label, t: s.t, body: s.body });
         this.tail = { E: this.tail.E, n: this.tail.n + 1 };
-      } else if (s.s === "miss" && s.sealed) this.tail = null;
+      } else if (s.s === "miss" && s.sealed) {
+        this.sealedAt.set(this.tail.E, this.tail.n);
+        this.tail = null;
+      }
       o++;
     }
     let ended = false;
@@ -230,8 +234,9 @@ export async function syncLanes(
   const Enow = P.era(ctx.api.serverNow());
   const walks = targets.map((x) => {
     if (x.lane === "ctl") {
+      // The tail: the prefix end of an earlier era not yet observed sealed, which a late claim can still fill (§6.5).
       const ctl = x.ep.ctl;
-      return new LaneWalk(ctl.next, null, Enow, (E, n) => P.Lctl(x.ep.keys.rk, E, n));
+      return new LaneWalk(ctl.next, ctlTail(x.ep), Enow, (E, n) => P.Lctl(x.ep.keys.rk, E, n));
     }
     const lane = x.ep.lanes[x.lane];
     const j = x.lane;
@@ -254,7 +259,12 @@ export async function syncLanes(
         const ctl = x.ep.ctl;
         for (const r of rows) {
           ctl.counts.set(r.E, Math.max(ctl.counts.get(r.E) ?? 0, r.n + 1));
-          if (P.posCmp(r, ctl.next) >= 0 && !ctl.queue.some((q) => q.E === r.E && q.n === r.n))
+          // A row at an earlier era's tail lies before `next`: it was never decided, and is decided first.
+          const late = r.E < ctl.next.E && !ctl.sealed.has(r.E);
+          if (
+            (late || P.posCmp(r, ctl.next) >= 0) &&
+            !ctl.queue.some((q) => q.E === r.E && q.n === r.n)
+          )
             ctl.queue.push(r);
         }
         ctl.queue.sort((a, b) => P.posCmp(a, b));

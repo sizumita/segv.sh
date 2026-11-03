@@ -99,6 +99,22 @@ describe("links", () => {
     expect(l).toMatchObject({ t: "link", c: [text("https://en.wikipedia.org/wiki/Foo_(bar)")] });
   });
 
+  it("keeps as many closing parentheses as the URL left open, and no more", () => {
+    expect(one("https://a.example/x((y))")[0]).toMatchObject({
+      t: "link",
+      c: [text("https://a.example/x((y))")],
+    });
+    expect(one("https://a.example/x(y)))")).toEqual([
+      {
+        t: "link",
+        href: "https://a.example/x(y)",
+        masked: false,
+        c: [text("https://a.example/x(y)")],
+      },
+      text("))"),
+    ]);
+  });
+
   it("does not style inside a URL", () => {
     const [l] = one("https://example.com/a_b_c/**x**");
     expect(l).toMatchObject({ t: "link", masked: false });
@@ -429,5 +445,20 @@ describe("hostile input", () => {
         expect(performance.now() - t0, JSON.stringify(unit)).toBeLessThan(200);
       }
     }
+  });
+
+  it("stays fast on a URL's run of parentheses, and on quote lines whose spoiler runs past the quote", () => {
+    const parens = `http://a${"(".repeat(7_500)}${")".repeat(7_500)}`;
+    let t0 = performance.now();
+    const [l] = one(parens);
+    expect(performance.now() - t0).toBeLessThan(200);
+    expect(l).toMatchObject({ t: "link", c: [text(parens)] });
+    const quotes = `${"> a\n".repeat(3_750)}> ||x\ny||`;
+    t0 = performance.now();
+    const bs = parse(quotes);
+    expect(performance.now() - t0).toBeLessThan(200);
+    // The spoiler runs past the quote: no line is a quote, and it stays in one paragraph.
+    expect(bs).toHaveLength(1);
+    expect(bs[0].t).toBe("p");
   });
 });

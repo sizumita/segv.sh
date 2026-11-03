@@ -14,6 +14,7 @@ import {
   cleanName,
   contest,
   copyKeyOf,
+  ctlRecorded,
   currentEpoch,
   leftIn,
   memberHandle,
@@ -3225,7 +3226,7 @@ export class Messaging {
         root: c.root,
         e: ep.e,
         lastTs: Math.max(0, Math.floor(c.lastTs)),
-        ctl: { E: ep.ctl.next.E, cnt: ep.ctl.next.n },
+        ctl: (({ E, n }) => ({ E, cnt: n }))(ctlRecorded(ep)),
         lanes: ep.lanes.map((l, j) => pos(ep.e, j, l)),
         followed,
       },
@@ -3257,7 +3258,9 @@ export class Messaging {
           lefts.map((l) => [P.b64u(l.uid), l.t, l.row]),
         ]),
       ]);
-      const recs = this.pendingRecords;
+      // A copy: records queued while the rows below are being written (learnUser outside the queue, recordEnd) are not
+      // in them, and must stay pending for the next flush.
+      const recs = [...this.pendingRecords];
       if (sig === this.lastHeads && recs.length === 0) return;
       // Split everything over as many self rows as needed (§7.3 "HEADS splitting"): every row stays within the cls-3
       // budget and the record cap, ends with a HEADS record (the cursor, and the entries placed in it), and holds

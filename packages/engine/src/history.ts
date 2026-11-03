@@ -183,8 +183,8 @@ async function olderHeads(ctx: SyncCtx, ep: Epoch): Promise<(Slot | null)[]> {
 
 /**
  * The backward walk over one epoch's lanes from `start` (the slot after each lane's last row to consider): probes
- * (E, n−32..n−1), and at n = 0 moves to the previous era with rows (the oldest loaded row's prev, or the dense-prefix
- * end of an earlier era down to E_start). Stops when `enough()` holds or every lane is exhausted, or after `rounds`.
+ * (E, n−32..n−1), and at n = 0 moves to the dense-prefix end of the previous era with rows (down to the era of the
+ * oldest loaded row's prev, or to E_start). Stops when `enough()` holds or every lane is exhausted, or after `rounds`.
  */
 async function walkBack(
   ctx: SyncCtx,
@@ -204,22 +204,25 @@ async function walkBack(
       const b = below[j];
       if (b.n === 0) {
         // At the start of an era: the oldest loaded row's prev names the previous era with rows (NONE: the lane's
-        // first row in this epoch); with nothing loaded in this era, probe the earlier eras down to E_start.
+        // first row in this epoch), and the walk goes on from the dense-prefix end of the highest era with rows down
+        // to prev's era, so a sibling's row written across the boundary is found too. Never from prev's n: the
+        // writer chooses it, and a forged one would send the walk through any number of empty slots. With nothing
+        // loaded in this era, probe the earlier eras down to E_start.
         const o = ep.lanes[j].oldest;
+        let floor = Estart;
         if (o && o.E === b.E) {
           if (P.isNone(o.prev) || o.prev.E >= b.E) {
             done[j] = true;
             continue;
           }
-          below[j] = { E: o.prev.E, n: o.prev.n + 1 };
-        } else {
-          const end = await earlierEnd(ctx, ep, j, b.E, Estart);
-          if (!end) {
-            done[j] = true;
-            continue;
-          }
-          below[j] = end;
+          floor = Math.max(o.prev.E, Estart);
         }
+        const end = await earlierEnd(ctx, ep, j, b.E, floor);
+        if (!end) {
+          done[j] = true;
+          continue;
+        }
+        below[j] = end;
       }
       const at = below[j];
       for (let n = Math.max(0, at.n - STEP); n < at.n; n++)

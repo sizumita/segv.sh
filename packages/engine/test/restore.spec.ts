@@ -5,9 +5,12 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   I,
   P,
+  buildMessage,
   chat,
   engineFor,
+  epoch,
   freshWorldPerTest,
+  postRow,
   makeUser,
   mustView,
   server,
@@ -142,5 +145,35 @@ describe("scrollback after a reload", () => {
         .views()
         .find((v) => v.id === id)!.unread,
     ).toBe(0); // scrollback never counts as unread
+  });
+
+  it("scrollback enters the previous era at its dense-prefix end, not at the slot a forged prev names", async () => {
+    const [alice, bob] = ["alice", "bob"].map((h) => makeUser(h));
+    const A = await engineFor(alice);
+    const B = await engineFor(bob);
+    const id = await A.createConversation(["bob"]);
+    await settle(A, B);
+    for (let i = 0; i < 3; i++) await B.sendText(id, `old ${i}`);
+    await settle(A, B);
+    const E0 = server().era;
+    server().advanceEra();
+    await settle(A, B);
+    await B.logout();
+    // Bob's first row of the new era names a previous row 320 000 slots past his last one.
+    const ep = epoch(A, id);
+    const msg = { type: P.MT.TEXT, text: "new", prev: { E: E0, n: 320_000 } } as const;
+    postRow(ep, buildMessage(bob, ep, { E: server().era, n: 0 }, msg));
+    await settle(A);
+    const gets = () =>
+      server().requests.filter((r) => r.who === "alice" && r.path === "/api/v2/get").length;
+    const start = gets();
+    const A2 = await engineFor(alice);
+    A2.markRead(id);
+    await settle(A2);
+    // The walk never steps through the empty slots below the forged position (10 000 gets of 32 slots each).
+    expect(gets() - start).toBeLessThan(100);
+    expect(chat(A2, id)).toEqual(
+      expect.arrayContaining(["bob: old 0", "bob: old 1", "bob: old 2", "bob: new"]),
+    );
   });
 });
