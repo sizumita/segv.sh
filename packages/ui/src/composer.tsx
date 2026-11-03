@@ -145,6 +145,22 @@ const Attach = component$<{ onPick$: QRL<(picked: File[], asFiles?: boolean) => 
   },
 );
 
+/** An arrow pointing up: send. */
+const SendIcon = () => (
+  <svg
+    class="icon"
+    viewBox="0 0 20 20"
+    aria-hidden="true"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  >
+    <path d="M10 16V4M5 9l5-5 5 5" />
+  </svg>
+);
+
 /** Why the composer is replaced by a notice (`ConversationView.blocked`); "" never reaches it. */
 const BLOCKED_TEXT: Record<Exclude<Blocked, "">, string> = {
   removed:
@@ -163,6 +179,16 @@ export const Composer = component$<{ convId: string; blocked: Blocked }>((props)
 
   useVisibleTask$(() => {
     if (matchMedia("(hover: hover) and (pointer: fine)").matches) ta.value?.focus();
+  });
+
+  /** The box grows with its text: by CSS where `field-sizing` works, otherwise to the text's height here. */
+  useVisibleTask$(({ track }) => {
+    if (CSS.supports("field-sizing: content")) return;
+    track(() => draft.value);
+    const el = ta.value;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
   });
 
   /** Adds picks: as files with "attach file", otherwise images as images and every other file as a file. */
@@ -264,52 +290,53 @@ export const Composer = component$<{ convId: string; blocked: Blocked }>((props)
       )}
       <div class="inputrow">
         <Attach onPick$={addFiles} />
-        <textarea
-          ref={ta}
-          rows={2}
-          aria-label="message"
-          placeholder="message"
-          bind:value={draft}
-          onKeyDown$={[
-            ENTER_SENDS,
-            $((_: KeyboardEvent, el: HTMLTextAreaElement) => {
-              if (el.getAttribute("data-send")) {
-                el.removeAttribute("data-send");
-                return send();
-              }
-            }),
-          ]}
-          onPaste$={[
-            STASH_FILES,
-            $((_: ClipboardEvent, el: HTMLTextAreaElement) => {
-              const s = el as Stash;
-              const f = s._segvFiles;
-              s._segvFiles = undefined;
-              if (f) return addFiles(f);
-            }),
-          ]}
-        />
+        <div class="field">
+          <textarea
+            ref={ta}
+            rows={1}
+            aria-label="message"
+            placeholder="message"
+            bind:value={draft}
+            onKeyDown$={[
+              ENTER_SENDS,
+              $((_: KeyboardEvent, el: HTMLTextAreaElement) => {
+                if (el.getAttribute("data-send")) {
+                  el.removeAttribute("data-send");
+                  return send();
+                }
+              }),
+            ]}
+            onPaste$={[
+              STASH_FILES,
+              $((_: ClipboardEvent, el: HTMLTextAreaElement) => {
+                const s = el as Stash;
+                const f = s._segvFiles;
+                s._segvFiles = undefined;
+                if (f) return addFiles(f);
+              }),
+            ]}
+          />
+          <button
+            type="button"
+            class="send"
+            aria-label="send"
+            onClick$={[
+              $(() => {
+                if (matchMedia("(hover: hover) and (pointer: fine)").matches) ta.value?.focus();
+              }),
+              send,
+            ]}
+            disabled={tooLong || (!draft.value.trim() && !pending.length)}
+          >
+            <SendIcon />
+          </button>
+        </div>
       </div>
-      <div class="row">
-        <span class={["small", "grow", tooLong ? "strong" : "dim", "hint"]}>
-          {tooLong
-            ? "message too long"
-            : hint.value || "enter to send · shift+enter for a new line"}
-        </span>
-        <button
-          type="button"
-          class="send"
-          onClick$={[
-            $(() => {
-              if (matchMedia("(hover: hover) and (pointer: fine)").matches) ta.value?.focus();
-            }),
-            send,
-          ]}
-          disabled={tooLong || (!draft.value.trim() && !pending.length)}
-        >
-          send
-        </button>
-      </div>
+      {(tooLong || hint.value) && (
+        <p class={["small", tooLong ? "strong" : "dim", "hint"]}>
+          {tooLong ? "message too long" : hint.value}
+        </p>
+      )}
     </div>
   );
 });

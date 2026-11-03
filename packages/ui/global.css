@@ -957,36 +957,82 @@ textarea:focus {
   display: grid;
   gap: 6px;
 }
-.composer textarea {
-  resize: none;
-  min-height: calc(2lh + 14px);
-  max-height: 40vh;
-  field-sizing: content;
-}
 .composer .hint {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.composer .send {
-  margin-left: auto;
-}
 .inputrow {
   display: flex;
   gap: 6px;
-  align-items: flex-start;
+  align-items: flex-end;
 }
-.inputrow textarea {
+/* The message box: one line that grows with the text, and the send arrow at its bottom right. The box draws the border,
+   so a scrollbar on long text stays left of the arrow. One line (24px + 9px above and below) is as tall as the arrow
+   (30px + 6px around it), so the text and the arrow are centred in it. */
+.field {
   flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: flex-end;
+  background: var(--surface);
+  border: 1px solid var(--edge);
+  border-radius: var(--r);
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
+}
+.field:focus-within {
+  border-color: var(--dim);
+  box-shadow: 0 0 0 3px var(--ring);
+}
+.field textarea,
+.field textarea:focus {
+  flex: 1;
+  resize: none;
+  font-size: 16px;
+  line-height: 24px;
+  padding: 9px 12px;
+  min-height: 42px;
+  max-height: 40vh;
+  field-sizing: content;
+  border: 0;
+  border-radius: var(--r) 0 0 var(--r);
+  background: none;
+  box-shadow: none;
+}
+.send {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  margin: 0 6px 6px 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-s);
+  background: var(--fg);
+  color: var(--bg);
+}
+.send:hover:not(:disabled) {
+  background: var(--dim);
+}
+.send:disabled {
+  opacity: 0.25;
+}
+.send .icon {
+  width: 16px;
+  height: 16px;
 }
 /* The "+" beside the message box, and its menu above it. */
 .attach {
   position: relative;
   flex: none;
 }
+/* As tall as the message box on one line. */
 .plus {
-  width: 36px;
-  height: calc(2lh + 14px);
+  width: 44px;
+  height: 44px;
   padding: 0;
   border-radius: var(--r);
 }
@@ -1204,13 +1250,6 @@ textarea:focus {
   .settings .sheet {
     padding: calc(10px + env(safe-area-inset-top)) max(16px, env(safe-area-inset-right))
       calc(24px + env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
-  }
-  .composer .hint:not(.strong) {
-    display: none;
-  }
-  /* The message box's font size, so that the "+" is as tall as its two lines. */
-  .plus {
-    font-size: 16px;
   }
   .picker {
     top: auto;
