@@ -488,13 +488,13 @@ export class FakeWorld implements WorldCtx, RtHost {
     this.writeCount++;
   }
 
-  /** (internal) WorldCtx: RealtimeDO.publish. */
+  /** (internal) WorldCtx: FeedDO.publish → ConnDO.deliver. */
   publish(rows: PublishRow[]): void {
     this.rt.publish(rows);
   }
 
   /**
-   * (internal) RtHost: the Worker's handling of `GET /api/v2/rt` with an upgrade. A 101 is the RealtimeDO's response
+   * (internal) RtHost: the Worker's handling of `GET /api/v2/rt` with an upgrade. A 101 is the ConnDO's response
    * passed on unchanged, so it carries none of the per-response headers (§9.7, §10.1: HELLO carries the time); a
    * refusal is an error response like any other: 404 for another path, 429 from RL_READ or the per-client cap, 503
    * at the global cap or while `wsEnabled` is false.
@@ -529,7 +529,7 @@ export class FakeWorld implements WorldCtx, RtHost {
     return fail === "after" ? { status: 0, headers: null } : out;
   }
 
-  /** The Worker's answer to a RealtimeDO refusal (the DO's status, error and `retry-after`); null for a 101. */
+  /** The Worker's answer to a ConnDO refusal (the DO's status, error and `retry-after`); null for a 101. */
   private admitRefusal(status: number): Res | null {
     if (status === 101) return null;
     const retry = { "retry-after": "60" };

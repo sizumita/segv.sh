@@ -31,17 +31,33 @@
   ],
   // Client-side-encrypted, content-addressed blobs: key "b/<b64u(sha256(blob))>".
   "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "segv-blobs" }],
+  // The push store (docs/PROTOCOL.md §9.8): sealed registrations, written at once; a KV namespace keeps no history.
+  // Create it with `wrangler kv namespace create segv-push` and put its id here (docs/DEPLOYMENT.md).
+  "kv_namespaces": [{ "binding": "PUSH_KV", "id": "REPLACE_WITH_THE_SEGV_PUSH_NAMESPACE_ID" }],
+  // Pushes due later than a Worker can wait (§9.8 "The Worker's part"): a message names the QuietDO to ask, nothing else.
+  "queues": {
+    "producers": [{ "binding": "PUSH_QUEUE", "queue": "segv-push" }],
+    "consumers": [
+      { "queue": "segv-push", "max_batch_size": 100, "max_batch_timeout": 1, "max_retries": 3 },
+    ],
+  },
+  // The daily expiry of push registrations not refreshed for 30 days (§9.8 "Expiry").
+  "triggers": { "crons": ["17 3 * * *"] },
   // docs/PROTOCOL.md §9: SHARD "shard/v2/{E}/{i}" and INBOX "inbox/v2/{E}/{g}" per era, BLOBREG
-  // "blobreg/v2", RT "rt/v2/0" (realtime WebSockets), CKPT "ckpt/v2" (signed checkpoints every 60 s),
-  // PUSH "push/v2" (Web Push registrations; addressed only while push is on, §9.8).
+  // "blobreg/v2", CONN "conn/v2/{c}" (the realtime WebSockets, RT_CONNS of them) and FEED "feed/v2/{j}" (topic
+  // fan-out to the ConnDOs, RT_FEEDS of them; §9.4), CKPT "ckpt/v2" (signed checkpoints every 60 s), BELL "bell/v2/{j}"
+  // and QUIET "quiet/v2/{k}" (push: the bell index and each account's window, hold and seen marks, memory only,
+  // PUSH_SHARDS of each; addressed only while push is on, §9.8).
   "durable_objects": {
     "bindings": [
       { "name": "SHARD", "class_name": "ShardDO" },
       { "name": "BLOBREG", "class_name": "BlobRegDO" },
       { "name": "INBOX", "class_name": "InboxDO" },
-      { "name": "RT", "class_name": "RealtimeDO" },
+      { "name": "CONN", "class_name": "ConnDO" },
+      { "name": "FEED", "class_name": "FeedDO" },
       { "name": "CKPT", "class_name": "CheckpointDO" },
-      { "name": "PUSH", "class_name": "PushDO" },
+      { "name": "BELL", "class_name": "BellDO" },
+      { "name": "QUIET", "class_name": "QuietDO" },
     ],
   },
   "migrations": [
@@ -51,6 +67,14 @@
     },
     // Web Push (§9.8).
     { "tag": "v2", "new_sqlite_classes": ["PushDO"] },
+    // The realtime path split into ConnDOs and FeedDOs (§9.4), and push moved to the KV store with memory-only BellDOs
+    // and QuietDOs (§9.8). The RealtimeDO (a tag key) and the PushDO (registrations, which devices make again at their
+    // next start or within a day) are gone.
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["ConnDO", "FeedDO", "BellDO", "QuietDO"],
+      "deleted_classes": ["RealtimeDO", "PushDO"],
+    },
   ],
   // Per-IP (IPv6 /64) abuse limits. Keys are never persisted. Period must be 10 or 60 seconds.
   "ratelimits": [
@@ -79,12 +103,18 @@
     // (lower eras are never instantiated).
     // Secrets (wrangler secret put; .dev.vars for vp dev): ROUTE_KEY (32 B b64u), SRV_KEY (Ed25519 seed b64u).
     // Web Push is off unless the secrets VAPID_SK (P-256 scalar, 32 B b64u) and PUSH_KEY (32 B b64u) are set, with
-    // VAPID_SUB (mailto: or https: contact). Optional: PUSH_HOSTS, POW_PUSH (20), PUSH_MAX_SUBS (100000),
-    // PUSH_DAY_SUBS (2000). An invalid push setting turns push off and nothing else (docs/PROTOCOL.md §9.8).
+    // VAPID_SUB (mailto: or https: contact). Optional: PUSH_HOSTS, POW_PUSH (20), PUSH_SHARDS (1). An invalid push
+    // setting turns push off and nothing else (docs/PROTOCOL.md §9.8).
     "DELTA_S": "10",
     "SKEW_S": "2",
     "INBOX_SLOT_S": "10",
     "E_FIRST": "42",
+    // The realtime path (docs/PROTOCOL.md §9.4): C ConnDOs hold the sockets (a client's go to one of them) and F
+    // FeedDOs (a power of two) fan rows out to them. Both may change at any deploy; sockets live at most an hour.
+    "RT_CONNS": "4",
+    "RT_FEEDS": "4",
+    // Push: the number of BellDOs and of QuietDOs (§9.8). May change at any deploy; the store is the truth.
+    "PUSH_SHARDS": "4",
     // Hostnames this Worker answers on (comma-separated; the first is canonical). Any other host gets a
     // 308 to https://<first><path> (pages) or 421 (/api/*). "" disables the check. localhost = local dev
     // (vp dev, wrangler dev, test/e2e). packages/server/src/hosts.ts.
@@ -124,14 +154,31 @@
         },
       ],
       "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "segv-blobs-canary" }],
+      "kv_namespaces": [
+        { "binding": "PUSH_KV", "id": "REPLACE_WITH_THE_SEGV_PUSH_CANARY_NAMESPACE_ID" },
+      ],
+      "queues": {
+        "producers": [{ "binding": "PUSH_QUEUE", "queue": "segv-push-canary" }],
+        "consumers": [
+          {
+            "queue": "segv-push-canary",
+            "max_batch_size": 100,
+            "max_batch_timeout": 1,
+            "max_retries": 3,
+          },
+        ],
+      },
+      "triggers": { "crons": ["17 3 * * *"] },
       "durable_objects": {
         "bindings": [
           { "name": "SHARD", "class_name": "ShardDO" },
           { "name": "BLOBREG", "class_name": "BlobRegDO" },
           { "name": "INBOX", "class_name": "InboxDO" },
-          { "name": "RT", "class_name": "RealtimeDO" },
+          { "name": "CONN", "class_name": "ConnDO" },
+          { "name": "FEED", "class_name": "FeedDO" },
           { "name": "CKPT", "class_name": "CheckpointDO" },
-          { "name": "PUSH", "class_name": "PushDO" },
+          { "name": "BELL", "class_name": "BellDO" },
+          { "name": "QUIET", "class_name": "QuietDO" },
         ],
       },
       // Ids that no other Worker of the account uses.
@@ -153,6 +200,9 @@
         "SKEW_S": "2",
         "INBOX_SLOT_S": "10",
         "E_FIRST": "42",
+        "RT_CONNS": "4",
+        "RT_FEEDS": "4",
+        "PUSH_SHARDS": "4",
         "APP_HOSTS": "canary.segv.sh",
         // The desktop apps' pages (segv.sh Canary on macOS); the mobile apps are segv.sh's only.
         "APP_ORIGINS": "tauri://localhost,https://tauri.localhost",

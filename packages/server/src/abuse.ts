@@ -1,5 +1,5 @@
 /** Abuse control: proof of work (docs/PROTOCOL.md §10.2) and per-IP rate limiting. Nothing here is persisted. */
-import { HMAC, POW_WINDOW_MS, hex, powCheck, powDifficulty, powPre, utf8, type PowScope } from "@segv/protocol/proto";
+import { POW_WINDOW_MS, clientTagOf, hex, powCheck, powDifficulty, powPre, type PowScope } from "@segv/protocol/proto";
 import { HttpError, logErr } from "./http";
 
 const POW_DEFAULTS: Readonly<Record<PowScope, number>> = { register: 20, wrap: 18, put: 16, inbox: 18, blob: 18, push: 20 };
@@ -136,9 +136,11 @@ export async function rateLimit(binding: RateLimit | undefined, scope: string, r
 }
 
 /**
- * Opaque per-client tag (hex, 128 bits) for counting a client's WebSockets: HMAC(key, clientKey). The key is
- * a random secret held by the RealtimeDO, so the tag cannot be reversed to an address by enumeration without it.
- * Tags only live on open sockets (acceptWebSocket tags); they are never written to storage.
+ * Opaque per-client tag (128 bits) for counting a client's WebSockets and picking its ConnDO (§4.4):
+ * tag(ck) = HMAC(ktag, "ws|" ‖ ck)[0..16], ktag being derived from ROUTE_KEY, so the tag cannot be reversed to an
+ * address by enumeration without the secret. Tags only live on open sockets (acceptWebSocket tags); they are never
+ * written to storage.
  */
-export const clientTag = (key: Uint8Array, request: Request): string =>
-  hex(HMAC(key, utf8(`ws|${clientKey(request)}`)).subarray(0, 16));
+export const clientTagBytes = (ktagKey: Uint8Array, request: Request): Uint8Array => clientTagOf(ktagKey, clientKey(request));
+/** The tag as the Worker sends it to the ConnDO: lowercase hex. */
+export const clientTag = (ktagKey: Uint8Array, request: Request): string => hex(clientTagBytes(ktagKey, request));

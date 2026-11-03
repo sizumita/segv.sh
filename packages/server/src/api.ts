@@ -29,6 +29,10 @@ import {
   hex,
   quietTag,
   receiptMsg,
+  connOf,
+  feedBits,
+  feedHash,
+  feedOf,
   routeV,
   secOf,
   shardOf,
@@ -54,7 +58,7 @@ import {
   type GetStatus,
   type PutResult,
 } from "@segv/protocol/wire";
-import { checkPow, clientTag, powParams, rateLimit } from "./abuse";
+import { checkPow, clientTagBytes, powParams, rateLimit } from "./abuse";
 import { dec64, enc64 } from "./b64";
 import {
   HttpError,
@@ -98,13 +102,15 @@ import {
   type V2Params,
 } from "./env";
 import { CORS_HEADERS, appOriginOf, isPreflight, preflightResponse, setCorsHeaders } from "./origins";
-import { PUSH_TOKENS, PUSH_WINDOW } from "./push-do";
+import { PUSH_TOKENS, PUSH_WINDOW, epOf, ownerOf, pushRing, qkOf, quietShard } from "./push";
+export { _setRingSleepForTests } from "./push";
 import {
   blobRegStub,
   ckptStub,
   inboxStub,
-  pushStub,
-  rtStub,
+  quietStub,
+  connStub,
+  feedStub,
   shardStub,
   type BlobMeta,
   type CkptRecord,
@@ -343,15 +349,28 @@ function group<T>(entries: { E: number; i: number; idx: number; item: T }[]): Ro
   return [...m.values()];
 }
 
+/** §10.3 step 6: the rows of a put grouped by their topics' FeedDO (feed(T), §4.4); one publish each, one retry each. */
 async function publish(c: Ctx, rows: RtPublishRow[]): Promise<void> {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      await rtStub(c.env).publish(rows);
-      return;
-    } catch (e) {
-      if (attempt === 1) console.error(JSON.stringify({ msg: "realtime publish failed", error: logErr(e) }));
-    }
+  const f = feedBits(c.params.rtFeeds);
+  const groups = new Map<number, RtPublishRow[]>();
+  for (const r of rows) {
+    const j = feedOf(feedHash(c.keys.feedKey, r.topic), f);
+    const list = groups.get(j);
+    if (list) list.push(r);
+    else groups.set(j, [r]);
   }
+  await Promise.all(
+    [...groups].map(async ([j, list]) => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          await feedStub(c.env, j).publish(list);
+          return;
+        } catch (e) {
+          if (attempt === 1) console.error(JSON.stringify({ msg: "realtime publish failed", error: logErr(e) }));
+        }
+      }
+    }),
+  );
 }
 
 async function put(c: Ctx): Promise<Response> {
@@ -647,8 +666,6 @@ async function blobMeta(c: Ctx, idBytes: Bytes): Promise<Response> {
 
 // ───────────── realtime (§10.8) ─────────────
 
-/** The RealtimeDO's client-tag key, cached per isolate (the value, never a cross-request promise). */
-let wsKey: Bytes | null = null;
 
 async function rt(c: Ctx): Promise<Response> {
   if (c.request.headers.get("upgrade")?.toLowerCase() !== "websocket") throw new HttpError(426, "expected websocket");
@@ -664,11 +681,11 @@ async function rt(c: Ctx): Promise<Response> {
     if (host !== c.url.host) throw new HttpError(403, "cross-origin websocket refused");
   }
   await readLimit(c);
-  const stub = rtStub(c.env);
-  wsKey ??= new Uint8Array(await stub.wsTagKey());
-  // Hand the DO a minimal request: the upgrade plus an opaque per-client tag, never client headers / IPs.
-  const res = await stub.fetch("https://rt.internal/rt", {
-    headers: { upgrade: "websocket", "x-segv-client": clientTag(wsKey, c.request) },
+  // The client's ConnDO is conn(ck) of its tag (§4.4). Hand it a minimal request: the upgrade plus the opaque tag,
+  // never client headers / IPs.
+  const tag = clientTagBytes(c.keys.tagKey, c.request);
+  const res = await connStub(c.env, connOf(tag, c.params.rtConns)).fetch("https://rt.internal/rt", {
+    headers: { upgrade: "websocket", "x-segv-client": hex(tag) },
   });
   if (res.status === 101) return res;
   let error = "websocket refused";
@@ -964,16 +981,15 @@ async function pushSub(c: Ctx, cfg: PushConfig): Promise<Response> {
   }
   if (seen.size > PUSH_TOKENS) throw new HttpError(400, `at most ${PUSH_TOKENS} tokens`);
   const quiet = o.quiet === undefined ? null : b64uField(o.quiet, 16, "quiet");
-  let r: string;
+  // The endpoint's QuietDO is its owner's: its account's quiet tag, or the endpoint itself (§9.8).
+  const ep = epOf(cfg.pushKey, endpoint);
+  const k = quietShard(ownerOf(ep, quiet ? qkOf(cfg.pushKey, quiet) : null), cfg.shards);
   try {
-    r = await pushStub(c.env).sub(endpoint, p256dh, auth, [...seen.values()], quiet);
+    await quietStub(c.env, k).sub(endpoint, p256dh, auth, [...seen.values()], quiet);
   } catch (e) {
     console.error(JSON.stringify({ msg: "push sub failed", error: logErr(e) }));
     throw new HttpError(503, "storage unavailable", { "retry-after": "5" });
   }
-  if (r === "full") throw new HttpError(503, "push full", { "retry-after": "3600" });
-  // The journal's next row is full (§9.8): the change is refused rather than kept where a restart would lose it.
-  if (r === "busy") throw new HttpError(503, "push busy", { "retry-after": "60" });
   return noContent();
 }
 
@@ -1007,18 +1023,9 @@ export function ringEraOk(E: number, nowMs: number, p: Pick<V2Params, "delta" | 
 /** §10.10 step 2: `t` is rounded down to Δ, so a row stored RING_FRESH seconds ago may carry a t up to Δ older. */
 export const ringRowFresh = (t: number, nowMs: number, delta: number): boolean => t + delta >= secOf(nowMs) - RING_FRESH;
 
-const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-let ringSleep = realSleep;
-
-/** Test hook: how the Worker waits for the push that a ring made due (null: a real timer). */
-export function _setRingSleepForTests(f: ((ms: number) => Promise<void>) | null): void {
-  ringSleep = f ?? realSleep;
-}
-
 /**
- * §10.10 steps 1–4. The wait happens here, where it costs nothing, rather than in PushDO: PushDO answers how long
- * until the push it made due, and `flush` then sends it on time (§9.8). A wait cut short (the Worker stopped) only
- * leaves the push to PushDO's next alarm run.
+ * §10.10 steps 1–4: the era bound and the freshness check here; the lookups, the `ring` calls, the hold and the
+ * sending in push.ts (§9.8 "The Worker's part").
  */
 async function ringAfter(c: Ctx, E: number, label: Bytes, tokens: Bytes[]): Promise<void> {
   try {
@@ -1026,11 +1033,9 @@ async function ringAfter(c: Ctx, E: number, label: Bytes, tokens: Bytes[]): Prom
     const v = routeV(krouteFor(c.keys, E), label);
     const [r] = (await shardStub(c.env, E, 0).get(E, 0, [{ v, label, mode: 1 } as ShardGetKey])) as ShardGetResult[];
     if (!r || r.s !== "hit" || !ringRowFresh(r.t, c.now, c.params.delta)) return;
-    const push = pushStub(c.env);
-    const wait = await push.ring(E, label, tokens);
-    if (wait === null) return;
-    await ringSleep(wait);
-    await push.flush();
+    const cfg = pushConfig(c.env);
+    if (!cfg) return;
+    await pushRing(c.env, cfg, E, label, tokens);
   } catch (e) {
     console.error(JSON.stringify({ msg: "ring failed", error: logErr(e) }));
   }
@@ -1061,7 +1066,10 @@ async function seen(c: Ctx): Promise<Response> {
 
 async function seenAfter(c: Ctx, Q: Bytes, rows: { E: number; label: Bytes }[]): Promise<void> {
   try {
-    await pushStub(c.env).seen(Q, rows);
+    const cfg = pushConfig(c.env);
+    if (!cfg) return;
+    const qh = qkOf(cfg.pushKey, Q);
+    await quietStub(c.env, quietShard(qh, cfg.shards)).seen(qh, rows);
   } catch (e) {
     console.error(JSON.stringify({ msg: "seen failed", error: logErr(e) }));
   }
@@ -1197,7 +1205,7 @@ export function routeLabel(path: string): string {
  * headers on the response actually returned (after any cache lookup), whoever built it: JSON, binary, streamed, or a
  * caches.default entry (whose stored headers are not trusted to carry them). Responses from caches.default have
  * immutable headers, so they are copied. The 101 WebSocket upgrade gets none of these headers: it is returned exactly
- * as the RealtimeDO built it (its headers are immutable, and its HELLO frame carries the server time; §9.7, §10.1).
+ * as the ConnDO built it (its headers are immutable, and its HELLO frame carries the server time; §9.7, §10.1).
  * The Worker entries also apply it to the 421 of host pinning on /api/v2/* paths, which never reaches handleApi
  * (§10.1: every /api/v2/* response carries x-segv-now, and an app origin can read it).
  */
@@ -1252,10 +1260,9 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
   return stampResponse(res, request, env, url, now);
 }
 
-/** Test hook: forget the per-isolate caches (ckpt ensure flag, client-tag key, the directory's cached P). */
+/** Test hook: forget the per-isolate caches (ckpt ensure flag, the directory's cached P). */
 export function _resetApiForTests(): void {
   ckptEnsured = false;
-  wsKey = null;
   _resetDirectoryCacheForTests();
 }
 

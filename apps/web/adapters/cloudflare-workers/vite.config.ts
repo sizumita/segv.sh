@@ -21,7 +21,7 @@ export default extendConfig(baseConfig, () => {
         // Qwik's optimizer forces preserveEntrySignatures "allow-extension" on SSR builds, which can
         // re-export shared chunks' symbols from the entry ("Incorrect type for map entry ..."). Keep
         // the entry's exports exactly what the source declares: `default` and the Durable Object classes
-        // (ShardDO, BlobRegDO, InboxDO, RealtimeDO, CheckpointDO).
+        // (ShardDO, BlobRegDO, InboxDO, ConnDO, FeedDO, CheckpointDO, BellDO, QuietDO).
         name: "segv:strict-worker-entry",
         enforce: "post",
         options(opts: Record<string, unknown>) {

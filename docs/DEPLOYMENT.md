@@ -83,7 +83,16 @@ Run the commands of these steps in `apps/web`, the directory of `wrangler.jsonc`
 ### Notifications (optional)
 
 Web Push is off until you set its secrets. With it on, params report `push`, and users can turn notifications on per
-device ([PROTOCOL.md §9.8](PROTOCOL.md)).
+device ([PROTOCOL.md §9.8](PROTOCOL.md)). The registrations live in a KV namespace, and pushes due later than the
+Worker can wait travel through a queue; both are named in `wrangler.jsonc`.
+
+0. Create the KV namespace and the queue once per deployment, and put the namespace's id into `wrangler.jsonc`
+   (`kv_namespaces`, binding `PUSH_KV`); the queue is named there already (`segv-push`, or `segv-push-canary`):
+
+   ```bash
+   pnpm exec wrangler kv namespace create segv-push
+   pnpm exec wrangler queues create segv-push
+   ```
 
 1. Set the VAPID key (a P-256 private scalar, 32 bytes base64url), the key that seals the stored registrations
    (32 random bytes base64url), and a contact the push services can reach:
@@ -141,12 +150,16 @@ fetch the two files from the canonical host, which answers them without a redire
 | `SKEW_S`        | 2                            | SKEW in seconds, 0–60: the bound on clock differences between server components. Constant within an era                                                                                      |
 | `INBOX_SLOT_S`  | 10                           | Δin in seconds, 1–3600: the length of an inbox slot. Constant for the deployment                                                                                                             |
 | `E_FIRST`       | 42                           | The era of the first deployment                                                                                                                                                              |
+| `PUSH_SHARDS`   | 4                            | The number of objects that index the push bells and of those that own the push registrations, 1–4096. May change at any deploy                                                               |
+| `RT_CONNS`      | 4                            | C, 1–4096: the number of objects that hold the realtime WebSockets; a client's sockets all go to one of them. May change at any deploy                                                       |
+| `RT_FEEDS`      | 4                            | F, a power of two in 1–4096: the number of objects that fan new rows out to them by topic. May change at any deploy                                                                          |
 | `APP_HOSTS`     | `segv.sh,localhost`          | The host names the Worker answers on, comma-separated; the first is canonical. Pages on other hosts are redirected to it (308), and API requests are refused (421). Empty disables the check |
 | `APP_ORIGINS`   | four origins (above)         | The origins of the native apps' pages, comma-separated, which may read API answers and open the realtime socket. Empty by default                                                            |
 | `APPLE_APP_IDS` | `NBDP5VK335.sh.segv.desktop` | The Apple apps' app IDs, comma-separated, for `/.well-known/apple-app-site-association` (404 while unset)                                                                                    |
 | `ANDROID_APPS`  | unset                        | The Android apps' package names and certificate fingerprints, comma-separated, for `/.well-known/assetlinks.json` (404 while unset)                                                          |
 
-A variable that is present but invalid (not a decimal number, out of range, or a `DELTA_S` that does not divide 604 800)
+A variable that is present but invalid (not a decimal number, out of range, a `DELTA_S` that does not divide 604 800, or
+an `RT_FEEDS` that is not a power of two)
 makes every `/api/v2/*` request answer 503 `server misconfigured`. Clients refuse a proof-of-work base above 26. The
 native apps' variables are the exception: an invalid one counts as unset and changes nothing else.
 
@@ -161,7 +174,7 @@ native apps' variables are the exception: an invalid one counts as unset and cha
 | `VAPID_SUB` | `mailto:` or `https:` URI (with `VAPID_SK`)     | The contact sent to push services                                  |
 
 Optional push variables: `PUSH_HOSTS` (the push service hosts that may receive pushes; default Apple, Google, Mozilla
-and Microsoft), `POW_PUSH` (20), `PUSH_MAX_SUBS` (100 000) and `PUSH_DAY_SUBS` (2 000).
+and Microsoft), `POW_PUSH` (20) and `PUSH_SHARDS` (1).
 
 ### Rate limits
 

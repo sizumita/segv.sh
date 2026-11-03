@@ -1,5 +1,5 @@
 /**
- * RealtimeDO fake (docs/PROTOCOL.md §9.4, §10.8) and the browser-side `FakeWebSocket` bound to a world.
+ * ConnDO fake (docs/PROTOCOL.md §9.4, §10.8) and the browser-side `FakeWebSocket` bound to a world.
  *
  * - On open the server sends HELLO {boot, now, seq = last assigned}.
  * - SUB / UNSUB / RESUME (by seq; only as the first binary frame; installs its topic set even on GAP). RESUME gets
@@ -16,7 +16,7 @@
  *   (a publish), as the DO's hour-tag sweep does.
  *
  * - The handshake: `FakeWebSocket.upgradeStatus` and `upgradeHeaders` hold the Worker's answer to the upgrade. A 101
- *   is passed on exactly as the RealtimeDO built it, with none of the per-response headers (`x-segv-now`, HSTS,
+ *   is passed on exactly as the ConnDO built it, with none of the per-response headers (`x-segv-now`, HSTS,
  *   `nosniff`, `no-referrer`; §9.7, §10.1): HELLO carries the server time instead. A refusal (404, 429, 503) is an
  *   ordinary error response with all of them.
  *
@@ -128,7 +128,7 @@ export class FakeRealtime {
 
   constructor(private readonly host: RtHost) {}
 
-  // ───────────── RealtimeDO.publish ─────────────
+  // ───────────── FeedDO.publish → ConnDO.deliver ─────────────
 
   publish(rows: readonly PublishRow[]): void {
     if (rows.length === 0) return;
@@ -198,7 +198,7 @@ export class FakeRealtime {
   // ───────────── socket lifecycle (called by FakeWebSocket) ─────────────
 
   /**
-   * The RealtimeDO's fetch(upgrade): 101, or 503 while disabled, 429 when the client already has `perClient` live
+   * The ConnDO's fetch(upgrade): 101, or 503 while disabled, 429 when the client already has `perClient` live
    * sockets (the client is `who`; every unattributed socket counts as its own client), 503 at the global cap.
    */
   admit(ws: FakeWebSocket): number {
@@ -402,7 +402,7 @@ export class FakeWebSocket {
   upgradeStatus = 0;
   /**
    * Headers of the upgrade response (null until answered, or when the answer was lost). Empty on a 101: the Worker
-   * passes the RealtimeDO's 101 on unchanged, without `x-segv-now`, HSTS, `nosniff` or `no-referrer` (§9.7, §10.1).
+   * passes the ConnDO's 101 on unchanged, without `x-segv-now`, HSTS, `nosniff` or `no-referrer` (§9.7, §10.1).
    * A refusal carries them all, as every other response does. (A browser exposes neither; this is for tests.)
    */
   upgradeHeaders: Headers | null = null;

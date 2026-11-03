@@ -18,7 +18,7 @@ export interface FakeParams {
   efirst: number;
 }
 
-/** A row the Worker hands to the RealtimeDO after a successful put (spec §10.3 step 6). */
+/** A row the Worker hands to the ConnDO after a successful put (spec §10.3 step 6). */
 export interface PublishRow {
   topic: Bytes;
   E: number;
@@ -41,7 +41,7 @@ export interface WorldCtx {
   readonly sealDelayMs: number;
   /** Counts every accepted write of any component (used by `settle`). */
   bumpWrites(): void;
-  /** RealtimeDO.publish (rows with a zero topic must not be passed). */
+  /** FeedDO.publish → ConnDO.deliver (rows with a zero topic must not be passed). */
   publish(rows: PublishRow[]): void;
 }
 

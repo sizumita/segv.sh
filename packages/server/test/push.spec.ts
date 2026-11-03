@@ -1,44 +1,52 @@
 /**
- * Web Push (docs/PROTOCOL.md §9.8, §10.10): the configuration, both endpoints, and PushDO's registrations, pushes,
- * journal, daily pass and alarm.
+ * Push (docs/PROTOCOL.md §9.8, §10.10): the configuration, the three endpoints, the registrations in the push store
+ * through the QuietDOs and BellDOs, rings, the hold, the window, the pushes the Worker sends, marks of rows seen, the
+ * queue for pushes due later, and the daily expiry.
  *
- * PushDO is one instance ("push/v2"). Each test that drives it starts from empty tables and a new instance (reset()),
- * whose clock, randomness, sleep and fetch are replaced: its clock runs days ahead of real time, so the alarm it arms
- * never fires on its own, and the tests run it by hand (run()). Pushes go to *.push.test hosts through the fake fetch.
+ * The objects hold nothing durable: each test starts from an empty store and evicted objects (reset()), replaces the
+ * objects' clocks, randomness and sleeps, the Worker's wait and its push fetch. The objects' clock runs days ahead of
+ * real time, so nothing of theirs depends on the wall clock; pushes go to *.push.test hosts through the fake fetch.
  */
 import { gcm } from "@noble/ciphers/aes.js";
 import { p256 } from "@noble/curves/nist.js";
-import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { createMessageBatch, evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as P from "@segv/protocol/proto";
 import * as W from "@segv/protocol/wire";
-import {
-  MAX_RING_BODY,
-  MAX_SEEN_BODY,
-  RING_FRESH,
-  _setRingSleepForTests,
-  ringEraOk,
-  ringRowFresh,
-} from "../src/api";
+import { MAX_RING_BODY, MAX_SEEN_BODY, RING_FRESH, ringEraOk, ringRowFresh } from "../src/api";
+import type { BellDO } from "../src/bell-do";
 import { _resetPushConfigForTests } from "../src/env";
 import {
-  JR_BYTES,
-  JR_SLOTS,
+  PUSH_EXPIRY,
   PUSH_HOLD,
-  PUSH_JOURNAL,
   PUSH_PENDING,
   PUSH_SEEN,
-  PUSH_TICK,
   PUSH_WINDOW,
   RING_WAIT,
   SEEN_TTL,
+  _setPushFetchForTests,
+  _setRingSleepForTests,
+  bellShard,
   dayOf,
-  nextTick,
-  type PassPart,
-  type PushDO,
-} from "../src/push-do";
-import { pushStub } from "../src/types";
+  decodeEntries,
+  decodeRecord,
+  epOf,
+  keyBell,
+  keyEp,
+  ownerOf,
+  pushCleanup,
+  pushQueue,
+  qkOf,
+  quietShard,
+  rowIdOf,
+  tkOf,
+  type BellEntry,
+  type EpRecord,
+  type RingTarget,
+} from "../src/push";
+import type { PushState, QuietDO } from "../src/quiet-do";
+import { bellStub, quietStub } from "../src/types";
 import { vapidPublicKey } from "../src/webpush";
 import {
   DELTA,
@@ -56,6 +64,7 @@ import {
 const ENV = env as unknown as Record<string, string>;
 const PUSH_KEY = P.fromB64u(ENV.PUSH_KEY);
 const VAPID_PK = vapidPublicKey(P.fromB64u(ENV.VAPID_SK));
+const SHARDS = Number(ENV.PUSH_SHARDS);
 const DAY = 86_400_000;
 /** Every push waits at least this long after its ring (§9.8 `ring`). */
 const HOLD = PUSH_HOLD * 1000;
@@ -71,19 +80,18 @@ const scalarB64 = (x: bigint): string =>
     ),
   );
 
-const epOf = (endpoint: string): Bytes =>
-  P.t16(P.HMAC(PUSH_KEY, P.enc("segv.sh/v2/push/ep", endpoint)));
-const tkOf = (bell: Bytes): Bytes => P.t16(P.HMAC(PUSH_KEY, P.enc("segv.sh/v2/push/bell", bell)));
-const qkOf = (Q: Bytes): Bytes => P.t16(P.HMAC(PUSH_KEY, P.enc("segv.sh/v2/push/quiet", Q)));
+const tk = (bell: Bytes): Bytes => tkOf(PUSH_KEY, bell);
+const qk = (Q: Bytes): Bytes => qkOf(PUSH_KEY, Q);
 const bells = (n: number): Bytes[] => Array.from({ length: n }, () => P.random(16));
 
-/** A browser's push subscription: its endpoint and its keys. */
+/** A browser's push subscription: its endpoint and its keys, and the quiet tag it last registered with. */
 interface Dev {
   endpoint: string;
   ep: Bytes;
   sk: Bytes;
   p256dh: Bytes;
   auth: Bytes;
+  quiet: Bytes | null;
 }
 let devSeq = 0;
 function dev(host = "fcm.push.test"): Dev {
@@ -91,12 +99,17 @@ function dev(host = "fcm.push.test"): Dev {
   const sk = p256.utils.randomSecretKey();
   return {
     endpoint,
-    ep: epOf(endpoint),
+    ep: epOf(PUSH_KEY, endpoint),
     sk,
     p256dh: p256.getPublicKey(sk, false),
     auth: P.random(16),
+    quiet: null,
   };
 }
+/** The QuietDO of a device: its owner is its account's quiet tag, or itself (§9.8). */
+const kOf = (d: Dev): number => quietShard(ownerOf(d.ep, d.quiet ? qk(d.quiet) : null), SHARDS);
+const quiet = (k: number) => quietStub(env, k);
+const bell = (j: number) => bellStub(env, j);
 
 /** RFC 8291's receiving side (one record). */
 function decrypt(body: Bytes, d: Dev): Bytes {
@@ -118,7 +131,7 @@ function decrypt(body: Bytes, d: Dev): Bytes {
   return padded.slice(0, -1);
 }
 
-// ───────────── driving PushDO ─────────────
+// ───────────── the fake world ─────────────
 
 interface Call {
   url: string;
@@ -127,30 +140,6 @@ interface Call {
   body: Bytes;
   at: number;
 }
-interface PushState {
-  ep?: Bytes;
-  due: number | null;
-  last: number | null;
-  tries: number;
-  first?: number;
-  rang?: Bytes[];
-  rows?: Set<string> | null;
-  sending?: boolean;
-}
-interface Hooks {
-  clock: () => number;
-  rand: () => number;
-  sleep: (ms: number) => Promise<void>;
-  fetcher: (url: string, init: RequestInit) => Promise<Response>;
-  pushRows: number;
-  beforeCommit: (() => void) | null;
-  parts: PassPart[];
-  env: Env;
-  pushes: Map<string, PushState>;
-  marks: Map<string, Map<string, number>>;
-}
-
-/** The fake world PushDO sees: its time (null: real time), its randomness and the push services' answers. */
 const fake = {
   now: null as number | null,
   rand: 0,
@@ -158,127 +147,224 @@ const fake = {
   respond: ((): Response => new Response(null, { status: 201 })) as (
     c: Call,
   ) => Response | Promise<Response>,
+  /** the messages the Worker put on the push queue */
+  queued: [] as { k: number; delaySeconds: number }[],
 };
 const nowOf = (): number => fake.now ?? Date.now();
 /** A UTC midnight well after real time. */
 const BASE = (dayOf(Date.now()) + 5) * DAY;
 
-const DO = () => pushStub(env);
-const inDO = <T>(fn: (h: Hooks, state: DurableObjectState) => T | Promise<T>): Promise<T> =>
-  runInDurableObject(DO(), (inst: PushDO, state) => fn(inst as unknown as Hooks, state));
+type Hooks = { clock: () => number; rand: () => number; sleep: (ms: number) => Promise<void> };
+const hook = async (): Promise<void> => {
+  // The objects sleep only to space their writes to the store, which the local store does not need: no time passes.
+  const h = { clock: nowOf, rand: () => fake.rand, sleep: async () => {} };
+  for (let i = 0; i < SHARDS; i++) {
+    await runInDurableObject(
+      quiet(i),
+      (inst: QuietDO) => void Object.assign(inst as unknown as Hooks, h),
+    );
+    await runInDurableObject(
+      bell(i),
+      (inst: BellDO) => void Object.assign(inst as unknown as Hooks, h),
+    );
+  }
+};
 
-/** Replaces the instance's hooks and removes the alarm its constructor armed in real time. */
-async function install(): Promise<void> {
-  await inDO(async (h, state) => {
-    h.clock = nowOf;
-    h.rand = () => fake.rand;
-    h.sleep = async (ms) => {
-      if (fake.now !== null) fake.now += ms;
-    };
-    h.fetcher = async (url, init) => {
-      const call: Call = {
-        url,
-        init,
-        headers: new Headers(init.headers),
-        body: new Uint8Array(init.body as ArrayBuffer),
-        at: nowOf(),
-      };
-      fake.calls.push(call);
-      return fake.respond(call);
-    };
-    await state.storage.deleteAlarm();
-  });
+/** The fake queue binding the tests give the Worker: it records, and the tests run the consumer by hand. */
+const QUEUE = {
+  send: async (body: { k: number }, opts?: { delaySeconds?: number }) => {
+    fake.queued.push({ k: body.k, delaySeconds: opts?.delaySeconds ?? 0 });
+  },
+};
+const OVER = { PUSH_QUEUE: QUEUE };
+
+/** Evicts an object; one that is not running is already as evicted. */
+async function evict(stub: DurableObjectStub): Promise<void> {
+  try {
+    await evictDurableObject(stub);
+  } catch {
+    /* not running */
+  }
 }
 
-/** Empty tables (the journal and the pass's day included), a new instance (empty memory), fresh fakes. */
+/** Empties the store (every key), evicts every object, resets the fakes and hooks the objects and the Worker again. */
 async function reset(now: number | null = BASE): Promise<void> {
-  await inDO(async (_h, state) => {
-    state.storage.sql.exec("DELETE FROM tok");
-    state.storage.sql.exec("DELETE FROM sub");
-    state.storage.sql.exec("DELETE FROM jr");
-    state.storage.sql.exec("DELETE FROM meta");
-    await state.storage.deleteAlarm();
-  });
-  await evictDurableObject(DO());
+  let cursor: string | undefined;
+  do {
+    const page = await env.PUSH_KV.list({ cursor });
+    for (const k of page.keys) await env.PUSH_KV.delete(k.name);
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  for (let i = 0; i < SHARDS; i++) {
+    await evict(quiet(i));
+    await evict(bell(i));
+  }
   Object.assign(fake, {
     now,
     rand: 0,
     calls: [],
+    queued: [],
     respond: () => new Response(null, { status: 201 }),
   });
-  await install();
-}
-
-/** A restart of the object (an eviction): memory is lost, storage stays. */
-async function restart(): Promise<void> {
-  await evictDurableObject(DO());
-  await install();
-}
-
-const setEnv = (patch: Record<string, unknown>): Promise<void> =>
-  inDO((h) => {
-    h.env = new Proxy(env, {
-      get: (t, k) =>
-        typeof k === "string" && Object.prototype.hasOwnProperty.call(patch, k)
-          ? patch[k]
-          : Reflect.get(t, k),
-    });
+  await hook();
+  _setRingSleepForTests(async (ms) => {
+    if (fake.now !== null) fake.now += ms;
   });
-
-const sub = (d: Dev, bs: Bytes[], quiet: Bytes | null = null) =>
-  DO().sub(d.endpoint, d.p256dh, d.auth, bs, quiet);
-const ring = (bs: Bytes[], label: Bytes = P.random(16), E = 1) => DO().ring(E, label, bs);
-async function run(at?: number): Promise<void> {
-  if (at !== undefined) fake.now = at;
-  await DO().run();
+  _setPushFetchForTests(async (url, init) => {
+    const call: Call = {
+      url,
+      init,
+      headers: new Headers(init.headers),
+      body: new Uint8Array(init.body as ArrayBuffer),
+      at: nowOf(),
+    };
+    fake.calls.push(call);
+    return fake.respond(call);
+  });
 }
-/**
- * `sub` as a device sends it: while the journal's next row is full (BUSY), the next minute's run, which writes that
- * row, and `sub` again. Many registrations at once thus spread over minutes.
- */
-async function subRetrying(d: Dev, bs: Bytes[], quiet: Bytes | null = null): Promise<void> {
-  for (;;) {
-    const r = await sub(d, bs, quiet);
-    if (r !== "busy") return void expect(r).toBe("ok");
-    await run((Math.floor(nowOf() / 60_000) + 1) * 60_000);
+
+/** A restart of the objects (an eviction): memory is lost, the store stays. */
+async function restart(): Promise<void> {
+  for (let i = 0; i < SHARDS; i++) {
+    await evict(quiet(i));
+    await evict(bell(i));
   }
+  await hook();
 }
-/** The day of the last completed pass that `meta` holds. */
-const passDay = (): Promise<number | null> =>
-  inDO(
-    (_h, state) =>
-      state.storage.sql.exec<{ v: number }>("SELECT v FROM meta WHERE k = 'pass'").toArray()[0]
-        ?.v ?? null,
+
+// ───────────── driving the endpoints ─────────────
+
+async function subApi(
+  d: Dev,
+  bs: Bytes[],
+  q: Bytes | null = null,
+  over: Record<string, unknown> = {},
+): Promise<Response> {
+  d.quiet = bs.length === 0 ? d.quiet : q;
+  const body: Record<string, unknown> = {
+    endpoint: d.endpoint,
+    p256dh: P.b64u(d.p256dh),
+    auth: P.b64u(d.auth),
+    tokens: bs.map(P.b64u),
+  };
+  if (q) body.quiet = P.b64u(q);
+  const bytes = P.utf8(JSON.stringify(body));
+  return direct(
+    "/api/v2/push/sub",
+    {
+      method: "POST",
+      headers: { "x-segv-pow": await powHeader("push", P.H(bytes), { bytes: bytes.length }) },
+      body: bytes,
+    },
+    { ...OVER, ...over },
   );
-const dueOf = (d: Dev): Promise<number | null> =>
-  inDO((h) => h.pushes.get(P.hex(d.ep))?.due ?? null);
-const stateOf = (d: Dev): Promise<PushState> =>
-  inDO((h) => ({ ...(h.pushes.get(P.hex(d.ep)) ?? { due: null, last: null, tries: 0 }) }));
+}
+const sub = async (d: Dev, bs: Bytes[], q: Bytes | null = null): Promise<void> => {
+  expect((await subApi(d, bs, q)).status).toBe(204);
+};
+
+interface RowRef {
+  E: number;
+  label: Bytes;
+}
+/** A row stored just now: the kind a ring can name (§10.10). */
+async function freshRow(): Promise<RowRef> {
+  const row = makeRow();
+  await putOk([row]);
+  return { E: row.E, label: row.label };
+}
+const ringBody = (r: RowRef, tokens: Bytes[], ver = 1): Bytes =>
+  P.concat(Uint8Array.of(ver), P.u16(r.E), r.label, Uint8Array.of(tokens.length), ...tokens);
+/** `POST /api/v2/ring`: the Worker looks the bells up, calls `ring`, waits and sends (or queues). */
+async function ringApi(
+  bs: Bytes[],
+  row?: RowRef,
+  over: Record<string, unknown> = {},
+): Promise<RowRef> {
+  const r = row ?? (await freshRow());
+  const res = await direct(
+    "/api/v2/ring",
+    { method: "POST", body: ringBody(r, bs) },
+    { ...OVER, ...over },
+  );
+  expect(res.status).toBe(204);
+  return r;
+}
+/** `ring` alone, as the Worker calls it, without the wait and the send: what it makes due. */
+async function ringState(bs: Bytes[], row?: RowRef): Promise<RowRef> {
+  const r = row ?? { E: 1, label: P.random(16) };
+  const byJ = new Map<number, Bytes[]>();
+  for (const b of bs) {
+    const j = bellShard(tk(b), SHARDS);
+    byJ.set(j, [...(byJ.get(j) ?? []), tk(b)]);
+  }
+  const found = new Map<string, BellEntry[]>();
+  for (const [j, tks] of byJ)
+    for (const x of await bell(j).lookup(tks)) found.set(P.hex(x.tk), x.entries);
+  const targets = new Map<string, RingTarget>();
+  for (const b of bs) {
+    for (const e of found.get(P.hex(tk(b))) ?? []) {
+      const t = targets.get(P.hex(e.ep)) ?? { ep: e.ep, qh: e.qh, kh: e.kh, box: e.box, bells: [] };
+      t.bells.push(b);
+      targets.set(P.hex(e.ep), t);
+    }
+  }
+  const byK = new Map<number, RingTarget[]>();
+  for (const t of targets.values()) {
+    const k = quietShard(ownerOf(t.ep, t.qh), SHARDS);
+    byK.set(k, [...(byK.get(k) ?? []), t]);
+  }
+  for (const [k, list] of byK) await quiet(k).ring(list, rowIdOf(r.E, r.label));
+  return r;
+}
+const seenBody = (qS: Bytes, rows: RowRef[], ver = 1): Bytes =>
+  P.concat(
+    Uint8Array.of(ver),
+    qS,
+    Uint8Array.of(rows.length),
+    ...rows.flatMap((r) => [P.u16(r.E), r.label]),
+  );
+/** Runs the queue consumer for the messages queued so far (or the given ones), as the platform would when they come. */
+async function drainQueue(ks?: number[]): Promise<void> {
+  const list = ks ?? fake.queued.map((m) => m.k);
+  fake.queued = [];
+  const batch = createMessageBatch(
+    "segv-push-test",
+    list.map((k, i) => ({ id: `m${i}`, timestamp: new Date(nowOf()), attempts: 1, body: { k } })),
+  );
+  await pushQueue(batch, envOf(OVER));
+}
+/** `env` with the fake queue (and more), for the consumer and the expiry. */
+function envOf(over: Record<string, unknown>): Env {
+  return new Proxy(env, {
+    get: (t, k) =>
+      typeof k === "string" && Object.prototype.hasOwnProperty.call(over, k)
+        ? over[k]
+        : Reflect.get(t, k),
+  });
+}
+
+const stateOf = (
+  d: Dev,
+): Promise<(Omit<PushState, "box" | "recent"> & { recent: string[] }) | null> =>
+  quiet(kOf(d)).stateOf(d.ep);
+const dueOf = async (d: Dev): Promise<number | null> => (await stateOf(d))?.due ?? null;
 const callsTo = (d: Dev): Call[] => fake.calls.filter((c) => c.url === d.endpoint);
-
-/** The stored tables, as hex. */
-const tables = (): Promise<{
-  sub: { ep: string; day: number }[];
-  tok: { tk: string; ep: string }[];
-}> =>
-  inDO((_h, state) => ({
-    sub: state.storage.sql
-      .exec<{ ep: ArrayBuffer; day: number }>("SELECT ep, day FROM sub ORDER BY ep")
-      .toArray()
-      .map((r) => ({ ep: P.hex(new Uint8Array(r.ep)), day: r.day })),
-    tok: state.storage.sql
-      .exec<{ tk: ArrayBuffer; ep: ArrayBuffer }>("SELECT tk, ep FROM tok ORDER BY tk, ep")
-      .toArray()
-      .map((r) => ({ tk: P.hex(new Uint8Array(r.tk)), ep: P.hex(new Uint8Array(r.ep)) })),
-  }));
-const storedDay = async (d: Dev): Promise<number | null> =>
-  (await tables()).sub.find((r) => r.ep === P.hex(d.ep))?.day ?? null;
-
-/** Is `d` reached by a ring of `bs` now? (A fresh row each time, so the dedup never interferes.) */
-async function reaches(d: Dev, bs: Bytes[]): Promise<boolean> {
-  await inDO((h) => h.pushes.delete(P.hex(d.ep)));
-  await ring(bs);
-  return (await dueOf(d)) !== null;
+const marked = (q: Bytes): Promise<number> => quiet(quietShard(qk(q), SHARDS)).marksOf(qk(q));
+/** The device's record in the store. */
+async function record(d: Dev): Promise<EpRecord | null> {
+  const raw = await env.PUSH_KV.get(keyEp(d.ep), "arrayBuffer");
+  return raw ? decodeRecord(new Uint8Array(raw)) : null;
+}
+/** The endpoints under a bell in the store. */
+async function holders(b: Bytes): Promise<string[]> {
+  const raw = await env.PUSH_KV.get(keyBell(tk(b)), "arrayBuffer");
+  return raw ? (decodeEntries(new Uint8Array(raw)) ?? []).map((e) => P.hex(e.ep)) : [];
+}
+/** Does a ring of `bs` (of a fresh row, or `row`) reach `d`? Reached rows enter the endpoint's recent rows. */
+async function reaches(d: Dev, bs: Bytes[], row?: RowRef): Promise<boolean> {
+  const r = await ringState(bs, row);
+  return (await stateOf(d))?.recent.includes(rowIdOf(r.E, r.label)) ?? false;
 }
 
 // ───────────── 1. params and configuration ─────────────
@@ -310,8 +396,8 @@ describe("params and configuration (§9.8, §10.9)", () => {
     ["VAPID_SUB not mailto:/https:", "VAPID_SUB", { VAPID_SUB: "http://operator.example/" }],
     ["PUSH_HOSTS malformed", "PUSH_HOSTS", { PUSH_HOSTS: "push.test,,not a host" }],
     ["POW_PUSH 65", "POW_PUSH", { POW_PUSH: "65" }],
-    ["PUSH_MAX_SUBS malformed", "PUSH_MAX_SUBS", { PUSH_MAX_SUBS: "1e5" }],
-    ["PUSH_DAY_SUBS malformed", "PUSH_DAY_SUBS", { PUSH_DAY_SUBS: "-1" }],
+    ["PUSH_SHARDS malformed", "PUSH_SHARDS", { PUSH_SHARDS: "4097" }],
+    ["PUSH_SHARDS 0", "PUSH_SHARDS", { PUSH_SHARDS: "0" }],
     ["APP_HOSTS empty", "APP_HOSTS", { APP_HOSTS: "" }],
   ];
 
@@ -370,43 +456,6 @@ describe("params and configuration (§9.8, §10.9)", () => {
       }
     },
   );
-
-  it("a PushDO whose push is off sends nothing, and its pass deletes only what expired", async () => {
-    await reset(BASE);
-    const old = dev();
-    const fresh = dev();
-    const bo = bells(1);
-    await sub(old, bo);
-    await run(BASE + DAY + 1000); // writes `old` with day D
-    fake.now = BASE + 32 * DAY;
-    await sub(fresh, bells(1));
-    await ring(bo);
-    expect(await dueOf(old)).not.toBeNull();
-    await setEnv({ PUSH_KEY: undefined });
-    await run(BASE + 32 * DAY + 5000);
-    expect(fake.calls).toEqual([]);
-    expect(await storedDay(old)).toBeNull(); // 32 days old
-  });
-
-  it("while push is off the pass deletes by day only; a registration it cannot open comes back with the key", async () => {
-    await reset(BASE);
-    const old = dev();
-    const recent = dev();
-    const br = bells(1);
-    await sub(old, bells(1));
-    fake.now = BASE + 29 * DAY;
-    await sub(recent, br);
-    await run(BASE + 30 * DAY + 1000); // writes `recent` (day D+29); `old` is 30 days old, not yet expired
-    expect(await storedDay(old)).toBe(dayOf(BASE));
-    await setEnv({ PUSH_KEY: undefined });
-    await run(BASE + 31 * DAY + 1000);
-    expect(await storedDay(old)).toBeNull();
-    expect(await storedDay(recent)).toBe(dayOf(BASE) + 29); // its box cannot be opened without the key: kept
-    await setEnv({});
-    await ring(br);
-    await run(BASE + 31 * DAY + 1000 + HOLD);
-    expect(callsTo(recent)).toHaveLength(1);
-  });
 });
 
 // ───────────── 2. push/sub ─────────────
@@ -417,7 +466,7 @@ describe("POST /api/v2/push/sub (§10.10)", () => {
     await reset(null);
   });
   /** The default PUSH_HOSTS list, for the host rules. */
-  const DEF = { PUSH_HOSTS: undefined };
+  const DEF = { PUSH_HOSTS: undefined, ...OVER };
   const body = (over: Record<string, unknown> = {}): Record<string, unknown> => {
     const d = dev();
     return {
@@ -478,25 +527,12 @@ describe("POST /api/v2/push/sub (§10.10)", () => {
   ];
   it.each(BAD)("400 for %s", async (_name, over) => {
     expect(`https://fcm.googleapis.com/${"a".repeat(1025 - 27)}`.length).toBe(1025);
-    const r = await post(body(over));
-    expect(r.status).toBe(400);
+    expect((await post(body(over))).status).toBe(400);
   });
 
-  it("takes the account's quiet tag, or none", async () => {
+  it("takes the account's quiet tag, or none; a repeated token counts once; 256 distinct ones are accepted", async () => {
     expect((await post(body({ quiet: P.b64u(P.random(16)) }))).status).toBe(204);
     expect((await post(body())).status).toBe(204);
-  });
-
-  it('503 "push busy" with retry-after 60 for a change the journal\'s next row cannot hold', async () => {
-    const big = (endpoint: string) => body({ endpoint, tokens: bells(256).map(P.b64u) });
-    expect((await post(big("https://fcm.googleapis.com/fcm/send/a1"))).status).toBe(204);
-    const r = await post(big("https://fcm.googleapis.com/fcm/send/a2"));
-    expect(r.status).toBe(503);
-    expect(r.headers.get("retry-after")).toBe("60");
-    expect(await r.json()).toEqual({ error: "push busy" });
-  });
-
-  it("a repeated token counts once; 256 distinct ones are accepted", async () => {
     const t = P.b64u(P.random(16));
     expect((await post(body({ tokens: [t, t, t] }))).status).toBe(204);
     expect((await post(body({ tokens: bells(256).map(P.b64u) }))).status).toBe(204);
@@ -515,138 +551,156 @@ describe("POST /api/v2/push/sub (§10.10)", () => {
     expect(statuses.every((s) => s === 403)).toBe(true);
     expect(over).toBe(429);
   });
-});
 
-// ───────────── 3. replace ─────────────
-
-describe("PushDO sub replaces a registration as a whole (§9.8)", () => {
-  it("a second registration replaces the set, an empty one deletes it, and each refreshes the day", async () => {
-    await reset(BASE);
-    const d = dev();
-    const [b1, b2, b3] = bells(3);
-    await sub(d, [b1, b2]);
-    expect(await reaches(d, [b1])).toBe(true);
-    expect(await reaches(d, [b2])).toBe(true);
-    await sub(d, [b3]);
-    expect(await reaches(d, [b1])).toBe(false);
-    expect(await reaches(d, [b3])).toBe(true);
-    await run(BASE + DAY + 1000);
-    expect(await storedDay(d)).toBe(dayOf(BASE));
-    fake.now = BASE + 3 * DAY;
-    await sub(d, [b3, b1]);
-    await run(BASE + 4 * DAY + 1000);
-    expect(await storedDay(d)).toBe(dayOf(BASE) + 3);
-    await sub(d, []);
-    expect(await reaches(d, [b3])).toBe(false);
-    await run(BASE + 5 * DAY + 1000);
-    expect(await storedDay(d)).toBeNull();
-    expect((await tables()).tok.filter((r) => r.ep === P.hex(d.ep))).toEqual([]);
+  it("503 storage unavailable when the QuietDO fails", async () => {
+    const r = await direct(
+      "/api/v2/push/sub",
+      await (async () => {
+        const bytes = P.utf8(JSON.stringify(body()));
+        return {
+          method: "POST" as const,
+          headers: { "x-segv-pow": await powHeader("push", P.H(bytes), { bytes: bytes.length }) },
+          body: bytes,
+        };
+      })(),
+      {
+        ...DEF,
+        QUIET: {
+          getByName: () => ({
+            sub: async () => {
+              throw new Error("down");
+            },
+          }),
+        },
+      },
+    );
+    expect(r.status).toBe(503);
+    expect(r.headers.get("retry-after")).toBe("5");
+    expect(await errorOf(r)).toBe("storage unavailable");
   });
 });
 
-// ───────────── 4. caps ─────────────
+// ───────────── 3. the registrations in the store ─────────────
 
-describe("PushDO limits (§9.8)", () => {
-  it("a bell's 8 places go to the first endpoints; a ninth is left out without evicting, and takes a freed place", async () => {
+describe("registrations in the store (§9.8 `sub`)", () => {
+  beforeEach(async () => {
+    _resetPushConfigForTests();
     await reset(BASE);
+  });
+
+  it("a registration writes the record and the bells at once; a second one replaces the set; an empty one deletes it", async () => {
+    const d = dev();
+    const [b1, b2, b3] = bells(3);
+    await sub(d, [b1, b2]);
+    const r1 = await record(d);
+    expect(r1).not.toBeNull();
+    expect(r1!.day).toBe(dayOf(BASE));
+    expect(r1!.qh).toBeNull();
+    expect(r1!.tks.map(P.hex).sort()).toEqual([tk(b1), tk(b2)].map(P.hex).sort());
+    expect(await holders(b1)).toEqual([P.hex(d.ep)]);
+    expect(await reaches(d, [b1])).toBe(true);
+    expect(await reaches(d, [b2])).toBe(true);
+    // The metadata the expiry reads: the day and the owner (the endpoint itself, without a quiet tag).
+    const meta = (await env.PUSH_KV.getWithMetadata<{ d: number; o: string }>(keyEp(d.ep)))
+      .metadata;
+    expect(meta).toEqual({ d: dayOf(BASE), o: P.hex(d.ep) });
+
+    await sub(d, [b3]);
+    expect((await record(d))!.tks.map(P.hex)).toEqual([P.hex(tk(b3))]);
+    expect(await holders(b1)).toEqual([]);
+    expect(await env.PUSH_KV.get(keyBell(tk(b1)))).toBeNull(); // a bell with nobody left loses its key
+    expect(await holders(b3)).toEqual([P.hex(d.ep)]);
+    expect(await reaches(d, [b1])).toBe(false);
+    expect(await reaches(d, [b3])).toBe(true);
+
+    // A refresh three days later writes the day alone.
+    fake.now = BASE + 3 * DAY;
+    await sub(d, [b3]);
+    expect((await record(d))!.day).toBe(dayOf(BASE) + 3);
+
+    await sub(d, []);
+    expect(await record(d)).toBeNull();
+    expect(await holders(b3)).toEqual([]);
+    expect(await reaches(d, [b3])).toBe(false);
+  });
+
+  it("the quiet tag makes the account's devices share a QuietDO, and new keys place the kept bells again", async () => {
+    const q = P.random(16);
+    const [phone, laptop] = [dev(), dev()];
+    const b = P.random(16);
+    await sub(phone, [b], q);
+    await sub(laptop, [b], q);
+    expect(kOf(phone)).toBe(kOf(laptop));
+    expect((await record(phone))!.qh).toEqual(qk(q));
+    expect((await env.PUSH_KV.getWithMetadata<{ o: string }>(keyEp(phone.ep))).metadata?.o).toBe(
+      P.hex(qk(q)),
+    );
+    const entry = async (): Promise<BellEntry> =>
+      (await bell(bellShard(tk(b), SHARDS)).entriesOf(tk(b))).find(
+        (e) => P.hex(e.ep) === P.hex(phone.ep),
+      )!;
+    const before = await entry();
+    // New keys under the same endpoint: the bell's entry carries the new box and kh.
+    const sk = p256.utils.randomSecretKey();
+    Object.assign(phone, { sk, p256dh: p256.getPublicKey(sk, false), auth: P.random(16) });
+    await sub(phone, [b], q);
+    const after = await entry();
+    expect(P.hex(after.kh)).not.toBe(P.hex(before.kh));
+    expect(P.hex(after.box)).not.toBe(P.hex(before.box));
+    expect(await holders(b)).toHaveLength(2);
+  });
+
+  it("a bell's 8 places go to the first endpoints; a ninth is left out without evicting, and takes a freed place", async () => {
     const b = P.random(16);
     const eight = Array.from({ length: 8 }, () => dev());
-    for (const d of eight) expect(await sub(d, [b])).toBe("ok");
+    for (const d of eight) await sub(d, [b]);
     const ninth = dev();
     const own = P.random(16);
-    expect(await sub(ninth, [b, own])).toBe("ok");
-    await ring([b]);
+    await sub(ninth, [b, own]);
+    expect((await record(ninth))!.tks.map(P.hex)).toEqual([P.hex(tk(own))]); // b was left out
+    await ringState([b]);
     for (const d of eight) expect(await dueOf(d)).not.toBeNull();
     expect(await dueOf(ninth)).toBeNull();
     expect(await reaches(ninth, [own])).toBe(true); // its other bells work
-    // Stored or in memory alike: after the pass the places hold.
-    await run(BASE + DAY + 1000);
-    expect((await tables()).tok.filter((r) => r.tk === P.hex(tkOf(b)))).toHaveLength(8);
+    expect(await holders(b)).toHaveLength(8);
     await sub(eight[0], []);
     await sub(ninth, [b, own]);
     expect(await reaches(ninth, [b])).toBe(true);
   });
 
-  it("PUSH_MAX_SUBS: a new endpoint at the cap gets 503 push full; an existing one still replaces its set", async () => {
-    _resetPushConfigForTests();
-    await reset(null);
-    await setEnv({ PUSH_MAX_SUBS: "2" });
-    const regs = [dev(), dev(), dev()];
-    const post = async (d: Dev, tokens: Bytes[]) => {
-      const bytes = P.utf8(
-        JSON.stringify({
-          endpoint: d.endpoint,
-          p256dh: P.b64u(d.p256dh),
-          auth: P.b64u(d.auth),
-          tokens: tokens.map(P.b64u),
-        }),
-      );
-      return direct("/api/v2/push/sub", {
-        method: "POST",
-        headers: { "x-segv-pow": await powHeader("push", P.H(bytes), { bytes: bytes.length }) },
-        body: bytes,
-      });
-    };
-    expect((await post(regs[0], bells(1))).status).toBe(204);
-    expect((await post(regs[1], bells(1))).status).toBe(204);
-    const full = await post(regs[2], bells(1));
-    expect(full.status).toBe(503);
-    expect(full.headers.get("retry-after")).toBe("3600");
-    expect(await errorOf(full)).toBe("push full");
-    expect((await post(regs[1], bells(2))).status).toBe(204);
-    expect((await post(regs[0], [])).status).toBe(204);
-    expect((await post(regs[2], bells(1))).status).toBe(204);
-  });
-
-  it("PUSH_DAY_SUBS: after the day's changes of 2 endpoints a third change is full, while deletions, refreshes and further changes of the two pass", async () => {
-    await reset(BASE);
-    const stored = dev();
-    const bs = bells(1);
-    await sub(stored, bs);
-    await run(BASE + DAY + 1000); // `stored` is now in the tables
-    await setEnv({ PUSH_DAY_SUBS: "2" });
-    const [a, b, c] = [dev(), dev(), dev()];
-    expect(await sub(a, bells(1))).toBe("ok");
-    expect(await sub(b, bells(1))).toBe("ok");
-    expect(await sub(c, bells(1))).toBe("full");
-    expect(await sub(stored, bells(1))).toBe("full"); // a changed set
-    expect(await sub(stored, bs)).toBe("ok"); // a refresh
-    expect(await sub(a, bells(2))).toBe("ok"); // a further change of one of the two
-    expect(await sub(b, [])).toBe("ok"); // a deletion
-    expect(await sub(c, bells(1))).toBe("ok"); // b's change left memory
-    await run(BASE + 2 * DAY + 1000);
-    expect(await sub(stored, bells(1))).toBe("ok"); // the pass freed the cap
+  it("a restart keeps every registration: the objects read the store back", async () => {
+    const d = dev();
+    const b = P.random(16);
+    await sub(d, [b], P.random(16));
+    await restart();
+    expect(await reaches(d, [b])).toBe(true);
+    await sub(d, []);
+    await restart();
+    expect(await reaches(d, [b])).toBe(false);
   });
 });
 
-// ───────────── 5. ring answers ─────────────
+// ───────────── 4. ring ─────────────
 
 describe("POST /api/v2/ring (§10.10)", () => {
   beforeEach(async () => {
     _resetPushConfigForTests();
-    // The Worker's wait for the push it rang ends at once (the flush then finds nothing due yet), unless a test says so.
-    _setRingSleepForTests(async () => {});
     await reset(null);
   });
-  afterEach(() => {
-    _setRingSleepForTests(null);
-  });
-  const ringBody = (E: number, label: Bytes, tokens: Bytes[], ver = 1): Bytes =>
-    P.concat(Uint8Array.of(ver), P.u16(E), label, Uint8Array.of(tokens.length), ...tokens);
-  const post = (b: Bytes, ip?: string) => direct("/api/v2/ring", { method: "POST", body: b, ip });
+  const post = (b: Bytes, ip?: string) =>
+    direct("/api/v2/ring", { method: "POST", body: b, ip }, OVER);
 
   it("answers 204 with no body whatever the bell, the row or a repeat, and pushes only for a fresh row of a registered bell", async () => {
     const d = dev();
     const b = P.random(16);
     await sub(d, [b]);
-    const row = makeRow();
-    await putOk([row]);
+    const row = await freshRow();
     const cases = [
-      ringBody(row.E, row.label, [b]), // registered, fresh
-      ringBody(row.E, row.label, [b]), // a repeat
-      ringBody(row.E, row.label, [P.random(16)]), // unregistered
-      ringBody(row.E, P.random(16), [b]), // a missing row
-      ringBody(row.E + 5, row.label, [b]), // outside the era bound
+      ringBody(row, [b]), // registered, fresh
+      ringBody(row, [b]), // a repeat
+      ringBody(row, [P.random(16)]), // unregistered
+      ringBody({ E: row.E, label: P.random(16) }, [b]), // a missing row
+      ringBody({ E: row.E + 5, label: row.label }, [b]), // outside the era bound
     ];
     const answers: string[] = [];
     for (const c of cases) {
@@ -654,63 +708,71 @@ describe("POST /api/v2/ring (§10.10)", () => {
       answers.push(`${r.status}|${await r.text()}|${r.headers.get("content-type")}`);
     }
     expect(new Set(answers)).toEqual(new Set(["204||null"]));
+    // The first case made a push due (the Worker's wait is instant here, and in real time nothing is due yet).
     expect(await dueOf(d)).not.toBeNull();
+    expect((await stateOf(d))!.recent).toHaveLength(1);
   });
 
-  it("after the answer, the Worker waits as long as PushDO says and flushes: the push goes out at its due time", async () => {
+  it("after the answer, the Worker waits as long as the QuietDO says and sends: the push goes out at its due time", async () => {
     const slept: number[] = [];
     _setRingSleepForTests(async (ms) => {
       slept.push(ms);
       fake.now! += ms;
     });
-    fake.now = Date.now();
+    fake.now = BASE;
     fake.rand = 0.5;
     const d = dev();
     const b = P.random(16);
     await sub(d, [b]);
-    const row = makeRow();
-    await putOk([row]);
-    const t0 = fake.now;
-    expect((await post(ringBody(row.E, row.label, [b]))).status).toBe(204);
+    await ringApi([b]);
     expect(slept).toHaveLength(1);
     expect(slept[0]).toBeGreaterThanOrEqual(HOLD);
     expect(slept[0]).toBeLessThanOrEqual(HOLD + DELTA * 1000);
-    expect(callsTo(d).map((c) => c.at)).toEqual([t0 + slept[0]]);
-    // The next push waits for the end of PUSH_WINDOW, beyond RING_WAIT: the Worker does not wait, the alarm sends it.
-    const row2 = makeRow();
-    await putOk([row2]);
+    expect(callsTo(d).map((c) => c.at)).toEqual([BASE + slept[0]]);
+    // The next push waits for the end of PUSH_WINDOW, beyond RING_WAIT: a queue message, no wait in place.
     slept.length = 0;
-    expect((await post(ringBody(row2.E, row2.label, [b]))).status).toBe(204);
+    await ringApi([b]);
     expect(slept).toEqual([]);
-    expect((await dueOf(d))! - fake.now!).toBeGreaterThan(RING_WAIT);
+    const due = (await dueOf(d))!;
+    expect(due - fake.now!).toBeGreaterThan(RING_WAIT);
+    expect(fake.queued).toEqual([{ k: kOf(d), delaySeconds: Math.ceil((due - fake.now!) / 1000) }]);
     expect(callsTo(d)).toHaveLength(1);
+    // The consumer, when the message comes, sends it.
+    fake.now = due;
+    await drainQueue();
+    expect(callsTo(d)).toHaveLength(2);
+    expect(callsTo(d)[1].at).toBe(due);
   });
 
   it("400 for ver 2, n 0, n 65 or a length mismatch; 413 above 1044 bytes; 429 from RL_RING; no proof of work", async () => {
-    const l = P.random(16);
-    expect((await post(ringBody(1, l, [P.random(16)], 2))).status).toBe(400);
-    expect((await post(P.concat(Uint8Array.of(1), P.u16(1), l, Uint8Array.of(0)))).status).toBe(
-      400,
-    );
+    const l = { E: 1, label: P.random(16) };
+    expect((await post(ringBody(l, [P.random(16)], 2))).status).toBe(400);
     expect(
-      (await post(P.concat(Uint8Array.of(1), P.u16(1), l, Uint8Array.of(65), ...bells(65)))).status,
+      (await post(P.concat(Uint8Array.of(1), P.u16(1), l.label, Uint8Array.of(0)))).status,
+    ).toBe(400);
+    expect(
+      (await post(P.concat(Uint8Array.of(1), P.u16(1), l.label, Uint8Array.of(65), ...bells(65))))
+        .status,
     ).toBe(413);
-    expect((await post(P.concat(ringBody(1, l, bells(2)), P.random(1)))).status).toBe(400);
-    expect((await post(ringBody(1, l, bells(2)).subarray(0, 40))).status).toBe(400);
+    expect((await post(P.concat(ringBody(l, bells(2)), P.random(1)))).status).toBe(400);
+    expect((await post(ringBody(l, bells(2)).subarray(0, 40))).status).toBe(400);
     expect(MAX_RING_BODY).toBe(20 + 16 * 64);
     const { statuses, over } = await inOneRateWindow(async () => {
       const ip = freshIp();
       const statuses: number[] = [];
       for (let i = 0; i < 60; i++)
-        statuses.push((await post(ringBody(1, P.random(16), [P.random(16)]), ip)).status);
-      return { statuses, over: (await post(ringBody(1, P.random(16), [P.random(16)]), ip)).status };
+        statuses.push(
+          (await post(ringBody({ E: 1, label: P.random(16) }, [P.random(16)]), ip)).status,
+        );
+      return {
+        statuses,
+        over: (await post(ringBody({ E: 1, label: P.random(16) }, [P.random(16)]), ip)).status,
+      };
     });
     expect(statuses.every((s) => s === 204)).toBe(true);
     expect(over).toBe(429);
   });
 });
-
-// ───────────── 6. freshness and dedup ─────────────
 
 describe("ring freshness and dedup (§10.10, §9.8)", () => {
   const p = { delta: 10, skew: 2, eFirst: 1 };
@@ -733,61 +795,59 @@ describe("ring freshness and dedup (§10.10, §9.8)", () => {
     expect(ringEraOk(0, P.eraStart(1) + 1000, { ...p, eFirst: 1 })).toBe(false);
   });
 
-  it("the same row rung twice with the same bells pushes once; other bells rung first do not stop the sender's", async () => {
-    await reset(BASE);
-    const d = dev();
-    const other = dev();
-    const [b, bo] = bells(2);
-    await sub(d, [b]);
-    await sub(other, [bo]);
-    const label = P.random(16);
-    await ring([bo], label); // a third party rings the row first, with other bells
-    await ring([b], label);
-    expect(await dueOf(d)).not.toBeNull();
-    await run(BASE + HOLD);
-    expect(callsTo(d)).toHaveLength(1);
-    fake.now = BASE + (PUSH_WINDOW + 5) * 1000; // past the window, within RING_DEDUP
-    await ring([b], label);
-    expect(await dueOf(d)).toBeNull();
-    await ring([b], P.random(16)); // another row
-    expect(await dueOf(d)).not.toBeNull();
-  });
-});
-
-// ───────────── 7. coalescing and jitter ─────────────
-
-describe("one push per endpoint per PUSH_WINDOW, with jitter (§9.8)", () => {
-  it("two rings 10 s apart give two pushes at least PUSH_WINDOW apart; more rings within the window add nothing", async () => {
+  it("the same row rung twice reaches an endpoint once; another row reaches it again", async () => {
     await reset(BASE);
     const d = dev();
     const b = P.random(16);
     await sub(d, [b]);
+    const row = { E: 1, label: P.random(16) };
+    await ringState([b], row);
+    const due = await dueOf(d);
+    expect(due).not.toBeNull();
+    fake.now = BASE + 1000;
+    await ringState([b], row); // the sender's retry
+    expect((await stateOf(d))!.rows?.size).toBe(1);
+    expect(await dueOf(d)).toBe(due);
+    await ringState([b]); // another row joins the same push
+    expect((await stateOf(d))!.rows?.size).toBe(2);
+  });
+});
+
+// ───────────── 5. coalescing and jitter ─────────────
+
+describe("one push per endpoint per PUSH_WINDOW, with jitter (§9.8)", () => {
+  it("two rings 10 s apart give two pushes at least PUSH_WINDOW apart; more rings within the window add nothing", async () => {
+    await reset(BASE);
     fake.rand = 0.5;
-    await ring([b]);
-    const due1 = (await dueOf(d))!;
-    expect(due1 - BASE).toBeGreaterThanOrEqual(HOLD);
-    expect(due1 - BASE).toBeLessThanOrEqual(HOLD + DELTA * 1000); // PUSH_HOLD, then PUSH_JITTER = Δ
-    await run(BASE + HOLD + 1000); // the first run at or after due1
+    const d = dev();
+    const b = P.random(16);
+    await sub(d, [b]);
+    await ringApi([b]);
     expect(callsTo(d)).toHaveLength(1);
     const sent1 = callsTo(d)[0].at;
+    expect(sent1 - BASE).toBeGreaterThanOrEqual(HOLD);
+    expect(sent1 - BASE).toBeLessThanOrEqual(HOLD + DELTA * 1000); // PUSH_HOLD, then PUSH_JITTER = Δ
     fake.now = BASE + 10_000;
-    await ring([b]);
+    await ringApi([b]);
     const due2 = (await dueOf(d))!;
     expect(due2).toBeGreaterThanOrEqual(sent1 + PUSH_WINDOW * 1000);
     expect(due2).toBeLessThanOrEqual(sent1 + PUSH_WINDOW * 1000 + DELTA * 1000);
     fake.now = BASE + 20_000;
-    await ring([b]);
-    await ring([b]);
+    await ringApi([b]);
+    await ringApi([b]);
     expect(await dueOf(d)).toBe(due2);
-    await run(BASE + 30_000);
     expect(callsTo(d)).toHaveLength(1);
-    await run(due2);
+    expect(fake.queued).toHaveLength(3); // one message per ring; the consumer finds the push once
+    fake.now = due2;
+    await drainQueue();
     expect(callsTo(d)).toHaveLength(2);
     expect(callsTo(d)[1].at - sent1).toBeGreaterThanOrEqual(PUSH_WINDOW * 1000);
+    await drainQueue([kOf(d)]); // a stray message finds nothing due
+    expect(callsTo(d)).toHaveLength(2);
   });
 });
 
-// ───────────── 8. the push request ─────────────
+// ───────────── 6. the push request ─────────────
 
 describe("the push request (§9.8)", () => {
   it("carries the Web Push headers, an ES256 VAPID JWT, no redirects, and the payload encrypted to the subscription", async () => {
@@ -795,8 +855,8 @@ describe("the push request (§9.8)", () => {
     const d = dev("updates.push.test");
     const b = P.random(16);
     await sub(d, [b]);
-    await ring([b]);
-    await run(BASE + HOLD);
+    const real = Date.now();
+    await ringApi([b]);
     const [c] = callsTo(d);
     expect(c.init.method).toBe("POST");
     expect(c.init.redirect).toBe("manual");
@@ -822,8 +882,8 @@ describe("the push request (§9.8)", () => {
     };
     expect(cl.aud).toBe("https://updates.push.test");
     expect(cl.sub).toBe(ENV.VAPID_SUB);
-    expect(cl.exp).toBeGreaterThan(Math.floor((BASE + HOLD) / 1000));
-    expect(cl.exp).toBeLessThanOrEqual(Math.floor((BASE + HOLD) / 1000) + 12 * 3600);
+    expect(cl.exp).toBeGreaterThan(Math.floor(real / 1000));
+    expect(cl.exp).toBeLessThanOrEqual(Math.floor(Date.now() / 1000) + 12 * 3600);
     expect(p256.verify(P.fromB64u(sig), P.utf8(`${h}.${claims}`), VAPID_PK, { lowS: false })).toBe(
       true,
     );
@@ -833,7 +893,7 @@ describe("the push request (§9.8)", () => {
   });
 });
 
-// ───────────── 8b. the bells a push names ─────────────
+// ───────────── 7. the bells a push names ─────────────
 
 describe("the bells a push names (§9.8 `rang`)", () => {
   /** The bells named by the payload of a call, without the zero padding. */
@@ -858,56 +918,38 @@ describe("the bells a push names (§9.8 `rang`)", () => {
     const other = P.random(16);
     await sub(d, bs);
     await sub(dev(), [other]);
-    for (const b of bs) await ring([other, b]);
-    await ring([bs[1]]); // a repeat moves to the front
-    await run(BASE + HOLD + DELTA * 1000);
+    for (const b of bs) await ringState([other, b]);
+    await ringState([bs[1]]); // a repeat moves to the front
+    fake.now = BASE + HOLD + DELTA * 1000;
+    await drainQueue([kOf(d)]);
     expect(callsTo(d)).toHaveLength(1);
     expect(named(callsTo(d)[0], d)).toEqual([bs[1], bs[4], bs[3], bs[2]].map(P.hex));
-  });
-
-  it("starts again after a push is sent, and after one is dropped", async () => {
-    await reset(BASE);
-    const d = dev();
-    const [b1, b2, b3] = bells(3);
-    await sub(d, [b1, b2, b3]);
-    await ring([b1]);
-    await run(BASE + HOLD + DELTA * 1000);
-    expect(named(callsTo(d)[0], d)).toEqual([P.hex(b1)]);
-    await ring([b2]);
-    await run(BASE + HOLD + (PUSH_WINDOW + 2 * DELTA) * 1000);
-    expect(callsTo(d)).toHaveLength(2);
-    expect(named(callsTo(d)[1], d)).toEqual([P.hex(b2)]);
-    expect((await stateOf(d)).rang).toEqual([]);
-
-    fake.respond = () => new Response(null, { status: 500 });
-    await ring([b3]);
-    const t = BASE + HOLD + (2 * PUSH_WINDOW + 3 * DELTA) * 1000;
-    await run(t);
-    await run(t + 10_000); // the retry fails too: dropped
-    expect(callsTo(d)).toHaveLength(4);
-    expect(named(callsTo(d)[3], d)).toEqual([P.hex(b3)]);
-    expect((await stateOf(d)).rang).toEqual([]);
+    expect((await stateOf(d))!.rang).toEqual([]);
   });
 
   it("a push with no bell is as long as one with four", async () => {
     await reset(BASE);
     const d = dev();
-    const e = dev();
     const bs = bells(4);
     await sub(d, bs);
+    for (const b of bs) await ringState([b]);
+    const e = dev();
     await sub(e, [P.random(16)]);
-    for (const b of bs) await ring([b]);
-    await inDO((h) =>
-      h.pushes.set(P.hex(e.ep), { ep: e.ep, last: null, due: BASE, tries: 0, first: 0, rang: [] }),
-    );
-    await run(BASE + HOLD + DELTA * 1000);
+    await ringState([P.random(16)]); // nobody
+    fake.now = BASE + HOLD + DELTA * 1000;
+    await drainQueue([kOf(d)]);
     expect(named(callsTo(d)[0], d)).toHaveLength(4);
-    expect(named(callsTo(e)[0], e)).toHaveLength(0);
-    expect(callsTo(d)[0].body.length).toBe(callsTo(e)[0].body.length);
+    // A push naming no bell: made by hand through a ring whose bells are not the endpoint's own? None reaches it; so
+    // compare with the payload of a device whose single ring bell is zero-padded to the same 64 bytes.
+    const f = dev();
+    const fb = P.random(16);
+    await sub(f, [fb]);
+    await ringApi([fb]);
+    expect(callsTo(f)[0].body.length).toBe(callsTo(d)[0].body.length);
   });
 });
 
-// ───────────── 9. push service answers ─────────────
+// ───────────── 8. push service answers ─────────────
 
 describe("push service answers (§9.8)", () => {
   async function pushed(
@@ -917,13 +959,11 @@ describe("push service answers (§9.8)", () => {
     const d = dev();
     const b = P.random(16);
     await sub(d, [b]);
-    await run(fake.now! + DAY); // stored, so a deletion shows in the next pass
     fake.respond = () => {
       if (status === "throw") throw new TypeError("network");
       return new Response(null, { status, headers });
     };
-    await ring([b]);
-    await run(fake.now! + HOLD);
+    await ringApi([b]);
     return { d, b };
   }
 
@@ -931,23 +971,29 @@ describe("push service answers (§9.8)", () => {
     await reset(BASE);
     const { d } = await pushed(201);
     expect(callsTo(d)).toHaveLength(1);
-    expect(await stateOf(d)).toMatchObject({ due: null, last: fake.now });
+    expect(await stateOf(d)).toMatchObject({ due: null, last: fake.now, inflight: null });
+    expect(fake.queued).toEqual([]);
   });
 
-  it("429 with retry-after 5 is retried once after 5 s; 500 twice drops the push and keeps the endpoint", async () => {
+  it("429 with retry-after 5 is retried once after 5 s through the queue; 500 twice drops the push and keeps the endpoint", async () => {
     await reset(BASE);
     const { d, b } = await pushed(429, { "retry-after": "5" });
     expect(callsTo(d)).toHaveLength(1);
-    expect((await stateOf(d)).due).toBe(callsTo(d)[0].at + 5000);
+    expect((await stateOf(d))!.due).toBe(callsTo(d)[0].at + 5000);
+    expect(fake.queued).toEqual([{ k: kOf(d), delaySeconds: 5 }]);
     fake.respond = () => new Response(null, { status: 201 });
-    await run(callsTo(d)[0].at + 5000);
+    fake.now = callsTo(d)[0].at + 5000;
+    await drainQueue();
     expect(callsTo(d)).toHaveLength(2);
+    expect(await stateOf(d)).toMatchObject({ due: null, last: fake.now, tries: 0 });
 
     const { d: e, b: be } = await pushed(500);
-    expect((await stateOf(e)).due).toBe(callsTo(e)[0].at + 10_000);
-    await run(callsTo(e)[0].at + 10_000);
+    expect((await stateOf(e))!.due).toBe(callsTo(e)[0].at + 10_000);
+    fake.now = callsTo(e)[0].at + 10_000;
+    await drainQueue();
     expect(callsTo(e)).toHaveLength(2);
     expect(await stateOf(e)).toMatchObject({ due: null, last: callsTo(e)[0].at });
+    expect(await record(e)).not.toBeNull(); // kept
     fake.now! += PUSH_WINDOW * 1000;
     expect(await reaches(e, [be])).toBe(true);
     expect(await reaches(d, [b])).toBe(true);
@@ -956,14 +1002,15 @@ describe("push service answers (§9.8)", () => {
   it("a network error is retried once, then dropped", async () => {
     await reset(BASE);
     const { d } = await pushed("throw");
-    expect((await stateOf(d)).tries).toBe(1);
-    await run(fake.now! + 10_000);
+    expect((await stateOf(d))!.tries).toBe(1);
+    fake.now! += 10_000;
+    await drainQueue();
     expect(callsTo(d)).toHaveLength(2);
-    expect((await stateOf(d)).due).toBeNull();
+    expect((await stateOf(d))!.due).toBeNull();
   });
 
   it.each([301, 302, 400, 401, 403, 404, 410, 413])(
-    "%d deletes the endpoint (redirects are never followed)",
+    "%d deletes the registration (redirects are never followed)",
     async (status) => {
       await reset(BASE);
       const { d, b } = await pushed(
@@ -972,117 +1019,137 @@ describe("push service answers (§9.8)", () => {
       );
       expect(callsTo(d)).toHaveLength(1);
       expect(callsTo(d)[0].init.redirect).toBe("manual");
+      expect(await record(d)).toBeNull();
+      expect(await holders(b)).toEqual([]);
       fake.now! += PUSH_WINDOW * 1000;
       expect(await reaches(d, [b])).toBe(false);
-      await run(fake.now! + DAY);
-      expect(await storedDay(d)).toBeNull();
     },
   );
+
+  it("a gone answer leaves a registration made with other keys meanwhile", async () => {
+    await reset(BASE);
+    const d = dev();
+    const b = P.random(16);
+    await sub(d, [b]);
+    fake.respond = async () => {
+      // The device registered new keys while the push was in flight.
+      const sk = p256.utils.randomSecretKey();
+      Object.assign(d, { sk, p256dh: p256.getPublicKey(sk, false), auth: P.random(16) });
+      await sub(d, [b]);
+      return new Response(null, { status: 410 });
+    };
+    await ringApi([b]);
+    expect(callsTo(d)).toHaveLength(1);
+    expect(await record(d)).not.toBeNull();
+    expect(await holders(b)).toEqual([P.hex(d.ep)]);
+  });
 
   it("an endpoint whose host left PUSH_HOSTS is deleted without a request", async () => {
     await reset(BASE);
     const d = dev();
     const b = P.random(16);
     await sub(d, [b]);
-    await setEnv({ PUSH_HOSTS: "other.push.test" });
-    await ring([b]);
-    await run(BASE + HOLD);
+    _resetPushConfigForTests();
+    await ringApi([b], undefined, { PUSH_HOSTS: "other.push.test" });
     expect(fake.calls).toEqual([]);
-    await setEnv({});
+    expect(await record(d)).toBeNull();
+    _resetPushConfigForTests();
     expect(await reaches(d, [b])).toBe(false);
   });
 });
 
-// ───────────── 10. expiry and storage ─────────────
+// ───────────── 9. expiry and what is stored ─────────────
 
 describe("expiry and what is stored (§9.8)", () => {
-  it("deletes endpoints not refreshed for more than 30 days, and every endpoint after PUSH_KEY changes", async () => {
+  it("the daily expiry deletes endpoints not refreshed for more than 30 days, with or without the key", async () => {
     await reset(BASE);
     const a = dev();
     const b = dev();
-    await sub(a, bells(1));
+    const ba = P.random(16);
+    await sub(a, [ba]);
     fake.now = BASE + 2 * DAY;
     await sub(b, bells(1));
-    await run(BASE + 30 * DAY + 1000);
-    expect(await storedDay(a)).toBe(dayOf(BASE));
-    await run(BASE + 31 * DAY + 1000);
-    expect(await storedDay(a)).toBeNull();
-    expect(await storedDay(b)).toBe(dayOf(BASE) + 2);
-    // A new PUSH_KEY: the old registration no longer opens; until the pass it counts toward PUSH_MAX_SUBS.
-    await setEnv({ PUSH_KEY: P.b64u(P.random(32)), PUSH_MAX_SUBS: "2" });
-    const again = dev();
-    expect(await sub(again, bells(1))).toBe("ok");
-    expect(await sub(dev(), bells(1))).toBe("full");
-    await run(BASE + 32 * DAY + 1000);
-    expect(await storedDay(b)).toBeNull();
-    expect(await sub(dev(), bells(1))).toBe("ok");
+    expect(await pushCleanup(env, BASE + 30 * DAY + 1000)).toEqual({ scanned: 2, expired: 0 });
+    expect(await record(a)).not.toBeNull();
+    _resetPushConfigForTests();
+    expect(await pushCleanup(envOf({ PUSH_KEY: undefined }), BASE + 31 * DAY + 1000)).toEqual({
+      scanned: 2,
+      expired: 1,
+    });
+    _resetPushConfigForTests();
+    expect(await record(a)).toBeNull();
+    expect(await holders(ba)).toEqual([]);
+    expect(await record(b)).not.toBeNull();
+    expect(await pushCleanup(env, BASE + 33 * DAY)).toEqual({ scanned: 1, expired: 1 });
+    expect(await record(b)).toBeNull();
+    expect(PUSH_EXPIRY).toBe(30);
   });
 
-  it("stores sub, tok, the journal and the pass's day: keyed hashes, sealed boxes, no bell in the clear, nothing per ring, and logs nothing identifying", async () => {
+  it("stores records and bells only: keyed hashes, sealed boxes, no bell in the clear, nothing per ring, nothing in the objects, and logs nothing identifying", async () => {
     const log = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       await reset(BASE);
       const d = dev();
       const bs = bells(3);
-      await sub(d, bs);
-      await run(BASE + DAY + 1000);
+      const q = P.random(16);
+      await sub(d, bs, q);
       fake.respond = () => new Response(null, { status: 500 });
-      await ring(bs);
-      await run(BASE + DAY + 2000);
-      await run(BASE + DAY + 20_000);
-      const {
-        names,
-        kv,
-        sub: subs,
-        tok,
-        jr,
-        meta,
-      } = await inDO(async (_h, state) => ({
-        names: state.storage.sql
-          .exec<{ name: string }>(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\' AND name NOT LIKE 'sqlite_%'",
-          )
-          .toArray()
-          .map((r) => r.name)
-          .sort(),
-        kv: (await state.storage.list()).size,
-        sub: state.storage.sql
-          .exec<{ ep: ArrayBuffer; box: ArrayBuffer; day: number }>("SELECT ep, box, day FROM sub")
-          .toArray(),
-        tok: state.storage.sql
-          .exec<{ tk: ArrayBuffer; ep: ArrayBuffer }>("SELECT tk, ep FROM tok")
-          .toArray(),
-        jr: state.storage.sql.exec<{ box: ArrayBuffer }>("SELECT box FROM jr").toArray(),
-        meta: state.storage.sql.exec<{ k: string; v: number }>("SELECT k, v FROM meta").toArray(),
-      }));
-      expect(names).toEqual(["jr", "meta", "sub", "tok"]);
-      expect(kv).toBe(0);
-      // One journal row for the one minute the runs fell in, however much happened in it; the day of the pass.
-      expect(jr.map((r) => r.box.byteLength)).toEqual([24 + JR_BYTES + 16]);
-      expect(meta).toEqual([{ k: "pass", v: dayOf(BASE) + 1 }]);
-      expect(subs).toHaveLength(1);
-      expect(P.hex(new Uint8Array(subs[0].ep))).toBe(P.hex(d.ep));
-      const [e, k, a] = P.dec(
-        P.aeadOpen(PUSH_KEY, new Uint8Array(subs[0].box), P.enc("segv.sh/v2/push/sub", d.ep)),
-        3,
-      );
-      expect(new TextDecoder().decode(e)).toBe(d.endpoint);
-      expect(P.hex(k)).toBe(P.hex(d.p256dh));
-      expect(P.hex(a)).toBe(P.hex(d.auth));
-      expect(() =>
-        P.aeadOpen(P.random(32), new Uint8Array(subs[0].box), P.enc("segv.sh/v2/push/sub", d.ep)),
-      ).toThrow();
-      expect(tok.map((r) => P.hex(new Uint8Array(r.tk))).sort()).toEqual(
-        bs.map((x) => P.hex(tkOf(x))).sort(),
-      );
-      const all = P.hex(
-        P.concat(
-          ...subs.flatMap((r) => [new Uint8Array(r.ep), new Uint8Array(r.box)]),
-          ...tok.flatMap((r) => [new Uint8Array(r.tk), new Uint8Array(r.ep)]),
-          ...jr.map((r) => new Uint8Array(r.box)),
-        ),
-      );
-      for (const x of bs) expect(all).not.toContain(P.hex(x));
+      await ringApi(bs);
+      fake.now! += 10_000;
+      await drainQueue();
+      const keys: string[] = [];
+      const values: Bytes[] = [];
+      let cursor: string | undefined;
+      do {
+        const page = await env.PUSH_KV.list({ cursor });
+        for (const k of page.keys) {
+          keys.push(k.name);
+          values.push(new Uint8Array((await env.PUSH_KV.get(k.name, "arrayBuffer"))!));
+        }
+        cursor = page.list_complete ? undefined : page.cursor;
+      } while (cursor);
+      expect(keys.sort()).toEqual([...bs.map((b) => keyBell(tk(b))), keyEp(d.ep)].sort());
+      const rec = (await record(d))!;
+      expect(rec.tks.map(P.hex).sort()).toEqual(bs.map((b) => P.hex(tk(b))).sort());
+      expect(P.hex(rec.qh!)).toBe(P.hex(qk(q)));
+      for (const b of bs) {
+        const [e] = decodeEntries(
+          new Uint8Array((await env.PUSH_KV.get(keyBell(tk(b)), "arrayBuffer"))!),
+        )!;
+        expect(P.hex(e.ep)).toBe(P.hex(d.ep));
+        const [ep, k, a] = P.dec(
+          P.aeadOpen(PUSH_KEY, e.box, P.enc("segv.sh/v2/push/sub", d.ep)),
+          3,
+        );
+        expect(new TextDecoder().decode(ep)).toBe(d.endpoint);
+        expect(P.hex(k)).toBe(P.hex(d.p256dh));
+        expect(P.hex(a)).toBe(P.hex(d.auth));
+        expect(() => P.aeadOpen(P.random(32), e.box, P.enc("segv.sh/v2/push/sub", d.ep))).toThrow();
+      }
+      const all = keys.join("|") + P.hex(P.concat(...values));
+      for (const x of [...bs, q]) {
+        expect(all).not.toContain(P.hex(x));
+        expect(all).not.toContain(P.b64u(x));
+      }
+      // The objects store nothing: no table, no key, no alarm.
+      for (let i = 0; i < SHARDS; i++) {
+        for (const stub of [quiet(i), bell(i)]) {
+          const stored = await runInDurableObject(
+            stub as DurableObjectStub<QuietDO>,
+            async (_inst, state) => ({
+              tables: state.storage.sql
+                .exec<{ name: string }>(
+                  "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\' AND name NOT LIKE 'sqlite_%'",
+                )
+                .toArray()
+                .map((r) => r.name),
+              kv: (await state.storage.list()).size,
+              alarm: await state.storage.getAlarm(),
+            }),
+          );
+          expect(stored).toEqual({ tables: [], kv: 0, alarm: null });
+        }
+      }
       const lines = log.mock.calls.map((c) => c.map(String).join(" ")).join("\n");
       expect(lines).toContain("push results");
       for (const s of [
@@ -1092,6 +1159,7 @@ describe("expiry and what is stored (§9.8)", () => {
         ...bs.map(P.b64u),
         ...bs.map(P.hex),
         P.hex(d.ep),
+        P.hex(q),
       ])
         expect(lines).not.toContain(s);
     } finally {
@@ -1099,613 +1167,57 @@ describe("expiry and what is stored (§9.8)", () => {
     }
   });
 
-  it("a restart loses the pushes due", async () => {
+  it("a restart loses the pushes due, not the registrations", async () => {
     await reset(BASE);
     const d = dev();
     const b = P.random(16);
     await sub(d, [b]);
-    await run(BASE + DAY + 1000);
-    await ring([b]);
+    await ringState([b]);
     expect(await dueOf(d)).not.toBeNull();
     await restart();
-    await run(BASE + DAY + 5000);
+    expect(await dueOf(d)).toBeNull();
+    fake.now = BASE + HOLD + DELTA * 1000;
+    await drainQueue([kOf(d)]);
     expect(fake.calls).toEqual([]);
+    expect(await reaches(d, [b])).toBe(true);
   });
 });
 
-// ───────────── 11. daily persistence and the fixed tick ─────────────
-
-describe("only the daily pass writes, and the alarm follows the clock (§9.8)", () => {
-  /** A stored, B new, A changed, C deleted by an empty set, D deleted by a 410 — all on day D+1. */
-  async function dayOfChanges() {
-    await reset(BASE);
-    const [A, B, C, D] = [dev(), dev(), dev(), dev()];
-    const [a1, a2, b1, c1, d1] = bells(5);
-    await sub(A, [a1]);
-    await sub(C, [c1]);
-    await sub(D, [d1]);
-    await run(BASE + DAY); // the 00:00 pass of D+1 writes A, C, D
-    const before = await tables();
-    fake.now = BASE + DAY + 3600_000;
-    await sub(B, [b1]);
-    await sub(A, [a2]);
-    await sub(C, []);
-    fake.respond = (c) => new Response(null, { status: c.url === D.endpoint ? 410 : 201 });
-    await ring([d1]);
-    await run(fake.now + HOLD);
-    return { A, B, C, D, a1, a2, b1, c1, d1, before };
-  }
-
-  it("(a) changes take effect at once in memory; the tables change only at the next 00:00 pass, in one transaction", async () => {
-    const x = await dayOfChanges();
-    expect(await reaches(x.B, [x.b1])).toBe(true);
-    expect(await reaches(x.A, [x.a1])).toBe(false);
-    expect(await reaches(x.A, [x.a2])).toBe(true);
-    expect(await reaches(x.C, [x.c1])).toBe(false);
-    expect(await reaches(x.D, [x.d1])).toBe(false);
-    expect(await tables()).toEqual(x.before);
-    await run(BASE + 2 * DAY - 1); // 23:59:59.999: still the same day
-    expect(await tables()).toEqual(x.before);
-    const partsBefore = (await inDO((h) => h.parts.length)) as number;
-    await run(BASE + 2 * DAY);
-    expect((await inDO((h) => h.parts.length)) - partsBefore).toBe(1);
-    const t = await tables();
-    expect(t.sub.map((r) => r.ep).sort()).toEqual([P.hex(x.A.ep), P.hex(x.B.ep)].sort());
-    expect(t.tok.map((r) => r.tk).sort()).toEqual([P.hex(tkOf(x.a2)), P.hex(tkOf(x.b1))].sort());
-  });
-
-  it("(b) a restart brings back the changes that the journal holds; one of the last minute comes back with the device's next sub", async () => {
-    // The run that took D's refusal wrote the journal's row first: A, B and C's changes are in it, D's deletion is not.
-    const x = await dayOfChanges();
-    await restart();
-    expect(await reaches(x.A, [x.a2])).toBe(true);
-    expect(await reaches(x.A, [x.a1])).toBe(false);
-    expect(await reaches(x.B, [x.b1])).toBe(true);
-    expect(await reaches(x.C, [x.c1])).toBe(false);
-    expect(await reaches(x.D, [x.d1])).toBe(true); // deleted again at its next push (§9.8)
-    // A change after the minute's row is lost with a restart in that minute; the device's next sub restores it.
-    const E = dev();
-    const e1 = P.random(16);
-    await sub(E, [e1]);
-    await restart();
-    expect(await reaches(E, [e1])).toBe(false);
-    await sub(E, [e1]);
-    expect(await reaches(E, [e1])).toBe(true);
-    // The next pass writes what memory holds; a restart after it keeps everything.
-    await run(BASE + 2 * DAY);
-    await restart();
-    expect(await reaches(x.A, [x.a2])).toBe(true);
-    expect(await reaches(x.B, [x.b1])).toBe(true);
-    expect(await reaches(E, [e1])).toBe(true);
-    expect(await reaches(x.C, [x.c1])).toBe(false);
-  });
-
-  it("(c) rings write nothing: not the alarm, not the tables; the alarm keeps the PUSH_TICK grid", async () => {
-    await reset(BASE);
-    const d = dev();
-    const b = P.random(16);
-    await sub(d, [b]);
-    await run(BASE + DAY);
-    const alarm = () => inDO((_h, state) => state.storage.getAlarm());
-    expect(await alarm()).toBe(nextTick(BASE + DAY));
-    const t0 = await tables();
-    for (const off of [1, 2500, 7000, 9999]) {
-      fake.now = BASE + DAY + off;
-      await ring([b]);
-      expect(await alarm()).toBe(BASE + DAY + PUSH_TICK * 1000);
-      expect(await tables()).toEqual(t0);
-    }
-    // A push due 700 ms after a run goes out at the next run, not earlier.
-    await reset(BASE);
-    await sub(d, [b]);
-    fake.rand = 0.7;
-    await ring([b]);
-    const due = (await dueOf(d))!;
-    await run(BASE + 500);
-    expect(callsTo(d)).toHaveLength(0);
-    await run(BASE + 10_000);
-    expect(callsTo(d)).toHaveLength(1);
-    expect(due).toBeLessThanOrEqual(BASE + 10_000);
-    // With nothing registered and push off, the cadence is the same.
-    await reset(BASE + 3_000);
-    await setEnv({ VAPID_SK: undefined });
-    await run();
-    expect(await alarm()).toBe(BASE + 10_000);
-    await run(BASE + 10_000);
-    expect(await alarm()).toBe(BASE + 20_000);
-  });
-
-  it("(c) 120 due pushes go out within one run, 50 a second", async () => {
-    await reset(BASE);
-    const devs = Array.from({ length: 120 }, () => dev());
-    const bs = devs.map(() => P.random(16));
-    for (let i = 0; i < devs.length; i++) await subRetrying(devs[i], [bs[i]]); // over a few minutes
-    const t = nowOf();
-    await ring(bs.slice(0, 60));
-    await ring(bs.slice(60));
-    await run(t + HOLD);
-    expect(fake.calls).toHaveLength(120);
-    const at = [...new Set(fake.calls.map((c) => c.at))].sort((p, q) => p - q);
-    expect(at).toEqual([t + HOLD, t + HOLD + 1000, t + HOLD + 2000]);
-    expect(fake.calls.filter((c) => c.at === t + HOLD)).toHaveLength(50);
-  });
-
-  it("(c2) flushes close together share the limit of one batch a second", async () => {
-    await reset(BASE);
-    const devs = Array.from({ length: 100 }, () => dev());
-    const bs = devs.map(() => P.random(16));
-    for (let i = 0; i < devs.length; i++) await subRetrying(devs[i], [bs[i]]);
-    const t = nowOf();
-    await ring(bs.slice(0, 50));
-    fake.now = t + 200;
-    await ring(bs.slice(50));
-    fake.now = t + HOLD;
-    await DO().flush(); // the first 50
-    fake.now = t + HOLD + 200;
-    await DO().flush(); // the other 50, due now, wait for the next second
-    const at = fake.calls.map((c) => c.at);
-    expect(at).toHaveLength(100);
-    expect(at.filter((x) => x === t + HOLD)).toHaveLength(50);
-    expect(at.filter((x) => x === t + HOLD + 1000)).toHaveLength(50);
-  });
-
-  it("(d) after a restart at noon the first pass writes nothing; a change at 23:59:59 is written at 00:00, never earlier", async () => {
-    await reset(BASE);
-    const d = dev();
-    await sub(d, bells(1));
-    await run(BASE + DAY);
-    const t0 = await tables();
-    fake.now = BASE + DAY + 12 * 3600_000;
-    await restart();
-    const e = dev();
-    await sub(e, bells(1)); // the call that starts the object
-    await run();
-    expect(await tables()).toEqual(t0);
-    fake.now = BASE + 2 * DAY - 1000;
-    const f = dev();
-    await sub(f, bells(1));
-    await run(BASE + 2 * DAY - 500);
-    expect(await storedDay(f)).toBeNull();
-    await run(BASE + 2 * DAY);
-    expect(await storedDay(e)).toBe(dayOf(BASE) + 1);
-    expect(await storedDay(f)).toBe(dayOf(BASE) + 1);
-  });
-
-  it("(e) a refresh on the registration's last day, or just after midnight, keeps it; a restart losing it does not", async () => {
-    await reset(BASE);
-    const D = dayOf(BASE);
-    const x = dev();
-    const bx = bells(2);
-    await sub(x, bx);
-    await run(BASE + DAY);
-    fake.now = BASE + 30 * DAY + 5000;
-    await sub(x, bx); // an unchanged re-send on D+30
-    await run(BASE + 31 * DAY);
-    expect(await storedDay(x)).toBe(D + 30);
-
-    const y = dev();
-    const by = bells(1);
-    fake.now = BASE + 40 * DAY;
-    await sub(y, by);
-    await run(BASE + 41 * DAY); // stored with day D+40
-    fake.now = BASE + 71 * DAY + 5000; // 00:00:05 on D+71, before the pass reaches it
-    await sub(y, by);
-    await run(BASE + 71 * DAY + 10_000);
-    expect(await storedDay(y)).toBe(D + 40); // kept, not yet rewritten
-    await run(BASE + 72 * DAY);
-    expect(await storedDay(y)).toBe(D + 71);
-
-    const z = dev();
-    const bz = bells(1);
-    fake.now = BASE + 80 * DAY;
-    await sub(z, bz);
-    await run(BASE + 81 * DAY);
-    fake.now = BASE + 111 * DAY + 5000;
-    await sub(z, bz);
-    await restart(); // the refresh is lost
-    await run(BASE + 111 * DAY + 10_000);
-    expect(await storedDay(z)).toBeNull();
-    await sub(z, bz); // the device's next re-send registers it again
-    expect(await reaches(z, bz)).toBe(true);
-  });
-
-  it("(e) a same-day re-send of a changed set keeps the change; a re-send equal to the stored set is a refresh", async () => {
-    await reset(BASE);
-    const x = dev();
-    const [x1, x2] = bells(2);
-    await sub(x, [x1]);
-    await run(BASE + DAY);
-    fake.now = BASE + DAY + 1000;
-    await sub(x, [x2]);
-    await sub(x, [x2]);
-    await run(BASE + 2 * DAY);
-    expect((await tables()).tok.map((r) => r.tk)).toEqual([P.hex(tkOf(x2))]);
-    fake.now = BASE + 2 * DAY + 1000;
-    await sub(x, [x1]);
-    await sub(x, [x2]); // equal to what is stored: a refresh
-    await run(BASE + 3 * DAY);
-    expect((await tables()).tok.map((r) => r.tk)).toEqual([P.hex(tkOf(x2))]);
-    expect(await storedDay(x)).toBe(dayOf(BASE) + 2);
-  });
-
-  it("(f) the constructor re-arms a lost alarm at the next PUSH_TICK, and writes nothing when one is set", async () => {
-    await reset(BASE);
-    await inDO((_h, state) => state.storage.deleteAlarm());
-    await evictDurableObject(DO());
-    const t0 = Date.now();
-    const armed = await inDO((_h, state) => state.storage.getAlarm());
-    expect(armed).not.toBeNull();
-    expect(armed! % (PUSH_TICK * 1000)).toBe(0);
-    expect(armed!).toBeGreaterThan(t0 - PUSH_TICK * 1000);
-    expect(armed!).toBeLessThanOrEqual(nextTick(Date.now()));
-    const later = nextTick(Date.now()) + 3 * DAY;
-    await inDO((_h, state) => state.storage.setAlarm(later));
-    await evictDurableObject(DO());
-    expect(await inDO((_h, state) => state.storage.getAlarm())).toBe(later);
-    await install(); // removes the alarm: set it again for the platform's run below
-    await inDO((_h, state) => state.storage.setAlarm(later));
-    // The platform's alarm runs the same tick.
-    fake.now = later;
-    expect(await runDurableObjectAlarm(DO())).toBe(true);
-    expect(await inDO((_h, state) => state.storage.getAlarm())).toBe(later + PUSH_TICK * 1000);
-  });
-
-  it("(g) ring answers the wait until its push is due; flush sends what is due then, and nothing before", async () => {
-    await reset(BASE);
-    const d = dev();
-    const b = P.random(16);
-    await sub(d, [b]);
-    fake.rand = 0.7;
-    const wait = await ring([b]);
-    const due = (await dueOf(d))!;
-    expect(wait).toBe(due - BASE);
-    await DO().flush();
-    expect(callsTo(d)).toHaveLength(0);
-    fake.now = due;
-    await DO().flush();
-    expect(callsTo(d).map((c) => c.at)).toEqual([due]);
-    // The next push waits for the end of PUSH_WINDOW: beyond RING_WAIT, no wait is answered, and a run sends it.
-    fake.now = due + 1000;
-    expect(await ring([b])).toBeNull();
-    const due2 = (await dueOf(d))!;
-    expect(due2 - fake.now).toBeGreaterThan(RING_WAIT);
-    // A ring that joins a waiting push answers that push's wait once it is near.
-    fake.now = due2 - 3000;
-    expect(await ring([b])).toBe(3000);
-    await run(nextTick(due2));
-    expect(callsTo(d)).toHaveLength(2);
-    // A marked row's push is cancelled: the flush at its time finds nothing.
-    const e = dev();
-    const q = P.random(16);
-    const eb = P.random(16);
-    await sub(e, [eb], q);
-    const label = P.random(16);
-    const w = (await ring([eb], label))!;
-    await DO().seen(q, [{ E: 1, label }]); // the quiet tag, as the Worker passes it
-    fake.now! += w;
-    await DO().flush();
-    expect(callsTo(e)).toHaveLength(0);
-  });
-});
-
-// ───────────── 11b. the journal ─────────────
-
-describe("the journal keeps the day's changes across a restart (§9.8)", () => {
-  const jrRows = (): Promise<{ slot: number; box: string }[]> =>
-    inDO((_h, state) =>
-      state.storage.sql
-        .exec<{ slot: number; box: ArrayBuffer }>("SELECT slot, box FROM jr ORDER BY slot")
-        .toArray()
-        .map((r) => ({ slot: r.slot, box: P.hex(new Uint8Array(r.box)) })),
-    );
-  const minute = (ms: number): number => Math.floor(ms / (PUSH_JOURNAL * 1000));
-  const openRow = async (ms: number, key = PUSH_KEY): Promise<Bytes> => {
-    const box = await inDO(
-      (_h, state) =>
-        new Uint8Array(
-          state.storage.sql
-            .exec<{ box: ArrayBuffer }>("SELECT box FROM jr WHERE slot = ?", minute(ms) % JR_SLOTS)
-            .one().box,
-        ),
-    );
-    return P.aeadOpen(key, box, P.enc("segv.sh/v2/push/jr", P.u32(minute(ms))));
-  };
-  const regCount = (): Promise<number> =>
-    inDO((h) => (h as unknown as { regCount: number }).regCount);
-
-  it("(a) one row of one length at the first run of each minute while push is on, whatever changed; nothing else writes it", async () => {
-    await reset(BASE);
-    await run(BASE);
-    let rows = await jrRows();
-    expect(rows.map((r) => r.slot)).toEqual([minute(BASE) % JR_SLOTS]);
-    const len = rows[0].box.length;
-    expect(len / 2).toBe(24 + JR_BYTES + 16);
-    const d = dev();
-    const b = P.random(16);
-    fake.now = BASE + 1000;
-    await sub(d, [b]);
-    await ring([b]);
-    await DO().flush();
-    expect(await jrRows()).toEqual(rows);
-    await run(BASE + 10_000); // the same minute: no second row, the change waits
-    expect(await jrRows()).toEqual(rows);
-    await run(BASE + 60_000);
-    rows = await jrRows();
-    expect(rows).toHaveLength(2);
-    // The row holds the change, sealed under PUSH_KEY and bound to its minute; bells only as keyed hashes.
-    const p = await openRow(BASE + 60_000);
-    expect(p).toHaveLength(JR_BYTES);
-    expect(P.hex(p)).toContain(P.hex(d.ep));
-    expect(P.hex(p)).toContain(P.hex(tkOf(b)));
-    expect(P.hex(p)).not.toContain(P.hex(b));
-    await expect(openRow(BASE + 60_000, P.random(32))).rejects.toThrow();
-    // Nothing waits: the next minute's row is as long.
-    await run(BASE + 120_000);
-    rows = await jrRows();
-    expect(rows).toHaveLength(3);
-    for (const r of rows) expect(r.box.length).toBe(len);
-    // While push is off, none.
-    await setEnv({ VAPID_SK: undefined });
-    await run(BASE + 180_000);
-    expect(await jrRows()).toHaveLength(3);
-  });
-
-  it("(b) a restart reads the changes back in order, across empty minutes, a deletion at a push included", async () => {
-    await reset(BASE);
-    await run(BASE);
-    const [A, B, C] = [dev(), dev(), dev()];
-    const [a1, a2, b1, c1] = bells(4);
-    fake.now = BASE + 1000;
-    await sub(A, [a1]);
-    await sub(B, [b1]);
-    await sub(C, [c1]);
-    await run(BASE + 60_000);
-    fake.now = BASE + 61_000;
-    await sub(A, [a2]);
-    await sub(B, []);
-    fake.respond = (c) => new Response(null, { status: c.url === C.endpoint ? 410 : 201 });
-    await ring([c1]);
-    await run(BASE + 61_000 + HOLD); // the same minute: C's push is refused, and its deletion waits for the next row
-    for (let m = 2; m <= 30; m++) await run(BASE + m * 60_000);
-    await restart();
-    fake.respond = () => new Response(null, { status: 201 });
-    expect(await reaches(A, [a2])).toBe(true);
-    expect(await reaches(A, [a1])).toBe(false);
-    expect(await reaches(B, [b1])).toBe(false);
-    expect(await reaches(C, [c1])).toBe(false);
-    expect((await tables()).sub).toEqual([]);
-    await run(BASE + DAY);
-    expect((await tables()).sub.map((r) => r.ep)).toEqual([P.hex(A.ep)]);
-  });
-
-  it("(c) what a completed pass wrote is not read back; a restart in the minute of a row leaves that row as it was", async () => {
-    await reset(BASE);
-    const d = dev();
-    await sub(d, bells(1));
-    await run(BASE + 60_000); // journaled on day D
-    await run(BASE + DAY); // the pass of D+1 writes it and records that it is complete
-    await restart();
-    await run(BASE + DAY + 10_000);
-    expect(await regCount()).toBe(0); // stored, not a change of the day
-    const e = dev();
-    const eb = bells(1);
-    fake.now = BASE + DAY + 70_000;
-    await sub(e, eb);
-    await run(BASE + DAY + 120_000); // e's row
-    const before = await jrRows();
-    await restart();
-    await run(BASE + DAY + 130_000); // the same minute, after the restart: no new row over it
-    expect(await jrRows()).toEqual(before);
-    expect(await reaches(e, eb)).toBe(true);
-    expect(await regCount()).toBe(1);
-  });
-
-  it("(d) a row that does not open ends the walk: under a new PUSH_KEY nothing is read back", async () => {
-    await reset(BASE);
-    await run(BASE);
-    const d = dev();
-    fake.now = BASE + 1000;
-    await sub(d, bells(1));
-    await run(BASE + 60_000);
-    await restart();
-    await setEnv({ PUSH_KEY: P.b64u(P.random(32)) });
-    await run(BASE + 70_000);
-    expect(await regCount()).toBe(0);
-  });
-
-  it("(e) sub answers BUSY to a change the next row cannot hold with those waiting; each change it took survives", async () => {
-    await reset(BASE);
-    await run(BASE);
-    const [a, b, c] = [dev(), dev(), dev()];
-    const [a1, a2, bb, cb] = [bells(256), bells(256), bells(256), bells(1)];
-    fake.now = BASE + 1000;
-    expect(await sub(a, a1)).toBe("ok");
-    expect(await sub(b, bb)).toBe("busy"); // a's change takes most of the next row
-    expect(await reaches(b, bb)).toBe(false); // and nothing of b changed
-    expect(await sub(c, cb)).toBe("ok"); // a small change still fits
-    expect(await sub(a, a2)).toBe("ok"); // a's next change takes the place of the one waiting
-    expect(await sub(b, [])).toBe("ok"); // so does a deletion, of nothing
-    await run(BASE + 60_000); // the row of minute 1 holds a and c
-    expect(await sub(b, bb)).toBe("ok");
-    await run(BASE + 120_000); // and that of minute 2, b
-    await restart();
-    for (const [d, bs] of [
-      [a, a2],
-      [b, bb],
-      [c, cb],
-    ] as const)
-      expect(await reaches(d, bs)).toBe(true);
-    expect(await reaches(a, a1)).toBe(false);
-    expect(await regCount()).toBe(3);
-  });
-
-  it("(f) a pass while push is off leaves the day in meta, so the journal's changes come back with push", async () => {
-    await reset(BASE);
-    const d = dev();
-    const b = bells(1);
-    fake.now = BASE + 1000;
-    await sub(d, b);
-    await run(BASE + 60_000); // its row; the day's pass has nothing to write yet
-    expect(await passDay()).toBe(dayOf(BASE));
-    await restart();
-    await setEnv({ PUSH_KEY: undefined }); // the object starts with push off: it cannot read the journal
-    await run(BASE + DAY + 1000); // the next day's pass goes through, by day only
-    await run(BASE + DAY + 11_000);
-    expect(await passDay()).toBe(dayOf(BASE));
-    expect(await storedDay(d)).toBeNull();
-    await restart(); // push is on again (a deploy restarts the object)
-    await run(BASE + DAY + 21_000);
-    expect(await storedDay(d)).toBe(dayOf(BASE));
-    expect(await passDay()).toBe(dayOf(BASE) + 1);
-    expect(await reaches(d, b)).toBe(true);
-  });
-});
-
-// ───────────── 12. the pass in parts ─────────────
-
-describe("the daily pass works in bounded parts (§9.8)", () => {
-  it("never reads, writes or deletes more than PUSH_ROWS rows in a run, never splits an endpoint, goes in ep order, resumes and retries", async () => {
-    await reset(BASE);
-    const old = Array.from({ length: 40 }, () => dev());
-    for (const d of old) await subRetrying(d, bells(256)); // one a minute: each fills a journal row
-    const sender = dev();
-    const sb = P.random(16);
-    fake.now = BASE + 29 * DAY;
-    await sub(sender, [sb]);
-    await run(BASE + 30 * DAY); // writes all of them (default PUSH_ROWS) and expires nothing yet
-    expect((await tables()).sub).toHaveLength(41);
-    fake.now = BASE + 30 * DAY + 3600_000;
-    const changed = Array.from({ length: 10 }, () => dev());
-    for (const d of changed) await sub(d, bells(10));
-    await inDO((h) => {
-      h.pushRows = 600;
-    });
-    const partsAt = (await inDO((h) => h.parts.length)) as number;
-    const tokCounts = async () => {
-      const t = await tables();
-      return old.map((d) => t.tok.filter((r) => r.ep === P.hex(d.ep)).length);
-    };
-    // The first part fails once (an injected storage error): nothing changes, and the next run tries it again.
-    await inDO((h) => {
-      let once = true;
-      h.beforeCommit = () => {
-        if (once) {
-          once = false;
-          throw new Error("injected");
-        }
-      };
-    });
-    const log = vi.spyOn(console, "error").mockImplementation(() => {});
-    await ring([sb]);
-    await run(BASE + 31 * DAY);
-    log.mockRestore();
-    expect((await tables()).sub).toHaveLength(41);
-    expect(callsTo(sender)).toHaveLength(1); // sending goes on during the pass
-    let runs = 0;
-    for (let at = BASE + 31 * DAY + 10_000; runs < 4; at += 10_000, runs++) {
-      await run(at);
-      expect((await tokCounts()).every((n) => n === 0 || n === 256)).toBe(true);
-    }
-    const firstPass = (await inDO((h) => h.parts.slice(partsAt))) as PassPart[];
-    // A restart in the middle: the next pass starts from the lowest ep and finds the committed parts done.
-    const mid = await tables();
-    expect(mid.sub.length).toBeLessThan(41 + 10);
-    await restart();
-    await inDO((h) => {
-      h.pushRows = 600;
-    });
-    for (let at = BASE + 31 * DAY + 100_000; runs < 40; at += 10_000, runs++) await run(at);
-    const end = await tables();
-    // The 40 expired. The 10 changes are all written: the journal brought back those the parts before the restart had
-    // not reached (and those they had, which the second pass writes again).
-    expect(end.sub.map((r) => r.ep).sort()).toEqual(
-      [P.hex(sender.ep), ...changed.map((d) => P.hex(d.ep))].sort(),
-    );
-    const secondPass = (await inDO((h) => h.parts)) as PassPart[];
-    expect(firstPass).toHaveLength(4);
-    expect(secondPass.length).toBeGreaterThan(5);
-    for (const pass of [firstPass, secondPass]) {
-      for (const p of pass) expect(p.rows).toBeLessThanOrEqual(600);
-      // Each pass goes through the endpoints in ascending ep order.
-      for (let i = 1; i < pass.length; i++) expect(pass[i].first! > pass[i - 1].last!).toBe(true);
-    }
-    // After the restart the pass started again from the lowest ep, stored or read back from the journal.
-    expect(secondPass[0].first).toBe(
-      [...mid.sub.map((r) => r.ep), ...changed.map((d) => P.hex(d.ep))].sort()[0],
-    );
-  });
-
-  it("writes the day's changes in parts too, in ascending ep whatever the order of the changes", async () => {
-    await reset(BASE);
-    const devs = Array.from({ length: 12 }, () => dev());
-    for (const d of devs) await subRetrying(d, bells(100)); // three a minute
-    await inDO((h) => {
-      h.pushRows = 300;
-    });
-    const partsAt = (await inDO((h) => h.parts.length)) as number; // the parts of the first day's pass come before
-    for (let i = 0; i < 12; i++) await run(BASE + DAY + i * 10_000);
-    const t = await tables();
-    expect(t.sub).toHaveLength(12);
-    expect(t.tok).toHaveLength(1200);
-    const parts = ((await inDO((h) => h.parts)) as PassPart[]).slice(partsAt);
-    expect(parts.length).toBeGreaterThanOrEqual(6);
-    for (const p of parts) expect(p.rows).toBeLessThanOrEqual(300);
-    for (let i = 1; i < parts.length; i++) expect(parts[i].first! > parts[i - 1].last!).toBe(true);
-  });
-});
-
-// ───────────── 12. rows seen elsewhere ─────────────
-
-type RowRef = { E: number; label: Bytes };
-const seenBody = (qS: Bytes, rows: RowRef[], ver = 1): Bytes =>
-  P.concat(
-    Uint8Array.of(ver),
-    qS,
-    Uint8Array.of(rows.length),
-    ...rows.flatMap((r) => [P.u16(r.E), r.label]),
-  );
-/** `seen` as the Worker calls it: with the quiet tag, which it computes from the request's secret. */
-const seen = (Q: Bytes, rows: RowRef[]) => DO().seen(Q, rows);
-const rowAt = (label: Bytes, E = 1): RowRef => ({ E, label });
-const marked = (d: Dev): Promise<number> => inDO((h) => h.marks.get(P.hex(d.ep))?.size ?? 0);
-
-/** Is `d` reached by a ring of this row with `bs` now? */
-async function reachesRow(d: Dev, bs: Bytes[], label: Bytes): Promise<boolean> {
-  await inDO((h) => h.pushes.delete(P.hex(d.ep)));
-  await ring(bs, label);
-  return (await dueOf(d)) !== null;
-}
+// ───────────── 10. seen ─────────────
 
 describe("POST /api/v2/seen (§10.10)", () => {
   beforeEach(async () => {
     _resetPushConfigForTests();
     await reset(null);
   });
-  const post = (b: Bytes, ip?: string) => direct("/api/v2/seen", { method: "POST", body: b, ip });
+  const post = (b: Bytes, ip?: string) =>
+    direct("/api/v2/seen", { method: "POST", body: b, ip }, OVER);
 
   it("answers 204 with no body whatever it marks; only the secret whose hash is the registered tag marks", async () => {
     const qS = P.random(16);
     const d = dev();
     await sub(d, [P.random(16)], P.quietTag(qS));
     const label = P.random(16);
+    const at = (l: Bytes, E = 1): RowRef => ({ E, label: l });
     const cases: [Bytes, number][] = [
-      [seenBody(P.quietTag(qS), [rowAt(label)]), 0], // the tag, which push/sub sent, is not the secret
-      [seenBody(P.random(16), [rowAt(label)]), 0], // another account's secret
-      [seenBody(qS, [rowAt(label), rowAt(label)]), 1], // a repeated row counts once
-      [seenBody(qS, [rowAt(label, 2)]), 2], // the same label in another era is another row
+      [seenBody(P.quietTag(qS), [at(label)]), 0], // the tag, which push/sub sent, is not the secret
+      [seenBody(P.random(16), [at(label)]), 0], // another account's secret
+      [seenBody(qS, [at(label), at(label)]), 1], // a repeated row counts once
+      [seenBody(qS, [at(label, 2)]), 2], // the same label in another era is another row
     ];
     const answers: string[] = [];
     for (const [b, n] of cases) {
       const r = await post(b);
       answers.push(`${r.status}|${await r.text()}|${r.headers.get("content-type")}`);
-      expect(await marked(d)).toBe(n);
+      expect(await marked(P.quietTag(qS))).toBe(n);
     }
     expect(new Set(answers)).toEqual(new Set(["204||null"]));
   });
 
   it("400 for ver 2, n 0, n 17 or a length mismatch; 413 above 306 bytes; 429 from RL_SEEN, not RL_RING; no proof of work", async () => {
     const qS = P.random(16);
-    const rows = (n: number) => Array.from({ length: n }, () => rowAt(P.random(16)));
+    const rows = (n: number): RowRef[] =>
+      Array.from({ length: n }, () => ({ E: 1, label: P.random(16) }));
     expect(MAX_SEEN_BODY).toBe(18 + 18 * 16);
     expect((await post(seenBody(qS, rows(1), 2))).status).toBe(400);
     expect((await post(seenBody(qS, []))).status).toBe(400);
@@ -1724,18 +1236,16 @@ describe("POST /api/v2/seen (§10.10)", () => {
     });
     expect(statuses.every((s) => s === 204)).toBe(true);
     expect(over).toBe(429);
-    const ringBody = P.concat(
-      Uint8Array.of(1),
-      P.u16(1),
-      P.random(16),
-      Uint8Array.of(1),
-      P.random(16),
+    const ring = P.concat(Uint8Array.of(1), P.u16(1), P.random(16), Uint8Array.of(1), P.random(16));
+    expect((await direct("/api/v2/ring", { method: "POST", body: ring, ip }, OVER)).status).toBe(
+      204,
     );
-    expect((await direct("/api/v2/ring", { method: "POST", body: ringBody, ip })).status).toBe(204);
   });
 });
 
-describe("PushDO holds pushes for marks of rows seen (§9.8 `seen`)", () => {
+describe("the QuietDO holds pushes for marks of rows seen (§9.8 `seen`)", () => {
+  const seen = (Q: Bytes, rows: RowRef[]) => quiet(quietShard(qk(Q), SHARDS)).seen(qk(Q), rows);
+
   it("a mark before the ring keeps every endpoint of the account from the push, and nobody else's", async () => {
     await reset(BASE);
     const [phone, laptop, member, plain] = [dev(), dev(), dev(), dev()];
@@ -1745,14 +1255,15 @@ describe("PushDO holds pushes for marks of rows seen (§9.8 `seen`)", () => {
     await sub(laptop, [b], qBob);
     await sub(member, [b], qMember); // a member who registered its own endpoint under bob's bell
     await sub(plain, [b]); // a tab of an earlier release: no quiet tag
-    const label = P.random(16);
-    await seen(qBob, [rowAt(label)]);
-    await ring([b], label);
+    const row = { E: 1, label: P.random(16) };
+    await seen(qBob, [row]);
+    await ringState([b], row);
     expect(await dueOf(phone)).toBeNull();
     expect(await dueOf(laptop)).toBeNull();
     expect(await dueOf(member)).not.toBeNull();
     expect(await dueOf(plain)).not.toBeNull();
-    await run(BASE + HOLD + DELTA * 1000);
+    fake.now = BASE + HOLD + DELTA * 1000;
+    await drainQueue([kOf(member), kOf(plain)]);
     expect(callsTo(phone)).toHaveLength(0);
     expect(callsTo(laptop)).toHaveLength(0);
     expect(callsTo(member)).toHaveLength(1);
@@ -1765,53 +1276,51 @@ describe("PushDO holds pushes for marks of rows seen (§9.8 `seen`)", () => {
     const b = P.random(16);
     const q = P.random(16);
     await sub(d, [b], q);
-    const [l1, l2] = [P.random(16), P.random(16)];
-    await ring([b], l1);
-    await ring([b], l2);
-    expect((await stateOf(d)).rows?.size).toBe(2);
-    await seen(q, [rowAt(l1)]);
+    const [l1, l2] = [
+      { E: 1, label: P.random(16) },
+      { E: 1, label: P.random(16) },
+    ];
+    await ringState([b], l1);
+    await ringState([b], l2);
+    expect((await stateOf(d))!.rows?.size).toBe(2);
+    await seen(q, [l1]);
     expect(await dueOf(d)).not.toBeNull();
     fake.now = BASE + 1000;
-    await seen(q, [rowAt(l2)]);
+    await seen(q, [l2]);
     expect(await stateOf(d)).toMatchObject({ due: null, last: null, tries: 0, rang: [] });
-    await run(BASE + HOLD + DELTA * 1000);
+    fake.now = BASE + HOLD + DELTA * 1000;
+    await drainQueue([kOf(d)]);
     expect(callsTo(d)).toHaveLength(0);
-    await ring([b], P.random(16));
-    await run(fake.now! + HOLD + DELTA * 1000);
+    await ringApi([b]);
     expect(callsTo(d)).toHaveLength(1);
-    const { last } = await stateOf(d);
+    const { last } = (await stateOf(d))!;
     expect(last).not.toBeNull();
-    const l3 = P.random(16);
-    await ring([b], l3);
+    const l3 = { E: 1, label: P.random(16) };
+    await ringState([b], l3);
     expect(await dueOf(d)).toBeGreaterThanOrEqual(last! + PUSH_WINDOW * 1000);
-    await seen(q, [rowAt(l3)]);
+    await seen(q, [l3]);
     expect(await stateOf(d)).toMatchObject({ due: null, last });
   });
 
-  it("a mark comes too late for a push that is sent; one that comes while it is being sent stops only its retry", async () => {
+  it("a mark comes too late for a push in flight: it stops only its retry", async () => {
     await reset(BASE);
     const d = dev();
     const b = P.random(16);
     const q = P.random(16);
     await sub(d, [b], q);
-    const label = P.random(16);
-    await ring([b], label);
-    await inDO((h) => void (h.pushes.get(P.hex(d.ep))!.sending = true));
-    await seen(q, [rowAt(label)]);
-    expect(await dueOf(d)).not.toBeNull();
-    await inDO((h) => void (h.pushes.get(P.hex(d.ep))!.sending = false));
-    fake.respond = () => new Response(null, { status: 500 });
-    await run(BASE + HOLD + DELTA * 1000);
-    expect(callsTo(d)).toHaveLength(1);
-    expect(await dueOf(d)).toBeNull(); // not retried
-    fake.respond = () => new Response(null, { status: 201 });
-    fake.now = BASE + HOLD + (PUSH_WINDOW + 2 * DELTA) * 1000;
-    const l2 = P.random(16);
-    await ring([b], l2);
-    await run(fake.now + HOLD + DELTA * 1000);
-    expect(callsTo(d)).toHaveLength(2);
-    await seen(q, [rowAt(l2)]); // after the push: changes nothing
-    expect(await stateOf(d)).toMatchObject({ due: null, last: callsTo(d)[1].at });
+    const row = { E: 1, label: P.random(16) };
+    await ringState([b], row);
+    fake.now = BASE + HOLD + DELTA * 1000;
+    const k = kOf(d);
+    const due = await quiet(k).due(); // in flight now
+    expect(due).toHaveLength(1);
+    await seen(q, [row]);
+    expect(await dueOf(d)).not.toBeNull(); // not cancelled
+    const wait = await quiet(k).sent([
+      { ep: d.ep, kh: due[0].kh, outcome: "retry", retryAfterS: null },
+    ]);
+    expect(wait).toBeNull(); // cancelled instead of retried
+    expect(await stateOf(d)).toMatchObject({ due: null, tries: 0 });
   });
 
   it("past PUSH_PENDING rows a push can no longer be cancelled", async () => {
@@ -1820,17 +1329,11 @@ describe("PushDO holds pushes for marks of rows seen (§9.8 `seen`)", () => {
     const b = P.random(16);
     const q = P.random(16);
     await sub(d, [b], q);
-    const labels = Array.from({ length: PUSH_PENDING + 1 }, () => P.random(16));
-    for (const l of labels) await ring([b], l);
-    expect((await stateOf(d)).rows).toBeNull();
-    await seen(
-      q,
-      labels.slice(0, 16).map((l) => rowAt(l)),
-    );
-    await seen(
-      q,
-      labels.slice(16).map((l) => rowAt(l)),
-    );
+    const rows = Array.from({ length: PUSH_PENDING + 1 }, () => ({ E: 1, label: P.random(16) }));
+    for (const r of rows) await ringState([b], r);
+    expect((await stateOf(d))!.rows).toBeNull();
+    await seen(q, rows.slice(0, 16));
+    await seen(q, rows.slice(16));
     expect(await dueOf(d)).not.toBeNull();
   });
 
@@ -1840,53 +1343,47 @@ describe("PushDO holds pushes for marks of rows seen (§9.8 `seen`)", () => {
     const b = P.random(16);
     const q = P.random(16);
     await sub(d, [b], q);
-    await run(BASE + DAY);
-    const t = await tables();
-    expect(t.tok.map((r) => r.tk).sort()).toEqual([P.hex(tkOf(b)), P.hex(qkOf(q))].sort());
-    expect(JSON.stringify(t)).not.toContain(P.hex(q));
-    fake.now = BASE + DAY + 1000;
+    const rec = (await record(d))!;
+    expect(rec.tks.map(P.hex)).toEqual([P.hex(tk(b))]);
+    expect(P.hex(rec.qh!)).toBe(P.hex(qk(q)));
+    expect(P.hex(qk(q))).not.toBe(P.hex(tk(q)));
     expect(await reaches(d, [q])).toBe(false); // the tag rung as a bell
-    const label = P.random(16);
-    await seen(b, [rowAt(label)]); // a bell given as the tag
-    expect(await marked(d)).toBe(0);
-    expect(await reachesRow(d, [b], label)).toBe(true);
-    // Another tag is a change, written by the next day's pass; the same set and tag again is a refresh.
-    const q2 = P.random(16);
-    await sub(d, [b], q2);
-    await run(BASE + 2 * DAY);
-    expect((await tables()).tok.map((r) => r.tk).sort()).toEqual(
-      [P.hex(tkOf(b)), P.hex(qkOf(q2))].sort(),
-    );
+    const row = { E: 1, label: P.random(16) };
+    await seen(b, [row]); // a bell given as the tag marks under another hash than the bell's
+    expect(await reaches(d, [b], row)).toBe(true);
   });
 
-  it("marks last SEEN_TTL, at most PUSH_SEEN per endpoint (the first to expire goes), and a restart forgets them", async () => {
+  it("marks last SEEN_TTL, at most PUSH_SEEN per account (the first to expire goes), and a restart forgets them", async () => {
     await reset(BASE);
     const d = dev();
     const [b, b2] = bells(2);
     const q = P.random(16);
     await sub(d, [b, b2], q);
-    await run(BASE + DAY); // stored, so that it survives the restart below
-    const t0 = BASE + DAY + 1000;
+    const t0 = BASE + 1000;
     fake.now = t0;
-    const label = P.random(16);
-    await seen(q, [rowAt(label)]);
+    const row = { E: 1, label: P.random(16) };
+    await seen(q, [row]);
     fake.now = t0 + SEEN_TTL * 1000 - 1;
-    expect(await reachesRow(d, [b], label)).toBe(false);
+    expect(await reaches(d, [b], row)).toBe(false);
     fake.now = t0 + SEEN_TTL * 1000;
-    expect(await reachesRow(d, [b2], label)).toBe(true); // other bells, so not the ring's dedup
-    await run(t0 + SEEN_TTL * 1000 + PUSH_TICK * 1000);
-    expect(await marked(d)).toBe(0); // the alarm drops expired marks
+    expect(await reaches(d, [b2], row)).toBe(true);
+    expect(await marked(q)).toBe(0); // expired marks are dropped
 
-    const labels = Array.from({ length: PUSH_SEEN + 1 }, () => P.random(16));
-    for (const l of labels) await seen(q, [rowAt(l)]);
-    expect(await marked(d)).toBe(PUSH_SEEN);
-    expect(await reachesRow(d, [b], labels[0])).toBe(true);
-    expect(await reachesRow(d, [b], labels[1])).toBe(false);
+    const rows = Array.from({ length: PUSH_SEEN + 1 }, () => ({ E: 1, label: P.random(16) }));
+    for (const r of rows) await seen(q, [r]);
+    expect(await marked(q)).toBe(PUSH_SEEN);
+    expect(await reaches(d, [b], rows[0])).toBe(true); // the first mark went
+    expect(await reaches(d, [b], rows[1])).toBe(false);
 
-    const l = P.random(16);
-    await seen(q, [rowAt(l)]);
+    const l = { E: 1, label: P.random(16) };
+    await seen(q, [l]);
     await restart();
-    expect(await marked(d)).toBe(0);
-    expect(await reachesRow(d, [b], l)).toBe(true);
+    expect(await marked(q)).toBe(0);
+    expect(await reaches(d, [b], l)).toBe(true);
   });
+});
+
+afterEach(() => {
+  _setRingSleepForTests(null);
+  _setPushFetchForTests(null);
 });

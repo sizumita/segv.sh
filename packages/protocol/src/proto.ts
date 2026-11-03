@@ -917,6 +917,43 @@ export function shardOf(v: Bytes, sE: number): number {
   return Number(x >> BigInt(63 - sE));
 }
 
+/** ktag = HMAC(ROUTE_KEY, "segv.sh/v2/ws-tag"): the key of the opaque client tag. Server only. */
+export function ktag(routeKey: Bytes): Bytes {
+  if (routeKey.length !== 32) throw new Error("ROUTE_KEY must be 32 bytes");
+  return HMAC(routeKey, utf8("segv.sh/v2/ws-tag"));
+}
+/** tag(ck) = HMAC(ktag, "ws|" ‖ ck)[0..16]: the opaque tag of the client whose rate-limit key is ck. */
+export const clientTagOf = (ktagKey: Bytes, ck: string): Bytes => HMAC(ktagKey, utf8(`ws|${ck}`)).slice(0, 16);
+/** conn(ck) = u32(tag(ck)[0..4]) mod C: the index of the client's ConnDO (§9.4). */
+export function connOf(tag: Bytes, C: number): number {
+  if (tag.length < 4) throw new Error("tag must be at least 4 bytes");
+  if (!Number.isInteger(C) || C < 1 || C > 4096) throw new Error("bad conn count");
+  return new DataView(tag.buffer, tag.byteOffset, 4).getUint32(0) % C;
+}
+/** kfeed = HMAC(ROUTE_KEY, "segv.sh/v2/feed"): the key of the feed hash. Server only. */
+export function kfeed(routeKey: Bytes): Bytes {
+  if (routeKey.length !== 32) throw new Error("ROUTE_KEY must be 32 bytes");
+  return HMAC(routeKey, utf8("segv.sh/v2/feed"));
+}
+/** h(T) = HMAC(kfeed, T)[0..8]: the feed hash of a topic. */
+export function feedHash(kfeedKey: Bytes, topic: Bytes): Bytes {
+  if (topic.length !== 16) throw new Error("topic must be 16 bytes");
+  return HMAC(kfeedKey, topic).slice(0, 8);
+}
+/** The f of F = 2^f FeedDOs (F a power of two in 1..4096); throws for any other F. */
+export function feedBits(F: number): number {
+  if (!Number.isInteger(F) || F < 1 || F > 4096 || (F & (F - 1)) !== 0) throw new Error("bad feed count");
+  return 31 - Math.clz32(F);
+}
+/** feed(T) = u64(h(T)) >> (64 − f): the index of the topic's FeedDO (§9.4). f = 0 ⇒ 0. */
+export function feedOf(h: Bytes, f: number): number {
+  if (!Number.isInteger(f) || f < 0 || f > 12) throw new Error("bad feed bits");
+  if (h.length !== 8) throw new Error("feed hash must be 8 bytes");
+  if (f === 0) return 0;
+  const x = new DataView(h.buffer, h.byteOffset, 8).getBigUint64(0);
+  return Number(x >> BigInt(64 - f));
+}
+
 // ───────────────────────── commitments (§9, §9.5, §9.6, §10.3, §3.3) ─────────────────────────
 
 /** leaf(data) = H(0x00 ‖ data). */

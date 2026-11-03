@@ -8,6 +8,7 @@ import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import * as P from "@segv/protocol/proto";
 import * as W from "@segv/protocol/wire";
+import { clientKey } from "../src/abuse";
 import {
   MAX_REGISTER_BODY,
   MAX_WRAP_BODY,
@@ -16,9 +17,9 @@ import {
   routeLabel,
 } from "../src/api";
 import type { CheckpointDO } from "../src/ckpt-do";
-import type { RealtimeDO, RtLimits } from "../src/realtime-do";
+import type { ConnDO, RtLimits } from "../src/conn-do";
 import type { ShardDO } from "../src/shard-do";
-import { shardStub, type ShardPutRow } from "../src/types";
+import { connName, shardStub, type ShardPutRow } from "../src/types";
 import {
   DIFF2,
   E_FIRST,
@@ -2020,12 +2021,21 @@ async function subscribed(c: RtClient, topics: Bytes[]): Promise<void> {
   throw new Error("subscription never took effect");
 }
 
-/** Runs `fn` inside the production RealtimeDO instance ("rt/v2/0"), with its test-visible fields. */
+/** The ConnDO index of a client address: conn(ck) of its tag under the test ROUTE_KEY and RT_CONNS (§4.4). */
+const connIndexOf = (ip: string): number =>
+  P.connOf(
+    P.clientTagOf(
+      P.ktag(P.fromB64u(env.ROUTE_KEY)),
+      clientKey(new Request(ORIGIN, { headers: { "cf-connecting-ip": ip } })),
+    ),
+    Number(env.RT_CONNS),
+  );
+/** Runs `fn` inside the ConnDO that serves the client at `ip`, with its test-visible fields. */
 type RtInner = { clock: () => number; limits: RtLimits };
-const rtInside = (fn: (i: RtInner, state: DurableObjectState) => void) =>
+const connInside = (ip: string, fn: (i: RtInner, state: DurableObjectState) => void) =>
   runInDurableObject(
-    (env.RT as unknown as DurableObjectNamespace<RealtimeDO>).getByName("rt/v2/0"),
-    (inst: RealtimeDO, state) => fn(inst as unknown as RtInner, state),
+    (env.CONN as unknown as DurableObjectNamespace<ConnDO>).getByName(connName(connIndexOf(ip))),
+    (inst: ConnDO, state) => fn(inst as unknown as RtInner, state),
   );
 
 const expectClosedWith = async (c: RtClient, code: number) => {
@@ -2155,39 +2165,42 @@ describe("GET /api/v2/rt", () => {
   });
 
   it("relays the global socket cap as 503 with retry-after", async () => {
-    const keep = await openRt();
+    const ip = freshIp();
+    const keep = await openRt({ ip });
     try {
-      await rtInside(
+      await connInside(
+        ip,
         (i, state) =>
           void (i.limits.total = state
             .getWebSockets()
             .filter((w) => w.readyState === WebSocket.OPEN).length),
       );
-      const full = await rtUpgrade();
+      const full = await rtUpgrade({ ip });
       expect(full.status).toBe(503);
       expect(full.headers.get("retry-after")).toBe("60");
       expectApiHeaders(full);
       expect(typeof (await errorOf(full))).toBe("string");
     } finally {
-      await rtInside((i) => void (i.limits.total = 20_000));
+      await connInside(ip, (i) => void (i.limits.total = 20_000));
       keep.close();
     }
-    (await openRt()).close();
+    (await openRt({ ip })).close();
   });
 
   it("closes sockets older than 1 h with 4000 before delivering to them", async () => {
     const T = randomTopic();
-    const old = await openRt();
+    const ip = freshIp();
+    const old = await openRt({ ip });
     try {
       await subscribed(old, [T]);
       const later = Date.now() + 2 * 3_600_000;
-      await rtInside((i) => void (i.clock = () => later));
+      await connInside(ip, (i) => void (i.clock = () => later));
       const row = makeRow({ topic: T });
       await putOk([row]);
       await expectClosedWith(old, 4000);
       expect(old.rows().some((r) => eq(r.label, row.label))).toBe(false);
     } finally {
-      await rtInside((i) => void (i.clock = () => Date.now()));
+      await connInside(ip, (i) => void (i.clock = () => Date.now()));
       old.close();
     }
     // A fresh socket gets the next row.
@@ -2256,7 +2269,8 @@ describe("GET /api/v2/rt", () => {
 
   it("RESUME replays the rows of its topics published since `since`, then RESUMED; an unknown boot gets GAP", async () => {
     const T = randomTopic();
-    const first = await openRt();
+    const ip = freshIp(); // one client: its sockets all reach its ConnDO (§4.4), whose boot the RESUME names
+    const first = await openRt({ ip });
     const since = first.hello!.seq;
     const boot = first.hello!.boot;
     let row: W.PutRow;
@@ -2269,7 +2283,7 @@ describe("GET /api/v2/rt", () => {
     } finally {
       first.close();
     }
-    const second = await openRt();
+    const second = await openRt({ ip });
     try {
       second.send({ f: "resume", boot, since, topics: [T] });
       await second.until(() => second.frames.some((f) => f.f === "resumed"), "RESUMED");
@@ -2285,7 +2299,7 @@ describe("GET /api/v2/rt", () => {
     } finally {
       second.close();
     }
-    const third = await openRt();
+    const third = await openRt({ ip });
     try {
       const otherBoot = boot.slice();
       otherBoot[0] ^= 0xff;
@@ -2418,7 +2432,8 @@ describe("era bounds (§9.7): no Durable Object for out-of-range eras", () => {
     const spies = {
       SHARD: spyNamespace(env.SHARD, calls),
       INBOX: spyNamespace(env.INBOX, calls),
-      RT: spyNamespace(env.RT, calls),
+      CONN: spyNamespace(env.CONN, calls),
+      FEED: spyNamespace(env.FEED, calls),
     };
     const put = W.encodePutRequest([
       makeRow({ E: 65000, topic: randomTopic() }),
@@ -2535,14 +2550,14 @@ describe("server time (x-segv-now) and cache before limits", () => {
     }
   });
 
-  it("the 101 upgrade is returned exactly as the RealtimeDO built it: no x-segv-now, HSTS, nosniff or no-referrer", async () => {
+  it("the 101 upgrade is returned exactly as the ConnDO built it: no x-segv-now, HSTS, nosniff or no-referrer", async () => {
     const PER_RESPONSE = [
       "x-segv-now",
       "strict-transport-security",
       "x-content-type-options",
       "referrer-policy",
     ];
-    // Through the Worker entry and the real RealtimeDO: HELLO carries the server time instead.
+    // Through the Worker entry and the real ConnDO: HELLO carries the server time instead.
     const res = await rtUpgrade();
     expect(res.status).toBe(101);
     for (const h of PER_RESPONSE) expect(res.headers.get(h), h).toBeNull();
@@ -2553,11 +2568,10 @@ describe("server time (x-segv-now) and cache before limits", () => {
     } finally {
       c.close();
     }
-    // handleApi hands back the very Response object the RealtimeDO returned, its headers untouched.
+    // handleApi hands back the very Response object the ConnDO returned, its headers untouched.
     _resetApiForTests();
     let built: Response | undefined;
-    const RT = fakeNs({
-      wsTagKey: async () => new Uint8Array(32).fill(9),
+    const CONN = fakeNs({
       fetch: async () => {
         const pair = new WebSocketPair();
         pair[1].accept();
@@ -2573,7 +2587,7 @@ describe("server time (x-segv-now) and cache before limits", () => {
       const r = await direct(
         "/api/v2/rt",
         { headers: { upgrade: "websocket", origin: ORIGIN } },
-        { RT },
+        { CONN },
       );
       expect(r.status).toBe(101);
       expect(r).toBe(built);
@@ -2689,7 +2703,7 @@ function countingLimiter(left = Number.POSITIVE_INFINITY) {
 }
 
 describe("Worker logic (fake Durable Objects)", () => {
-  it("publishes OK rows that carry a topic in one publish call (one retry), never delaying or changing the response", async () => {
+  it("publishes OK rows that carry a topic in one publish call per FeedDO (one retry), never delaying or changing the response", async () => {
     const shardRows: unknown[] = [];
     const SHARD = fakeNs({
       put: async (_E: number, _i: number, rows: { v: Bytes; label: Bytes }[]) => {
@@ -2702,13 +2716,17 @@ describe("Worker logic (fake Durable Objects)", () => {
       },
     });
     const published: unknown[][] = [];
+    const feedNames: string[] = [];
     let failures = 1;
-    const RT = fakeNs({
-      publish: async (rows: unknown[]) => {
-        published.push(rows);
-        if (failures-- > 0) throw new Error("rt down");
+    const FEED = fakeNs(
+      {
+        publish: async (rows: unknown[]) => {
+          published.push(rows);
+          if (failures-- > 0) throw new Error("feed down");
+        },
       },
-    });
+      feedNames,
+    );
     const E = eraNow();
     const T = randomTopic();
     const rows = [
@@ -2719,7 +2737,7 @@ describe("Worker logic (fake Durable Objects)", () => {
       makeRow({ E: E + 1, topic: T }),
     ];
     const bytes = W.encodePutRequest(rows);
-    const res = await direct("/api/v2/put", await powInit("put", bytes), { SHARD, RT });
+    const res = await direct("/api/v2/put", await powInit("put", bytes), { SHARD, FEED });
     expect(res.status).toBe(200);
     const out = W.decodePutResponse(await bytesOf(res));
     expect(out.map((r) => r.s)).toEqual(["ok", "ok", "ok", "conflict", "wrong_era"]);
@@ -2735,8 +2753,13 @@ describe("Worker logic (fake Durable Objects)", () => {
     expect(shardRows.map((r) => P.b64u((r as { v: Bytes }).v))).toEqual(
       rows.slice(0, 4).map((r) => P.b64u(P.routeV(testKroute(E), r.label))),
     );
-    // One publish of the two OK rows with a topic, retried once after a failure.
+    // One publish of the two OK rows with a topic to T's FeedDO (feed(T), §4.4), retried once after a failure.
     expect(published).toHaveLength(2);
+    const j = P.feedOf(
+      P.feedHash(P.kfeed(P.fromB64u(env.ROUTE_KEY)), T),
+      P.feedBits(Number(env.RT_FEEDS)),
+    );
+    expect(feedNames).toEqual([`feed/v2/${j}`, `feed/v2/${j}`]);
     const want = [1, 2].map((i) => ({
       topic: T,
       E,
@@ -2752,20 +2775,20 @@ describe("Worker logic (fake Durable Objects)", () => {
     failures = 5;
     published.length = 0;
     const b2 = W.encodePutRequest([makeRow({ topic: T })]);
-    const r2 = await direct("/api/v2/put", await powInit("put", b2), { SHARD, RT });
+    const r2 = await direct("/api/v2/put", await powInit("put", b2), { SHARD, FEED });
     expect(r2.status).toBe(200);
     expect(W.decodePutResponse(await bytesOf(r2))[0].s).toBe("ok");
     expect(published).toHaveLength(2);
 
-    // Only zero topics: RealtimeDO is not addressed at all.
-    const rtNames: string[] = [];
+    // Only zero topics: no FeedDO is addressed at all.
+    const quiet: string[] = [];
     const b3 = W.encodePutRequest([makeRow(), makeRow()]);
     const r3 = await direct("/api/v2/put", await powInit("put", b3), {
       SHARD,
-      RT: fakeNs({ publish: async () => {} }, rtNames),
+      FEED: fakeNs({ publish: async () => {} }, quiet),
     });
     expect(r3.status).toBe(200);
-    expect(rtNames).toEqual([]);
+    expect(quiet).toEqual([]);
   });
 
   it("passes FULL and BAD through; 503 when a shard fails", async () => {
@@ -3060,19 +3083,22 @@ describe("Worker logic (fake Durable Objects)", () => {
     }
   });
 
-  it("rt: forwards only the upgrade and an opaque client tag to the RealtimeDO, and relays its refusals", async () => {
+  it("rt: forwards only the upgrade and an opaque client tag to the client's ConnDO, and relays its refusals", async () => {
     _resetApiForTests();
     const seen: Request[] = [];
-    const RT = fakeNs({
-      wsTagKey: async () => new Uint8Array(32).fill(7),
-      fetch: async (url: string, init: RequestInit) => {
-        seen.push(new Request(url, init));
-        return new Response(JSON.stringify({ error: "too many sockets" }), {
-          status: 429,
-          headers: { "retry-after": "60" },
-        });
+    const connNames: string[] = [];
+    const CONN = fakeNs(
+      {
+        fetch: async (url: string, init: RequestInit) => {
+          seen.push(new Request(url, init));
+          return new Response(JSON.stringify({ error: "too many sockets" }), {
+            status: 429,
+            headers: { "retry-after": "60" },
+          });
+        },
       },
-    });
+      connNames,
+    );
     try {
       const ip = freshIp();
       const res = await direct(
@@ -3081,13 +3107,15 @@ describe("Worker logic (fake Durable Objects)", () => {
           ip,
           headers: { upgrade: "websocket", origin: ORIGIN, cookie: "x=1", "user-agent": "ua" },
         },
-        { RT },
+        { CONN },
       );
       expect(res.status).toBe(429);
       expect(res.headers.get("retry-after")).toBe("60");
       expect(await errorOf(res)).toBe("too many sockets");
-      await direct("/api/v2/rt", { ip, headers: { upgrade: "websocket" } }, { RT });
+      await direct("/api/v2/rt", { ip, headers: { upgrade: "websocket" } }, { CONN });
       expect(seen).toHaveLength(2);
+      // The ConnDO is conn(ck) of the tag (§4.4): the same one for both requests.
+      expect(connNames).toEqual([connName(connIndexOf(ip)), connName(connIndexOf(ip))]);
       const h = [...seen[0].headers.keys()].sort();
       expect(h).toEqual(["upgrade", "x-segv-client"]);
       const tag = seen[0].headers.get("x-segv-client")!;

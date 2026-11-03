@@ -1,14 +1,15 @@
 /**
  * Deployment parameters and server secrets for the v2 API (docs/PROTOCOL.md §3.1, §4.4, §9.5, §9.7).
  *
- * Vars (wrangler.jsonc "vars", strings): DELTA_S (Δ), SKEW_S (SKEW), INBOX_SLOT_S (Δin), E_FIRST. A var that is
+ * Vars (wrangler.jsonc "vars", strings): DELTA_S (Δ), SKEW_S (SKEW), INBOX_SLOT_S (Δin), E_FIRST, RT_CONNS (C) and
+ * RT_FEEDS (F, a power of two; §9.4). A var that is
  * present but invalid (not decimal, out of range, or a Δ that does not divide 604 800) makes the Worker answer
  * 503 "server misconfigured" on /api/v2/* (v2ParamsValid() is false); v2Params() falls back to the default.
  * Secrets: ROUTE_KEY (32 bytes, b64u) and SRV_KEY (32-byte Ed25519 seed, b64u). When either is missing or
  * malformed the Worker answers 503 "server misconfigured" on /api/v2/* (serverKeys() returns null).
  * Shared by the Worker and every v2 Durable Object (they must agree on Δ and SKEW).
  */
-import { ERA_MS, ERA_NONE, era, fromB64u, kcommit, kroute, sigPub, sign } from "@segv/protocol/proto";
+import { ERA_MS, ERA_NONE, era, fromB64u, kcommit, kfeed, kroute, ktag, sigPub, sign } from "@segv/protocol/proto";
 import { appHosts } from "./hosts";
 import { parseVapidKey, vapidPublicKey } from "./webpush";
 
@@ -21,6 +22,10 @@ export interface V2Params {
   inboxSlot: number;
   /** Era of the first deploy: lower eras are answered "sealed / not found" without any DO call. */
   eFirst: number;
+  /** C: the number of ConnDOs (§9.4). Default 1. */
+  rtConns: number;
+  /** F: the number of FeedDOs, a power of two (§9.4). Default 1. */
+  rtFeeds: number;
 }
 
 /** Inbox constants (§9.3, §10.9). */
@@ -46,6 +51,8 @@ const VARS: Readonly<Record<keyof V2Params, VarSpec>> = {
   skew: { name: "SKEW_S", dflt: 2, min: 0, max: 60 },
   inboxSlot: { name: "INBOX_SLOT_S", dflt: 10, min: 1, max: 3600 },
   eFirst: { name: "E_FIRST", dflt: 0, min: 0, max: ERA_NONE - 1 },
+  rtConns: { name: "RT_CONNS", dflt: 1, min: 1, max: 4096 },
+  rtFeeds: { name: "RT_FEEDS", dflt: 1, min: 1, max: 4096, ok: (n) => (n & (n - 1)) === 0 },
 };
 
 /** The var's value; undefined when it is absent, null when it is present but invalid. */
@@ -61,12 +68,20 @@ function intVar(env: Env, v: VarSpec): number | null | undefined {
 /** The deployment parameters, with the default for any absent or invalid var (the Durable Objects use this). */
 export function v2Params(env: Env): V2Params {
   const get = (v: VarSpec): number => intVar(env, v) ?? v.dflt;
-  return { delta: get(VARS.delta), skew: get(VARS.skew), inboxSlot: get(VARS.inboxSlot), eFirst: get(VARS.eFirst) };
+  return {
+    delta: get(VARS.delta),
+    skew: get(VARS.skew),
+    inboxSlot: get(VARS.inboxSlot),
+    eFirst: get(VARS.eFirst),
+    rtConns: get(VARS.rtConns),
+    rtFeeds: get(VARS.rtFeeds),
+  };
 }
 
 /**
- * False when a deployment var is present but invalid (not decimal, out of range, or a DELTA_S that does not divide
- * 604 800): the Worker then answers 503 "server misconfigured" on /api/v2/* instead of running on a fallback.
+ * False when a deployment var is present but invalid (not decimal, out of range, a DELTA_S that does not divide
+ * 604 800, or an RT_FEEDS that is not a power of two): the Worker then answers 503 "server misconfigured" on /api/v2/*
+ * instead of running on a fallback.
  */
 export function v2ParamsValid(env: Env): boolean {
   return Object.values(VARS).every((v) => intVar(env, v) !== null);
@@ -84,6 +99,10 @@ export function eraBounds(nowMs: number, skewS: number): { now: number; lo: numb
 
 export interface ServerKeys {
   routeKey: Uint8Array;
+  /** ktag: the key of the opaque client tag (§4.4) */
+  tagKey: Uint8Array;
+  /** kfeed: the key of the topic feed hash (§4.4) */
+  feedKey: Uint8Array;
   /** Ed25519 seed (SRV_SK) */
   srvSeed: Uint8Array;
   /** srvKey, published in params */
@@ -110,7 +129,8 @@ export function serverKeys(env: Env): ServerKeys | null {
   if (route === null || srv === null) return null;
   if (keyCache && keyCache.route === route && keyCache.srv === srv) return keyCache.keys;
   const srvSeed = fromB64u(srv);
-  const keys: ServerKeys = { routeKey: fromB64u(route), srvSeed, srvPk: sigPub(srvSeed) };
+  const routeKey = fromB64u(route);
+  const keys: ServerKeys = { routeKey, tagKey: ktag(routeKey), feedKey: kfeed(routeKey), srvSeed, srvPk: sigPub(srvSeed) };
   keyCache = { route, srv, keys };
   krouteCache.clear();
   signKey = null;
@@ -177,10 +197,8 @@ export interface PushConfig {
   hosts: readonly string[];
   /** POW_PUSH */
   powBase: number;
-  /** PUSH_MAX_SUBS */
-  maxSubs: number;
-  /** PUSH_DAY_SUBS */
-  daySubs: number;
+  /** PUSH_SHARDS: the number of BellDOs and of QuietDOs (§9.8) */
+  shards: number;
   /** The first APP_HOSTS host: the payload's `navigate` is https://<appHost>/ */
   appHost: string;
 }
@@ -191,8 +209,7 @@ const PUSH_HOST_RE = new RegExp(`^(?:\\*\\.)?${HOST_LABEL}(?:\\.${HOST_LABEL})+$
 /** Push vars with bounds. The spec gives no upper bounds; these keep a typo from becoming an unbounded setting. */
 const PUSH_INT_VARS = {
   powBase: { name: "POW_PUSH", dflt: 20, re: /^\d{1,2}$/, min: 0, max: 64 },
-  maxSubs: { name: "PUSH_MAX_SUBS", dflt: 100_000, re: /^\d{1,8}$/, min: 1, max: 10_000_000 },
-  daySubs: { name: "PUSH_DAY_SUBS", dflt: 2_000, re: /^\d{1,6}$/, min: 1, max: 100_000 },
+  shards: { name: "PUSH_SHARDS", dflt: 1, re: /^\d{1,4}$/, min: 1, max: 4096 },
 } as const;
 
 type PushParse = { ok: true; cfg: PushConfig } | { ok: false; bad: string | null };
@@ -216,7 +233,7 @@ function parsePush(env: Env): PushParse {
     hosts = hostsRaw.split(",").map((h) => h.trim().toLowerCase());
     if (hosts.length === 0 || !hosts.every((h) => PUSH_HOST_RE.test(h))) return { ok: false, bad: "PUSH_HOSTS" };
   }
-  const ints: Record<keyof typeof PUSH_INT_VARS, number> = { powBase: 0, maxSubs: 0, daySubs: 0 };
+  const ints: Record<keyof typeof PUSH_INT_VARS, number> = { powBase: 0, shards: 0 };
   for (const [k, v] of Object.entries(PUSH_INT_VARS) as [keyof typeof PUSH_INT_VARS, (typeof PUSH_INT_VARS)[keyof typeof PUSH_INT_VARS]][]) {
     const raw = rawVar(env, v.name);
     if (raw === undefined || raw === null) {
@@ -240,8 +257,7 @@ function parsePush(env: Env): PushParse {
       pushKey: fromB64u(pk),
       hosts,
       powBase: ints.powBase,
-      maxSubs: ints.maxSubs,
-      daySubs: ints.daySubs,
+      shards: ints.shards,
       appHost: app[0],
     },
   };
@@ -259,7 +275,21 @@ function validVapidSub(s: string): boolean {
   }
 }
 
-const PUSH_VAR_NAMES = ["VAPID_SK", "PUSH_KEY", "VAPID_SUB", "PUSH_HOSTS", "POW_PUSH", "PUSH_MAX_SUBS", "PUSH_DAY_SUBS", "APP_HOSTS"];
+const PUSH_VAR_NAMES = ["VAPID_SK", "PUSH_KEY", "VAPID_SUB", "PUSH_HOSTS", "POW_PUSH", "PUSH_SHARDS", "APP_HOSTS"];
+
+/**
+ * PUSH_SHARDS alone (§9.8): the value, 1 when the var is absent, null when it is present but malformed. The daily
+ * expiry routes by it whether or not push is on (a malformed value then counts as 1).
+ */
+export function pushShardsOf(env: Env): number | null {
+  const v = PUSH_INT_VARS.shards;
+  const raw = rawVar(env, v.name);
+  if (raw === undefined || raw === null) return v.dflt;
+  const s = typeof raw === "number" ? String(raw) : raw;
+  if (typeof s !== "string" || !v.re.test(s)) return null;
+  const n = Number(s);
+  return n < v.min || n > v.max ? null : n;
+}
 let pushCache: { sig: string; cfg: PushConfig | null } | null = null;
 const pushLogged = new Set<string>();
 

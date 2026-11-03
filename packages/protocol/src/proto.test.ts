@@ -1647,6 +1647,53 @@ describe("server routing (§4.4)", () => {
     expect(P.shardOf(buf.subarray(2), 1)).toBe(1);
     for (const s of [-1, 17, 1.5]) expect(() => P.shardOf(vs[1], s)).toThrow(/shard/);
   });
+
+  it("ktag / tag / conn and kfeed / h / feed follow the spec (§4.4, §9.4)", () => {
+    const kt = P.ktag(ROUTE_KEY);
+    const kf = P.kfeed(ROUTE_KEY);
+    expect(toHex(kt)).toBe(toHex(hmacN(ROUTE_KEY, "segv.sh/v2/ws-tag")));
+    expect(toHex(kf)).toBe(toHex(hmacN(ROUTE_KEY, "segv.sh/v2/feed")));
+    expect(toHex(kt)).not.toBe(toHex(kf));
+    for (const n of [0, 31, 33]) {
+      expect(() => P.ktag(new Uint8Array(n))).toThrow(/ROUTE_KEY/);
+      expect(() => P.kfeed(new Uint8Array(n))).toThrow(/ROUTE_KEY/);
+    }
+    // The client tag and its ConnDO.
+    for (const ck of ["4:10.0.0.1", "6:2001:db8:77:1::/64", "x:unknown"]) {
+      const tag = P.clientTagOf(kt, ck);
+      expect(tag.length).toBe(16);
+      expect(toHex(tag)).toBe(toHex(hmacN(kt, `ws|${ck}`).subarray(0, 16)));
+      const u32 = ((tag[0] << 24) >>> 0) + (tag[1] << 16) + (tag[2] << 8) + tag[3];
+      for (const C of [1, 2, 3, 7, 4096]) expect(P.connOf(tag, C)).toBe(u32 % C);
+    }
+    for (const C of [0, 4097, 1.5]) expect(() => P.connOf(new Uint8Array(16), C)).toThrow(/conn/);
+    expect(() => P.connOf(new Uint8Array(3), 2)).toThrow(/4 bytes/);
+    // The feed hash and its FeedDO.
+    const r = prng(0xfeed);
+    for (let i = 0; i < 100; i++) {
+      const T = r.bytes(16);
+      const h = P.feedHash(kf, T);
+      expect(h.length).toBe(8);
+      expect(toHex(h)).toBe(toHex(hmacN(kf, T).subarray(0, 8)));
+      expect(P.feedOf(h, 0)).toBe(0);
+      for (const f of [1, 2, 6, 12]) expect(P.feedOf(h, f)).toBe(Number(beToBig(h) >> BigInt(64 - f)));
+    }
+    expect(P.feedOf(fromHex("ffffffffffffffff"), 12)).toBe(4095);
+    expect(P.feedOf(fromHex("8000000000000000"), 1)).toBe(1);
+    expect(P.feedOf(fromHex("7fffffffffffffff"), 1)).toBe(0);
+    for (const n of [0, 15, 17]) expect(() => P.feedHash(kf, new Uint8Array(n))).toThrow(/16 bytes/);
+    for (const f of [-1, 13, 1.5]) expect(() => P.feedOf(new Uint8Array(8), f)).toThrow(/feed/);
+    expect(() => P.feedOf(new Uint8Array(7), 1)).toThrow(/8 bytes/);
+    for (const [F, f] of [
+      [1, 0],
+      [2, 1],
+      [4, 2],
+      [64, 6],
+      [4096, 12],
+    ] as const)
+      expect(P.feedBits(F)).toBe(f);
+    for (const F of [0, 3, 6, 8192, 1.5]) expect(() => P.feedBits(F)).toThrow(/feed/);
+  });
 });
 
 // ───────────────────────── commitments (§9, §12) ─────────────────────────

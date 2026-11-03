@@ -1,29 +1,41 @@
-/** RealtimeDO (docs/PROTOCOL.md §9.4, §10.8): HELLO, SUB / UNSUB / RESUME, publish, limits, caps, max age, hibernation. */
+/**
+ * ConnDO (docs/PROTOCOL.md §9.4, §10.8): HELLO, SUB / UNSUB / RESUME, deliver, limits, caps, max age, hibernation, and
+ * the interest it keeps at the FeedDOs.
+ */
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import * as P from "@segv/protocol/proto";
 import * as W from "@segv/protocol/wire";
-import type { RealtimeDO, RtLimits } from "../src/realtime-do";
-import type { RtPublishRow } from "../src/types";
+import type { ConnDO, FeedLink, RtLimits } from "../src/conn-do";
+import type { FeedDO } from "../src/feed-do";
+import { connName, feedName, type RtPublishRow } from "../src/types";
 
 /** The protected / private fields the tests drive or observe. */
-type Inner = Pick<RealtimeDO, "publish"> & {
+type Inner = Pick<ConnDO, "deliver" | "topicsFor" | "alarm"> & {
   clock: () => number;
   limits: RtLimits;
+  feeds: FeedLink;
   pairs: number;
   seq: number;
+  settle: () => Promise<void>;
 };
-type Stub = DurableObjectStub<RealtimeDO>;
+type Stub = DurableObjectStub<ConnDO>;
 type Frame = W.ServerFrame | { f: "text"; text: string };
 
 const HOUR_MS = 3_600_000;
 
-/** A fresh RealtimeDO instance per test (the class does not care about its name). */
-const fresh = (): Stub =>
-  (env.RT as unknown as DurableObjectNamespace<RealtimeDO>).getByName(
-    `rt-test/${crypto.randomUUID()}`,
-  );
+/** The FeedDO of a topic under the test deployment (ROUTE_KEY, RT_FEEDS of ../wrangler.test.jsonc). */
+const KFEED = P.kfeed(P.fromB64u(env.ROUTE_KEY));
+const FBITS = P.feedBits(Number(env.RT_FEEDS));
+const jOf = (T: Uint8Array): number => P.feedOf(P.feedHash(KFEED, T), FBITS);
+const feedOf = (T: Uint8Array): DurableObjectStub<FeedDO> =>
+  (env.FEED as unknown as DurableObjectNamespace<FeedDO>).getByName(feedName(jOf(T)));
+
+/** A fresh ConnDO per test: an index far above RT_CONNS, so that no FeedDO pulls it at start (§9.4). */
+const randomC = (): number => 2 ** 20 + Math.floor(Math.random() * 2 ** 30);
+const fresh = (c = randomC()): Stub =>
+  (env.CONN as unknown as DurableObjectNamespace<ConnDO>).getByName(connName(c));
 const clientTag = (): string => P.hex(P.random(16));
 const topic = (): Uint8Array => P.random(16);
 const row = (t: Uint8Array, cls = 0): RtPublishRow => ({
@@ -39,7 +51,7 @@ const inside = <R>(
   stub: Stub,
   fn: (inst: Inner, state: DurableObjectState) => R | Promise<R>,
 ): Promise<R> =>
-  runInDurableObject(stub, (inst: RealtimeDO, state) => fn(inst as unknown as Inner, state));
+  runInDurableObject(stub, (inst: ConnDO, state) => fn(inst as unknown as Inner, state));
 const setClock = (stub: Stub, ms: number) => inside(stub, (i) => void (i.clock = () => ms));
 const setLimits = (stub: Stub, l: Partial<RtLimits>) =>
   inside(stub, (i) => void Object.assign(i.limits, l));
@@ -150,7 +162,7 @@ const sameRow = (got: W.RtRow, want: RtPublishRow) =>
   got.cls === want.cls &&
   P.equalBytes(got.body, want.body);
 
-describe("RealtimeDO connect", () => {
+describe("ConnDO connect", () => {
   it("426 without an upgrade; HELLO {boot, now, seq} right after accept", async () => {
     const stub = fresh();
     const plain = await stub.fetch("https://rt.test/");
@@ -163,7 +175,7 @@ describe("RealtimeDO connect", () => {
     expect(h.now).toBeGreaterThanOrEqual(before);
     expect(h.now).toBeLessThanOrEqual(Date.now());
     expect(h.seq).toBe(0);
-    await stub.publish([row(topic()), row(topic())]);
+    await stub.deliver([row(topic()), row(topic())]);
     const b = await connect(stub);
     const h2 = await b.hello();
     expect(P.b64u(h2.boot)).toBe(P.b64u(h.boot)); // same boot, seq = last assigned
@@ -181,18 +193,15 @@ describe("RealtimeDO connect", () => {
     a.ws.close(1000);
   });
 
-  it("wsTagKey is 32 random bytes kept in meta; nothing about topics or rows is persisted", async () => {
+  it("stores nothing: no table and no key of its own, before or after a wake (§13.1)", async () => {
     const stub = fresh();
-    const k = await stub.wsTagKey();
-    expect(k).toHaveLength(32);
     const a = await connect(stub);
     const T = topic();
     a.send({ f: "sub", topics: [T] });
     await pairsAre(stub, 1);
-    await stub.publish([row(T)]);
+    await stub.deliver([row(T)]);
     await a.rowsAre(1);
     await evictDurableObject(stub);
-    expect(P.b64u(await stub.wsTagKey())).toBe(P.b64u(k));
     const stored = await inside(stub, async (_i, state) => ({
       tables: state.storage.sql
         .exec<{ name: string }>(
@@ -201,18 +210,14 @@ describe("RealtimeDO connect", () => {
         )
         .toArray()
         .map((r) => r.name),
-      keys: state.storage.sql
-        .exec<{ k: string }>("SELECT k FROM meta")
-        .toArray()
-        .map((r) => r.k),
       kv: [...(await state.storage.list()).keys()],
     }));
-    expect(stored).toEqual({ tables: ["meta"], keys: ["ws-tag-key"], kv: [] });
+    expect(stored).toEqual({ tables: [], kv: [] });
     a.ws.close(1000);
   });
 });
 
-describe("RealtimeDO delivery", () => {
+describe("ConnDO delivery", () => {
   it("SUB, then a publish to two topics: each socket receives only its topics, one ROWS frame per publish", async () => {
     const stub = fresh();
     const [T1, T2] = [topic(), topic()];
@@ -224,12 +229,12 @@ describe("RealtimeDO delivery", () => {
 
     const r1 = row(T1);
     const r2 = row(T2, 1);
-    await stub.publish([r1, r2]);
+    await stub.deliver([r1, r2]);
     const r3 = row(T2);
-    await stub.publish([r3]);
+    await stub.deliver([r3]);
     const r4 = row(T1, 3);
     const r5 = row(T1);
-    await stub.publish([r4, r5]);
+    await stub.deliver([r4, r5]);
 
     await a.rowsAre(3);
     await b.rowsAre(2);
@@ -253,8 +258,8 @@ describe("RealtimeDO delivery", () => {
     await pairsAre(stub, 1);
     const x = row(T1);
     const y = row(T2);
-    await stub.publish([x]);
-    await stub.publish([y]);
+    await stub.deliver([x]);
+    await stub.deliver([y]);
     await a.rowsAre(1);
     expect(a.rows()).toHaveLength(1);
     expect(sameRow(a.rows()[0], y)).toBe(true);
@@ -273,9 +278,9 @@ describe("RealtimeDO delivery", () => {
     await pairsAre(stub, 3);
     a.send({ f: "unsub", topics: [T1] }); // a keeps T2 under the same prefix
     await pairsAre(stub, 2);
-    await stub.publish([row(T1)]);
+    await stub.deliver([row(T1)]);
     const y = row(T2);
-    await stub.publish([y]);
+    await stub.deliver([y]);
     await a.rowsAre(1);
     await b.rowsAre(1);
     expect(sameRow(a.rows()[0], y)).toBe(true);
@@ -304,7 +309,7 @@ describe("RealtimeDO delivery", () => {
     }
     const gone = row(ts[0]);
     const kept = row(ts[200]);
-    await stub.publish([gone, kept]);
+    await stub.deliver([gone, kept]);
     await a.rowsAre(1);
     expect(a.rows()).toHaveLength(1);
     expect(sameRow(a.rows()[0], kept)).toBe(true);
@@ -332,10 +337,10 @@ describe("RealtimeDO delivery", () => {
     let first: unknown[];
     let second: unknown[];
     try {
-      await stub.publish([x]);
+      await stub.deliver([x]);
       first = rowsSent();
       sends.mockClear();
-      await stub.publish([y, z]);
+      await stub.deliver([y, z]);
       second = rowsSent();
     } finally {
       sends.mockRestore();
@@ -357,7 +362,7 @@ describe("RealtimeDO delivery", () => {
   });
 });
 
-describe("RealtimeDO RESUME", () => {
+describe("ConnDO RESUME", () => {
   it("with the current boot: replays ring rows newer than since on its topics, then RESUMED; the topics are installed", async () => {
     const stub = fresh();
     const [T1, T2] = [topic(), topic()];
@@ -366,8 +371,8 @@ describe("RealtimeDO RESUME", () => {
     const x1 = row(T1);
     const x2 = row(T2);
     const x3 = row(T1);
-    await stub.publish([x1, x2]);
-    await stub.publish([x3]);
+    await stub.deliver([x1, x2]);
+    await stub.deliver([x3]);
 
     const b = await connect(stub);
     b.send({ f: "resume", boot, since: 1, topics: [T1] });
@@ -382,7 +387,7 @@ describe("RealtimeDO RESUME", () => {
     expect(c.rows().map((r) => r.seq)).toEqual([1, 2, 3]);
 
     const x4 = row(T1);
-    await stub.publish([x4]);
+    await stub.deliver([x4]);
     await b.rowsAre(2);
     expect(sameRow(b.rows()[1], x4)).toBe(true);
     expect(b.rows()[1].seq).toBe(4);
@@ -397,8 +402,8 @@ describe("RealtimeDO RESUME", () => {
     const { boot, seq } = await a.hello();
     const x = row(T);
     const y = row(T);
-    await stub.publish([x]);
-    await stub.publish([y]);
+    await stub.deliver([x]);
+    await stub.deliver([y]);
     const b = await connect(stub);
     b.send({ f: "resume", boot, since: seq, topics: [T] });
     await b.until(() => b.frames.some((f) => f.f === "resumed"), "RESUMED");
@@ -411,14 +416,14 @@ describe("RealtimeDO RESUME", () => {
   it("a stale boot gets GAP(since), and the topics are still installed", async () => {
     const stub = fresh();
     const T = topic();
-    await stub.publish([row(T)]);
+    await stub.deliver([row(T)]);
     const a = await connect(stub);
     a.send({ f: "resume", boot: P.random(8), since: 7, topics: [T] });
     await a.until(() => a.frames.length >= 2, "GAP");
     expect(a.frames[1]).toEqual({ f: "gap", since: 7 });
     await pairsAre(stub, 1);
     const y = row(T);
-    await stub.publish([y]);
+    await stub.deliver([y]);
     await a.rowsAre(1);
     expect(sameRow(a.rows()[0], y)).toBe(true);
     a.ws.close(1000);
@@ -431,7 +436,7 @@ describe("RealtimeDO RESUME", () => {
     await setLimits(stub, { ringRows: 2 });
     let a = await connect(stub);
     const { boot } = await a.hello();
-    await stub.publish([row(T), row(T), row(T)]); // seq 1 is dropped
+    await stub.deliver([row(T), row(T), row(T)]); // seq 1 is dropped
     const gap = await connect(stub);
     gap.send({ f: "resume", boot, since: 0, topics: [T] });
     await gap.until(() => gap.frames.length >= 2, "GAP");
@@ -441,7 +446,7 @@ describe("RealtimeDO RESUME", () => {
     await ok.until(() => ok.frames.some((f) => f.f === "resumed"), "RESUMED");
     expect(ok.rows().map((r) => r.seq)).toEqual([2, 3]);
     // The GAP socket still gets new rows.
-    await stub.publish([row(T)]);
+    await stub.deliver([row(T)]);
     await gap.rowsAre(1);
     expect(gap.rows()[0].seq).toBe(4);
     for (const s of [a, gap, ok]) s.ws.close(1000);
@@ -451,7 +456,7 @@ describe("RealtimeDO RESUME", () => {
     await setLimits(stub, { ringBytes: 2 * (47 + P.BODY_LENS[0]) });
     a = await connect(stub);
     const h2 = await a.hello();
-    await stub.publish([row(T), row(T), row(T)]);
+    await stub.deliver([row(T), row(T), row(T)]);
     let b = await connect(stub);
     b.send({ f: "resume", boot: h2.boot, since: 0, topics: [T] });
     await b.until(() => b.frames.length >= 2, "GAP");
@@ -465,9 +470,9 @@ describe("RealtimeDO RESUME", () => {
     await setClock(stub, t0);
     a = await connect(stub);
     const h3 = await a.hello();
-    await stub.publish([row(T)]);
+    await stub.deliver([row(T)]);
     await setClock(stub, t0 + 10 * 60_000);
-    await stub.publish([row(T)]);
+    await stub.deliver([row(T)]);
     await setClock(stub, t0 + 10 * 60_000 + 1);
     b = await connect(stub);
     b.send({ f: "resume", boot: h3.boot, since: 0, topics: [T] });
@@ -483,7 +488,7 @@ describe("RealtimeDO RESUME", () => {
   it("a since above the last assigned seq (current boot) gets GAP; since = seq is RESUMED with nothing to replay", async () => {
     const stub = fresh();
     const T = topic();
-    await stub.publish([row(T), row(T)]);
+    await stub.deliver([row(T), row(T)]);
     const a = await connect(stub);
     const { boot, seq } = await a.hello();
     expect(seq).toBe(2);
@@ -501,7 +506,7 @@ describe("RealtimeDO RESUME", () => {
     expect(b.frames.map((f) => f.f)).toEqual(["hello", "resumed"]);
 
     const y = row(T);
-    await stub.publish([y]);
+    await stub.deliver([y]);
     await a.rowsAre(1);
     await b.rowsAre(1);
     expect(sameRow(a.rows()[0], y) && sameRow(b.rows()[0], y)).toBe(true);
@@ -518,7 +523,7 @@ describe("RealtimeDO RESUME", () => {
     const [T, U] = [topic(), topic()];
     const a = await connect(stub);
     const { boot } = await a.hello();
-    await stub.publish([row(T), row(U), row(U), row(T), row(T)]); // T at seq 1, 4, 5
+    await stub.deliver([row(T), row(U), row(U), row(T), row(T)]); // T at seq 1, 4, 5
 
     // since 0 on T: three rows (3 · size) are over the budget.
     const b = await connect(stub);
@@ -537,7 +542,7 @@ describe("RealtimeDO RESUME", () => {
     await pairsAre(stub, 2);
 
     const y = row(T);
-    await stub.publish([y]);
+    await stub.deliver([y]);
     await b.rowsAre(1);
     await c.rowsAre(3);
     expect(sameRow(b.rows()[0], y)).toBe(true);
@@ -546,7 +551,7 @@ describe("RealtimeDO RESUME", () => {
   });
 });
 
-describe("RealtimeDO protocol violations", () => {
+describe("ConnDO protocol violations", () => {
   const closes = async (setup: (s: Sock, stub: Stub) => Promise<void> | void, code = 1008) => {
     const stub = fresh();
     await setClock(stub, Math.floor(Date.now() / 60_000) * 60_000 + 1_000); // one fixed minute
@@ -655,7 +660,7 @@ describe("RealtimeDO protocol violations", () => {
     await d.closedWith(1013);
     // The others are untouched.
     const x = row(TA[1]);
-    await stub.publish([x]);
+    await stub.deliver([x]);
     await a.rowsAre(1);
     expect(sameRow(a.rows()[0], x)).toBe(true);
     expect(a.closed()).toBeNull();
@@ -665,7 +670,7 @@ describe("RealtimeDO protocol violations", () => {
   });
 });
 
-describe("RealtimeDO caps and age", () => {
+describe("ConnDO caps and age", () => {
   it("429 per client and 503 in total, counted through tags without deserialising any attachment", async () => {
     const stub = fresh();
     const spy = vi.spyOn(WebSocket.prototype, "deserializeAttachment");
@@ -746,7 +751,7 @@ describe("RealtimeDO caps and age", () => {
     const Tp = topic();
     pinged[0].send({ f: "sub", topics: [Tp] });
     await pairsAre(stub, 1);
-    await stub.publish([row(Tp)]);
+    await stub.deliver([row(Tp)]);
     await pinged[0].rowsAre(1);
     for (const s of [...pinged, ...recent, ninth, ...more, otherClient]) s.ws.close(1000);
   });
@@ -794,7 +799,7 @@ describe("RealtimeDO caps and age", () => {
     await pairsAre(stub, 2);
     expect(old.closed()).toBeNull(); // counting at h0 + 1 h did not close the previous hour
     await setClock(stub, h0 + HOUR_MS + 61_000);
-    await stub.publish([row(T)]);
+    await stub.deliver([row(T)]);
     await old.closedWith(4000);
     await young.rowsAre(1);
     expect(old.rows()).toEqual([]);
@@ -820,7 +825,7 @@ describe("RealtimeDO caps and age", () => {
 
     await evictDurableObject(stub);
     const x = row(T1);
-    await stub.publish([x]);
+    await stub.deliver([x]);
     await a.rowsAre(1);
     expect(sameRow(a.rows()[0], x)).toBe(true);
     expect(a.rows()[0].seq).toBe(1); // seq restarts with the new boot
@@ -829,7 +834,7 @@ describe("RealtimeDO caps and age", () => {
     a.send({ f: "unsub", topics: [T1] });
     await pairsAre(stub, 1);
     const y = row(T2);
-    await stub.publish([row(T1), y]);
+    await stub.deliver([row(T1), y]);
     await a.rowsAre(2);
     expect(sameRow(a.rows()[1], y)).toBe(true);
 
@@ -844,17 +849,173 @@ describe("RealtimeDO caps and age", () => {
     b.ws.close(1000);
   });
 
-  it("publish rejects malformed rows", async () => {
+  it("deliver rejects malformed rows", async () => {
     const stub = fresh();
-    await inside(stub, (inst) => {
+    await inside(stub, async (inst) => {
       const ok = row(topic());
-      expect(() => inst.publish([{ ...ok, topic: P.random(15) }])).toThrow(TypeError);
-      expect(() => inst.publish([{ ...ok, label: P.random(17) }])).toThrow(TypeError);
-      expect(() => inst.publish([{ ...ok, cls: 4 }])).toThrow(TypeError);
-      expect(() => inst.publish([{ ...ok, body: P.random(P.BODY_LENS[1]) }])).toThrow(TypeError);
-      expect(() => inst.publish([{ ...ok, E: 0x10000 }])).toThrow(TypeError);
-      expect(() => inst.publish([{ ...ok, t: -1 }])).toThrow(TypeError);
+      await expect(inst.deliver([{ ...ok, topic: P.random(15) }])).rejects.toThrow(TypeError);
+      await expect(inst.deliver([{ ...ok, label: P.random(17) }])).rejects.toThrow(TypeError);
+      await expect(inst.deliver([{ ...ok, cls: 4 }])).rejects.toThrow(TypeError);
+      await expect(inst.deliver([{ ...ok, body: P.random(P.BODY_LENS[1]) }])).rejects.toThrow(
+        TypeError,
+      );
+      await expect(inst.deliver([{ ...ok, E: 0x10000 }])).rejects.toThrow(TypeError);
+      await expect(inst.deliver([{ ...ok, t: -1 }])).rejects.toThrow(TypeError);
       expect(inst.seq).toBe(0);
     });
+  });
+});
+
+/** Waits until the object has answered every FeedDO call it made so far. */
+const settled = (stub: Stub) => inside(stub, (i) => i.settle());
+/** Whether FeedDO j holds topic T for ConnDO c. */
+const feedHas = async (T: Uint8Array, c: number) =>
+  (await feedOf(T).topicsOf(c)).includes(P.hex(T));
+
+describe("ConnDO interest (§9.4)", () => {
+  it("a SUB puts the topic into the FeedDO's interest, which then delivers; an UNSUB and a close take it out", async () => {
+    const c = randomC();
+    const stub = fresh(c);
+    const T = topic();
+    const a = await connect(stub);
+    const b = await connect(stub);
+    a.send({ f: "sub", topics: [T] });
+    await pairsAre(stub, 1);
+    await settled(stub);
+    expect(await feedHas(T, c)).toBe(true);
+    const x = row(T);
+    await feedOf(T).publish([x]);
+    await a.rowsAre(1);
+    expect(sameRow(a.rows()[0], x)).toBe(true);
+
+    // A second socket on the same topic changes nothing at the FeedDO; the first UNSUB keeps the interest.
+    b.send({ f: "sub", topics: [T] });
+    await pairsAre(stub, 2);
+    a.send({ f: "unsub", topics: [T] });
+    await pairsAre(stub, 1);
+    await settled(stub);
+    expect(await feedHas(T, c)).toBe(true);
+    const y = row(T);
+    await feedOf(T).publish([y]);
+    await b.rowsAre(1);
+    expect(sameRow(b.rows()[0], y)).toBe(true);
+    expect(a.rows()).toHaveLength(1);
+
+    // The last socket's close withdraws the topic.
+    b.ws.close(1000);
+    await eventually(
+      () => feedHas(T, c),
+      (x) => !x,
+      "withdrawal",
+    );
+    await feedOf(T).publish([row(T)]);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(b.rows()).toHaveLength(1);
+    a.ws.close(1000);
+  });
+
+  it("topicsFor(j) answers the distinct topics at that FeedDO, whichever sockets hold them", async () => {
+    const stub = fresh();
+    const [T1, T2] = [topic(), topic()];
+    const a = await connect(stub);
+    const b = await connect(stub);
+    a.send({ f: "sub", topics: [T1, T2] });
+    b.send({ f: "sub", topics: [T1] });
+    await pairsAre(stub, 3);
+    const at = async (j: number) => (await stub.topicsFor(j)).map(P.hex).sort();
+    const want = (j: number) =>
+      [T1, T2]
+        .filter((T) => jOf(T) === j)
+        .map(P.hex)
+        .sort();
+    for (const j of new Set([jOf(T1), jOf(T2)])) expect(await at(j)).toEqual(want(j));
+    expect(await at(9_999)).toEqual([]);
+    a.ws.close(1000);
+    await eventually(
+      () => at(jOf(T2)),
+      (x) => !x.includes(P.hex(T2)),
+      "T2 gone",
+    );
+    expect(await at(jOf(T1))).toEqual([P.hex(T1)]); // b still holds T1
+    b.ws.close(1000);
+  });
+
+  it("a failed FeedDO call is repaired by the alarm with the full set, and the alarm then keeps the resync cadence", async () => {
+    const c = randomC();
+    const stub = fresh(c);
+    const T = topic();
+    const calls: string[] = [];
+    let fail = 1;
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await inside(stub, (i) => {
+        i.feeds = {
+          interest: async (j, cc, added, removed) => {
+            calls.push(`interest:${j}:${cc}:${added.length}:${removed.length}`);
+            if (fail-- > 0) throw new Error("feed down");
+          },
+          replace: async (j, cc, topics) => {
+            calls.push(`replace:${j}:${cc}:${topics.map(P.hex).join("+")}`);
+          },
+        };
+      });
+      const a = await connect(stub);
+      const t0 = Date.now();
+      a.send({ f: "sub", topics: [T] });
+      await pairsAre(stub, 1);
+      await settled(stub);
+      expect(calls).toEqual([`interest:${jOf(T)}:${c}:1:0`]);
+      // The failure armed a retry within 1 s.
+      const retryAt = await inside(stub, (_i, state) => state.storage.getAlarm());
+      expect(retryAt).not.toBeNull();
+      expect(retryAt! - t0).toBeLessThanOrEqual(1_000 + 50);
+      await inside(stub, (i) => i.alarm());
+      expect(calls).toEqual([`interest:${jOf(T)}:${c}:1:0`, `replace:${jOf(T)}:${c}:${P.hex(T)}`]);
+      // Repaired: the next alarm is the regular resync, about 300 s out, and sends the full set again.
+      const next = await inside(stub, (_i, state) => state.storage.getAlarm());
+      expect(next! - Date.now()).toBeGreaterThan(290_000);
+      await inside(stub, (i) => i.alarm());
+      expect(calls).toHaveLength(3);
+      expect(calls[2]).toBe(`replace:${jOf(T)}:${c}:${P.hex(T)}`);
+      // With no topic left, the alarm sends nothing and arms nothing.
+      a.send({ f: "unsub", topics: [T] });
+      await pairsAre(stub, 0);
+      await settled(stub);
+      expect(calls).toHaveLength(4); // the withdrawal
+      expect(calls[3]).toBe(`interest:${jOf(T)}:${c}:0:1`);
+      await inside(stub, (_i, state) => state.storage.deleteAlarm()); // an alarm run by hand consumes nothing
+      await inside(stub, (i) => i.alarm());
+      expect(calls).toHaveLength(4);
+      expect(await inside(stub, (_i, state) => state.storage.getAlarm())).toBeNull();
+      a.ws.close(1000);
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it("a socket that closes while the object is evicted still withdraws its topics", async () => {
+    const c = randomC();
+    const stub = fresh(c);
+    const [T, U] = [topic(), topic()];
+    const a = await connect(stub);
+    const b = await connect(stub);
+    a.send({ f: "sub", topics: [T, U] });
+    b.send({ f: "sub", topics: [U] });
+    await pairsAre(stub, 3);
+    await settled(stub);
+    expect(await feedHas(T, c)).toBe(true);
+    await evictDurableObject(stub);
+    a.ws.close(1000);
+    await eventually(
+      () => feedHas(T, c),
+      (x) => !x,
+      "T withdrawn",
+    );
+    expect(await feedHas(U, c)).toBe(true); // b still holds U
+    const y = row(U);
+    await feedOf(U).publish([y]);
+    await b.rowsAre(1);
+    expect(sameRow(b.rows()[0], y)).toBe(true);
+    b.ws.close(1000);
   });
 });
