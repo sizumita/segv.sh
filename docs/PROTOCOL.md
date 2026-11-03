@@ -2562,8 +2562,9 @@ or that were deleted, that day may be co-members (§13.4).
   registered bells that the rings carried, newest first, at most `PUSH_BELLS` = 4), and the rows that rang it since
   its last push (`rows`: a hash of each row's `(E, label)`, at most `PUSH_PENDING` = 16; once more rows ring it,
   `rows` is dropped for that push, which then can no longer be cancelled), both kept until that push is sent, dropped
-  or cancelled; and the rings of the last `RING_DEDUP` = 120 s, each identified by a hash of its row and of its
-  distinct bells in ascending byte order.
+  or cancelled; while a request for that push is out, the bells and rows of the rings that came since it was made
+  (`later`: bells and rows kept as `rang` and `rows` are), until its answer; and the rings of the last `RING_DEDUP` =
+  120 s, each identified by a hash of its row and of its distinct bells in ascending byte order.
 - **The rows that an account marked seen** (`seen`, below), which are never written: per endpoint, a hash of each
   row's `(E, label)` with the time it expires, `SEEN_TTL` = 120 s after its last mark, at most `PUSH_SEEN` = 64 per
   endpoint (a mark beyond them drops the one that expires first).
@@ -2620,7 +2621,9 @@ none, and gets no notes.
 2. For each distinct endpoint registered under the `tk` of one of `tokens`, except one whose rows marked seen hold
    this row: put the bells of `tokens` under which it is registered at the front of its `rang`, in their order in
    `tokens`, removing their earlier places there and keeping the first `PUSH_BELLS`. Then, if a push to it is due,
-   add the row to its `rows` (when it has `rows`) and change nothing else; otherwise set
+   add the row to its `rows` (when it has `rows`); when a request for that push is out, also put those bells and the
+   row in its `later` in the same way, since that request was made without them: its answer leaves them due (below),
+   while a retry carries them. Change nothing else. Otherwise set
    `due = max(now + PUSH_HOLD·1000, last + PUSH_WINDOW·1000) + j` (`now + PUSH_HOLD·1000 + j` when there is no
    `last`), `tries = 0` and `rows` = this row, where `PUSH_HOLD` = 5 s and j is uniform in `[0, PUSH_JITTER·1000]` ms,
    drawn per endpoint and push.
@@ -2647,9 +2650,9 @@ time would end first. `flush` writes nothing.
 rows while it was in use (§11.13). For each endpoint registered under the `tk` of `Q`, and each row:
 
 1. add the row to the endpoint's rows marked seen, expiring `SEEN_TTL` after now (renewing it when it is there);
-2. remove the row from the `rows` of the push due to the endpoint, if any. When that empties its `rows`, and the push
-   is not being sent at that moment, cancel it: nothing is due, `tries = 0`, `rang` and `rows` are emptied, and `last`
-   stays.
+2. remove the row from the `rows` of the push due to the endpoint, if any, and from its `later`. When that empties its
+   `rows`, and the push is not being sent at that moment, cancel it: nothing is due, `tries = 0`, `rang` and `rows`
+   are emptied, and `last` stays.
 
 A later ring of a marked row reaches none of these endpoints (`ring` step 2). `seen` writes nothing, not even the
 alarm, and does nothing when no endpoint is registered under the `tk` of `Q`. So a push is cancelled only when every
@@ -2832,10 +2835,15 @@ Every push of a transport thus has the same fixed text, every quiet push the sam
 every push of a transport the same length; no push carries the text of a message, a sender or a count. The answer
 decides the rest:
 
-- a 2xx: the push is sent; `last` = when it was sent, nothing is due, and `rang` and `rows` are emptied;
+- a 2xx: the push is sent; `last` = when it was sent, `tries = 0`, and `rang` and `rows` become the bells and rows of
+  the request's `later`. When a ring came while the request was out, and `seen` has not emptied the rows of `later`
+  since, a push of them is due as `ring` step 2 would make it due now:
+  `due = max(now + PUSH_HOLD·1000, last + PUSH_WINDOW·1000) + j`, with j drawn afresh, which is
+  `last + PUSH_WINDOW·1000 + j` since a request takes at most 10 s. Otherwise nothing is due;
 - a 429, a 5xx, a network error, no answer within 10 s, or, for FCM, a failed request for its access token: retry once
   (`tries = 1`), after the answer's `retry-after` when that is at most 60 s, else after 10 s; when the retry fails as
-  well, drop the push (`last` = its first attempt, `rang` and `rows` emptied), and keep the endpoint;
+  well, drop the push (`last` = its first attempt, then `rang`, `rows` and what is due as after a 2xx), and keep the
+  endpoint;
 - an answer that refuses the device: for Web Push anything else, a 3xx or any 4xx other than 429 (404 and 410 for a
   subscription that expired or was revoked, 400, 401, 403, 413); for APNs a 410, or a 400 whose reason is
   `BadDeviceToken` or `DeviceTokenNotForTopic`; for FCM a 404 (`UNREGISTERED`), or a 403 whose error code is

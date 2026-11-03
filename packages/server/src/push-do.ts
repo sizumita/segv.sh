@@ -296,6 +296,11 @@ interface PushState {
   rows: Set<string> | null;
   /** its request is in flight: a mark no longer cancels it */
   sending: boolean;
+  /**
+   * The rings that came while its current attempt was out, which that attempt does not carry (§9.8 `later`): their
+   * bells, newest first, and their rows not marked seen since (null: too many to cancel). Null: none came.
+   */
+  later: { rang: Bytes[]; rows: Set<string> | null } | null;
 }
 
 /** `fresh` in front of `rang`, without repeats, at most PUSH_BELLS (§9.8 `ring` step 2). */
@@ -310,6 +315,13 @@ function rangWith(fresh: readonly Bytes[], rang: readonly Bytes[]): Bytes[] {
     if (out.length === PUSH_BELLS) break;
   }
   return out;
+}
+
+/** `rows` with `row` added; null once more than PUSH_PENDING rows rang (§9.8 `rows`). */
+function rowsWith(rows: Set<string> | null, row: string): Set<string> | null {
+  if (!rows) return null;
+  rows.add(row);
+  return rows.size > PUSH_PENDING ? null : rows;
 }
 
 interface SubRow {
@@ -780,7 +792,6 @@ export class PushDO extends DurableObject<Env> {
         eps.set(k, e);
       }
     }
-    const jitter = v2Params(this.env).delta * 1000;
     let first = Infinity;
     for (const [k, { ep, bells }] of eps) {
       // A device of its account has shown this row while in use (§9.8 `seen`).
@@ -789,19 +800,27 @@ export class PushDO extends DurableObject<Env> {
       const rang = rangWith(bells, st?.rang ?? []);
       if (st && st.due !== null) {
         st.rang = rang;
-        if (st.rows) {
-          st.rows.add(row);
-          if (st.rows.size > PUSH_PENDING) st.rows = null;
+        st.rows = rowsWith(st.rows, row);
+        // The attempt out now was built without this ring: whatever its answer, this ring is not lost with it.
+        if (st.sending) {
+          const l = st.later ?? { rang: [], rows: new Set<string>() };
+          st.later = { rang: rangWith(bells, l.rang), rows: rowsWith(l.rows, row) };
         }
         first = Math.min(first, st.due);
         continue;
       }
       const last = st?.last ?? null;
-      const due = Math.max(now + HOLD_MS, last === null ? 0 : last + WINDOW_MS) + Math.floor(this.rand() * (jitter + 1));
-      this.pushes.set(k, { ep, last, due, tries: 0, first: 0, rang, rows: new Set([row]), sending: false });
+      const due = this.dueAfter(now, last);
+      this.pushes.set(k, { ep, last, due, tries: 0, first: 0, rang, rows: new Set([row]), sending: false, later: null });
       first = Math.min(first, due);
     }
     return first - now <= RING_WAIT ? Math.max(0, first - now) : null;
+  }
+
+  /** The `due` of a push that rings make due at `now` (§9.8 `ring` step 2), j drawn afresh. */
+  private dueAfter(now: number, last: number | null): number {
+    const jitter = v2Params(this.env).delta * 1000;
+    return Math.max(now + HOLD_MS, last === null ? 0 : last + WINDOW_MS) + Math.floor(this.rand() * (jitter + 1));
   }
 
   /**
@@ -836,7 +855,9 @@ export class PushDO extends DurableObject<Env> {
       while (m.size > PUSH_SEEN) m.delete(m.keys().next().value as string);
       this.marks.set(k, m);
       const st = this.pushes.get(k);
-      if (!st || st.due === null || !st.rows) continue;
+      if (!st || st.due === null) continue;
+      for (const id of ids) st.later?.rows?.delete(id);
+      if (!st.rows) continue;
       for (const id of ids) st.rows.delete(id);
       if (st.rows.size === 0 && !st.sending) Object.assign(st, { due: null, tries: 0, rang: [], rows: new Set() });
     }
@@ -1085,7 +1106,7 @@ export class PushDO extends DurableObject<Env> {
     const cfg = this.config();
     if (!cfg) {
       // While push is off nothing is sent, and what is due is dropped.
-      for (const st of this.pushes.values()) Object.assign(st, { due: null, rang: [], rows: new Set() });
+      for (const st of this.pushes.values()) Object.assign(st, { due: null, rang: [], rows: new Set(), later: null });
       return;
     }
     const tally = { sent: 0, retried: 0, dropped: 0, deleted: 0 };
@@ -1107,8 +1128,9 @@ export class PushDO extends DurableObject<Env> {
         .slice(0, PUSH_BATCH);
       if (due.length === 0) break;
       this.nextBatch = start + 1000;
-      // Their `due` stays set while they are sent: a ring meanwhile coalesces into them (§9.8 `ring` step 2), and a
-      // mark no longer cancels them.
+      // Their `due` stays set while they are sent: a ring meanwhile coalesces into them, so that a retry carries it,
+      // and is also kept apart in `later`, which their answer leaves due (§9.8 `ring` step 2); a mark no longer
+      // cancels them.
       const results = await Promise.all(
         due.map(async (s) => {
           s.sending = true;
@@ -1168,6 +1190,8 @@ export class PushDO extends DurableObject<Env> {
     const timer = setTimeout(() => abort.abort(), PUSH_TIMEOUT_MS);
     try {
       this.signer = this.signer?.cfg === cfg ? this.signer : { cfg, s: new VapidSigner(cfg.vapidSk, cfg.vapidSub) };
+      // What this attempt carries: rings from here on go to `later` as well.
+      s.later = null;
       const body = await encryptPayload(pushPayload(cfg.appHost, s.rang), t.p256dh, t.auth);
       const authorization = await this.signer.s.authorization(url.origin, at);
       const res = await this.fetcher(t.endpoint, {
@@ -1199,25 +1223,36 @@ export class PushDO extends DurableObject<Env> {
       clearTimeout(timer);
     }
     if (typeof status === "number" && status >= 200 && status < 300) {
-      Object.assign(s, { last: at, due: null, tries: 0, rang: [], rows: new Set() });
+      this.ended(s, at);
       return "sent";
     }
     if (status === "error" || status === 429 || status >= 500) {
       if (s.rows?.size === 0) {
         // Every row that rang it was marked seen while this attempt was out: cancelled rather than retried.
-        Object.assign(s, { due: null, tries: 0, rang: [], rows: new Set() });
+        Object.assign(s, { due: null, tries: 0, rang: [], rows: new Set(), later: null });
         return null;
       }
       if (s.tries === 0) {
         const ra = retryAfterS(retryAfter);
-        Object.assign(s, { tries: 1, due: this.clock() + (ra !== null && ra <= 60 ? ra * 1000 : RETRY_MS) });
+        // The retry carries the rings that came meanwhile: they are in `rang` and `rows` already.
+        Object.assign(s, { tries: 1, due: this.clock() + (ra !== null && ra <= 60 ? ra * 1000 : RETRY_MS), later: null });
         return "retried";
       }
-      Object.assign(s, { last: s.first, due: null, tries: 0, rang: [], rows: new Set() });
+      this.ended(s, s.first);
       return "dropped";
     }
     // A 3xx (never followed) or any other 4xx: no push service accepts this endpoint any more.
     this.deleteAtPush(ep, seen);
     return "deleted";
+  }
+
+  /**
+   * A push sent or dropped, its window counted from `last`: what its attempts carried is gone, and the rings that came
+   * during its last one are due as if they came now (§9.8), unless every row of them was marked seen meanwhile.
+   */
+  private ended(s: PushState, last: number): void {
+    const l = s.later;
+    Object.assign(s, { last, due: null, tries: 0, rang: [], rows: new Set(), later: null });
+    if (l && l.rows?.size !== 0) Object.assign(s, { due: this.dueAfter(this.clock(), last), rang: l.rang, rows: l.rows });
   }
 }
