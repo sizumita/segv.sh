@@ -68,6 +68,12 @@ export interface JoinCtx {
   contact(uidB: string): P.ContactRec | null;
   warn(text: string, critical?: boolean): void;
   /**
+   * An epoch e that the copy holds but has not loaded (below the start of a restore, §11.4 step 5): the bundle its
+   * records name for e, and H(D_e) (the copy's root, or D from a DESC record or that bundle; null when the record does
+   * not check). Null when the copy does not hold e, or has it loaded. `hD` throws on a transient failure.
+   */
+  unloaded(c: Copy, e: number): { bundleId: Bytes; hD(): Promise<Bytes | null> } | null;
+  /**
    * §6.7 step 4: catches up the control lane of a held copy's current epoch; true once its winner is final and
    * processed, or every slot is decided not e-valid, or the copy has ended (throws on a transient failure).
    */
@@ -121,14 +127,32 @@ async function dbyCheck(
   return { user: { handle: u.handle, sigPk: u.sigPk, kh: member.kh, kemPk: u.kemPk }, member };
 }
 
+/** H(D) of epoch e of the copy, loaded or not (§11.4 step 5), or null when it does not hold e. */
+async function heldHash(ctx: JoinCtx, c: Copy, e: number): Promise<Bytes | null> {
+  const x = c.epochs.get(e);
+  if (x) return x.D.hash;
+  return (await ctx.unloaded(c, e)?.hD()) ?? null;
+}
+
+/**
+ * A held copy of J's conversation names J's bundle for J's epoch, loaded or not: one bundle holds one D, so J is a
+ * duplicate (§6.7 step 3), known without fetching anything.
+ */
+export function heldBundle(ctx: Pick<JoinCtx, "copiesOf" | "unloaded">, J: P.Join): boolean {
+  return ctx.copiesOf(P.b64u(J.conv)).some((c) => {
+    const b = c.epochs.get(J.e)?.bundleId ?? ctx.unloaded(c, J.e)?.bundleId;
+    return !!b && P.equalBytes(b, J.bundleId);
+  });
+}
+
 /**
  * A J for epoch e contradicts the history of an ended copy (§6.7 step 6 "Forks of an ended copy"): the copy holds e
- * with another H(D) (the same one is a duplicate, step 3), or e is the epoch after its last, whose final claim removed
- * self.
+ * (loaded or not) with another H(D) (the same one is a duplicate, step 3), or e is the epoch after its last, whose
+ * final claim removed self. Throws on a transient failure.
  */
-function contradicts(c: Copy, e: number, hD: Bytes): boolean {
-  const x = c.epochs.get(e);
-  return x ? !P.equalBytes(x.D.hash, hD) : e === c.current + 1;
+async function contradicts(ctx: JoinCtx, c: Copy, e: number, hD: Bytes): Promise<boolean> {
+  const x = await heldHash(ctx, c, e);
+  return x ? !P.equalBytes(x, hD) : e === c.current + 1;
 }
 
 /**
@@ -143,6 +167,7 @@ export async function acceptJoin(ctx: JoinCtx, J: P.Join, src: JoinSource): Prom
   const parkOn = (e: unknown): JoinOutcome => park(e instanceof Error ? e.message : String(e));
   // Step 1, in this order, so that a J naming a large blob costs no download.
   if (P.sgb2BOfSize(J.bundleSize) === null) return drop(MALFORMED_KEY);
+  if (heldBundle(ctx, J)) return { kind: "duplicate" };
   let meta: { t: number; size: number } | null;
   let got: { bytes: Bytes; sizeOk: boolean } | null;
   try {
@@ -160,13 +185,19 @@ export async function acceptJoin(ctx: JoinCtx, J: P.Join, src: JoinSource): Prom
   if (!chk.ok) return drop(chk.failed === "dsig" ? INVALID_SIG_KEY : MALFORMED_KEY);
   const D = chk.D;
   const held = ctx.copiesOf(P.b64u(J.conv));
-  // Step 3: a copy, ended or not, already holds (conv, e) with this H(D).
-  const duplicate = () =>
-    held.some((c) => {
-      const x = c.epochs.get(J.e);
-      return !!x && P.equalBytes(x.D.hash, D.hash);
-    });
-  if (duplicate()) return { kind: "duplicate" };
+  // Step 3: a copy, ended or not, already holds (conv, e) with this H(D), also an epoch a restore did not load.
+  const duplicate = async () => {
+    for (const c of held) {
+      const x = await heldHash(ctx, c, J.e);
+      if (x && P.equalBytes(x, D.hash)) return true;
+    }
+    return false;
+  };
+  try {
+    if (await duplicate()) return { kind: "duplicate" };
+  } catch (e) {
+    return parkOn(e);
+  }
   // Step 4: settle the held copies. A copy created earlier in this poll is not held yet: park until it is.
   for (const c of held) {
     if (!c.key) return park("an earlier join of this conversation is being recorded");
@@ -177,7 +208,11 @@ export async function acceptJoin(ctx: JoinCtx, J: P.Join, src: JoinSource): Prom
     }
   }
   // Step 3 again: the settle can move a copy to e through its own entry.
-  if (duplicate()) return { kind: "duplicate" };
+  try {
+    if (await duplicate()) return { kind: "duplicate" };
+  } catch (e) {
+    return parkOn(e);
+  }
   // Step 5: "Claimed". An ended copy fits no J.
   for (const c of held) {
     if (c.removed) continue;
@@ -188,7 +223,12 @@ export async function acceptJoin(ctx: JoinCtx, J: P.Join, src: JoinSource): Prom
   }
   // Step 6, no fit. An ended copy counts only for a J that contradicts its history (a fork).
   const live = held.filter((c) => !c.removed);
-  const forks = held.filter((c) => c.removed && contradicts(c, J.e, D.hash));
+  const forks: Copy[] = [];
+  try {
+    for (const c of held) if (c.removed && (await contradicts(ctx, c, J.e, D.hash))) forks.push(c);
+  } catch (e) {
+    return parkOn(e);
+  }
   const counted = new Set<Copy>([...live, ...forks]);
   let ended: Copy | null = null;
   if (forks.length === 0 && live.every((c) => J.e < rootEpoch(c))) {

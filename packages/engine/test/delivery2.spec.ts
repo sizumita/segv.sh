@@ -16,6 +16,7 @@ import {
   sleep,
   view,
   waitFor,
+  type TestUser,
 } from "./harness";
 
 freshWorldPerTest();
@@ -190,6 +191,137 @@ describe("a parked WELCOME (§6.7 step 4, §7.3)", () => {
     const after = I(D2).self!.fold.headsOf(key)!;
     expect(after.lanes[j].cnt).toBeGreaterThan(row.n);
     void carol;
+  });
+});
+
+/**
+ * Fails `u`'s self-lane puts that hold a CONV_JOIN with a 500 while `failing()` (nothing is stored), counting them.
+ */
+function failJoinPuts(u: TestUser, failing: () => boolean): { count: number } {
+  const n = { count: 0 };
+  server().hooks.beforePut = (rows, who) => {
+    if (who !== u.handle || !failing()) return;
+    for (const r of rows) {
+      let recs: P.SelfRecord[];
+      try {
+        recs = P.openSelf(u.id.kS, r.E, r.label, r.body).records;
+      } catch {
+        continue;
+      }
+      if (recs.some((x) => x.rtype === P.RT.CONV_JOIN)) {
+        n.count++;
+        throw new Error("CONV_JOIN put fails");
+      }
+    }
+  };
+  return n;
+}
+
+/** Alice and dave with a 1:1 in which dave has posted, so it is dave's WELCOME channel (§6.12 step 1). */
+async function welcomeChannel() {
+  const [alice, carol, dave] = ["alice", "carol", "dave"].map((h) => makeUser(h));
+  const A = await engineFor(alice);
+  const D = await engineFor(dave);
+  const one = await A.createConversation(["dave"]);
+  await settle(A, D);
+  await D.sendText(one, "hi alice");
+  await settle(A, D);
+  const key = `${P.b64u(epoch(A, one).D.conv)}.${P.b64u(epoch(D, one).D.hash)}`; // the 1:1 is at its root epoch
+  const j = P.memberIndex(epoch(A, one).D, alice.uid);
+  return { alice, carol, dave, A, D, one, key, j };
+}
+
+describe("a WELCOME whose CONV_JOIN write fails (§6.7 step 1, §7.3 Durability order)", () => {
+  it("keeps the J and the lane's HEADS position before the row until the write is CAS OK", async () => {
+    const { dave, A, D, one, key, j } = await welcomeChannel();
+    let failing = true;
+    const fails = failJoinPuts(dave, () => failing);
+    const g = await A.createConversation(["carol", "dave"], "g");
+    await settle(A, D);
+    expect(fails.count).toBeGreaterThan(0);
+    expect(view(D, g)).toBeUndefined();
+    const row = epoch(A, one).lanes[j].last!; // alice's WELCOME row in the 1:1
+    // the lane moves on past the WELCOME; HEADS keeps the lane before it
+    await A.sendText(one, "after the welcome");
+    await settle(A, D);
+    expect(chat(D, one)).toContain("alice: after the welcome");
+    expect(I(D).self!.fold.headsOf(key)!.lanes[j]).toEqual({ E: row.E, cnt: row.n });
+    // the next catch-up writes it
+    failing = false;
+    await settle(A, D);
+    expect(mustView(D, g).name).toBe("# g");
+    expect(I(D).self!.fold.headsOf(key)!.lanes[j].cnt).toBeGreaterThan(row.n);
+  });
+
+  it("a parked J whose retry fails to write stays parked, with the other parked Js", async () => {
+    const { dave, A, D, one, key, j } = await welcomeChannel();
+    let metaFails = true;
+    server().hooks.fail = (m, p, who) =>
+      metaFails &&
+      who === "dave" &&
+      m === "GET" &&
+      p.startsWith("/api/v2/blob/") &&
+      p.endsWith("/meta")
+        ? "before"
+        : undefined;
+    const g = await A.createConversation(["carol", "dave"], "g");
+    await settle(A, D);
+    const h = await A.createConversation(["carol", "dave"], "h");
+    await settle(A, D);
+    expect(view(D, g)).toBeUndefined(); // both parked
+    expect(view(D, h)).toBeUndefined();
+    const rowH = epoch(A, one).lanes[j].last!; // the WELCOME of h
+    // meta recovers; the CONV_JOIN put of the retry fails once
+    metaFails = false;
+    server().hooks.fail = undefined;
+    let once = true;
+    const fails = failJoinPuts(dave, () => once);
+    await I(D)
+      .catchUp()
+      .catch(() => {});
+    expect(fails.count).toBe(1);
+    once = false;
+    await A.sendText(one, "after the welcomes");
+    await settle(A, D);
+    expect(mustView(D, g).name).toBe("# g");
+    expect(mustView(D, h).name).toBe("# h");
+    expect(I(D).self!.fold.headsOf(key)!.lanes[j].cnt).toBeGreaterThan(rowH.n);
+  });
+});
+
+describe("a WELCOME before the processed position (§11.10)", () => {
+  it("whose J no copy holds still goes through §6.7: a group whose J was never recorded is recovered", async () => {
+    const { A, D, one, key, j, dave } = await welcomeChannel();
+    // a device that drops the J without recording it (as one whose CONV_JOIN write failed once could)
+    const m = (D as unknown as { msg: { processJoins: () => Promise<string[]> } }).msg;
+    const real = m.processJoins;
+    m.processJoins = async () => ["dropped"];
+    const g = await A.createConversation(["carol", "dave"], "g");
+    await settle(A, D);
+    m.processJoins = real;
+    const row = epoch(A, one).lanes[j].last!;
+    await A.sendText(one, "after the welcome");
+    await settle(A, D);
+    expect(view(D, g)).toBeUndefined();
+    expect(I(D).self!.fold.headsOf(key)!.lanes[j].cnt).toBeGreaterThan(row.n); // HEADS is past the WELCOME
+    await D.logout();
+    // the reload's initial history reads the row again
+    const D2 = await engineFor(dave);
+    await settle(A, D2);
+    expect(mustView(D2, g).name).toBe("# g");
+    expect(D2.getState().warnings).toEqual([]);
+    // and the next reload holds it, and skips the WELCOME by its bundle: no `meta` request of §6.7 step 1
+    const from = server().requests.length;
+    await D2.logout();
+    const D3 = await engineFor(dave);
+    await settle(A, D3);
+    expect(mustView(D3, g).name).toBe("# g");
+    const meta = `/api/v2/blob/${P.b64u(epoch(A, g).bundleId)}/meta`;
+    expect(
+      server()
+        .requests.slice(from)
+        .filter((r) => r.who === "dave" && r.path === meta),
+    ).toEqual([]);
   });
 });
 
