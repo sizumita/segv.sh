@@ -354,6 +354,32 @@ export function newControl(start: Slot): ControlLane {
   };
 }
 
+/**
+ * The earliest era before the control lane's `next` whose dense-prefix end this device has not observed sealed, at the
+ * end it observed: the slot the control walk keeps probing, as a member lane keeps its `tail` (§11.2). Around an era
+ * boundary both shards accept writes for up to SKEW (§9.1), so a claim can still land there after rows of a later era
+ * were decided; it comes earlier in order, and is decided before them (§6.5). Null when every earlier era was observed
+ * sealed.
+ */
+export function ctlTail(ep: Epoch): Slot | null {
+  const ctl = ep.ctl;
+  for (let E = ep.Estart ?? ctl.next.E; E < ctl.next.E; E++)
+    if (!ctl.sealed.has(E)) return { E, n: ctl.counts.get(E) ?? 0 };
+  return null;
+}
+
+/**
+ * The control position that a HEADS entry records (§7.2 "HEADS positions"): every era before it observed sealed, and
+ * every slot before it decided not e-valid. That is `next`, unless an earlier era was not observed sealed (its tail),
+ * or a row found there still waits to be decided: a reader trusts every era before the position as sealed (§6.5).
+ */
+export function ctlRecorded(ep: Epoch): Slot {
+  let at = ctlTail(ep) ?? ep.ctl.next;
+  const first = ep.ctl.queue[0];
+  if (first && P.posCmp(first, at) < 0) at = first;
+  return { E: at.E, n: at.n };
+}
+
 export function currentEpoch(c: Copy): Epoch {
   const ep = c.epochs.get(c.current);
   if (!ep) throw new UserError("conversation not ready");

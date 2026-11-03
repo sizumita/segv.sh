@@ -114,6 +114,9 @@ function blocks(s: string, quotes: boolean): Block[] {
   const out: Block[] = [];
   const n = s.length;
   let para = -1; // start of the open paragraph
+  // A run of "> " lines up to here whose spoiler runs past it: no later line before here starts a quote either (each
+  // one's run has the same end, and its line is in that spoiler or before it), so the run is not collected again.
+  let noQuoteBefore = 0;
   const flush = (end: number) => {
     if (para < 0) return;
     const text = s.slice(para, s[end - 1] === "\n" ? end - 1 : end);
@@ -136,7 +139,7 @@ function blocks(s: string, quotes: boolean): Block[] {
         out.push({ t: "quote", c: blocks(rest.startsWith("\n") ? rest.slice(1) : rest, false) });
         return out;
       }
-      if (quotes && line.startsWith("> ")) {
+      if (quotes && i >= noQuoteBefore && line.startsWith("> ")) {
         const lines: string[] = [];
         let k = i;
         while (k < n && s.startsWith("> ", k)) {
@@ -150,6 +153,7 @@ function blocks(s: string, quotes: boolean): Block[] {
           i = k;
           continue;
         }
+        noQuoteBefore = k;
       }
       if ((m = HEADING.exec(line)) && !runsPast(i, end)) {
         flush(i);
@@ -434,14 +438,16 @@ function linkAt(s: string, i: number, depth: number): { node: Inline; end: numbe
   URL_RE.lastIndex = i;
   const m = URL_RE.exec(s);
   if (!m) return null;
-  let url = m[0];
-  // Keep a closing parenthesis that closes one opened in the URL (https://en.wikipedia.org/wiki/Foo_(bar)).
-  while (s[i + url.length] === ")" && count(url, "(") > count(url, ")")) url += ")";
+  // Keep a closing parenthesis that closes one opened in the URL (https://en.wikipedia.org/wiki/Foo_(bar)). The
+  // balance is counted once, not again for each parenthesis kept: a run of them stays linear.
+  let end = i + m[0].length;
+  for (let open = count(m[0], "(") - count(m[0], ")"); open > 0 && s[end] === ")"; open--) end++;
+  const url = s.slice(i, end);
   const href = safeHref(url);
   if (!href) return null;
   return {
     node: { t: "link", href, masked: false, c: [{ t: "text", v: url }] },
-    end: i + url.length,
+    end,
   };
 }
 

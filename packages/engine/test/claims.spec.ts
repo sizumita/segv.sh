@@ -1,6 +1,6 @@
 // Claims: e-validity, winner and finality, processing, commits (docs/PROTOCOL.md §6.3–§6.6, §6.10, §11.3 step 2).
 import { describe, expect, it } from "vite-plus/test";
-import { CHANGING } from "../src/conv";
+import { CHANGING, ctlRecorded } from "../src/conv";
 import { INVALID_CHANGE, frozenInvalid, frozenNoKey } from "../src/claims";
 import { FROZEN_REMOVAL } from "../src/send";
 import { UNDECRYPTABLE } from "../src/sync";
@@ -70,6 +70,44 @@ describe("winner", () => {
       expect(crit(X)).toContain(UNDECRYPTABLE);
     }
     expect(systemLines(B, id).at(-1)).toBe("@alice renamed the conversation to “first”");
+  });
+
+  it("junk decided in a later era leaves an unsealed earlier era open: a claim that lands there still wins", async () => {
+    server().sealDelayMs = 3_600_000; // an ended era stays unsealed until sealPrevious()
+    const {
+      users: [alice, bob, carol],
+      engines: [A, B, C],
+      id,
+    } = await group(["alice", "bob", "carol"]);
+    const ep = epoch(A, id);
+    const E = server().era;
+    // A rename by alice, registered now; its claim is stored later at (E, 0), as a shard whose clock lags would.
+    const late = await commitChange(alice, ep, [alice, bob, carol], "late", {
+      at: { E, k: 0 },
+      noPost: true,
+    });
+    server().advanceEra();
+    junkRow(E + 1, P.Lctl(ep.keys.rk, E + 1, 0), 1);
+    await settle(A, B, C);
+    for (const X of [A, B, C]) {
+      expect(epoch(X, id).ctl.next).toEqual({ E: E + 1, n: 1 }); // the junk is decided
+      // Era E was never observed sealed: a HEADS entry records the control position no later than its end.
+      expect(ctlRecorded(epoch(X, id))).toEqual({ E, n: 0 });
+    }
+    const msg = A as unknown as {
+      msg: { headsDue: boolean; lastHeads: string; flushHeads(): Promise<void> };
+    };
+    msg.msg.headsDue = true;
+    await msg.msg.flushHeads();
+    const A2 = await engineFor(alice); // restored from that HEADS entry
+    expect(epoch(A2, id).ctl.sealed.has(E)).toBe(false);
+    postRow(ep, late.claim);
+    server().sealPrevious();
+    await settle(A, A2, B, C);
+    for (const X of [A, A2, B, C]) {
+      expect(mustView(X, id).epoch).toBe(1);
+      expect(mustView(X, id).name).toBe("# late");
+    }
   });
 
   it("a claim whose bundle is registered at or after the claim's time is e-invalid for every member", async () => {
