@@ -76,6 +76,56 @@ const toasts = () =>
 
 const clearToasts = () => powershell(`${TOASTS} $h.Clear('${AUMID}')`);
 
+/** Lists a process's top-level windows, and closes one as its close button does (WM_CLOSE). */
+const WINDOWS = `Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class SegvWindows {
+  delegate bool EnumProc(IntPtr hwnd, IntPtr lparam);
+  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc proc, IntPtr lparam);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr hwnd, StringBuilder text, int max);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, StringBuilder text, int max);
+  [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr w, IntPtr l);
+  public static string[] Of(uint pid) {
+    var found = new List<string>();
+    EnumWindows(delegate (IntPtr h, IntPtr l) {
+      uint p;
+      GetWindowThreadProcessId(h, out p);
+      if (p == pid) {
+        var title = new StringBuilder(256);
+        GetWindowText(h, title, 256);
+        var cls = new StringBuilder(256);
+        GetClassName(h, cls, 256);
+        found.Add(h.ToInt64() + "|" + (IsWindowVisible(h) ? "visible" : "hidden") + "|" + cls + "|" + title);
+      }
+      return true;
+    }, IntPtr.Zero);
+    return found.ToArray();
+  }
+  public static bool Close(long hwnd) {
+    return PostMessage(new IntPtr(hwnd), 0x0010, IntPtr.Zero, IntPtr.Zero);
+  }
+}
+"@
+`;
+
+/** A process's top-level windows: handle, whether visible, class and title. */
+const windowsOf = (pid) =>
+  list(
+    powershell(`${WINDOWS} ConvertTo-Json -Compress -InputObject @([SegvWindows]::Of(${pid}))`),
+  ).map((line) => {
+    const [hwnd, state, cls, ...title] = String(line).split("|");
+    return { hwnd, visible: state === "visible", cls, title: title.join("|") };
+  });
+
+const describe = (ws) =>
+  ws.map((w) => `${w.hwnd} ${w.visible ? "visible" : "hidden"} ${w.cls} "${w.title}"`).join(", ") ||
+  "none";
+
 /** The processes, other than this script's, whose command line holds `text`: a browser started for a URL. */
 const processesWith = (text) =>
   list(
@@ -258,21 +308,34 @@ export async function windows({ base, browser, shots, exe, cdpPort }) {
         // What went wrong, all of it: one run tells whether the window closed, whether the page saw it, and whether
         // the notification came anyway.
         const failures = [];
-        // The process's main window is its visible top-level window: 0 once the window is hidden.
-        const mainWindow = () => powershell(`(Get-Process -Id ${app.pid}).MainWindowHandle`);
-        const shown = mainWindow();
-        if (powershell(`(Get-Process -Id ${app.pid}).CloseMainWindow()`) !== "True")
-          failures.push(`no window to close (main window ${shown})`);
-        const closed = await until(() => mainWindow() === "0", 10_000);
-        if (!closed)
-          failures.push(`the window ${shown} did not close (main window ${mainWindow()})`);
+        // The app's window, by its title: the process has other top-level windows (the tray's, the web view's), and
+        // the one that .NET takes for its main window may be another.
+        const before = windowsOf(app.pid);
+        note(`the app's windows: ${describe(before)}`);
+        const main = before.find((w) => w.visible && w.title === "segv.sh");
+        let closed = false;
+        if (!main) failures.push(`no visible window titled "segv.sh"`);
+        else if (powershell(`${WINDOWS} [SegvWindows]::Close(${main.hwnd})`) !== "True")
+          failures.push(`could not send WM_CLOSE to ${main.hwnd}`);
+        else {
+          closed = Boolean(
+            await until(
+              () => !windowsOf(app.pid).find((w) => w.hwnd === main.hwnd)?.visible,
+              10_000,
+            ),
+          );
+          if (!closed) failures.push(`the window ${main.hwnd} did not close`);
+        }
         const hidden = await until(async () => (await visibility(W)) === "hidden", 10_000);
         const page = () =>
           W.page.evaluate(
             () => `${document.visibilityState}, ${document.hasFocus() ? "focused" : "not focused"}`,
           );
         if (!hidden) failures.push(`the page did not go hidden (${await page()})`);
-        note(`window ${shown} ${closed ? "closed" : "still shown"}; page ${await page()}`);
+        note(
+          `window ${main?.hwnd ?? "-"} ${closed ? "closed" : "still shown"}; page ${await page()}; ` +
+            `the app's windows: ${describe(windowsOf(app.pid))}`,
+        );
         await sleep(HIDDEN_MS);
         if (hidden && (await visibility(W)) !== "hidden")
           failures.push("the page did not stay hidden");
