@@ -1,5 +1,6 @@
 // Deliveries, WELCOMEs, parked joins and stale times (docs/PROTOCOL.md §6.1, §6.7, §6.11, §6.12, §10.1).
 import { describe, expect, it } from "vite-plus/test";
+import { CHANGING } from "../src/conv";
 import { notNotified } from "../src/deliver";
 import {
   I,
@@ -61,6 +62,72 @@ describe("creation crash and resume", () => {
     await pending;
     const A2 = await engineFor(alice);
     expect(I(A2).views()).toEqual([]);
+  });
+});
+
+describe("a commit that gave up after its claim was stored (§6.3, §6.11)", () => {
+  /** alice and bob in a group, carol registered; alice resumes another session's records only after 10 minutes. */
+  async function setup() {
+    const [alice, bob, carol] = ["alice", "bob", "carol"].map((h) => makeUser(h));
+    const A = await engineFor(alice, { delays: { resumeAfter: 600_000 } });
+    const B = await engineFor(bob);
+    const C = await engineFor(carol);
+    const id = await A.createConversation(["bob"], "g");
+    await settle(A, B, C);
+    await B.accept(id);
+    await settle(A, B, C);
+    return { A, B, C, id, carol };
+  }
+
+  /** carol was delivered J of epoch 1: she holds the conversation, and alice's DELIVERED records cover her. */
+  function deliveredToCarol(A: ReturnType<typeof newEngine>, C: typeof A, id: string, uid: string) {
+    expect(mustView(C, id).epoch).toBe(1);
+    const covered = [...I(A).self!.fold.delivered.values()].some((s) => s.has(uid));
+    expect(covered).toBe(true);
+  }
+
+  it("CHANGING after the finality wait: once the claim wins, this session delivers J", async () => {
+    const { A, B, C, id, carol } = await setup();
+    server().sealDelayMs = 3_600_000; // the era before the claim's stays open: the claim cannot be final
+    server().advanceEra();
+    const invites = postSizes().length;
+    let done = false;
+    let error: unknown = null;
+    void A.addMembers(id, ["carol"])
+      .catch((e: unknown) => (error = e))
+      .finally(() => (done = true));
+    for (let i = 0; i < 400 && !done; i++) {
+      server().tick(1000);
+      await sleep(5);
+    }
+    expect(done).toBe(true);
+    expect((error as Error | null)?.message).toBe(CHANGING);
+    server().sealPrevious();
+    await settle(A, B, C);
+    expect(mustView(A, id).epoch).toBe(1);
+    expect(mustView(B, id).epoch).toBe(1);
+    deliveredToCarol(A, C, id, carol.uidB);
+    expect(postSizes().slice(invites)).toEqual([1]); // one job, one invite
+  });
+
+  it("a lost CAS answer whose probe fails: the commit's own claim wins at the next sync, and J is delivered", async () => {
+    const { A, B, C, id, carol } = await setup();
+    const topic = epoch(A, id).topic;
+    let failUntil = 0;
+    server().hooks.afterPut = (rows, _res, who) => {
+      if (who !== "alice" || failUntil || !rows.some((r) => P.equalBytes(r.topic, topic))) return;
+      failUntil = Date.now() + 2000;
+      return "lose";
+    };
+    server().hooks.fail = (_m, p, who) =>
+      who === "alice" && p === "/api/v2/get" && Date.now() < failUntil ? "before" : null;
+    const invites = postSizes().length;
+    await A.addMembers(id, ["carol"]);
+    expect(failUntil).toBeGreaterThan(0);
+    await settle(A, B, C);
+    expect(mustView(A, id).epoch).toBe(1);
+    deliveredToCarol(A, C, id, carol.uidB);
+    expect(postSizes().slice(invites)).toEqual([1]);
   });
 });
 
