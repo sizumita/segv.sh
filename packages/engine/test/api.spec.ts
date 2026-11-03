@@ -1,7 +1,15 @@
 // The client API module (packages/engine/src/api.ts) at unit level: params bounds (§3.1), the server-time estimate
 // (§10.1), the PoW window restart (§10.2), and the prefix bits of directory lookups (§10.6).
 import { describe, expect, it } from "vite-plus/test";
-import { Api, ApiError, ServerClock, checkParams, isTransient } from "../src/api";
+import {
+  Api,
+  ApiError,
+  REQUEST_TIMEOUT_MS,
+  ServerClock,
+  UPLOAD_BYTES_PER_S,
+  checkParams,
+  isTransient,
+} from "../src/api";
 import { I, P, TestClock, engineFor, freshWorldPerTest, makeUser, server } from "./harness";
 
 freshWorldPerTest();
@@ -301,5 +309,115 @@ describe("directory prefix bits (§10.6)", () => {
     expect(s.rtt).toBeGreaterThanOrEqual(0);
     expect(Math.abs(s.s + (I(R).clock.mono() - s.mid) - server().now())).toBeLessThan(1000);
     expect(server().requests.filter((r) => r.who === "sampler").length).toBeGreaterThan(3);
+  });
+});
+
+describe("request deadlines (§10.1)", () => {
+  /** Lets pending promise callbacks run. */
+  const flush = () => new Promise<void>((r) => setTimeout(r, 0));
+  const headers = { "cache-control": "no-store", "x-segv-now": String(PARAMS.now) };
+
+  it("a request that never answers fails as a transient timeout on the engine's clock, and its signal aborts", async () => {
+    const c = new TestClock();
+    c.pauseMono();
+    let signal: AbortSignal | undefined;
+    const api = new Api({
+      clock: c,
+      fetch: ((_: unknown, init?: RequestInit) => {
+        signal = init?.signal ?? undefined;
+        return new Promise<Response>(() => {}); // a transport that ignores the signal
+      }) as typeof fetch,
+    });
+    let err: unknown = null;
+    const run = api.request("/api/v2/params").catch((e: unknown) => (err = e));
+    c.advance(REQUEST_TIMEOUT_MS - 1);
+    await flush();
+    expect(err).toBeNull();
+    c.advance(1);
+    await run;
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).status).toBe(0);
+    expect((err as ApiError).message).toBe("timeout");
+    expect(isTransient(err)).toBe(true);
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it("the deadline covers the whole answer: headers that come in time with a body that never ends still fail", async () => {
+    const c = new TestClock();
+    c.pauseMono();
+    const api = new Api({
+      clock: c,
+      fetch: (async () =>
+        new Response(new ReadableStream({ start: (ctl) => ctl.enqueue(new Uint8Array(1)) }), {
+          headers,
+        })) as typeof fetch,
+    });
+    let err: unknown = null;
+    const run = api.readInbox(10, 0).catch((e: unknown) => (err = e));
+    await flush();
+    c.advance(REQUEST_TIMEOUT_MS);
+    await run;
+    expect((err as ApiError).message).toBe("timeout");
+  });
+
+  it("a blob download goes on while bytes keep coming, and fails once they stop for the deadline", async () => {
+    const c = new TestClock();
+    c.pauseMono();
+    let body!: ReadableStreamDefaultController<Uint8Array>;
+    const api = new Api({
+      clock: c,
+      fetch: (async () =>
+        new Response(new ReadableStream({ start: (ctl) => void (body = ctl) }), {
+          headers: { "content-length": "4" },
+        })) as typeof fetch,
+    });
+    const got = api.getBlob(new Uint8Array(32), 4);
+    for (let i = 0; i < 3; i++) {
+      await flush();
+      c.advance(REQUEST_TIMEOUT_MS - 1000); // 87 s in all, never 30 s without a byte
+      body.enqueue(new Uint8Array(1));
+    }
+    await flush();
+    body.enqueue(new Uint8Array(1));
+    body.close();
+    expect((await got)?.sizeOk).toBe(true);
+
+    const stalled = api.getBlob(new Uint8Array(32), 4).catch((e: unknown) => e);
+    await flush();
+    body.enqueue(new Uint8Array(1));
+    await flush();
+    c.advance(REQUEST_TIMEOUT_MS);
+    const err = await stalled;
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).message).toMatch(/timeout/);
+    expect(isTransient(err)).toBe(true);
+  });
+
+  it("a blob upload's deadline grows with its body", async () => {
+    const c = new TestClock();
+    c.pauseMono();
+    const size = 64 * UPLOAD_BYTES_PER_S; // 64 s more than an ordinary request
+    let sent!: () => void;
+    const putSent = new Promise<void>((r) => (sent = r));
+    const api = new Api({
+      clock: c,
+      fetch: (async (input: RequestInfo | URL) => {
+        if (String(input) === "/api/v2/params")
+          return new Response(JSON.stringify({ ...PARAMS, pow: { ...PARAMS.pow, blob: 0 } }), {
+            headers,
+          });
+        sent();
+        return new Promise<Response>(() => {});
+      }) as typeof fetch,
+    });
+    let err: unknown = null;
+    const run = api.putBlob(new Uint8Array(32), new Uint8Array(size)).catch((e) => (err = e));
+    await putSent;
+    c.advance(REQUEST_TIMEOUT_MS + 63_000);
+    await flush();
+    expect(err).toBeNull();
+    c.advance(1000);
+    await run;
+    expect((err as ApiError).message).toBe("timeout");
   });
 });

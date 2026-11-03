@@ -350,22 +350,36 @@ export class Messaging {
     for (const rt of this.rts) rt.stop();
     this.rts.length = 0;
     for (const t of this.timers) t.cancel();
-    void this.worker?.then((w) => w?.terminate());
+    void this.inbox?.then((x) => x.worker?.terminate());
   }
 
-  private worker: Promise<Worker | null> | null = null;
+  private inbox: Promise<{ worker: Worker | null; decrypt: Decrypt }> | null = null;
 
   /**
    * Trial decryption in the inbox Web Worker when one can be made (§11.5 step 2; EngineOptions.inboxWorker: absent
-   * is the default factory, null is none), else on this thread.
+   * is the default factory, null is none), else on this thread. A worker that fails is dropped, and the session goes
+   * on with this thread, as when none can be made.
    */
   private async decrypter(): Promise<Decrypt> {
     const opt = this.h.opts.inboxWorker;
     if (opt === null) return sameThread;
     const make = opt ?? (() => import("./inbox-worker-url").then((m) => m.createInboxWorker()));
-    this.worker ??= make().catch(() => null);
-    const w = await this.worker;
-    return w ? workerDecrypt(w) : sameThread;
+    const none = { worker: null, decrypt: sameThread };
+    this.inbox ??= make()
+      .catch(() => null)
+      .then((worker) =>
+        worker
+          ? {
+              worker,
+              decrypt: workerDecrypt(
+                worker,
+                this.h.clock,
+                () => (this.inbox = Promise.resolve(none)),
+              ),
+            }
+          : none,
+      );
+    return (await this.inbox).decrypt;
   }
 
   private every(ms: () => number, fn: () => Promise<unknown>): void {

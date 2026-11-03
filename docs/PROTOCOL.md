@@ -2890,6 +2890,17 @@ pushes a second, quiet pushes included; a flood of registrations or rings can fi
   the system may set; only the elapsed-time checks of §11.3 steps 6 and 8 read it. Every API call a client makes
   regularly (`get`, `put`, params, `blob/meta`, directory, `ckpt/latest`) is `no-store`, so the estimate of §3.1 never
   goes stale.
+- **Timeouts.** A client MUST give every request a deadline on its monotonic clock. A request that misses it is
+  aborted and counts as a timeout: a transient failure, like a network error (for a put, "outcome unknown", §10.3).
+  The deadline is 30 s from just before the request is sent until its whole answer has been read. Two kinds of request
+  can be large, and get more time:
+  - A blob upload gets 30 s plus one second per 16 KiB of its body, about 13 minutes for 12 MiB. A page sees no
+    progress of an upload, so the deadline is that of the slowest link the client still serves.
+  - A blob download gets 30 s for its answer headers, then 30 s again for every chunk of its body, so it goes on as
+    long as bytes keep arriving.
+
+  The platforms set no deadline of their own, or only a long one. Without this one, a request that never answers, on a
+  connection that went half-open during sleep or at a network change, would hold up every request queued behind it.
 - **Hardening.** §9.7 applies to every response (the `101` upgrade only through its exemption), including the era
   bounds and the cache-before-limits rule.
 - **Cross-origin requests.** Only the pages of the deployment's own origin and of its app origins (`APP_ORIGINS`,
@@ -3936,7 +3947,10 @@ The client polls every `max(inboxSlot, 2)` seconds while the page is visible, on
    era. A 410 moves the cursor to `(max(E_FIRST, E_now − 3), 0)`. Without a cursor (the self lane holds no HEADS
    record), start at the registration cursor with `t_r = start(regEra)` (below).
 2. Trial-decrypt each row (§5.3), in chunks in a Web Worker, so the page stays responsive. A decapsulation that throws
-   means "not for me". Process each J (§6.7). Joins found in one poll are processed one after the other, each after
+   means "not for me". A worker that fails (an `error` or `messageerror` event, as when its script does not load) or
+   leaves a chunk unanswered for 30 s is terminated. Its waiting chunks, and every later chunk of the session, are
+   then decrypted on the page's thread, yielding to the event loop between chunks, so a failed worker never stops a
+   poll. Process each J (§6.7). Joins found in one poll are processed one after the other, each after
    the held copies of its conversation are caught up and settled (§6.7 step 4). A J of a conversation of which an
    earlier J of the same poll created a copy is parked, with the cursor before it, until the next poll, when that copy
    is held and settled (§6.7 step 4): so an honest sequence of re-adds, each after a removal
