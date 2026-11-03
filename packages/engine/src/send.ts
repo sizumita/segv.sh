@@ -52,8 +52,8 @@ export interface SendCtx {
   wait(ms: number): Promise<void>;
   /** applies a row of this device's own lane (or a sibling's) found by the send */
   applyOwn(c: Copy, ep: Epoch, row: FoundRow): void;
-  /** the local echo for a row about to be put (so the row replaces it when it arrives first) */
-  expectEcho(key: string): void;
+  /** the local echo for a row about to be put, with its body (so the row replaces it when it arrives first) */
+  expectEcho(key: string, body: Bytes): void;
   beforePutAttempt?: () => void | Promise<void>;
   progress(text: string): void;
   /**
@@ -178,6 +178,10 @@ async function steps12(
   }
 }
 
+/** A TEXT, IMAGE or FILE: a row with a view and an echo. */
+const visibleRow = (type: number): boolean =>
+  type === P.MT.TEXT || type === P.MT.IMAGE || type === P.MT.FILE;
+
 /** A row sent on self's lane: its slot, label, sealed body and order data. */
 export interface SentRow extends FoundRow {
   e: number;
@@ -216,7 +220,7 @@ export async function sendRow(ctx: SendCtx, c: Copy, content: P.MBody): Promise<
     } catch {
       throw new UserError("message is too long");
     }
-    ctx.expectEcho(rowKey(Estar, row.label));
+    ctx.expectEcho(rowKey(Estar, row.label), row.body);
     const req = W.encodePutRequest([
       { E: Estar, label: row.label, cls: row.cls, topic: ep.topic, body: row.body },
     ]);
@@ -249,8 +253,7 @@ export async function sendRow(ctx: SendCtx, c: Copy, content: P.MBody): Promise<
       found.t = res.t;
       ctx.applyOwn(c, ep, found);
       // Stored: an OK, a lost answer's retry or probe that finds our body, a late row too (§11.3 step 6, §11.13).
-      if (content.type === P.MT.TEXT || content.type === P.MT.IMAGE || content.type === P.MT.FILE)
-        ctx.ring?.(c, ep, Estar, row.label);
+      if (visibleRow(content.type)) ctx.ring?.(c, ep, Estar, row.label);
       // Step 8: a late row counts as delivered only while the copy is still in its epoch, or in e+1 with no own row
       // there (the others still follow self's lane of e).
       if (elapsed(ctx, sent) >= (params.delta + params.skew) * 1000) {
@@ -264,6 +267,9 @@ export async function sendRow(ctx: SendCtx, c: Copy, content: P.MBody): Promise<
             !next.lanes[next.myIndex].seen);
         if (!r || r.timedOut || !stillFollowed) throw new UserError(NOT_DELIVERED);
       }
+      // A message row that §6.8 drops (a final claim removed self before it landed) was not delivered (step 7).
+      if (visibleRow(content.type) && !ep.rows.get(rowKey(Estar, row.label))?.shown)
+        throw new UserError(NOT_DELIVERED);
       return { ...found, e: ep.e };
     }
     if (res.s === "conflict") {

@@ -3679,9 +3679,11 @@ same error instead, nothing keeps its body, and it is not retried (the user reac
      of work). A slow proof of work, a frozen tab or a WRONG_ERA wait thus costs one more `get`, never a row in an
      epoch the others have left (§11.2).
    - **OK**: verify the receipt, apply the row locally (the echo becomes `sent`, unless the row is late, step 8), and
-     update the lane head. For a TEXT, IMAGE or FILE row, this success and the two others below (a CONFLICT with its
-     own body, a probe that finds its own body) are each followed by the row's ring (§11.13), whether or not this
-     device has notifications on.
+     update the lane head. If the row arrives first (§11.6, or a catch-up), its view takes the echo's place, with status
+     `sending`, until the send decides; only a row with exactly the body sent does, never a sibling's row in that slot.
+     For a TEXT, IMAGE or FILE row, this success and the two others below (a CONFLICT with its own body, a probe that
+     finds its own body) are each followed by the row's ring (§11.13), whether or not this device has notifications
+     on.
    - **CONFLICT(o)**:
      - if `o.body` is exactly what was sent: success (a lost response was retried);
      - else if `o` opens under `mk_e` and is a valid row of this lane signed by self (a sibling device): apply it as a
@@ -3697,8 +3699,9 @@ same error instead, nothing keeps its body, and it is not retried (the user reac
        the request failed); try again". The client keeps the sealed body and its slot.
      - If every probe fails: the echo becomes `failed` with the same error, and the client keeps the body.
    - Any other 4xx: the echo becomes `failed`, with the server's error.
-7. After success, if the cut rule (§6.8) later drops this row because a final winning claim removed the sender, mark the
-   echo `failed`, with the same "not delivered" error (a dropped REACTION counts for nothing, §11.12).
+7. After success, if the cut rule (§6.8) drops this row because a final winning claim removed the sender, when it is
+   applied or later, mark the echo `failed`, with the same "not delivered" error (a dropped REACTION counts for
+   nothing, §11.12).
 8. **Late rows.** A row is *late* when the answer to its put (or to the probe that found its body) arrived `Δ + SKEW`
    seconds or more after its latest step-1 probe was sent, by the monotonic clock, the wall clock or the estimated
    server time (as in step 6), or
