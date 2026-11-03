@@ -217,8 +217,12 @@ export async function windows({ base, browser, shots, exe, cdpPort }) {
       await send(B, `see ${url}`);
       await seen(W, url);
       await W.page.locator(`.thread a[href="${url}"]`).first().click();
-      const started = await until(() => processesWith(url), 30_000);
-      check(started, `no browser started for the link`);
+      // An empty list is no browser: keep waiting for one.
+      const started = await until(() => {
+        const found = processesWith(url);
+        return found.length > 0 ? found : null;
+      }, 30_000);
+      check(started?.length > 0, `no browser started for the link`);
       note(`started ${started.map((p) => p.name).join(", ")}`);
       check(
         W.page.url().startsWith("https://tauri.localhost/"),
