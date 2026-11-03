@@ -196,6 +196,14 @@ export function parseIndexName(name: string | undefined, kind: "conn" | "feed" |
 }
 
 /** Parses "shard/v2/{E}/{i}" / "inbox/v2/{E}/{g}" (decimal, no padding). */
+/** Validates the (E, g, rel) of an inbox notice (§9.3): E a u16 below 0xFFFF, g and rel u32s. */
+export function checkNotice(E: unknown, g: unknown, rel: unknown): void {
+  if (!Number.isInteger(E) || (E as number) < 0 || (E as number) > 0xfffe) throw new TypeError("notice: bad era");
+  for (const x of [g, rel]) {
+    if (!Number.isInteger(x) || (x as number) < 0 || (x as number) > 0xffffffff) throw new TypeError("notice: bad number");
+  }
+}
+
 export function parseEraName(name: string | undefined, kind: "shard" | "inbox"): { E: number; i: number } {
   const m = name ? new RegExp(`^${kind}/v2/(0|[1-9]\\d{0,4})/(0|[1-9]\\d{0,4})$`).exec(name) : null;
   if (!m) throw new Error(`${kind} DO: unexpected name`);

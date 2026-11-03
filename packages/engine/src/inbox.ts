@@ -43,6 +43,8 @@ export interface InboxScan {
    * `end(E) + (2·SKEW + 2·Δin)·1000`; the current era never is.
    */
   cursor: InboxCursor;
+  /** the `closed` each era read reported (the last page's), by era; an era answered 410 is absent */
+  closed: Map<number, number>;
 }
 
 export const MALFORMED_INVITE = "ignored a malformed conversation key";
@@ -125,6 +127,7 @@ export async function scanInbox(
   const lo = Math.max(p.efirst, Enow - 3);
   const from = start.E < lo ? { E: lo, rel: 0 } : start;
   const joins: FoundJoin[] = [];
+  const closedBy = new Map<number, number>();
   let next: InboxCursor | null = null;
   for (let E = from.E; E <= Enow; E++) {
     let after = E === from.E ? from.rel : 0;
@@ -151,10 +154,15 @@ export async function scanInbox(
       if ((e as { status?: number }).status === 410) continue; // older than E_now − 3: gone (§10.5)
       throw e;
     }
+    closedBy.set(E, closed);
     const complete = E < Enow && issued >= P.eraEnd(E) + (2 * p.skew + 2 * p.inboxSlot) * 1000;
     if (!complete && next === null) next = { E, rel: closed };
   }
-  return { joins, cursor: next ?? { E: Enow, rel: from.E === Enow ? from.rel : 0 } };
+  return {
+    joins,
+    cursor: next ?? { E: Enow, rel: from.E === Enow ? from.rel : 0 },
+    closed: closedBy,
+  };
 }
 
 /** The earlier of two cursors. */

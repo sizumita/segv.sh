@@ -43,6 +43,8 @@ export interface WorldCtx {
   bumpWrites(): void;
   /** FeedDO.publish → ConnDO.deliver (rows with a zero topic must not be passed). */
   publish(rows: PublishRow[]): void;
+  /** InboxDO alarm → FeedDO.inbox → ConnDO.deliverInbox: an INBOX notice to every socket subscribed to Tinbox(E, g). */
+  notice(E: number, g: number, rel: number): void;
 }
 
 /** A fake HTTP response before the world adds the common headers. */

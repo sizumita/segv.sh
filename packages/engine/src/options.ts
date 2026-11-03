@@ -49,9 +49,7 @@ export interface EngineDelays {
   headsInterval: number;
   /** and after a random delay of up to this much */
   headsJitter: number;
-  /** inbox poll interval (§11.5: max(inboxSlot, 2) s by default; 0 = derived from params) */
-  pollInterval: number;
-  /** catch-up interval while the realtime socket is down */
+  /** catch-up interval while the realtime socket is down (the inbox is read at each catch-up, and on notices, §11.5) */
   catchUpInterval: number;
 }
 
@@ -63,7 +61,6 @@ export const DEFAULT_DELAYS: EngineDelays = {
   resumeAfter: 10 * 60_000,
   headsInterval: 30 * 60_000,
   headsJitter: 5 * 60_000,
-  pollInterval: 0,
   catchUpInterval: 10_000,
 };
 

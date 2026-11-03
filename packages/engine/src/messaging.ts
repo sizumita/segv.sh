@@ -197,6 +197,10 @@ export class Messaging {
   private readonly rts: Realtime[] = [];
   /** monotonic time of the last periodic catch-up */
   private lastPeriodic = -Infinity;
+  /** the eras whose inbox notice topics are subscribed (§10.8) */
+  private inboxEras: number[] = [];
+  /** the poll Δin after a notice whose slot the read had not reached (§10.8); at most one pending */
+  private inboxRetry: EngineTimer | null = null;
   private WS: WebSocketCtor | null = null;
   private seqCounter = 0;
   private localCounter = 0;
@@ -308,9 +312,10 @@ export class Messaging {
     this.repeatLeaves();
   }
 
-  /** Starts realtime and the periodic inbox poll and catch-up (§11.5, §11.6). */
+  /** Starts realtime and the periodic catch-up (§11.6); the inbox is read on notices and at catch-ups (§11.5). */
   start(): void {
     this.live = true;
+    this.lastPeriodic = this.h.clock.mono(); // the restore just synced everything; the connect runs its own catch-up
     // §11.4 step 10: a snapshot when the era has none or many records were applied since the latest one.
     void this.h.track(this.maybeSnapshot()).catch(() => {});
     const WS =
@@ -318,15 +323,12 @@ export class Messaging {
       (typeof WebSocket === "undefined" ? null : (WebSocket as unknown as WebSocketCtor));
     this.WS = WS;
     this.subscribe();
-    this.every(
-      () => Math.max(this.params().inboxSlot, 2) * 1000,
-      () => this.h.enqueue(() => this.pollInbox()),
-    );
     // The loop ticks at the short interval, so a socket that drops gets the short cadence at once, not after the
-    // long wait that was scheduled while it was connected.
+    // long wait that was scheduled while it was connected. Each tick also keeps the inbox notice topics on E_now.
     this.every(
       () => this.h.delays.catchUpInterval,
       () => {
+        this.refreshInboxTopics();
         const now = this.h.clock.mono();
         if (this.rts[0]?.connected && now - this.lastPeriodic < CONNECTED_CATCH_UP_MS)
           return Promise.resolve();
@@ -341,6 +343,8 @@ export class Messaging {
     for (const rt of this.rts) rt.stop();
     this.rts.length = 0;
     for (const t of this.timers) t.cancel();
+    this.inboxRetry?.cancel();
+    this.inboxRetry = null;
     void this.worker?.then((w) => w?.terminate());
   }
 
@@ -1856,6 +1860,7 @@ export class Messaging {
         onMissed: () => void this.catchUpSoon(),
         onSubscribed: () => void this.catchUpSoon(),
         onHello: (s, sent, recv) => this.h.api.time.add(s, sent, recv),
+        onInbox: (E, g, rel) => this.onInbox(E, g, rel),
         onState: () => this.h.setConnected(this.rts.some((x) => x.connected)),
       },
       this.h.api.origin,
@@ -1865,13 +1870,15 @@ export class Messaging {
   }
 
   /**
-   * The topics, in priority order (§10.8): Tself, the current epochs of accepted copies by recent activity, the old
-   * epochs with followed lanes (§11.2), then the live links' Tlink. Requests are never subscribed. At most 256 per
-   * socket and 2 sockets; the rest are covered by catch-up.
+   * The topics, in priority order (§10.8): Tself, the inbox notice topics (§9.3), the current epochs of accepted
+   * copies by recent activity, the old epochs with followed lanes (§11.2), then the live links' Tlink. Requests are
+   * never subscribed. At most 256 per socket and 2 sockets; the rest are covered by catch-up.
    */
   private subscribe(): void {
     if (!this.live || !this.WS) return;
     const topics: Bytes[] = [P.topicSelf(this.h.acc.id.nS)];
+    this.inboxEras = this.inboxErasNow();
+    for (const E of this.inboxEras) topics.push(P.topicInbox(E, 0));
     const accepted = [...this.copies.values()]
       .filter((c) => !c.request && !c.removed)
       .sort((a, b) => b.lastTs - a.lastTs);
@@ -1903,8 +1910,49 @@ export class Messaging {
 
   // ───────────────────────── inbox and joins (§6.7, §11.5) ─────────────────────────
 
-  /** Reads the inbox, accepts the joins found (in order) and moves the cursor (§11.5). */
-  async pollInbox(): Promise<void> {
+  /** The eras whose inbox notices are watched (§10.8): E_now − 1 .. E_now + 1, within retention and below 0xFFFF. */
+  private inboxErasNow(): number[] {
+    const p = this.params();
+    const En = P.era(this.h.api.serverNow());
+    const lo = Math.max(p.efirst, En - 3);
+    return [En - 1, En, En + 1].filter((E) => E >= lo && E <= 0xfffe);
+  }
+
+  /** Subscribes again when the era moved on, so that the notice topics follow E_now (§10.8). */
+  private refreshInboxTopics(): void {
+    const want = this.inboxErasNow();
+    if (want.length === this.inboxEras.length && want.every((E, i) => E === this.inboxEras[i]))
+      return;
+    this.subscribe();
+  }
+
+  /**
+   * An INBOX notice (§10.8): slot `rel` of bucket `g` of era `E` closed with rows. Poll the inbox; when the read of E
+   * did not reach `rel` (a response cached before the close, or an era this device does not read yet), poll once more
+   * after Δin. The catch-up every 300 s covers whatever these two miss.
+   */
+  private onInbox(E: number, g: number, rel: number): void {
+    if (g !== 0 || !this.live || this.stopped) return;
+    void this.h
+      .track(
+        this.h.enqueue(async () => {
+          const closed = await this.pollInbox();
+          if ((closed.get(E) ?? -1) >= rel || this.inboxRetry) return;
+          this.inboxRetry = this.h.clock.setTimer(() => {
+            this.inboxRetry = null;
+            if (!this.live || this.stopped) return;
+            void this.h.track(this.h.enqueue(() => this.pollInbox())).catch(() => {});
+          }, this.params().inboxSlot * 1000);
+        }),
+      )
+      .catch(() => {});
+  }
+
+  /**
+   * Reads the inbox, accepts the joins found (in order) and moves the cursor (§11.5). Returns the `closed` each era
+   * read reported.
+   */
+  async pollInbox(): Promise<Map<number, number>> {
     this.h.api.beginOperation(); // a poll's joins share one fresh answer per prefix (§10.6)
     const p = await this.h.api.params();
     const scan = await scanInbox(
@@ -1921,6 +1969,7 @@ export class Messaging {
       scan.joins.map((x) => ({ J: x.J, at: { E: x.E, rel: x.rel } })),
       scan.cursor,
     );
+    return scan.closed;
   }
 
   private joinCtx(pending: NewCopy[]): JoinCtx {

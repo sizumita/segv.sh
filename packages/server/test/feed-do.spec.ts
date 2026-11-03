@@ -8,7 +8,7 @@ import type { ConnDO } from "../src/conn-do";
 import type { ConnLink, FeedDO, FeedLimits } from "../src/feed-do";
 import { connName, feedName, type RtPublishRow } from "../src/types";
 
-type FeedInner = Pick<FeedDO, "publish" | "interest" | "replace" | "topicsOf"> & {
+type FeedInner = Pick<FeedDO, "publish" | "inbox" | "interest" | "replace" | "topicsOf"> & {
   clock: () => number;
   limits: FeedLimits;
   conns: (c: number) => ConnLink;
@@ -44,9 +44,11 @@ async function socket(stub: DurableObjectStub<ConnDO>, c = -1) {
   expect(res.status).toBe(101);
   const ws = res.webSocket!;
   const rows: W.RtRow[] = [];
+  const frames: W.ServerFrame[] = [];
   let hello = false;
   ws.addEventListener("message", (e) => {
     const f = W.decodeServerFrame(new Uint8Array(e.data as ArrayBuffer));
+    frames.push(f);
     if (f.f === "hello") hello = true;
     if (f.f === "rows") rows.push(...f.rows);
   });
@@ -61,6 +63,7 @@ async function socket(stub: DurableObjectStub<ConnDO>, c = -1) {
     c,
     ws,
     rows,
+    frames,
     sub: (topics: Uint8Array[]) => ws.send(W.encodeClientFrame({ f: "sub", topics })),
     rowsAre: (n: number) =>
       eventually(
@@ -177,6 +180,7 @@ describe("FeedDO", () => {
         const real = i.conns;
         i.conns = (cc) => ({
           topicsFor: (j) => real(cc).topicsFor(j),
+          deliverInbox: (E, g, rel) => real(cc).deliverInbox(E, g, rel),
           deliver: async (rows) => {
             if (failures > 0) {
               failures--;
@@ -231,6 +235,46 @@ describe("FeedDO", () => {
       await feedInside(feed, (i) => void (i.clock = () => Date.now()));
       await feed.replace(c, []);
     }
+  });
+
+  it("inbox(E, g, rel) reaches the ConnDOs with interest in Tinbox(E, g) only, as one INBOX frame per socket (§9.3)", async () => {
+    const E = 42;
+    const g = 1 + Math.floor(Math.random() * 1e6);
+    const T = P.topicInbox(E, g);
+    const conn = connAt(C - 1);
+    const s = await socket(conn);
+    const other = await socket(conn);
+    s.sub([T]);
+    other.sub([topic()]);
+    await eventually(
+      () => feedOf(T).topicsOf(C - 1),
+      (x) => x.includes(P.hex(T)),
+      "interest",
+    );
+    await feedOf(T).inbox(E, g, 7);
+    const inboxFrames = (x: typeof s) => x.frames.filter((f) => f.f === "inbox");
+    await eventually(
+      () => inboxFrames(s).length,
+      (n) => n >= 1,
+      "INBOX",
+    );
+    expect(inboxFrames(s)).toEqual([{ f: "inbox", E, g, rel: 7 }]);
+    await sleep(50);
+    expect(inboxFrames(other)).toEqual([]);
+    expect(s.rows).toEqual([]);
+    await feedInside(feedOf(T), async (i) => {
+      for (const [e, gg, r] of [
+        [-1, 0, 0],
+        [0xffff, 0, 0],
+        [0, -1, 0],
+        [0, 0, 2 ** 32],
+        [1.5, 0, 0],
+      ]) {
+        await expect(i.inbox(e, gg, r)).rejects.toThrow(TypeError);
+      }
+    });
+    s.close();
+    other.close();
   });
 
   it("rejects malformed rows, topics and indexes", async () => {

@@ -208,4 +208,17 @@ export class AlarmSlot {
       console.error(JSON.stringify({ msg: "setAlarm failed", error: logErr(e) }));
     });
   }
+
+  /** Arms min(current alarm, due) and waits for the write (alarm handlers, whose re-arm tests observe at once). */
+  async set(due: number): Promise<void> {
+    if (!Number.isFinite(due)) return;
+    if (this.armed !== null && this.armed <= due) return;
+    this.armed = due;
+    try {
+      await this.storage.setAlarm(due);
+    } catch (e) {
+      this.armed = null;
+      console.error(JSON.stringify({ msg: "setAlarm failed", error: logErr(e) }));
+    }
+  }
 }

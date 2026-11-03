@@ -23,16 +23,18 @@
  *    row after it; also GAP when the rows to replay exceed `replayBytes` (the client catches up instead).
  *  - deliver(): from a FeedDO: assigns seqs, appends to the ring, sends one ROWS frame per subscribed socket;
  *    sockets that get the same rows share one encoding.
+ *  - deliverInbox(): from a FeedDO (§9.3): one INBOX frame to each socket subscribed to Tinbox(E, g); no seq, no ring,
+ *    no replay.
  *  - Sockets older than 1 h are closed with 4000 (hour tags older than the previous hour whenever sockets are
  *    counted or sent to, and the exact age before sending).
  */
 import { DurableObject } from "cloudflare:workers";
-import { BODY_LENS, byteCmp, equalBytes, feedBits, feedHash, feedOf, hex } from "@segv/protocol/proto";
+import { BODY_LENS, byteCmp, equalBytes, feedBits, feedHash, feedOf, hex, topicInbox } from "@segv/protocol/proto";
 import { RT_MAX_CLIENT_FRAME, RT_MAX_TOPICS, decodeClientFrame, encodeServerFrame, type ClientFrame, type RtRow } from "@segv/protocol/wire";
 import { AlarmSlot } from "./batch";
 import { serverKeys, v2Params } from "./env";
 import { logErr } from "./http";
-import { feedStub, parseIndexName, type RtPublishRow } from "./types";
+import { checkNotice, feedStub, parseIndexName, type RtPublishRow } from "./types";
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 3_600_000;
@@ -501,6 +503,29 @@ export class ConnDO extends DurableObject<Env> {
       this.sendFrames(ws, frames);
     }
     await this.settle(); // sockets dropped here (max age, a failed send) are withdrawn before the call returns
+  }
+
+  /**
+   * §9.4 deliverInbox (from a FeedDO, §9.3): one INBOX frame to each socket subscribed to Tinbox(E, g). A notice gets
+   * no seq, enters no ring and is never replayed.
+   */
+  async deliverInbox(E: number, g: number, rel: number): Promise<void> {
+    checkNotice(E, g, rel);
+    const T = topicInbox(E, g);
+    const now = this.clock();
+    this.sweep(now);
+    const socks = this.mirror();
+    const cands = this.index.get(prefixOf(T));
+    if (cands) {
+      const frame = encodeServerFrame({ f: "inbox", E, g, rel });
+      for (const ws of cands) {
+        const att = socks.get(ws);
+        if (!att || !hasTopic(att.topics, T)) continue;
+        if (now - att.t > this.limits.maxAgeMs) this.drop(ws, 4000, "max age");
+        else this.trySend(ws, frame);
+      }
+    }
+    await this.settle(); // sockets dropped here are withdrawn before the call returns
   }
 
   /** Drops rows older than ringMs and beyond ringRows / ringBytes, oldest first. */

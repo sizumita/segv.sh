@@ -1426,6 +1426,26 @@ describe("self lane labels (§4.1)", () => {
     expect(P.topicSelf(nS).length).toBe(16);
   });
 
+  it("Tinbox(E, g) = t16(H(enc(\"segv.sh/v2/topic/inbox\", u16 E, u32 g))) (§9.3), public and keyless", () => {
+    for (const [E, g] of [
+      [0, 0],
+      [3, 7],
+      [0xfffe, 0xffffffff],
+    ]) {
+      expect(toHex(P.topicInbox(E, g))).toBe(toHex(tr16(sha(refEnc("segv.sh/v2/topic/inbox", be16(E), be32(g))))));
+      expect(P.topicInbox(E, g).length).toBe(16);
+    }
+    expect(toHex(P.topicInbox(1, 0))).not.toBe(toHex(P.topicInbox(0, 1)));
+    for (const [E, g] of [
+      [-1, 0],
+      [0x10000, 0],
+      [0, 2 ** 32],
+      [1.5, 0],
+    ]) {
+      expect(() => P.topicInbox(E, g)).toThrow();
+    }
+  });
+
   it("rejects E and n outside u16 / u32 instead of aliasing", () => {
     for (const f of [P.Lself, P.Lsnap]) {
       expect(() => f(rS, 0x10000, 0)).toThrow();

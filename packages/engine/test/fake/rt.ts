@@ -23,7 +23,7 @@
  * Test controls: `restart()` (new boot and empty ring, so the next RESUME gets GAP), `enabled` (false: new sockets
  * fail to connect and publishes are lost), `dropPublish(pred)` (lose matching publishes), `closeAll()`.
  */
-import { b64u, random, type Bytes } from "@segv/protocol/proto";
+import { b64u, random, topicInbox, type Bytes } from "@segv/protocol/proto";
 import {
   RT_MAX_CLIENT_FRAME,
   RT_MAX_TOPICS,
@@ -125,6 +125,8 @@ export class FakeRealtime {
   private dropPred: ((row: PublishRow) => boolean) | null = null;
   /** Rows published (accepted into the ring) and dropped, for assertions. */
   readonly stats = { published: 0, dropped: 0 };
+  /** Every inbox notice the InboxDO announced (§9.3), delivered or not, for assertions. */
+  readonly notices: { E: number; g: number; rel: number; at: number }[] = [];
 
   constructor(private readonly host: RtHost) {}
 
@@ -164,6 +166,21 @@ export class FakeRealtime {
       );
       if (match.length === 0 || !this.checkAge(ws, now)) continue;
       for (const frame of rowFrames(match)) setTimeout(() => ws._deliver(frame), 0);
+    }
+  }
+
+  // ───────────── InboxDO.alarm → FeedDO.inbox → ConnDO.deliverInbox ─────────────
+
+  /** An INBOX notice (§9.3, §10.8) to every open socket subscribed to Tinbox(E, g): no seq, no ring, no replay. */
+  inbox(E: number, g: number, rel: number): void {
+    const now = this.host.now();
+    this.notices.push({ E, g, rel, at: now });
+    if (!this.enabled) return;
+    const key = b64u(topicInbox(E, g));
+    const frame = encodeServerFrame({ f: "inbox", E, g, rel });
+    for (const ws of this.sockets) {
+      if (!ws.topics.has(key) || !this.checkAge(ws, now)) continue;
+      setTimeout(() => ws._deliver(frame), 0);
     }
   }
 

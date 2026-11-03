@@ -1,25 +1,39 @@
-/** InboxDO (docs/PROTOCOL.md §9.3): slot clock, Δin pin, closed_hw, era end, posts, paging, slot commitments. */
+/** InboxDO (docs/PROTOCOL.md §9.3): slot clock, Δin pin, closed_hw, era end, posts, paging, slot commitments, notices. */
 import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import * as P from "@segv/protocol/proto";
 import { INBOX_DAY_CAP } from "../src/env";
-import type { InboxDO } from "../src/inbox-do";
+import type { InboxDO, InboxFeedLink } from "../src/inbox-do";
 import { inboxStub, type InboxHead, type InboxPostOut, type InboxReadOut } from "../src/types";
 
 /** Δin = INBOX_SLOT_S = 1 s and SKEW = 0 in ../wrangler.test.jsonc. */
 const D = 1000;
 const E_NOW = P.era(Date.now());
+/**
+ * The era most tests use: the next one, so that every test time lies in the future. workerd runs an alarm as soon as
+ * its time has passed, and a post arms the notice alarm of its slot (§9.3); an alarm run by the runtime between two
+ * steps of a test, with whatever clock the test last fixed, would settle `closed_hw` behind the test's back.
+ */
+const E_NEXT = E_NOW + 1;
 const DAY_MS = 86_400_000;
 
 /** The RPC methods plus the protected / private fields the tests drive. */
-type Inner = Pick<InboxDO, "post" | "read" | "head"> & {
+type Inner = Pick<InboxDO, "post" | "read" | "head" | "alarm"> & {
   clock: () => number;
   jitter: (D: number) => number;
   skewMs: number;
   inboxSlot: number;
   dayCap: number;
+  feeds: (j: number) => InboxFeedLink;
+  noticed: number;
 };
+
+/** feed(Tinbox(E, g)) under the test deployment (ROUTE_KEY, RT_FEEDS of ../wrangler.test.jsonc). */
+const KFEED = P.kfeed(P.fromB64u(env.ROUTE_KEY));
+const FBITS = P.feedBits(Number(env.RT_FEEDS));
+const feedJOf = (E: number, g: number): number =>
+  P.feedOf(P.feedHash(KFEED, P.topicInbox(E, g)), FBITS);
 
 /** Unix ms at the start of slot `s` (slot = ⌊(ms − T0)/D⌋) plus `off` ms. */
 const atSlot = (s: number, off = 0): number => P.T0_MS + s * D + off;
@@ -31,7 +45,7 @@ const invites = (n: number) => Array.from({ length: n }, invite);
 let gNext = 1 + Math.floor(Math.random() * 50_000);
 
 /** A fresh InboxDO ("inbox/v2/{E}/{g}" with an unused g) and helpers that run calls at a chosen time. */
-function box(E = E_NOW) {
+function box(E = E_NEXT) {
   const g = gNext++;
   const stub = inboxStub(env, E, g);
   /** Runs `fn` inside the object with the clock at `now` (and the jitter fixed at `j` when given). */
@@ -76,7 +90,7 @@ const rels = (out: InboxPostOut): (number | string)[] => {
 };
 
 /** A time well inside era E (one hour after its start), on an exact slot boundary. */
-const inside = (E = E_NOW): number => P.eraStart(E) + 3_600_000;
+const inside = (E = E_NEXT): number => P.eraStart(E) + 3_600_000;
 
 describe("InboxDO slot clock", () => {
   it("rel and closed with fixed jitter: a row is invisible until its slot closes", async () => {
@@ -602,6 +616,134 @@ describe("InboxDO era end", () => {
     expect((await at(end + 1_999)).ended).toBe(false);
     expect(await c.post(end + 1_999, [invite()])).toEqual({ s: "wrong_era", era: c.E + 1 });
     expect((await at(end + 2_000)).ended).toBe(true);
+  });
+});
+
+describe("InboxDO notices (§9.3)", () => {
+  type Call = { j: number; E: number; g: number; rel: number };
+  /** Replaces the FeedDO link with a recorder; the first `fail` calls throw. */
+  async function record(b: ReturnType<typeof box>, fail = 0): Promise<Call[]> {
+    const calls: Call[] = [];
+    let left = fail;
+    await b.at(Date.now(), (i) => {
+      i.feeds = (j) => ({
+        inbox: async (E, g, rel) => {
+          calls.push({ j, E, g, rel });
+          if (left-- > 0) throw new Error("feed down");
+        },
+      });
+    });
+    return calls;
+  }
+  const alarmOf = (b: ReturnType<typeof box>) =>
+    runInDurableObject(b.stub, (_i: InboxDO, s) => s.storage.getAlarm());
+  /** Runs the scheduled alarm with the object's clock at `now`. */
+  const fire = async (b: ReturnType<typeof box>, now: number) => {
+    await b.at(now, () => {});
+    expect(await runDurableObjectAlarm(b.stub)).toBe(true);
+  };
+
+  it("a post arms the alarm at T0 + rel·D + (SKEW + 1)·1000 of its smallest new rel; the alarm settles, announces the newest closed slot with rows and persists noticed", async () => {
+    const b = box();
+    const calls = await record(b);
+    const S = slotOf(inside());
+    expect(await alarmOf(b)).toBe(P.eraEnd(b.E)); // the seal
+    expect(rels(await b.post(atSlot(S, 400), [invite(), invite()], 0))).toEqual([S + 1, S + 1]);
+    expect(await alarmOf(b)).toBe(atSlot(S + 1) + 1000);
+    expect(rels(await b.post(atSlot(S + 2, 400), [invite()], 0))).toEqual([S + 3]);
+    expect(await alarmOf(b)).toBe(atSlot(S + 1) + 1000); // the earlier one is kept
+    // At its time slot S + 1 has closed (so has S + 2, which is empty): one notice, noticed = closed, the next slot armed.
+    await fire(b, atSlot(S + 1) + 1000);
+    expect(calls).toEqual([{ j: feedJOf(b.E, b.g), E: b.E, g: b.g, rel: S + 1 }]);
+    expect(await b.meta("noticed")).toBe(S + 2);
+    expect(await b.meta("closed_hw")).toBe(S + 2); // the alarm settled: a read right after sees the slot
+    expect((await b.read(atSlot(S + 2, 0))).rows.map((x) => x.rel)).toEqual([S + 1, S + 1]);
+    expect(await alarmOf(b)).toBe(atSlot(S + 3) + 1000);
+    await fire(b, atSlot(S + 3) + 1000);
+    expect(calls.map((c) => c.rel)).toEqual([S + 1, S + 3]);
+    expect(await b.meta("noticed")).toBe(S + 4);
+    expect(await alarmOf(b)).toBe(P.eraEnd(b.E)); // nothing pending: the seal only
+    // Nothing new: an alarm announces nothing.
+    await b.at(atSlot(S + 9), () => {});
+    await runDurableObjectAlarm(b.stub);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("several slots closed since the last notice give one notice, naming the newest", async () => {
+    const b = box();
+    const calls = await record(b);
+    const S = slotOf(inside());
+    expect(rels(await b.post(atSlot(S, 100), [invite()], 0))).toEqual([S + 1]);
+    expect(rels(await b.post(atSlot(S + 1, 100), [invite()], 0))).toEqual([S + 2]);
+    expect(rels(await b.post(atSlot(S + 4, 100), [invite()], 0))).toEqual([S + 5]);
+    // The alarm ran late (the object was away): slots S + 1 and S + 2 are closed, S + 5 is not.
+    await fire(b, atSlot(S + 4, 500));
+    expect(calls.map((c) => c.rel)).toEqual([S + 2]);
+    expect(await b.meta("noticed")).toBe(S + 4);
+    expect(await alarmOf(b)).toBe(atSlot(S + 5) + 1000);
+  });
+
+  it("an alarm before the slot closed announces nothing and comes back at the slot's time, never within a second", async () => {
+    const b = box();
+    const calls = await record(b);
+    const S = slotOf(inside());
+    expect(rels(await b.post(atSlot(S, 100), [invite()], 0))).toEqual([S + 1]);
+    await fire(b, atSlot(S + 1) - 20); // 1.02 s early by this object's clock
+    expect(calls).toEqual([]);
+    expect(await b.meta("noticed")).toBe(S); // the closed slots so far, none with rows
+    expect(await alarmOf(b)).toBe(atSlot(S + 1) + 1000);
+    await fire(b, atSlot(S + 1) + 1000 - 600); // again a little early, but the slot has closed: announced
+    expect(calls.map((c) => c.rel)).toEqual([S + 1]);
+  });
+
+  it("a FeedDO call that fails is made once more, then given up; the slot counts as announced", async () => {
+    const S = slotOf(inside());
+    const once = box();
+    const c1 = await record(once, 1);
+    expect(rels(await once.post(atSlot(S, 100), [invite()], 0))).toEqual([S + 1]);
+    await fire(once, atSlot(S + 1) + 1000);
+    expect(c1.map((c) => c.rel)).toEqual([S + 1, S + 1]);
+
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const down = box();
+      const c2 = await record(down, 99);
+      expect(rels(await down.post(atSlot(S, 100), [invite()], 0))).toEqual([S + 1]);
+      await fire(down, atSlot(S + 1) + 1000);
+      expect(c2).toHaveLength(2);
+      expect(errors).toHaveBeenCalledTimes(1);
+      expect(await down.meta("noticed")).toBe(S + 2);
+      expect(await alarmOf(down)).toBe(P.eraEnd(down.E));
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it("the seal announces whatever is still pending once closed is final", async () => {
+    const b = box();
+    const calls = await record(b);
+    const end = P.eraEnd(b.E);
+    const r = rels(await b.post(end - 100, [invite()], 0));
+    expect(r).toEqual([slotOf(end - 100) + 1]); // a slot that closes after end(E)
+    expect(await alarmOf(b)).toBe(end); // the seal (SKEW = 0) comes before that slot's notice time
+    await fire(b, end);
+    expect(await b.meta("ended")).toBe(1);
+    expect(calls.map((c) => c.rel)).toEqual(r);
+    expect(await alarmOf(b)).toBeNull();
+  });
+
+  it("noticed starts at closed_hw in an object without the key, and at the key once it exists", async () => {
+    const b = box();
+    const S = slotOf(inside());
+    await b.read(atSlot(S, 10)); // closed_hw = S
+    await evictDurableObject(b.stub);
+    expect(await b.at(atSlot(S, 20), (i) => i.noticed)).toBe(S);
+    const calls = await record(b);
+    expect(rels(await b.post(atSlot(S, 100), [invite()], 0))).toEqual([S + 1]);
+    await fire(b, atSlot(S + 1) + 1000);
+    expect(calls.map((c) => c.rel)).toEqual([S + 1]);
+    await evictDurableObject(b.stub);
+    expect(await b.at(atSlot(S + 2, 20), (i) => i.noticed)).toBe(S + 2);
   });
 });
 

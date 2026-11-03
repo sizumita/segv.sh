@@ -14,6 +14,11 @@
  * 7 · dayCap rows). Reads return whole rel groups and persist `closed_hw`. Slots with rows are committed (head
  * chain, t = rel) once closed.
  *
+ * Notices (§9.3): a slot with rows is announced on Tinbox(E, 0) once it has closed and SKEW + 1 s have passed on the
+ * inbox clock (the DO's alarm), with one notice per alarm naming the newest closed slot with rows; the seal announces
+ * whatever is still pending. `flushNotices()` runs the alarms that are due; the world calls it after every clock move,
+ * and a real timer calls it when the earliest alarm comes due in real time.
+ *
  * Test controls: `dayCap` (default 2000), `rollDay()` (a new cap day), `inboxJitter(fn)` (the per-row j),
  * `wrongEraOnce(era?)` (refuse the next post with WRONG_ERA), and `post()` (an attacker post that bypasses the
  * era window, rate limits and PoW).
@@ -65,6 +70,8 @@ class InboxEra {
   /** rel of the newest committed slot, or −1 */
   lastSlot = -1;
   readonly slots: { rel: number; n: number; root: Bytes; head: Bytes }[] = [];
+  /** the largest slot announced on Tinbox(E, 0) (the DO's meta 'noticed', §9.3) */
+  noticed = 0;
   constructor(readonly E: number) {}
 }
 
@@ -78,6 +85,8 @@ export class FakeInbox {
   private jitterFn: InboxJitterFn | null = null;
   /** wrongEraOnce(): the eras the next posts are refused with (undefined: the era of the inbox clock) */
   private readonly forcedWrongEra: (number | undefined)[] = [];
+  /** the real timer for the earliest notice alarm */
+  private noticeTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private readonly w: WorldCtx) {}
 
@@ -281,7 +290,73 @@ export class FakeInbox {
     s.byEid.set(eidB, row);
     s.cnt.set(day, n + 1);
     this.w.bumpWrites();
+    this.flushNotices(); // arms the alarm for the new row's slot (§9.3)
     return { rel: row.rel };
+  }
+
+  // ───────────── notices (§9.3) ─────────────
+
+  /** When slot `rel` of era `s` is announced: T0 + rel·D + (SKEW + 1)·1000 on the inbox clock. */
+  private noticeAt(s: InboxEra, rel: number): number {
+    return T0_MS + rel * this.slotMs(s) + (this.w.params.skew + 1) * 1000;
+  }
+
+  /** The alarm of era `s`: its smallest slot with rows above `noticed`, or the seal, whichever is first; null when nothing is pending. */
+  private alarmAt(s: InboxEra): number | null {
+    const i = firstAbove(s.rows, s.noticed);
+    if (i >= s.rows.length) return null;
+    return Math.min(this.noticeAt(s, s.rows[i].rel), eraEnd(s.E) + this.w.params.skew * 1000);
+  }
+
+  /**
+   * The InboxDO alarms (§9.3): for every era whose alarm is due on the inbox clock, settle (persist closed_hw and
+   * commit the closed slots), persist `noticed = closed` and announce the newest closed slot with rows above the old
+   * `noticed`; then arm the real timer for the earliest alarm still pending.
+   */
+  flushNotices(): void {
+    const now = this.w.inboxNow();
+    let next = Infinity;
+    for (const s of this.eras.values()) {
+      for (;;) {
+        const due = this.alarmAt(s);
+        if (due === null) break;
+        if (now < due) {
+          next = Math.min(next, due);
+          break;
+        }
+        this.prepare(s.E, now);
+        const closed = this.report(s, now);
+        if (closed <= s.noticed) {
+          next = Math.min(next, now + 1000); // fired early (clock differences): again in a second, never at once
+          break;
+        }
+        let top: number | null = null;
+        for (
+          let i = firstAbove(s.rows, s.noticed);
+          i < s.rows.length && s.rows[i].rel <= closed;
+          i++
+        )
+          top = s.rows[i].rel;
+        s.noticed = closed;
+        if (top !== null) this.w.notice(s.E, 0, top);
+      }
+    }
+    if (this.noticeTimer) clearTimeout(this.noticeTimer);
+    this.noticeTimer = null;
+    if (!Number.isFinite(next)) return;
+    this.noticeTimer = setTimeout(
+      () => {
+        this.noticeTimer = null;
+        this.flushNotices();
+      },
+      Math.max(0, next - this.w.inboxNow()),
+    );
+  }
+
+  /** Stops the notice timer (the world is closed). */
+  close(): void {
+    if (this.noticeTimer) clearTimeout(this.noticeTimer);
+    this.noticeTimer = null;
   }
 
   /** j for one inserted row: 0 without `inboxJitter`, else the callback's value floored and clamped into [0, D). */

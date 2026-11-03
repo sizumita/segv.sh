@@ -12,7 +12,7 @@ import type { FeedDO } from "../src/feed-do";
 import { connName, feedName, type RtPublishRow } from "../src/types";
 
 /** The protected / private fields the tests drive or observe. */
-type Inner = Pick<ConnDO, "deliver" | "topicsFor" | "alarm"> & {
+type Inner = Pick<ConnDO, "deliver" | "deliverInbox" | "topicsFor" | "alarm"> & {
   clock: () => number;
   limits: RtLimits;
   feeds: FeedLink;
@@ -359,6 +359,35 @@ describe("ConnDO delivery", () => {
     expect(both.rows().map((r) => r.seq)).toEqual([1, 2, 3]);
     expect(sameRow(both.rows()[2], z)).toBe(true);
     for (const s of [...many, both]) s.ws.close(1000);
+  });
+});
+
+describe("ConnDO inbox notices (§9.3)", () => {
+  it("deliverInbox sends one INBOX frame to the sockets subscribed to Tinbox(E, g), assigns no seq and replays nothing", async () => {
+    const stub = fresh();
+    const E = 42;
+    const g = 3;
+    const T = P.topicInbox(E, g);
+    const a = await connect(stub);
+    const b = await connect(stub);
+    a.send({ f: "sub", topics: [T] });
+    b.send({ f: "sub", topics: [topic()] });
+    await pairsAre(stub, 2);
+    await inside(stub, (i) => i.deliverInbox(E, g, 9));
+    await a.until(() => a.frames.some((f) => f.f === "inbox"), "INBOX");
+    expect(a.frames.filter((f) => f.f === "inbox")).toEqual([{ f: "inbox", E, g, rel: 9 }]);
+    expect(b.frames.filter((f) => f.f === "inbox")).toEqual([]);
+    expect(await inside(stub, (i) => i.seq)).toBe(0);
+    // A RESUME from the HELLO's seq replays nothing: a notice enters no ring.
+    const h = await a.hello();
+    const c = await connect(stub);
+    c.send({ f: "resume", boot: h.boot, since: h.seq, topics: [T] });
+    await c.until(() => c.frames.some((f) => f.f === "resumed"), "RESUMED");
+    expect(c.rows()).toEqual([]);
+    expect(c.frames.filter((f) => f.f === "inbox")).toEqual([]);
+    await expect(inside(stub, (i) => i.deliverInbox(0x10000, 0, 0))).rejects.toThrow();
+    await expect(inside(stub, (i) => i.deliverInbox(0, 0, -1))).rejects.toThrow();
+    for (const s of [a, b, c]) s.ws.close(1000);
   });
 });
 

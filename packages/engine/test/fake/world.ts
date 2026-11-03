@@ -277,6 +277,12 @@ const ckptJson = (e: CkptEntry) => ({
 
 // ───────────────────────── the world ─────────────────────────
 
+/** §10.5: a non-final inbox read expires with the slot it reports (whole seconds by the Worker's clock, 1..Δin). */
+function inboxCacheControl(closed: number, nowMs: number, inboxSlot: number): string {
+  const end = T0_MS + (closed + 1) * inboxSlot * 1000;
+  return `public, max-age=${Math.min(inboxSlot, Math.max(1, Math.floor((end - nowMs) / 1000)))}`;
+}
+
 export class FakeWorld implements WorldCtx, RtHost {
   // ── clocks and parameters ──
   /** Server time = Date.now() + offsetMs. */
@@ -378,6 +384,7 @@ export class FakeWorld implements WorldCtx, RtHost {
   advance(ms: number, opts: { keepSockets?: boolean } = {}): void {
     this.offsetMs += ms;
     if (!opts.keepSockets) this.rt.closeAll(1001, "clock moved");
+    this.inbox.flushNotices();
   }
 
   /**
@@ -394,6 +401,7 @@ export class FakeWorld implements WorldCtx, RtHost {
     if (!Number.isFinite(ms) || ms < 0) throw new RangeError("tick: ms must be ≥ 0");
     this.offsetMs += ms;
     for (const c of this.clocks) c.advance(ms);
+    this.inbox.flushNotices();
   }
 
   /** Moves server time to the start of era `E_now + n`, plus 1 s; closes every FakeWebSocket. Returns the new era. */
@@ -401,6 +409,7 @@ export class FakeWorld implements WorldCtx, RtHost {
     const now = this.now();
     this.offsetMs += eraStart(era(now) + n) + 1000 - now;
     if (!opts.keepSockets) this.rt.closeAll(1001, "new era");
+    this.inbox.flushNotices();
     return this.era;
   }
 
@@ -461,6 +470,7 @@ export class FakeWorld implements WorldCtx, RtHost {
   /** Closes every socket (end of a test). */
   close(): void {
     this.rt.closeAll(1001, "world closed");
+    this.inbox.close();
   }
 
   // ───────────── transports ─────────────
@@ -491,6 +501,11 @@ export class FakeWorld implements WorldCtx, RtHost {
   /** (internal) WorldCtx: FeedDO.publish → ConnDO.deliver. */
   publish(rows: PublishRow[]): void {
     this.rt.publish(rows);
+  }
+
+  /** (internal) WorldCtx: the InboxDO's notice (§9.3) on its way to the sockets. */
+  notice(E: number, g: number, rel: number): void {
+    this.rt.inbox(E, g, rel);
   }
 
   /**
@@ -1000,7 +1015,10 @@ export class FakeWorld implements WorldCtx, RtHost {
     const key = `${req.url.origin}/api/v2/inbox/${E}/${bucket}?after=${after}&limit=${limit}`;
     return this.cachedRead(req, log, key, () => {
       const r = this.inbox.read(E, after, limit);
-      const cache = r.ended && !r.more ? IMMUTABLE : `public, max-age=${this.params.inboxSlot}`;
+      const cache =
+        r.ended && !r.more
+          ? IMMUTABLE
+          : inboxCacheControl(r.closed, this.now(), this.params.inboxSlot);
       return bin(encodeInboxRead({ closed: r.closed, more: r.more, rows: r.rows }), { cache });
     });
   }

@@ -2131,6 +2131,7 @@ makes §6.4(g) final.
 
 ```sql
 CREATE TABLE meta (k TEXT PRIMARY KEY, v BLOB NOT NULL) WITHOUT ROWID;     -- 'head', 'closed_hw', 'ended',
+  -- 'noticed' (the last slot announced, "Notices" below),
   -- 'slot' (Δin in seconds, pinned by the first write: a post that inserts a row, or the first persisted closed_hw;
   -- every rel and closed_hw is in units of it; §3.1)
 CREATE TABLE inv  (id INTEGER PRIMARY KEY, bucket INTEGER NOT NULL, rel INTEGER NOT NULL,
@@ -2188,6 +2189,30 @@ breaks ties only in stage 2), and the chain uses `t = rel`.
 **`head(E, g)`** settles as `read` does (persisting `closed_hw` and committing slots) and returns
 `{head, t_last, ended}`: `t_last` is the `rel` of the newest slot row (0 when there is none), and `ended` says whether
 `ended` is persisted.
+
+**Notices.** Each bucket has a public realtime topic,
+
+```
+Tinbox(E, g) = t16(H(enc("segv.sh/v2/topic/inbox", u16 E, u32 g)))
+```
+
+on which the InboxDO announces a slot that closed with rows in it, so that clients read the bucket when there is
+something to read instead of polling it every slot (§10.8, §11.5). `noticed` is the largest slot announced so far: 0
+in a new object, and `closed_hw` in an object that finds no `'noticed'` key (every slot up to it was readable before
+the key existed). A post that inserts rows arms the alarm at `T0 + rel·D + (SKEW + 1)·1000` for the smallest `rel` it
+assigned (`min(current alarm, due)`, in the same synchronous block as the insert; the alarm is the one of §9 "Identity
+and alarms", shared with the seal). By then every cached read from before the close has expired (§10.5; the extra
+second covers the rounding of a cached read's lifetime to whole seconds). When the alarm fires, the object settles as
+`head` does (persisting `closed_hw` and committing the closed slots), persists `noticed = closed`, and calls
+`inbox(E, g, rel)` on the FeedDO of `Tinbox(E, g)` (§9.4) with the largest `rel` that has rows and
+`noticed_before < rel ≤ closed`, if there is one: one call, however many slots closed since the last notice. A call
+that fails is made once more and then given up (a notice is best effort: clients catch up within 300 s, §11.6). The
+alarm is then re-armed for the smallest `rel` above `closed` that has rows, if any, never sooner than 1 s. After
+`ended`, `closed` is final (above), so the seal alarm announces whatever was still pending, whether or not its slot's
+nominal close time has come. Notices are not stored, numbered or replayed: a client not subscribed when one is sent
+learns of the rows at its next catch-up. A notice says only what a read of the bucket shows, that slot `rel` holds
+rows, and goes out at a time that depends on `rel` alone: it reveals neither when a post was made nor how many rows
+or posts a slot holds, and nothing about a sender or a recipient (§13.1).
 
 **Retention.** Clients never read inbox eras older than `E_now − 3`, and the Worker answers 410 for them. The rows are
 still stored (and committed).
@@ -2294,6 +2319,10 @@ the ring like any other.
 send one NOTE frame (§10.8), and drop the sockets that fail to receive. A note gets no `seq`, enters no ring and is never
 replayed, so a socket that is not open when it comes never gets it.
 
+**`deliverInbox(E, g, rel)`** (RPC from a FeedDO, §9.3): for each socket subscribed to `Tinbox(E, g)`, send one INBOX
+frame (§10.8), and drop the sockets that fail to receive. Like a note, an inbox notice gets no `seq`, enters no ring and
+is never replayed.
+
 **FeedDO state.** In memory only: for each topic of its range, the ConnDOs with interest in it, and for each ConnDO the
 time of its last `interest` or `replace`. Before it answers anything, a FeedDO that starts (its first request, or its
 first after an eviction) **pulls** the interest of every ConnDO `c < C` with `topicsFor(j)`, so that a restart loses no
@@ -2309,12 +2338,15 @@ up.
 
 **`note(topic, note)`** (RPC from the Worker, §10.11): one `deliverNote` to each ConnDO with interest in `topic`.
 
+**`inbox(E, g, rel)`** (RPC from an InboxDO, §9.3): one `deliverInbox` to each ConnDO with interest in `Tinbox(E, g)`,
+made once more when it fails.
+
 **`interest(c, added, removed)`** and **`replace(c, topics)`** (RPC from a ConnDO): as above. `c` is an integer in
 `0..2^31 − 1` and each topic 16 bytes; anything else throws.
 
-**Durability.** Nothing about topics, rows or notes is persisted. After a ConnDO restart, `boot` changes, so a RESUME
-gets GAP. A hibernatable DO is also evicted after a short time without events (an auto-answered `ping` is not an
-event): its in-memory state, the ring and `boot` included, is reset, and the constructor runs again on the next event.
+**Durability.** Nothing about topics, rows, notes or notices is persisted. After a ConnDO restart, `boot` changes, so
+a RESUME gets GAP. A hibernatable DO is also evicted after a short time without events (an auto-answered `ping` is not
+an event): its in-memory state, the ring and `boot` included, is reset, and the constructor runs again on the next event.
 The 10-minute window is therefore an upper bound, reached only while the ConnDO stays resident; at low traffic most
 RESUMEs after a reconnect get GAP, which costs a catch-up (§11.6), never a lost row. A FeedDO restart loses nothing: it
 pulls. Rows published while a FeedDO's picture of a ConnDO lags (a call that failed, a pull that has not answered) are
@@ -3073,13 +3105,16 @@ Cache rules:
 
 - A 200 response for an era whose InboxDO has persisted `ended` (§9.3) and that has `more = 0` is immutable
   (`public, max-age=31536000, immutable`).
-- Every other 200 response is `public, max-age=Δin`: the current era, a past era whose InboxDO has not yet persisted
-  `ended` (normally the SKEW seconds after `end(E)`), and any response with `more = 1`.
+- Every other 200 response is `public, max-age=m`, with `m` the whole seconds from the Worker's `now` to the end of
+  the slot it reports, `T0 + (closed + 1)·D`, at least 1 and at most Δin: the current era, a past era whose InboxDO
+  has not yet persisted `ended` (normally the SKEW seconds after `end(E)`), and any response with `more = 1`. A
+  response expires with the slot it reports, so a read made on an INBOX notice (sent `SKEW + 1` s after the slot
+  closed, §9.3) is not served from before the close.
 - The Worker serves every inbox read from `caches.default` when present, before the rate limiter (§9.7). Entries are
   keyed by the canonical `(E, bucket, after, limit)` (an absent `after` is 0 and an absent `limit` is 1024), and each
   200 response is stored with its own `cache-control`. Every row up to the reported `closed` is final, so a response
-  at most Δin old is still correct; most clients poll with the same `after` (the last `closed`), and §11.5 step 3's
-  `2·Δin` margin covers the cache age.
+  at most Δin old is still correct; the clients that read on the same notice use the same `after` (their last
+  `closed`), so one read of the InboxDO serves them all, and §11.5 step 3's `2·Δin` margin covers the cache age.
 
 ### 10.6 Directory (JSON)
 
@@ -3239,6 +3274,7 @@ ROWS    = 0x81 | u16 n (1..65535) | (u64 seq | topic[16] | u16 E | label[16] | u
 GAP     = 0x82 | u64 since_seq                                    rows published after since_seq may have been missed
 RESUMED = 0x83                                                    the replay for RESUME is complete
 NOTE    = 0x84 | topic[16] | note[552]                            a sync note for one of the socket's topics (§11.16)
+INBOX   = 0x85 | u16 E | u32 g | u32 rel                          slot rel of inbox bucket g of era E closed with rows (§9.3)
 ```
 
 The server MUST NOT send a ROWS frame with `n = 0`; a client treats one as unparseable (close and reconnect, as for
@@ -3266,11 +3302,16 @@ costs a catch-up (§11.6), never a lost row.
 
 - Keep the highest `seq` received, or HELLO's `seq`.
 - Subscribe to at most 256 topics per socket and use at most 2 sockets per tab, in priority order: `Tself`, the
-  current epochs of accepted copies by recent activity, followed old epochs (§11.2), then links. Request copies are
-  never subscribed (§11.5). Copies beyond the budget are covered by catch-up (§11.6).
+  inbox notice topics (below), the current epochs of accepted copies by recent activity, followed old epochs (§11.2),
+  then links. Request copies are never subscribed (§11.5). Copies beyond the budget are covered by catch-up (§11.6).
 - On reconnect, send RESUME, and SUB any further topics.
 - Send NOTES on every socket: right after its RESUME, or as its first frame when it sends none. On a NOTE frame for
   `Tself`, apply the note (§11.16); ignore a NOTE frame for any other topic.
+- Subscribe, on the first socket and right after `Tself` in priority, to the notice topics `Tinbox(E, 0)` (§9.3) of
+  the eras `E_now − 1`, `E_now` and `E_now + 1` that lie in `max(E_FIRST, E_now − 3)..0xFFFE`, and recompute that set
+  at least every 300 s (the era changes once a week). On an INBOX frame for one of them, poll the inbox (§11.5); when
+  the poll's read of that era reports `closed < rel`, poll once more after Δin. Ignore an INBOX frame for any other
+  bucket.
 - After GAP, run catch-up (§11.6). After a SUB of a topic that was not subscribed before, run a one-shot probe of that
   topic's expected slots, since rows published before the SUB are not replayed.
 - Reconnect with backoff of 1 s, doubling to 30 s, with jitter. After a close with 1008 or 1013, wait at least 60 s and
@@ -3509,7 +3550,8 @@ time (§6.3 step 5) use the injectable clock.
      "the public keys registered for your account do not match your passkey's keys".
    - Otherwise take `handle` and `regEra` from the response.
 3. Load and verify checkpoints (§12.3).
-4. Restore (§11.4), open the realtime socket, and start the inbox poll.
+4. Restore (§11.4), open the realtime socket, which subscribes to the inbox notices (§10.8), and start the catch-up
+   loop (§11.6).
 
 After `register`, the client writes its first self row: a HEADS record (`c = 0`) whose cursor is the registration
 cursor of §11.5, taken once from the register response's `x-segv-now` and kept by every retry of the write, so its
@@ -3891,7 +3933,11 @@ each restore until a HEADS row or snapshot holds its ENDED record, normally only
 
 ### 11.5 Inbox poll and requests
 
-The client polls every `max(inboxSlot, 2)` seconds while the page is visible, on reconnect, and after unlock.
+A **poll** is one read of the inbox, below. The client polls on an INBOX notice for a bucket it watches (§10.8), at
+every catch-up (§11.6: on reconnect, then every 300 s while the realtime socket is up and every 10 s while it is
+down), and after unlock (§11.4 step 7). Nothing polls at the slot cadence: a notice follows a post within
+`2·Δin + SKEW + 1` s (the row's slot with its jitter, then the notice, §9.3), about what polling every Δin gave, at
+one read per notice instead of one per slot per client.
 
 1. Let `(Ec, rc)` be the cursor. For each era E from `max(Ec, E_now − 3)` to `era(server now)` (from params or
    `x-segv-now`): `GET …/inbox/{E}/0?after=a` until `more = 0`, with `a = rc` for `E = Ec` and `a = 0` for every later
@@ -4006,6 +4052,8 @@ Rows on a slot in the expected map that fail decryption occupy the slot: the cli
 an undecryptable message" and advances.
 
 **On a NOTE frame** (§10.8) for `Tself`, the client applies the note (§11.16); it ignores one for any other topic.
+
+**On an INBOX frame** (§10.8) for a watched bucket, the client polls the inbox (§11.5).
 
 **Catch-up** runs:
 
@@ -4729,9 +4777,10 @@ are kept. Critical warnings are kept until sign-out.
 | devices ↔ account | None. | The devices of one account register the same bells, so the stored registrations link them (not to the account). | — | — |
 
 Never stored anywhere: topics, WebSocket topic subscriptions (the ConnDOs' socket attachments and the FeedDOs' indexes
-live with the open sockets, §9.4), IPs, RESUME rings, rate-limit keys, arrival order inside a Δ batch, and inbox
-jitter. The push store holds only what §9.8 lists, and never a uid, handle, conversation, topic, IP or sender (§0.1, §13.4). The N column applies only to devices that turned notifications on; N sees nothing of the
-others.
+live with the open sockets, §9.4), IPs, RESUME rings, rate-limit keys, arrival order inside a Δ batch, inbox jitter,
+and inbox notices (§9.3; a notice says only that a slot of a bucket holds rows, when the slot closes). The push store
+holds only what §9.8 lists, and never a uid, handle, conversation, topic, IP or sender (§0.1, §13.4). The N column
+applies only to devices that turned notifications on; N sees nothing of the others.
 
 ### 13.2 Properties of v1 that stage 1 weakens
 
@@ -4786,7 +4835,8 @@ Each item is a deliberate trade-off that stage 2 or 3 addresses. None is silent.
 6. **Latency.**
    - Every membership change and every creation waits at least `Δ + SKEW` (12 s in production) before it becomes
      visible to others, and the creator's first messages wait for it too.
-   - First contact by handle arrives within about `inboxSlot` plus the poll interval.
+   - First contact by handle arrives within about `2·Δin + SKEW + 1` s (the invite's slot with its jitter, then the
+     notice, §9.3): 23 s in production.
    - The first message after a leave waits for the rotation.
    - Every send costs one more `get` (the control-lane probe of §11.3 step 1), as v1's sync before every send did, and
      another when preparing the put (a slow proof of work, a frozen tab) or its answer takes long (§11.3 steps 6

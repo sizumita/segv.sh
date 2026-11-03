@@ -502,6 +502,17 @@ async function inboxPost(c: Ctx): Promise<Response> {
   return json({ results: res.results });
 }
 
+/**
+ * The cache-control of an inbox read that is not final (§10.5): the response expires with the slot it reports,
+ * `T0 + (closed + 1)·D`, by the Worker's clock, in whole seconds, at least 1 and at most Δin. A read made on an
+ * INBOX notice (SKEW + 1 s after the slot closed, §9.3) is then never served from before the close.
+ */
+export function inboxCacheControl(closed: number, nowMs: number, inboxSlot: number): string {
+  const end = T0_MS + (closed + 1) * inboxSlot * 1000;
+  const secs = Math.min(inboxSlot, Math.max(1, Math.floor((end - nowMs) / 1000)));
+  return `public, max-age=${secs}`;
+}
+
 async function inboxRead(c: Ctx, E: number, bucket: number): Promise<Response> {
   if (bucket !== 0) throw new HttpError(400, "unknown bucket");
   const { now: Enow, hi } = eraBounds(c.now, c.params.skew);
@@ -518,7 +529,7 @@ async function inboxRead(c: Ctx, E: number, bucket: number): Promise<Response> {
   await readLimit(c);
   const r = await inboxStub(c.env, E, 0).read(E, 0, bucket, after, limit);
   for (const row of r.rows) if (row.body.length !== INBOX_BODY_LEN) throw new Error("inbox: bad stored body");
-  const cc = r.ended && !r.more ? IMMUTABLE : `public, max-age=${c.params.inboxSlot}`;
+  const cc = r.ended && !r.more ? IMMUTABLE : inboxCacheControl(r.closed, c.now, c.params.inboxSlot);
   const res = binary(encodeInboxRead({ closed: r.closed, more: r.more, rows: r.rows }), cc);
   cachePut(c, key, res);
   return res;

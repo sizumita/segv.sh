@@ -2,12 +2,27 @@
 import { describe, expect, it } from "vitest";
 import * as P from "@segv/protocol/proto";
 import { clientKey, clientTag } from "../src/abuse";
+import { inboxCacheControl } from "../src/api";
 import { dec64, enc64 } from "../src/b64";
 import { logErr } from "../src/http";
 import { appHosts } from "../src/hosts";
 
 const req = (ip?: string) =>
   new Request("https://x/", { headers: ip === undefined ? {} : { "cf-connecting-ip": ip } });
+
+describe("inboxCacheControl (§10.5)", () => {
+  it("expires with the slot it reports: whole seconds, at least 1, at most Δin", () => {
+    const D = 10;
+    const closed = 1234;
+    const end = P.T0_MS + (closed + 1) * D * 1000;
+    expect(inboxCacheControl(closed, end - 7_400, D)).toBe("public, max-age=7");
+    expect(inboxCacheControl(closed, end - 300, D)).toBe("public, max-age=1");
+    expect(inboxCacheControl(closed, end + 5_000, D)).toBe("public, max-age=1"); // the object's clock behind the Worker's
+    expect(inboxCacheControl(closed, end - 25_000, D)).toBe("public, max-age=10"); // the Worker's clock behind the object's
+    expect(inboxCacheControl(closed, end - 999, 1)).toBe("public, max-age=1");
+    expect(inboxCacheControl(closed, end - 1_000, 1)).toBe("public, max-age=1");
+  });
+});
 
 describe("b64", () => {
   it("matches proto.b64u / proto.fromB64u for every length", () => {

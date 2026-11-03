@@ -478,6 +478,8 @@ export const RT_HELLO = 0x80;
 export const RT_ROWS = 0x81;
 export const RT_GAP = 0x82;
 export const RT_RESUMED = 0x83;
+/** 0x84 is NOTE (§10.8), which no server sends yet. */
+export const RT_INBOX = 0x85;
 
 export type ClientFrame =
   | { f: "sub"; topics: Bytes[] }
@@ -532,7 +534,8 @@ export type ServerFrame =
   | { f: "hello"; boot: Bytes; now: number; seq: number }
   | { f: "rows"; rows: RtRow[] }
   | { f: "gap"; since: number }
-  | { f: "resumed" };
+  | { f: "resumed" }
+  | { f: "inbox"; E: number; g: number; rel: number };
 
 export function encodeServerFrame(x: ServerFrame): Bytes {
   const w = new Writer();
@@ -550,6 +553,8 @@ export function encodeServerFrame(x: ServerFrame): Bytes {
       return w.u8(RT_GAP).u64(x.since).done();
     case "resumed":
       return w.u8(RT_RESUMED).done();
+    case "inbox":
+      return w.u8(RT_INBOX).u16(x.E).u32(x.g).u32(x.rel).done();
     default:
       return fail("bad frame");
   }
@@ -576,6 +581,7 @@ export function decodeServerFrame(b: Bytes): ServerFrame {
     out = { f: "rows", rows };
   } else if (op === RT_GAP) out = { f: "gap", since: r.u64() };
   else if (op === RT_RESUMED) out = { f: "resumed" };
+  else if (op === RT_INBOX) out = { f: "inbox", E: r.u16(), g: r.u32(), rel: r.u32() };
   else return fail("bad frame type");
   r.end();
   return out;

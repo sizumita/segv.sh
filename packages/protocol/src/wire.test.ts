@@ -206,6 +206,8 @@ const CORPUS: Case[] = [
   server({ f: "rows", rows: [rtRow(0, 2), rtRow(1, 3)] }, "ROWS ×2"),
   server({ f: "gap", since: 12345 }, "GAP"),
   server({ f: "resumed" }, "RESUMED"),
+  server({ f: "inbox", E: 7, g: 0, rel: 123_456 }, "INBOX"),
+  server({ f: "inbox", E: 0xfffe, g: 0xffffffff, rel: 0xffffffff }, "INBOX max"),
 ];
 
 // ═════════════════════════ 1. layouts ═════════════════════════
@@ -295,7 +297,9 @@ describe("layouts against the spec, byte for byte", () => {
     const t1 = fill(16, 1);
     const t2 = fill(16, 2);
     const boot = fill(8, 0xbb);
-    expect([W.RT_SUB, W.RT_UNSUB, W.RT_RESUME, W.RT_HELLO, W.RT_ROWS, W.RT_GAP, W.RT_RESUMED]).toEqual([1, 2, 3, 0x80, 0x81, 0x82, 0x83]);
+    expect([W.RT_SUB, W.RT_UNSUB, W.RT_RESUME, W.RT_HELLO, W.RT_ROWS, W.RT_GAP, W.RT_RESUMED, W.RT_INBOX]).toEqual([
+      1, 2, 3, 0x80, 0x81, 0x82, 0x83, 0x85,
+    ]);
     const frames: [W.ClientFrame, B][] = [
       [{ f: "sub", topics: [t1, t2] }, cat(u8(1), u16(2), t1, t2)],
       [{ f: "unsub", topics: [t1] }, cat(u8(2), u16(1), t1)],
@@ -313,6 +317,7 @@ describe("layouts against the spec, byte for byte", () => {
       [{ f: "rows", rows: [row] }, cat(u8(0x81), u16(1), u64(9), t1, u16(41), t2, u32(1234), u8(1), b1)],
       [{ f: "gap", since: 77 }, cat(u8(0x82), u64(77))],
       [{ f: "resumed" }, u8(0x83)],
+      [{ f: "inbox", E: 41, g: 7, rel: 123_456 }, cat(u8(0x85), u16(41), u32(7), u32(123_456))],
     ];
     for (const [f, want] of sframes) {
       expect(toHex(W.encodeServerFrame(f)), f.f).toBe(toHex(want));

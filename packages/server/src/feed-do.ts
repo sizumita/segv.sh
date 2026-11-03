@@ -12,12 +12,14 @@
  *  - publish(rows): one deliver per ConnDO with interest in a row's topic, in the order published, retried once, then
  *    dropped for that ConnDO (its clients catch up, §11.6). The ConnDO stubs come from `conns`, an instance field
  *    that tests can replace.
+ *  - inbox(E, g, rel): from an InboxDO (§9.3): one deliverInbox per ConnDO with interest in Tinbox(E, g), retried
+ *    once.
  */
 import { DurableObject } from "cloudflare:workers";
-import { BODY_LENS, hex } from "@segv/protocol/proto";
+import { BODY_LENS, hex, topicInbox } from "@segv/protocol/proto";
 import { v2Params } from "./env";
 import { logErr } from "./http";
-import { connStub, parseIndexName, type RtPublishRow } from "./types";
+import { checkNotice, connStub, parseIndexName, type RtPublishRow } from "./types";
 
 export interface FeedLimits {
   /** RT_FORGET: interest from a ConnDO silent for this long is dropped */
@@ -35,6 +37,7 @@ const FEED_LIMITS: Readonly<FeedLimits> = { forgetMs: 900_000, pullTimeoutMs: 5_
 /** What a FeedDO calls on a ConnDO. */
 export interface ConnLink {
   deliver(rows: RtPublishRow[]): Promise<void>;
+  deliverInbox(E: number, g: number, rel: number): Promise<void>;
   topicsFor(j: number): Promise<Uint8Array[]>;
 }
 
@@ -120,6 +123,17 @@ export class FeedDO extends DurableObject<Env> {
     await Promise.all([...per].map(([c, list]) => this.deliverTo(c, list)));
   }
 
+  /** §9.3 notice from an InboxDO: one deliverInbox per ConnDO with interest in Tinbox(E, g), made once more on failure. */
+  async inbox(E: number, g: number, rel: number): Promise<void> {
+    checkNotice(E, g, rel);
+    const now = this.clock();
+    this.repull(now);
+    this.expire(now);
+    const set = this.byTopic.get(hex(topicInbox(E, g)));
+    if (!set) return;
+    await Promise.all([...set].map((c) => this.twice(() => this.conns(c).deliverInbox(E, g, rel), "feed inbox failed")));
+  }
+
   // ───────────── RPC from the ConnDOs ─────────────
 
   /** A change of ConnDO c's distinct-topic set at this FeedDO (§9.4 "Interest"). */
@@ -171,13 +185,18 @@ export class FeedDO extends DurableObject<Env> {
     for (const c of this.pending) void this.pull(c);
   }
 
-  private async deliverTo(c: number, rows: RtPublishRow[]): Promise<void> {
+  private deliverTo(c: number, rows: RtPublishRow[]): Promise<void> {
+    return this.twice(() => this.conns(c).deliver(rows), "feed deliver failed");
+  }
+
+  /** A ConnDO call, made once more when it fails, then given up (its clients catch up, §11.6). */
+  private async twice(call: () => Promise<void>, msg: string): Promise<void> {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        await this.conns(c).deliver(rows);
+        await call();
         return;
       } catch (e) {
-        if (attempt === 1) console.error(JSON.stringify({ msg: "feed deliver failed", error: logErr(e) }));
+        if (attempt === 1) console.error(JSON.stringify({ msg, error: logErr(e) }));
       }
     }
   }
