@@ -3,12 +3,15 @@
 //! view lacks in native code: the remembered session under a key of the system's key store (session.rs), passkeys of
 //! the canonical host (passkey.rs), the system's notifications and the app's badge (notify.rs, badge.rs). The app
 //! keeps running with its window closed, with an icon in the menu bar or the system tray and its page hidden
-//! (background.rs), MAY start hidden when the user signs in to the system, tells the page when the system wakes
-//! (wake.rs), opens `segv:` links, and a published build updates itself (update.rs).
+//! (background.rs), MAY start hidden when the user signs in to the system, keeps the page's timers on schedule while it
+//! is hidden (alarm.rs), tells the page when the system wakes or the network changes (wake.rs), opens `segv:` links and
+//! sends the page's links to other sites to the browser (links.rs), and a published build updates itself (update.rs).
 
+mod alarm;
 mod background;
 #[cfg(any(windows, test))]
 mod badge;
+mod links;
 mod notify;
 mod passkey;
 mod session;
@@ -166,31 +169,51 @@ fn tray(app: &AppHandle<Wry>) -> tauri::Result<()> {
     Ok(())
 }
 
-/// The main window on Windows, which tauri.windows.conf.json leaves to this function: Mica behind the page on Windows 11,
-/// and an opaque window before it, where a transparent one would show the desktop through the page. The script tells
-/// the page which, in a global that it reads before anything else (chrome.ts): it runs before the document is parsed,
-/// when the document may not have its root element yet.
-#[cfg(windows)]
+/// The main window, which tauri.conf.json leaves to this function, so that the page's links to other sites open in
+/// the browser (links.rs) rather than nowhere.
+///
+/// On Windows: Mica behind the page on Windows 11, and an opaque window before it, where a transparent one would show
+/// the desktop through the page. The script tells the page which, in a global that it reads before anything else
+/// (chrome.ts): it runs before the document is parsed, when the document may not have its root element yet.
 fn main_window(app: &AppHandle<Wry>) -> tauri::Result<()> {
-    use tauri::utils::config::WindowEffectsConfig;
-    use tauri::window::Effect;
     let Some(conf) = app.config().app.windows.iter().find(|w| w.label == "main").cloned() else {
         return Ok(());
     };
-    let mica = windows_version::OsVersion::current().build >= 22000;
-    let backdrop = if mica { "mica" } else { "none" };
-    let mut window = tauri::WebviewWindowBuilder::from_config(app, &conf)?
+    let dev = cfg!(debug_assertions)
+        .then(|| app.config().build.dev_url.clone())
+        .flatten();
+    let window = tauri::WebviewWindowBuilder::from_config(app, &conf)?
         .title(&app.package_info().name)
-        .initialization_script(format!(
-            "Object.defineProperty(window,\"__SEGV_WINDOW__\",{{value:Object.freeze({{os:\"windows\",backdrop:\"{backdrop}\"}})}});"
-        ))
-        .transparent(mica);
-    if mica {
-        window = window.effects(WindowEffectsConfig {
-            effects: vec![Effect::Mica],
-            ..Default::default()
+        .on_new_window(|url, _| {
+            links::open(&url);
+            tauri::webview::NewWindowResponse::Deny
+        })
+        .on_navigation(move |url| {
+            if links::external(url, dev.as_ref()) {
+                links::open(url);
+                return false;
+            }
+            true
         });
-    }
+    #[cfg(windows)]
+    let window = {
+        use tauri::utils::config::WindowEffectsConfig;
+        use tauri::window::Effect;
+        let mica = windows_version::OsVersion::current().build >= 22000;
+        let backdrop = if mica { "mica" } else { "none" };
+        let mut window = window
+            .initialization_script(format!(
+                "Object.defineProperty(window,\"__SEGV_WINDOW__\",{{value:Object.freeze({{os:\"windows\",backdrop:\"{backdrop}\"}})}});"
+            ))
+            .transparent(mica);
+        if mica {
+            window = window.effects(WindowEffectsConfig {
+                effects: vec![Effect::Mica],
+                ..Default::default()
+            });
+        }
+        window
+    };
     window.build()?;
     Ok(())
 }
@@ -250,13 +273,14 @@ pub fn run() {
             passkey::passkey_create,
             passkey::passkey_prf,
             passkey::passkey_sign_in,
+            alarm::alarm,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
-            #[cfg(windows)]
             main_window(&handle)?;
             session::prepare();
             notify::init(&handle);
+            alarm::init(&handle);
             wake::observe(&handle);
             if updates {
                 update::init(&handle);

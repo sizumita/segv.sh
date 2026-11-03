@@ -15,6 +15,7 @@ const COMMANDS: &[&str] = &[
     "passkey_create",
     "passkey_prf",
     "passkey_sign_in",
+    "alarm",
 ];
 
 fn main() {

@@ -21,6 +21,7 @@
     "allow-passkey-capability",
     "allow-passkey-create",
     "allow-passkey-prf",
-    "allow-passkey-sign-in"
+    "allow-passkey-sign-in",
+    "allow-alarm"
   ]
 }

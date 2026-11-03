@@ -1,15 +1,16 @@
 // The platform that the desktop app gives the engine (docs/PROTOCOL.md §11.14; EngineOptions): the deployment's
 // canonical origin, passkeys through the system's own API (AuthenticationServices on macOS, the WebAuthn API of
-// Windows), the remembered session in the app's own files under a key of the system's key store, and notifications that
-// the app shows itself while it runs (§11.13 "Apps without push"). Each one is a command of the app's native code
-// (src-tauri/src).
-import type {
-  EngineOptions,
-  LocalNotification,
-  LocalNotifier,
-  LocalPermission,
-  PasskeyPlatform,
-  SessionStore,
+// Windows), the remembered session in the app's own files under a key of the system's key store, notifications that the
+// app shows itself while it runs (§11.13 "Apps without push"), and a clock whose timers keep their schedule while the
+// window is closed. Each one is a command of the app's native code (src-tauri/src).
+import {
+  alarmClock,
+  type EngineOptions,
+  type LocalNotification,
+  type LocalNotifier,
+  type LocalPermission,
+  type PasskeyPlatform,
+  type SessionStore,
 } from "@segv/engine";
 import { openSettings } from "@segv/ui";
 import { invoke } from "@tauri-apps/api/core";
@@ -93,6 +94,23 @@ const notifier: LocalNotifier = {
   badge: (count) => send("badge", { count }),
 };
 
+/**
+ * The engine's clock: the page's own timers, and while the window is closed (the page hidden) also the alarm of the
+ * native code (src-tauri/src/alarm.rs), since a hidden web view may run the page's timers late. The realtime socket's
+ * pings and reconnects, the catch-up and the notifications thus keep their schedule.
+ */
+const alarms = alarmClock({
+  arm: (ms) => send("alarm", { ms }),
+  hidden: () => document.visibilityState === "hidden",
+});
+
+/** Follows the native alarm and the page's visibility (`alarms`). */
+export async function followAlarms(): Promise<void> {
+  document.addEventListener("visibilitychange", () => alarms.visibility());
+  await listen("segv:alarm", () => alarms.alarm());
+  alarms.visibility();
+}
+
 const CHAT = /^#c\/[A-Za-z0-9_-]{12}$/;
 
 /**
@@ -133,6 +151,8 @@ export function platform(): EngineOptions {
     // No push transport (§11.14 "Notifications"): the app notifies from the rows that reach it while it runs.
     push: { platform: null },
     local: { notifier },
+    clock: alarms.clock,
+    // The system woke, or the network changed (src-tauri/src/wake.rs).
     onWake: (fn) => void listen("segv:wake", () => fn()),
   };
 }

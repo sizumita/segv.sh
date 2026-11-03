@@ -64,10 +64,14 @@ app's platform through `EngineOptions` (`apps/desktop/src/platform.ts`): the dep
 call and the realtime socket, passkeys through the system's own API (AuthenticationServices on macOS, the WebAuthn API
 of Windows; the RP ID stays the canonical host), the remembered session in a file of the app's local data directory
 sealed under a key of the system's key store (the data protection keychain on macOS; on Windows a key of the TPM, or
-DPAPI on a device without one), and notifications that the app shows itself while it runs, also with its window closed
-(§11.13, "Apps without push"). Their native side is in `apps/desktop/src-tauri/src`; the commands that the page may call
-are listed in `build.rs` and granted in `capabilities/main.json`. The window is Liquid Glass on macOS 26 and later and
-Mica on Windows 11 (`windowEffects` in `tauri.conf.json`; on Windows `src/lib.rs` makes the window), and
+DPAPI on a device without one), notifications that the app shows itself while it runs, also with its window closed
+(§11.13, "Apps without push"), and a clock whose timers the native code also fires while the page is hidden
+(`alarmClock` of `packages/engine`, `src-tauri/src/alarm.rs`), so that the realtime socket keeps its pings and
+reconnects with the window closed. The native code tells the page when the system wakes and when the network changes
+(`src-tauri/src/wake.rs`), and opens the page's links to other sites in the browser (`src-tauri/src/links.rs`). Their
+native side is in `apps/desktop/src-tauri/src`; the commands that the page may call are listed in `build.rs` and granted
+in `capabilities/main.json`. The window is Liquid Glass on macOS 26 and later and Mica on Windows 11 (`windowEffects` in
+`tauri.conf.json`; `src/lib.rs` makes the window), and
 `apps/desktop/src/desktop.css` lets it show through the page's chrome. `tauri.windows.conf.json` holds what differs on
 Windows: a window with the system's title bar, the page's CSP (Tauri's bridge answers at `https://ipc.localhost` there),
 WebView2's switches that keep the page's timers running while the window is closed, and the installer.
