@@ -141,7 +141,7 @@ try {
       await open(B, room);
       for (let k = 0; k < n; k++) {
         const text = `${tag} ${k} ${room} ` + "lorem ipsum dolor sit amet ".repeat(1 + (k % 5));
-        const box = B.page.getByLabel("message");
+        const box = B.page.getByLabel("message", { exact: true });
         await box.fill(text);
         await box.press("Enter");
         // The composer takes the text once its handler ran: the next fill would replace it before.

@@ -118,7 +118,7 @@ export async function newConversation(d, handles, name, { atForm } = {}) {
       .map((h) => `@${h}`)
       .join(", ");
   await d.page.locator(".convhead .title", { hasText: title }).waitFor({ timeout: T });
-  await d.page.getByLabel("message").waitFor({ timeout: T });
+  await d.page.getByLabel("message", { exact: true }).waitFor({ timeout: T });
 }
 
 /** Switches the left pane to a list (chats, requests, archives); the switcher shows once there is more than chats. */
@@ -148,14 +148,17 @@ export async function openRequest(d, convName, text) {
   await seen(d, text);
   await d.page.waitForTimeout(1000); // reading it must not accept it
   check(await requestBar(d).isVisible(), `${d.name}: the request was accepted by opening it`);
-  check(!(await d.page.getByLabel("message").isVisible()), `${d.name}: a request shows a composer`);
+  check(
+    !(await d.page.getByLabel("message", { exact: true }).isVisible()),
+    `${d.name}: a request shows a composer`,
+  );
 }
 
 const requestBar = (d) => d.page.getByRole("region", { name: "request" });
 
 export async function accept(d) {
   await requestBar(d).getByRole("button", { name: "accept", exact: true }).click();
-  await d.page.getByLabel("message").waitFor({ timeout: T });
+  await d.page.getByLabel("message", { exact: true }).waitFor({ timeout: T });
 }
 
 export async function inList(d, list, convName) {
@@ -164,8 +167,8 @@ export async function inList(d, list, convName) {
 }
 
 export async function send(d, text) {
-  await d.page.getByLabel("message").fill(text);
-  await d.page.getByLabel("message").press("Enter");
+  await d.page.getByLabel("message", { exact: true }).fill(text);
+  await d.page.getByLabel("message", { exact: true }).press("Enter");
   await seen(d, text);
   await d.page.waitForFunction(() => !document.body.innerText.includes("sending…"), null, {
     timeout: T,

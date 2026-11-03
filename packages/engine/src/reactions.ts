@@ -3,10 +3,7 @@
 // computed again whenever a row arrives or a §6.8 decision changes, so devices holding the same rows agree.
 import * as P from "@segv/protocol/proto";
 import { acceptedOld, rowKey, type Copy, type ReactionRow } from "./conv";
-import type { ReactionView } from "./types";
-
-/** At most this many emoji are on per member and target (§11.12 `MAX_REACTIONS`). */
-export const MAX_REACTIONS = 8;
+import { MAX_REACTIONS, type ReactionView } from "./types";
 
 /**
  * The message key of the row a REACTION row reacts to (§11.12 "Target"): a TEXT, IMAGE or FILE row the copy holds and

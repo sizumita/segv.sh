@@ -4261,6 +4261,10 @@ lane's `prev` chain (§12.2). It writes no self record of its own.
   agree on the state and differ only in what they show. A client SHOULD send one emoji only, and SHOULD NOT send a
   REACTION that changes nothing by the state it holds (an add of an emoji that is on, a remove of one that is off, or
   an add beyond the 8).
+- **Form.** The state tells emoji apart by their bytes, so one emoji sent in two forms counts as two. A client SHOULD
+  send an emoji in its fully-qualified form (Unicode's `emoji-test.txt`), and an emoji whose fully-qualified form is
+  longer than 32 bytes without its U+FE0F, which makes it fit: only kisses with skin tones are that long, by at most
+  3 bytes, and only through their U+FE0F.
 - **Not a message.** A REACTION creates no `MessageView` and is not a message for `VIEW_MESSAGES` (§11.10); it never
   counts toward `unread`, never raises `lastTs` (§11.8), shows no system line (§11.9) and does not ring (§11.13). It
   is a valid row of its member wherever a rule asks for one: the followed lanes and sweeps (§11.2), the qualifying

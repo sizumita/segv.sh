@@ -44,6 +44,9 @@ export interface FileRef {
   size: number;
 }
 
+/** At most this many emoji are on per member and message (§11.12 `MAX_REACTIONS`); the UI offers no more. */
+export const MAX_REACTIONS = 8;
+
 /** One emoji under a message (§11.12): how many members have it on, and whether self is one of them. */
 export interface ReactionView {
   emoji: string;
