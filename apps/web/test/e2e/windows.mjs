@@ -185,7 +185,9 @@ async function launch(exe, port) {
       }
       await until("DevTools port");
     }
-    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
+    // No default overrides: Playwright's focus emulation would keep the page visible and focused (Chromium counts an
+    // emulated focus as a viewer) with the window closed, and the app does not notify of what is on a page in use.
+    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`, { noDefaults: true });
     for (;;) {
       const page = browser
         .contexts()
