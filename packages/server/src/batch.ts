@@ -209,6 +209,12 @@ export class AlarmSlot {
     });
   }
 
+  /** Deletes the alarm (nothing is left to do: a paged shard). */
+  async clear(): Promise<void> {
+    this.armed = null;
+    await this.storage.deleteAlarm();
+  }
+
   /** Arms min(current alarm, due) and waits for the write (alarm handlers, whose re-arm tests observe at once). */
   async set(due: number): Promise<void> {
     if (!Number.isFinite(due)) return;

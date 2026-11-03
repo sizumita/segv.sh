@@ -12,6 +12,8 @@
  *    are in flight at a time. A component that fails keeps its previous head. The list is sorted by cid,
  *    hd = H(heads), C_q = H(enc("segv.sh/v2/ckpt", C_{q−1}, u32 q, u32 sec, hd)), sig = Sign(SRV_SK, enc(…, q, C_q)).
  *    An unchanged hd makes no new checkpoint.
+ *  - Once per UTC hour it also wakes a few shards of past eras (head(), from 'page:era' up to E_now − 2) so that
+ *    every sealed shard gets paged into R2 (§9.1 "Paging", §9.5 "Sweep"); eras found paged are marked 'paged:<E>'.
  *  - latest() / get(q) / range(after, limit) are the §10.9 reads.
  *
  * Time is read through the protected `clock` field so tests can override it.
@@ -48,6 +50,8 @@ const SIZE_WARN_BYTES = 2 * 2 ** 30;
 const COMPONENT_TIMEOUT_MS = 10_000;
 /** Component calls in flight at a time (§9.5). */
 const COLLECT_CONCURRENCY = 32;
+/** Shards of past eras woken per hour so that each gets paged (§9.5 "Sweep"). */
+const SWEEP_SHARDS = 16;
 
 /** Runs the jobs with at most `n` in flight. The jobs never throw (each catches its own failure). */
 async function pool(jobs: readonly (() => Promise<void>)[], n: number): Promise<void> {
@@ -120,6 +124,7 @@ export class CheckpointDO extends DurableObject<Env> {
   protected componentTimeoutMs = COMPONENT_TIMEOUT_MS;
   /** S_E (§9.1); an instance field so tests can set a count without a deployment variable. */
   protected shardsOf = (E: number): number => shardsOf(v2Params(this.env).shardMap, E);
+  protected sweepShards = SWEEP_SHARDS;
 
   private readonly sql: SqlStorage;
   private readonly kv: Meta;
@@ -300,6 +305,7 @@ export class CheckpointDO extends DurableObject<Env> {
       jobs.push(() => inbox(E - 1, true));
     }
     await pool(jobs, COLLECT_CONCURRENCY);
+    await this.sweep(now, E, eFirst, metaWrites);
 
     const list = [...heads]
       .map(([cid, head]): Head => ({ cid, head }))
@@ -321,6 +327,46 @@ export class CheckpointDO extends DurableObject<Env> {
     const sig = await srvSign(keys, ckptSigMsg(q, C));
     if ((this.latestRow()?.q ?? 0) !== q - 1) throw new Error("checkpoint: concurrent writer"); // single-flight: unreachable
     this.commit({ q, sec, hd, heads: headsEnc, C, sig }, metaWrites);
+  }
+
+  /**
+   * §9.5 "Sweep": once per UTC hour, head() on the shards of past eras from `page:era` (the lowest era not known to
+   * be paged) up to E_now − 2, at most `sweepShards` of them, so that a sealed shard that still holds rows arms its
+   * paging (§9.1). An era whose shards all answer `paged` is marked and never asked again; the cursor skips marks.
+   */
+  private async sweep(now: number, E: number, eFirst: number, metaWrites: Map<string, number | Uint8Array>): Promise<void> {
+    const hour = Math.floor(now / HOUR_MS);
+    if ((this.kv.num("page:hour") ?? -1) >= hour) return;
+    metaWrites.set("page:hour", hour);
+    let cursor = this.kv.num("page:era") ?? Math.max(eFirst, 0);
+    let calls = 0;
+    for (let e = cursor; e <= E - 2 && calls < this.sweepShards; e++) {
+      if (this.kv.num(`paged:${e}`) !== null) {
+        if (e === cursor) cursor = e + 1;
+        continue;
+      }
+      const S = this.shardsOf(e);
+      let all = true;
+      const jobs: (() => Promise<void>)[] = [];
+      for (let i = 0; i < S; i++) {
+        jobs.push(async () => {
+          try {
+            const h = await this.timed(Promise.resolve(shardStub(this.env, e, i).head(e, i)));
+            if (!h.paged) all = false;
+          } catch (err) {
+            all = false;
+            console.error(JSON.stringify({ msg: "sweep: shard unreachable", E: e, error: logErr(err) }));
+          }
+        });
+      }
+      calls += S;
+      await pool(jobs, COLLECT_CONCURRENCY);
+      if (all) {
+        metaWrites.set(`paged:${e}`, 1);
+        if (e === cursor) cursor = e + 1;
+      }
+    }
+    if (cursor !== (this.kv.num("page:era") ?? -1)) metaWrites.set("page:era", cursor);
   }
 
   /** One transaction for the checkpoint row and its meta, and the next alarm in the same synchronous block. */

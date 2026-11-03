@@ -29,7 +29,9 @@
       "migrations_dir": "../../packages/server/migrations",
     },
   ],
-  // Client-side-encrypted, content-addressed blobs: key "b/<b64u(sha256(blob))>".
+  // Client-side-encrypted, content-addressed blobs: key "b/<b64u(sha256(blob))>". Also the rows, index and manifest of
+  // every sealed era's shards ("seal/v2/{E}/{i}/…", docs/PROTOCOL.md §9.1 "Paging"), which the shards write
+  // themselves before they empty their storage.
   "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "segv-blobs" }],
   // The push store (docs/PROTOCOL.md §9.8): sealed registrations, written at once; a KV namespace keeps no history.
   // Create it with `wrangler kv namespace create segv-push` and put its id here (docs/DEPLOYMENT.md).

@@ -23,6 +23,7 @@ import {
   INBOX_BODY_LEN,
   MAX_ID_LEN,
   T0_MS,
+  concat,
   eraEnd,
   eraStart,
   era,
@@ -73,6 +74,7 @@ import {
   readBody,
   sha256,
   HSTS,
+  joinStreams,
 } from "./http";
 import {
   _resetDirectoryCacheForTests,
@@ -104,6 +106,21 @@ import {
   shardsOf,
 } from "./env";
 import { CORS_HEADERS, appOriginOf, isPreflight, preflightResponse, setCorsHeaders } from "./origins";
+import {
+  _resetSealForTests,
+  batchHeader,
+  checkManifest,
+  feedPageHeader,
+  isPagedError,
+  r2Range,
+  sealBatchTable,
+  sealForget,
+  sealKey,
+  sealLookup,
+  sealManifest,
+  sealPage,
+  type SealManifest,
+} from "./seal";
 import { PUSH_TOKENS, PUSH_WINDOW, epOf, ownerOf, pushRing, qkOf, quietShard } from "./push";
 export { _setRingSleepForTests } from "./push";
 import {
@@ -424,6 +441,56 @@ async function put(c: Ctx): Promise<Response> {
   return binary(encodePutResponse(wire));
 }
 
+const unavailable = (): HttpError => new HttpError(503, "storage unavailable", { "retry-after": "5" });
+
+/**
+ * The manifest of shard (E, i) when it is paged (§9.1 "Paging"), else null. Looked for only once the era is sealed
+ * by the Worker's clock, unless `force` (the ShardDO just answered "shard: paged"). A manifest that does not verify,
+ * or whose s_E is not the shard map's, is a 503: the keys were routed under another count.
+ */
+async function pagedManifest(c: Ctx, E: number, i: number, force = false): Promise<SealManifest | null> {
+  if (!force && !sealedByClock(c, E)) return null;
+  let m: SealManifest | null;
+  try {
+    m = await sealManifest(c.env.BLOBS, c.keys.srvPk, E, i, c.now, force);
+  } catch (e) {
+    console.error(JSON.stringify({ msg: "seal manifest failed", error: logErr(e) }));
+    throw unavailable();
+  }
+  if (m && m.sbits !== shardBitsOf(c.params.shardMap, E)) {
+    console.error(JSON.stringify({ msg: "seal: SHARD_MAP differs from the paged shard's count", E }));
+    throw unavailable();
+  }
+  return m;
+}
+
+/** §10.4: the keys of one shard, from the ShardDO or, once it is paged, from its files in R2. */
+async function shardGet(c: Ctx, E: number, i: number, items: ShardGetKey[]): Promise<ShardGetResult[]> {
+  let m = await pagedManifest(c, E, i);
+  if (!m) {
+    try {
+      return (await shardStub(c.env, E, i).get(E, i, items)) as ShardGetResult[];
+    } catch (e) {
+      if (!isPagedError(e)) {
+        console.error(JSON.stringify({ msg: "shard get failed", error: logErr(e) }));
+        throw unavailable();
+      }
+      sealForget(E, i);
+      m = await pagedManifest(c, E, i, true);
+      if (!m) {
+        console.error(JSON.stringify({ msg: "shard get failed", error: "paged shard without a manifest" }));
+        throw unavailable();
+      }
+    }
+  }
+  try {
+    return await sealLookup(c.env.BLOBS, m, items);
+  } catch (e) {
+    console.error(JSON.stringify({ msg: "seal get failed", error: logErr(e) }));
+    throw unavailable();
+  }
+}
+
 async function get(c: Ctx): Promise<Response> {
   await readLimit(c);
   const bytes = await readBody(c.request, GET_MAX_BYTES);
@@ -448,13 +515,7 @@ async function get(c: Ctx): Promise<Response> {
   );
   await Promise.all(
     routed.map(async (g) => {
-      let res: ShardGetResult[];
-      try {
-        res = (await shardStub(c.env, g.E, g.i).get(g.E, g.i, g.items)) as ShardGetResult[];
-      } catch (e) {
-        console.error(JSON.stringify({ msg: "shard get failed", error: logErr(e) }));
-        throw new HttpError(503, "storage unavailable", { "retry-after": "5" });
-      }
+      const res = await shardGet(c, g.E, g.i, g.items);
       g.idx.forEach((idx, k) => (out[idx] = res[k]));
     }),
   );
@@ -765,8 +826,20 @@ async function feed(c: Ctx, E: number, i: number): Promise<Response> {
   const hit = await cacheGet(key);
   if (hit) return hit;
   await readLimit(c);
+  let m = await pagedManifest(c, E, i);
   const shard = shardStub(c.env, E, i);
-  const page = await shard.feedBatches(E, i, after, FEED_BUDGET);
+  let page: ShardFeedBatches | null = null;
+  if (!m) {
+    try {
+      page = await shard.feedBatches(E, i, after, FEED_BUDGET);
+    } catch (e) {
+      if (!isPagedError(e)) throw e;
+      sealForget(E, i);
+      m = await pagedManifest(c, E, i, true);
+      if (!m) throw unavailable();
+    }
+  }
+  if (m || !page) return sealFeed(c, m!, E, i, after, key);
   const immutable = page.more || page.sealed;
   const cacheControl = immutable ? IMMUTABLE : "no-store";
   const inline = page.batches.flatMap((b) => (b.rows ? [{ ...b, rows: b.rows }] : []));
@@ -789,16 +862,38 @@ async function feed(c: Ctx, E: number, i: number): Promise<Response> {
   });
 }
 
-/** §10.9 batch header: u32 t | u32 n | root[32] | head[32]. */
-function feedBatchHeader(t: number, n: number, root: Bytes, head: Bytes): Bytes {
-  if (root.length !== 32 || head.length !== 32) throw new Error("feed: malformed batch from the shard");
-  const out = new Uint8Array(72);
-  const dv = new DataView(out.buffer);
-  dv.setUint32(0, t);
-  dv.setUint32(4, n);
-  out.set(root, 8);
-  out.set(head, 40);
-  return out;
+/**
+ * A paged shard's page (§10.9): the same composition from the shard's batch table, and the bytes from one Range of
+ * `rows`; buffered and cached when it fits the budget, streamed (with the extra tokens) when it is one larger batch.
+ */
+async function sealFeed(c: Ctx, m: SealManifest, E: number, i: number, after: number, key: string): Promise<Response> {
+  let page;
+  try {
+    page = sealPage(await sealBatchTable(c.env.BLOBS, m), after, FEED_BUDGET);
+  } catch (e) {
+    console.error(JSON.stringify({ msg: "seal feed failed", error: logErr(e) }));
+    throw unavailable();
+  }
+  const top = feedPageHeader(page.more, page.batches.length);
+  const rowsKey = sealKey(E, i, "rows");
+  if (page.bytes <= FEED_BUDGET) {
+    let body: Bytes;
+    try {
+      body = await r2Range(c.env.BLOBS, rowsKey, page.from, page.bytes);
+    } catch (e) {
+      console.error(JSON.stringify({ msg: "seal feed failed", error: logErr(e) }));
+      throw unavailable();
+    }
+    const res = binary(concat(top, body), IMMUTABLE);
+    cachePut(c, key, res);
+    return res;
+  }
+  for (let k = feedTokens(page.bytes) - 1; k > 0; k--) await readLimit(c);
+  const obj = await c.env.BLOBS.get(rowsKey, { range: { offset: page.from, length: page.bytes } }).catch(() => null);
+  if (!obj) throw unavailable();
+  return new Response(joinStreams([top, obj.body]), {
+    headers: { "content-type": OCTET, "cache-control": IMMUTABLE, ...SECURITY_HEADERS },
+  });
 }
 
 /** §10.9 rows: (label[16] | u8 cls | body[CLASSES[cls] + 40]) × rows, in the order given. */
@@ -836,12 +931,9 @@ function feedStream(
 ): ReadableStream<Uint8Array> {
   let pending: ShardFeedRows | null = first;
   async function* chunks(): AsyncGenerator<Bytes> {
-    const top = new Uint8Array(5);
-    top[0] = page.more ? 1 : 0;
-    new DataView(top.buffer).setUint32(1, page.batches.length);
-    yield top;
+    yield feedPageHeader(page.more, page.batches.length);
     for (const b of page.batches) {
-      yield feedBatchHeader(b.t, b.n, b.root, b.head);
+      yield batchHeader(b.t, b.n, b.root, b.head);
       if (b.rows) {
         if (b.rows.length !== b.n) throw new Error("feed: batch row count mismatch");
         yield feedRowBytes(b.rows);
@@ -879,6 +971,36 @@ function feedStream(
       await it.return(undefined);
     },
   });
+}
+
+/** `GET /api/v2/seal/{E}/{i}` (§10.9): the manifest of a paged shard, as stored, once it verifies. */
+async function sealInfo(c: Ctx, E: number, i: number): Promise<Response> {
+  const { hi } = eraBounds(c.now, c.params.skew);
+  if (E > hi || E < c.params.eFirst || i >= shardsOf(c.params.shardMap, E)) throw new HttpError(404, "no such shard");
+  const key = `${c.url.origin}/api/v2/seal/${E}/${i}`;
+  const hit = await cacheGet(key);
+  if (hit) return hit;
+  await readLimit(c);
+  let text: string | null;
+  try {
+    const obj = await c.env.BLOBS.get(sealKey(E, i, "manifest"));
+    text = obj ? await obj.text() : null;
+  } catch (e) {
+    console.error(JSON.stringify({ msg: "seal manifest failed", error: logErr(e) }));
+    throw unavailable();
+  }
+  if (text === null) throw new HttpError(404, "not paged");
+  try {
+    await checkManifest(text, c.keys.srvPk, E, i);
+  } catch (e) {
+    console.error(JSON.stringify({ msg: "seal manifest failed", error: logErr(e) }));
+    throw unavailable();
+  }
+  const res = new Response(text, {
+    headers: { "content-type": "application/json; charset=utf-8", "cache-control": IMMUTABLE, ...SECURITY_HEADERS },
+  });
+  cachePut(c, key, res);
+  return res;
 }
 
 // ───────────── directory (§10.6) ─────────────
@@ -1096,6 +1218,7 @@ const INBOX_PATH = /^\/api\/v2\/inbox\/(\d{1,6})\/(\d{1,10})$/;
 const BLOB_PATH = /^\/api\/v2\/blob\/([A-Za-z0-9_-]{43})(\/meta)?$/;
 const CKPT_PATH = /^\/api\/v2\/ckpt\/(\d{1,10})$/;
 const FEED_PATH = /^\/api\/v2\/feed\/(\d{1,6})\/(\d{1,6})$/;
+const SEAL_PATH = /^\/api\/v2\/seal\/(\d{1,6})\/(\d{1,6})$/;
 const DIR_PREFIX_PATH = /^\/api\/v2\/dir\/(h|u)\/(\d{1,2})\/(\d{1,10})$/;
 const DIR_UID_PATH = /^\/api\/v2\/dir\/uid\/([^/]{1,64})$/;
 const DIR_WRAPS_PATH = /^\/api\/v2\/dir\/wraps\/([^/]{1,1400})$/;
@@ -1181,6 +1304,11 @@ async function route(c: Ctx): Promise<Response> {
     methods(c, ["GET"]);
     return feed(c, decimal(m[1], 0xfffe, "era"), decimal(m[2], 0xffff, "shard"));
   }
+  m = SEAL_PATH.exec(path);
+  if (m) {
+    methods(c, ["GET"]);
+    return sealInfo(c, decimal(m[1], 0xfffe, "era"), decimal(m[2], 0xffff, "shard"));
+  }
   m = DIR_PREFIX_PATH.exec(path);
   if (m) {
     methods(c, ["GET"]);
@@ -1206,6 +1334,7 @@ export function routeLabel(path: string): string {
   if (path.startsWith(`${P}/blob/`)) return path.endsWith("/meta") ? `${P}/blob/:id/meta` : `${P}/blob/:id`;
   if (CKPT_PATH.test(path)) return `${P}/ckpt/:q`;
   if (FEED_PATH.test(path)) return `${P}/feed/:E/:i`;
+  if (SEAL_PATH.test(path)) return `${P}/seal/:E/:i`;
   if (DIR_PREFIX_PATH.test(path)) return `${P}/dir/:kind/:p/:x`;
   if (DIR_UID_PATH.test(path)) return `${P}/dir/uid/:uid`;
   if (DIR_WRAPS_PATH.test(path)) return `${P}/dir/wraps/:id`;
@@ -1277,5 +1406,6 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
 export function _resetApiForTests(): void {
   ckptEnsured = false;
   _resetDirectoryCacheForTests();
+  _resetSealForTests();
 }
 

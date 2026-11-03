@@ -3,9 +3,9 @@
  * Tests that need to observe or replace a binding call handleApi directly
  * (helpers.direct) with a spied or fake namespace.
  */
-import { runInDurableObject } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import * as P from "@segv/protocol/proto";
 import * as W from "@segv/protocol/wire";
 import { clientKey } from "../src/abuse";
@@ -873,16 +873,17 @@ describe("GET /api/v2/feed and /api/v2/ckpt", () => {
     const N = 2100; // one Δ batch of 2100 class-3 rows: 2100 × (17 + 16 424) B ≈ 34.5 MB on the wire
     const sent = new Map<string, ShardPutRow>();
     for (let k = 0; k < N; k += 300) {
-      const part = Array.from({ length: 300 }, () => ({
-        v: P.random(8),
-        label: randomLabel(),
-        cls: 3,
-        body: randomBody(3),
-      }));
+      const part = Array.from({ length: 300 }, () => {
+        const v = P.random(8);
+        v[0] &= 0x7f; // a routing value is below 2^63 (§4.4)
+        return { v, label: randomLabel(), cls: 3, body: randomBody(3) };
+      });
       for (const r of await shard.put(E, 0, part)) expect(r.s).toBe("ok");
       for (const r of part) sent.set(P.b64u(r.label), r);
     }
-    await shardClock(P.eraEnd(E) + 1000); // the next RPC seals the era, closing the batch
+    // Past the era's end: the next RPC seals it, closing the batch. Far past it, so that the paging alarm the seal
+    // arms (clock + 1 s, §9.1) lies in the real future and only runs when this test runs it.
+    await shardClock(P.eraStart(eraNow() + 500));
     const { batches, head } = await feedVerified(E, true);
     expect(batches).toHaveLength(1);
     const [b] = batches;
@@ -893,6 +894,29 @@ describe("GET /api/v2/feed and /api/v2/ckpt", () => {
     for (const r of b.rows) expect(eq(r.body, sent.get(P.b64u(r.label))!.body)).toBe(true);
     expect(new Set(b.rows.map((r) => P.b64u(r.label))).size).toBe(N);
     expect(eq(head, (await shard.head(E, 0)).head)).toBe(true);
+    // Paged into R2 (three parts of 16 MiB), the page is the same: streamed from one Range of `rows` (§10.9).
+    for (let k = 0; ; k++) {
+      const paged = await runInDurableObject(shard, (_inst: ShardDO, state) => {
+        const v = state.storage.sql
+          .exec<{ v: SqlStorageValue }>("SELECT v FROM meta WHERE k = 'state'")
+          .toArray()[0]?.v;
+        return v === "paged";
+      });
+      if (paged) break;
+      expect(k, "paging alarms").toBeLessThan(40);
+      expect(await runDurableObjectAlarm(shard)).toBe(true);
+    }
+    const again = await feedVerified(E, true);
+    expect(again.batches).toHaveLength(1);
+    expect(again.batches[0].n).toBe(N);
+    expect(eq(again.head, head)).toBe(true);
+    for (const r of again.batches[0].rows)
+      expect(eq(r.body, sent.get(P.b64u(r.label))!.body)).toBe(true);
+    const seal = (await (await api(`/api/v2/seal/${E}/0`)).json()) as {
+      rows: { n: number; sha256: string[] };
+    };
+    expect(seal.rows.n).toBe(N);
+    expect(seal.rows.sha256).toHaveLength(3);
   }, 120_000);
 
   it("ckpt: 404 for q = 0 and unknown q; 400 on bad range parameters", async () => {
@@ -3215,4 +3239,125 @@ describe("routeLabel", () => {
     expect(routeLabel("/api/v2/put")).toBe("/api/v2/put");
     expect(routeLabel("/api/v2/whatever/secret")).toBe("/api/v2/*");
   });
+});
+
+describe('paged shards (§9.1 "Paging", §10.4, §10.9)', () => {
+  it("answers get, feed and seal of a paged shard from R2, byte for byte as the shard did", async () => {
+    // A future era, so that nothing fires on its own: the shard runs on its own clock, and the Worker's clock is
+    // moved past the era's end for the duration of the test.
+    const E = eraNow() + 30;
+    const kr = testKroute(E);
+    const s = shardStub(env, E, 0);
+    const clock = (ms: number) =>
+      runInDurableObject(s, (inst: ShardDO) => {
+        (inst as unknown as { clock: () => number }).clock = () => ms;
+      });
+    const rows = [
+      makeRow({ E, cls: 0 }),
+      makeRow({ E, cls: 2 }),
+      makeRow({ E, cls: 1 }),
+      makeRow({ E, cls: 3 }),
+    ];
+    const toShard = (rs: W.PutRow[]): ShardPutRow[] =>
+      rs.map((r) => ({ v: P.routeV(kr, r.label), label: r.label, cls: r.cls, body: r.body }));
+    await clock(P.eraStart(E) + 1000);
+    for (const r of await s.put(E, 0, toShard(rows.slice(0, 3)))) expect(r.s).toBe("ok");
+    await clock(P.eraStart(E) + 2000);
+    for (const r of await s.put(E, 0, toShard(rows.slice(3)))) expect(r.s).toBe("ok");
+    const sealedAt = P.eraEnd(E) + 5000;
+    await clock(sealedAt);
+    const now = vi.spyOn(Date, "now").mockReturnValue(sealedAt);
+    try {
+      const keys: W.GetKey[] = [
+        ...rows.map((r) => ({ E, label: r.label, mode: 0 as const })),
+        { E, label: rows[1].label, mode: 1 },
+        { E, label: randomLabel(), mode: 0 },
+      ];
+      const getVia = async (
+        origin: string,
+        overrides: Record<string, unknown> = {},
+      ): Promise<W.GetStatus[]> => {
+        const res = await direct(
+          "/api/v2/get",
+          { method: "POST", body: W.encodeGetRequest(keys), origin },
+          overrides,
+        );
+        expect(res.status, res.status === 200 ? "" : await res.clone().text()).toBe(200);
+        return W.decodeGetResponse(
+          await bytesOf(res),
+          keys.map((k) => k.mode),
+        );
+      };
+      const feedVia = async (origin: string): Promise<Bytes[]> => {
+        const pages: Bytes[] = [];
+        for (let after = 0; ;) {
+          const res = await direct(`/api/v2/feed/${E}/0?after=${after}`, { origin });
+          expect(res.status, res.status === 200 ? "" : await res.clone().text()).toBe(200);
+          expect(res.headers.get("cache-control")).toBe(IMMUTABLE);
+          const b = await bytesOf(res);
+          pages.push(b);
+          const f = W.decodeFeed(b);
+          if (!f.more) return pages;
+          after = f.batches[f.batches.length - 1].t;
+        }
+      };
+      // From the shard: sealed, not paged yet (the Worker looked for a manifest and found none).
+      const got0 = await getVia("https://a.segv.test");
+      expect(got0.slice(0, 4).map((g) => g.s)).toEqual(["hit", "hit", "hit", "hit"]);
+      expect(got0[4]).toMatchObject({ s: "hit", cls: 2 });
+      expect(got0[5]).toEqual({ s: "miss", sealed: true });
+      const pages0 = await feedVia("https://a.segv.test");
+      expect(pages0).toHaveLength(1);
+      expect(
+        await errorOf(await direct(`/api/v2/seal/${E}/0`, { origin: "https://a.segv.test" })),
+      ).toBe("not paged");
+      // The shard pages itself.
+      const paged = () =>
+        runInDurableObject(s, (_inst: ShardDO, state) => {
+          const v = state.storage.sql
+            .exec<{ v: SqlStorageValue }>("SELECT v FROM meta WHERE k = 'state'")
+            .toArray()[0]?.v;
+          return v === "paged";
+        });
+      for (let k = 0; !(await paged()); k++) {
+        expect(k, "paging alarms").toBeLessThan(40);
+        expect(await runDurableObjectAlarm(s)).toBe(true);
+      }
+      // The Worker still remembers "no manifest": the shard answers "shard: paged", and R2 takes over, with the
+      // same answers and the same bytes (another origin, so that caches.default has no say).
+      expect(await getVia("https://b.segv.test")).toEqual(got0);
+      expect(await feedVia("https://b.segv.test")).toEqual(pages0);
+      // Once the manifest is known, the shard is not addressed at all.
+      const calls: string[] = [];
+      expect(
+        await getVia("https://c.segv.test", { SHARD: spyNamespace(env.SHARD, calls) }),
+      ).toEqual(got0);
+      expect(calls).toEqual([]);
+      // The manifest: immutable JSON naming this shard, with kroute_E behind the era's kcommit; other shards: 404.
+      const seal = await direct(`/api/v2/seal/${E}/0`, { origin: "https://b.segv.test" });
+      expect(seal.status).toBe(200);
+      expect(seal.headers.get("cache-control")).toBe(IMMUTABLE);
+      expect(seal.headers.get("content-type")).toBe("application/json; charset=utf-8");
+      const m = (await seal.json()) as {
+        era: number;
+        shard: number;
+        kroute: string;
+        rows: { n: number };
+      };
+      expect(m).toMatchObject({ era: E, shard: 0, kroute: P.b64u(kr) });
+      expect(m.rows.n).toBe(4);
+      const info = (await (
+        await direct(`/api/v2/era/${E}`, { origin: "https://b.segv.test" })
+      ).json()) as { kcommit: string };
+      expect(P.b64u(P.kcommit(P.fromB64u(m.kroute)))).toBe(info.kcommit);
+      expect(
+        await errorOf(await direct(`/api/v2/seal/${E}/1`, { origin: "https://b.segv.test" })),
+      ).toBe("no such shard");
+      expect(
+        await errorOf(await direct(`/api/v2/seal/${E + 1}/0`, { origin: "https://b.segv.test" })),
+      ).toBe("not paged");
+    } finally {
+      now.mockRestore();
+    }
+  }, 60_000);
 });

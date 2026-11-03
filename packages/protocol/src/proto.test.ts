@@ -2543,3 +2543,59 @@ describe("known-answer vectors", () => {
     expect(V.powPre).toBe(KAT.powPre);
   });
 });
+
+describe("sealed shards (§9.1 \"Paging\")", () => {
+  it("sealBucketBits: about 1 024 rows per bucket, at most 2^16 buckets", () => {
+    expect([0, 1, 1024, 1025, 2048, 2049, 1024 * 2 ** 16, 1024 * 2 ** 16 + 1, 2 ** 40].map(P.sealBucketBits)).toEqual([
+      0, 0, 0, 1, 1, 2, 16, 16, 16,
+    ]);
+    expect(() => P.sealBucketBits(-1)).toThrow();
+  });
+
+  it("sealBucketOf takes the b bits of v below its shard bits", () => {
+    // v = 0x5ac3… : below the clear top bit the bits run 1011010 11000011 …
+    const v = new Uint8Array([0x5a, 0xc3, 0, 0, 0, 0, 0, 0]);
+    expect(P.sealBucketOf(v, 0, 0)).toBe(0);
+    expect(P.sealBucketOf(v, 0, 3)).toBe(0b101);
+    expect(P.shardOf(v, 3)).toBe(0b101);
+    expect(P.sealBucketOf(v, 3, 4)).toBe(0b1010);
+    expect(P.sealBucketOf(v, 7, 8)).toBe(0xc3);
+    expect(P.sealBucketOf(v, 16, 16)).toBe(0);
+    expect(() => P.sealBucketOf(v, 0, 17)).toThrow();
+    expect(() => P.sealBucketOf(new Uint8Array(7), 0, 1)).toThrow();
+  });
+
+  it("sealSigMsg lays the manifest's fields out as §9.1 writes them", () => {
+    const sha = (k: number) => P.H(P.u8(k));
+    const m = {
+      era: 41,
+      shard: 2,
+      sbits: 2,
+      kroute: P.H(P.utf8("kroute")),
+      head: P.H(P.utf8("head")),
+      tLast: 1234,
+      part: 16777216,
+      n: 3,
+      b: 1,
+      dir: P.concat(P.u32(0), P.u32(1), P.u32(3)),
+      nb: 2,
+      rows: { size: 1000, sha256: [sha(1), sha(2)] },
+      idx: { size: 84, sha256: [sha(3)] },
+      batches: { size: 160, sha256: [sha(4)] },
+    };
+    const f = P.dec(P.sealSigMsg(m), 18);
+    expect(P.fromUtf8(f[0])).toBe("segv.sh/v2/seal");
+    expect(f.slice(1, 4)).toEqual([P.u16(41), P.u16(2), P.u8(2)]);
+    expect(f[4]).toEqual(m.kroute);
+    expect(f[5]).toEqual(m.head);
+    expect(f.slice(6, 10)).toEqual([P.u32(1234), P.u32(16777216), P.u32(3), P.u8(1)]);
+    expect(f[10]).toEqual(P.H(m.dir));
+    expect(f[11]).toEqual(P.u32(2));
+    expect(f[12]).toEqual(P.u64(1000));
+    expect(f[13]).toEqual(P.H(P.concat(sha(1), sha(2))));
+    expect(f[14]).toEqual(P.u64(84));
+    expect(f[15]).toEqual(P.H(sha(3)));
+    expect(f[16]).toEqual(P.u64(160));
+    expect(f[17]).toEqual(P.H(sha(4)));
+  });
+});

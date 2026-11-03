@@ -56,6 +56,8 @@ export interface ShardHead {
   sealed: boolean;
   /** storage.sql.databaseSize */
   size: number;
+  /** nothing is left to page (§9.1 "Paging"): the shard is paged into R2, or sealed without rows */
+  paged: boolean;
 }
 
 /** One row of a closed batch, as the feed carries it (§10.9). */

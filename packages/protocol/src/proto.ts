@@ -1006,6 +1006,83 @@ export const ckptC = (prevC: Bytes, q: number, sec: number, hd: Bytes): Bytes =>
   H(enc("segv.sh/v2/ckpt", prevC, u32(q), u32(sec), hd));
 export const ckptSigMsg = (q: number, C: Bytes): Bytes => enc("segv.sh/v2/ckpt-sig", u32(q), C);
 
+// ───────────────────────── sealed shards in R2 (§9.1 "Paging") ─────────────────────────
+
+/** Bytes of one `idx` entry: label[16] | u32 t | u8 cls | u8 0 | u48 off. */
+export const SEAL_IDX_ENTRY = 28;
+/** Bytes of one `batches` entry: u32 t | u32 n | root[32] | head[32] | u64 off. */
+export const SEAL_BATCH_ENTRY = 80;
+
+/** b of a paged shard with n rows: 0 for n ≤ 1024, else min(16, ⌈log2(n / 1024)⌉) (about 1 024 rows per bucket). */
+export function sealBucketBits(n: number): number {
+  if (!Number.isSafeInteger(n) || n < 0) throw new Error("sealBucketBits: bad n");
+  if (n <= 1024) return 0;
+  let b = 0;
+  while (b < 16 && 1024 * 2 ** b < n) b++;
+  return b;
+}
+
+/** bucket(v) = (v >> (63 − s_E − b)) mod 2^b: the b bits of the routing value below the shard bits. */
+export function sealBucketOf(v: Bytes, sE: number, b: number): number {
+  if (v.length !== 8) throw new Error("sealBucketOf: v must be 8 bytes");
+  if (!Number.isInteger(sE) || sE < 0 || sE > 16 || !Number.isInteger(b) || b < 0 || b > 16) throw new Error("sealBucketOf: bad bits");
+  if (b === 0) return 0;
+  const x = new DataView(v.buffer, v.byteOffset, 8).getBigUint64(0);
+  return Number((x >> BigInt(63 - sE - b)) & BigInt(2 ** b - 1));
+}
+
+/** One file of a paged shard, as the manifest describes it: its size and the SHA-256 of each of its parts. */
+export interface SealFile {
+  size: number;
+  sha256: Bytes[];
+}
+
+/** What the manifest of a paged shard commits to (§9.1 "Paging"); `dir` is the big-endian u32 counts. */
+export interface SealSummary {
+  era: number;
+  shard: number;
+  sbits: number;
+  kroute: Bytes;
+  head: Bytes;
+  tLast: number;
+  part: number;
+  n: number;
+  b: number;
+  dir: Bytes;
+  nb: number;
+  rows: SealFile;
+  idx: SealFile;
+  batches: SealFile;
+}
+
+/**
+ * sig = Sign(SRV_SK, enc("segv.sh/v2/seal", u16 E, u16 i, u8 s_E, kroute_E, head, u32 closed_t, u32 part, u32 n, u8 b,
+ * H(dir), u32 nb, u64 size(rows), H(sha of rows), u64 size(idx), H(sha of idx), u64 size(batches), H(sha of batches))).
+ */
+export function sealSigMsg(m: SealSummary): Bytes {
+  const shas = (f: SealFile): Bytes => H(concat(...f.sha256));
+  return enc(
+    "segv.sh/v2/seal",
+    u16(m.era),
+    u16(m.shard),
+    u8(m.sbits),
+    m.kroute,
+    m.head,
+    u32(m.tLast),
+    u32(m.part),
+    u32(m.n),
+    u8(m.b),
+    H(m.dir),
+    u32(m.nb),
+    u64(m.rows.size),
+    shas(m.rows),
+    u64(m.idx.size),
+    shas(m.idx),
+    u64(m.batches.size),
+    shas(m.batches),
+  );
+}
+
 /** receipt = Sign(SRV_SK, enc("segv.sh/v2/receipt", u16 E, label, H(body), u32 t)) (§10.3). */
 export const receiptMsg = (E: number, label: Bytes, body: Bytes, t: number): Bytes =>
   enc("segv.sh/v2/receipt", u16(E), label, H(body), u32(t));

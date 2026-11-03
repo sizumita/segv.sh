@@ -278,6 +278,34 @@ export async function web({ base, browser, shots, P, Wire }) {
       check(Date.now() - t0 < 150_000, "no checkpoint covered every shard within 150 s");
       await new Promise((res) => setTimeout(res, 2000));
     }
+    // Paging (§9.1): an open era's shards have no manifest; a sealed one with rows has one that verifies, names the
+    // era's kroute_E behind its kcommit, and whose head is the feed's last head.
+    const sealNow = await fetch(`${base}/api/v2/seal/${Enow}/0`);
+    check(sealNow.status === 404, `seal ${Enow}: ${sealNow.status}`);
+    for (let E = startEra; E < Enow; E++) {
+      const S = await shardsOf(E);
+      for (let i = 0; i < S; i++) {
+        const batches = await feedOf(E, i);
+        const r = await fetch(`${base}/api/v2/seal/${E}/${i}`);
+        if (batches.length === 0) {
+          check(r.status === 404, `seal ${E}/${i}: ${r.status} for an empty shard`);
+          continue;
+        }
+        if (r.status === 404) continue; // sealed, not paged yet
+        check(r.ok, `seal ${E}/${i}: ${r.status}`);
+        const m = await r.json();
+        const info = await (await fetch(`${base}/api/v2/era/${E}`)).json();
+        check(
+          P.b64u(P.kcommit(P.fromB64u(m.kroute))) === info.kcommit,
+          `seal ${E}/${i}: kroute does not match kcommit`,
+        );
+        check(
+          m.head === P.b64u(batches.at(-1).head),
+          `seal ${E}/${i}: the manifest's head is not the feed's`,
+        );
+        check(m.rows.n === batches.reduce((n, b) => n + b.n, 0), `seal ${E}/${i}: row count`);
+      }
+    }
     // Inbox rows: the one size, no plaintext.
     let invites = 0;
     for (let E = startEra; E <= Enow; E++)

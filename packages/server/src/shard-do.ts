@@ -1,5 +1,5 @@
 /**
- * ShardDO — one era's create-only row store (docs/PROTOCOL.md §9.1). Name "shard/v2/{E}/{i}" (stage 1: i = 0).
+ * ShardDO — one era's create-only row store (docs/PROTOCOL.md §9.1). Name "shard/v2/{E}/{i}".
  *
  *  - put: H(body) of every well-formed row is computed natively (crypto.subtle) first; then one synchronous
  *    transactionSync per call (no await inside): prepare(), the accept window start(E) − SKEW ≤ now < end(E), FULL
@@ -11,6 +11,12 @@
  *    share the one DO alarm; the earliest due is always armed, in the same synchronous block as the commit.
  *  - prepare() seals once now ≥ end(E) + SKEW: closes the open batch and persists state = sealed. MISS(sealed)
  *    is only answered once that is persisted.
+ *  - Paging (§9.1 "Paging"): a sealed shard that holds rows writes itself into R2 (seal.ts: rows, idx, batches, then
+ *    the manifest), alarm by alarm in slices of a few parts, with the progress of every part persisted (pager.ts), then
+ *    verifies the files the way the Worker reads them, persists state = paged, drops its tables and deleteAll()s its
+ *    storage, keeping only the meta it still answers head() from. From then on get and the feed RPCs throw
+ *    "shard: paged" and the Worker reads R2. A sealed shard without rows never pages. An ended-era object that finds
+ *    no state but its manifest in R2 restores its meta from it.
  *  - s_E (the shard map, §9.1) is pinned in meta 'sbits' by the first put that inserts a row; a put or get of a
  *    well-formed key that routes to another shard under it throws, so a SHARD_MAP changed within an era fails loudly
  *    (the Worker answers 503) instead of storing or missing rows.
@@ -21,22 +27,48 @@
  *    Worker gets a page's batch list (with the rows inline when the page fits) and pulls an oversized batch's rows
  *    in label-ordered chunks; the HTTP page still never splits a batch (§10.9).
  *
- * Time is read through the protected `clock` field and Δ / SKEW through `params`, so tests can override them.
+ * Time is read through the protected `clock` field and Δ / SKEW through `params`, so tests can override them, as
+ * they can the part size and the parts per paging slice.
  */
 import { DurableObject } from "cloudflare:workers";
 import {
   BODY_LENS,
+  b64u,
   era,
   eraEnd,
   eraStart,
+  fromB64u,
+  random,
+  routeV,
+  sealBucketBits,
+  sealBucketOf,
+  sealSigMsg,
   secOf,
   shardCid,
   shardOf,
   tpub,
+  type Bytes,
+  type SealSummary,
 } from "@segv/protocol/proto";
 import { AlarmSlot, BATCH_SCHEMA, BatchChain, Meta, ab, leafShardFromHash } from "./batch";
-import { sha256 } from "./http";
-import { v2Params, shardBitsOf } from "./env";
+import { krouteFor, serverKeys, shardBitsOf, srvSign, v2Params } from "./env";
+import { ed25519Verify, logErr, sha256 } from "./http";
+import { PartSink, type Resume } from "./pager";
+import {
+  FEED_BATCH_HDR,
+  FEED_ROW_HDR,
+  SEAL_PART,
+  ShardPagedError,
+  batchHeader,
+  checkManifest,
+  dirBytes,
+  encodeBatchEntry,
+  encodeIdxEntry,
+  manifestJson,
+  sealBatchTable,
+  sealKey,
+  sealLookup,
+} from "./seal";
 import {
   parseEraName,
   type ShardFeedBatch,
@@ -54,11 +86,15 @@ import {
 const FULL_BYTES = 8 * 2 ** 30;
 /** Batches read per SQL round trip while building a feed page. */
 const FEED_CHUNK = 64;
-/** Wire bytes of a feed batch header (u32 t | u32 n | root | head) and per-row overhead (label | u8 cls). */
-const FEED_BATCH_HDR = 4 + 4 + 32 + 32;
-const FEED_ROW_HDR = 16 + 1;
 /** The smallest wire size of a feed row (class 0): bounds how many rows one feedRows call can return. */
 const FEED_ROW_MIN = FEED_ROW_HDR + BODY_LENS[0];
+/** Paging: parts uploaded per alarm, the gap between slices, rows / entries read per SQL round trip. */
+const PAGE_PARTS = 4;
+const PAGE_STEP_MS = 1000;
+const PAGE_ROWS_CHUNK = 256;
+const PAGE_ENTRIES_CHUNK = 1024;
+/** Rows looked up through the files before a shard trusts them (§9.1 "Paging"). */
+const VERIFY_SAMPLES = 16;
 
 /**
  * §9.1's row table plus `bh` = H(body), written with the row (stage-1 deviation, so that closeBatch never reads a
@@ -77,15 +113,22 @@ CREATE TABLE IF NOT EXISTS row (
 );
 CREATE INDEX IF NOT EXISTS row_t ON row (t, label);
 `;
+/** Paging scratch: each row's and each batch's offset in `rows`, filled while `rows` is written, dropped at the end. */
+const PAGE_SCHEMA = `
+CREATE TABLE IF NOT EXISTS roff (id INTEGER PRIMARY KEY, off INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS boff (t INTEGER PRIMARY KEY, off INTEGER NOT NULL);
+`;
 
 const isBytes = (x: unknown, len: number): x is Uint8Array => x instanceof Uint8Array && x.length === len;
+/** A routing value (§4.4): 8 bytes below 2^63. Paging sorts rows by v and cuts buckets from its top bits. */
+const isRoutingValue = (x: unknown): x is Uint8Array => isBytes(x, 8) && (x[0] & 0x80) === 0;
 
-/** BAD check of §9.1: len(body) = CLASSES[cls] + 40, len(label) = 16, len(v) = 8. */
+/** BAD check of §9.1: len(body) = CLASSES[cls] + 40, len(label) = 16, v a routing value. */
 function wellFormed(r: unknown): r is ShardPutRow {
   if (typeof r !== "object" || r === null) return false;
   const { v, label, cls, body } = r as Record<string, unknown>;
   return (
-    isBytes(v, 8) &&
+    isRoutingValue(v) &&
     isBytes(label, 16) &&
     typeof cls === "number" &&
     Number.isInteger(cls) &&
@@ -93,6 +136,35 @@ function wellFormed(r: unknown): r is ShardPutRow {
     cls < BODY_LENS.length &&
     isBytes(body, BODY_LENS[cls])
   );
+}
+
+type Phase = "rows" | "idx" | "batches" | "verify";
+type PageFile = "rows" | "idx" | "batches";
+/** The persisted progress of one file (meta 'pg:<file>', JSON). */
+interface FileProgress {
+  uploadId: string;
+  parts: { etag: string; sha: string }[];
+  size: number;
+  resume: Resume<unknown> | null;
+}
+/** One item of a file: its position (what a resume names), its bytes, and the scratch it writes when committed. */
+interface Item<P> {
+  pos: P;
+  bytes: Bytes;
+  /** runs in the commit of the part the item starts in; `fresh` is false when the item is being re-sent */
+  side?: (off: number, fresh: boolean) => void;
+}
+interface RowPos {
+  t: number;
+  /** null: the batch header */
+  label: string | null;
+}
+interface IdxPos {
+  v: string;
+  label: string;
+}
+interface BatchPos {
+  t: number;
 }
 
 export class ShardDO extends DurableObject<Env> {
@@ -103,6 +175,9 @@ export class ShardDO extends DurableObject<Env> {
   protected shardBits: number;
   private sbitsLogged = false;
   protected fullBytes = FULL_BYTES;
+  /** Paging: the part size of the files (R2 needs at least 5 MiB) and the parts uploaded per alarm. */
+  protected partSize = SEAL_PART;
+  protected pageParts = PAGE_PARTS;
 
   private readonly E: number;
   private readonly i: number;
@@ -128,11 +203,17 @@ export class ShardDO extends DurableObject<Env> {
     this.meta = new Meta(this.sql);
     this.chain = new BatchChain(this.sql, this.meta, this.cid, (t) => this.leavesAt(t));
     this.alarmSlot = new AlarmSlot(ctx.storage);
-    // §9 "Identity and alarms": arm min(getAlarm(), due) unless the era has ended (then prepare() seals).
+    // §9 "Identity and alarms": arm min(getAlarm(), due) unless the era has ended (then prepare() seals); a sealed
+    // shard that still holds rows arms its paging; one whose storage was lost after it paged restores its meta.
     void ctx.blockConcurrencyWhile(async () => {
       await this.alarmSlot.load();
-      if (this.sealed() || this.clock() >= this.sealAt()) return;
-      this.alarmSlot.arm(this.due());
+      const now = this.clock();
+      if (this.state() === null && now >= this.sealAt()) await this.recover();
+      if (!this.sealed() && now < this.sealAt()) {
+        this.alarmSlot.arm(this.due());
+        return;
+      }
+      this.armPaging(now);
     });
   }
 
@@ -194,18 +275,21 @@ export class ShardDO extends DurableObject<Env> {
     });
     // Same synchronous block as the commit: the alarm is committed together with the rows.
     if (wrote) this.alarmSlot.arm(this.due());
+    else this.armPaging(now);
     return out;
   }
 
   get(E: number, i: number, keys: ShardGetKey[]): ShardGetResult[] {
     this.checkId(E, i);
     if (!Array.isArray(keys)) throw new TypeError("get: keys must be an array");
+    if (this.paged()) throw new ShardPagedError();
     const now = this.clock();
     this.ctx.storage.transactionSync(() => this.prepare(now));
+    this.armPaging(now);
     const sealed = this.sealed();
     const sbits = this.sbits();
     return keys.map((k): ShardGetResult => {
-      if (typeof k !== "object" || k === null || !isBytes(k.v, 8) || !isBytes(k.label, 16)) return { s: "miss", sealed };
+      if (typeof k !== "object" || k === null || !isRoutingValue(k.v) || !isBytes(k.label, 16)) return { s: "miss", sealed };
       this.checkRoute(k.v, sbits);
       if (k.mode === 0) {
         const o = this.sql
@@ -231,8 +315,16 @@ export class ShardDO extends DurableObject<Env> {
       this.prepare(now);
       if (!this.sealed()) this.chain.closeIfDue(tpub(now, this.delta()));
     });
+    this.armPaging(now);
     const s = this.chain.state();
-    return { head: s.head, tLast: s.closedT ?? 0, sealed: this.sealed(), size: this.sql.databaseSize };
+    const sealed = this.sealed();
+    return {
+      head: s.head,
+      tLast: s.closedT ?? 0,
+      sealed,
+      size: this.sql.databaseSize,
+      paged: this.paged() || (sealed && s.closedT === null),
+    };
   }
 
   /**
@@ -247,8 +339,10 @@ export class ShardDO extends DurableObject<Env> {
     this.checkId(E, i);
     if (!Number.isSafeInteger(afterT) || afterT < 0) throw new RangeError("feedBatches: bad afterT");
     if (!Number.isSafeInteger(budget) || budget < 1) throw new RangeError("feedBatches: bad budget");
+    if (this.paged()) throw new ShardPagedError();
     const now = this.clock();
     this.ctx.storage.transactionSync(() => this.prepare(now));
+    this.armPaging(now);
     const batches: ShardFeedBatch[] = [];
     let bytes = 0;
     let more = false;
@@ -282,24 +376,44 @@ export class ShardDO extends DurableObject<Env> {
     if (!Number.isSafeInteger(t) || t < 0) throw new RangeError("feedRows: bad t");
     if (afterLabel !== null && !isBytes(afterLabel, 16)) throw new RangeError("feedRows: bad afterLabel");
     if (!Number.isSafeInteger(budget) || budget < 1) throw new RangeError("feedRows: bad budget");
+    if (this.paged()) throw new ShardPagedError();
     const now = this.clock();
     this.ctx.storage.transactionSync(() => this.prepare(now));
+    this.armPaging(now);
     const closed = this.sql.exec("SELECT 1 FROM batch WHERE t = ?", t).toArray().length > 0;
     if (!closed) throw new RangeError("feedRows: no closed batch at t");
     return this.rowsOf(t, afterLabel, budget);
   }
 
-  /** Batch close and seal (§9.1): one alarm, always armed at the earliest due. */
+  /** Batch close, seal, and the paging slices (§9.1): one alarm, always armed at the earliest due. */
   async alarm(): Promise<void> {
     this.alarmSlot.fired();
     const now = this.clock();
+    const wasSealed = this.sealed();
     this.ctx.storage.transactionSync(() => {
       this.prepare(now);
       if (!this.sealed()) this.chain.closeIfDue(tpub(now, this.delta()));
     });
-    if (this.sealed()) return;
-    // Never re-arm in the past (a clock that stepped back would otherwise spin the alarm).
-    this.alarmSlot.arm(Math.max(this.due(), now + 1000));
+    if (!this.sealed()) {
+      // Never re-arm in the past (a clock that stepped back would otherwise spin the alarm).
+      this.alarmSlot.arm(Math.max(this.due(), now + 1000));
+      return;
+    }
+    if (!this.pageable()) return;
+    if (!wasSealed) {
+      // Sealed by this alarm: the paging starts with the next one.
+      await this.alarmSlot.set(now + PAGE_STEP_MS);
+      return;
+    }
+    let done: boolean;
+    try {
+      done = await this.pageSlice();
+    } catch (e) {
+      // The runtime retries a failed alarm with back-off; the hourly sweep (§9.5) and every RPC re-arm it after that.
+      console.error(JSON.stringify({ msg: "shard: paging step failed", E: this.E, i: this.i, error: logErr(e) }));
+      throw e;
+    }
+    if (!done) await this.alarmSlot.set(now + PAGE_STEP_MS);
   }
 
   // ───────────── internals ─────────────
@@ -308,14 +422,20 @@ export class ShardDO extends DurableObject<Env> {
     if (E !== this.E || i !== this.i) throw new Error("shard DO: E / i do not match the object name");
   }
 
-  private sealed(): boolean {
-    return this.meta.str("state") === "sealed";
+  private state(): string | null {
+    return this.meta.str("state");
   }
 
-  /**
-   * Δ of this era: pinned by the first write, the deployment parameter before that. A deployment Δ that differs
-   * from the pinned one is logged once per instance (§3.1); the pinned value always wins.
-   */
+  /** Sealed or paged: no write can land any more. */
+  private sealed(): boolean {
+    const s = this.state();
+    return s === "sealed" || s === "paged";
+  }
+
+  private paged(): boolean {
+    return this.state() === "paged";
+  }
+
   /** s_E of this era: the pinned value, or the deployment's until the first write pins it (§9.1 "Shard map"). */
   private sbits(): number {
     const pinned = this.meta.num("sbits");
@@ -333,6 +453,10 @@ export class ShardDO extends DurableObject<Env> {
     if (shardOf(v, sbits) !== this.i) throw new Error("shard: key routed to another shard (SHARD_MAP changed within the era?)");
   }
 
+  /**
+   * Δ of this era: pinned by the first write, the deployment parameter before that. A deployment Δ that differs
+   * from the pinned one is logged once per instance (§3.1); the pinned value always wins.
+   */
   private delta(): number {
     const pinned = this.meta.num("delta");
     if (pinned === null) return this.params.delta;
@@ -412,5 +536,422 @@ export class ShardDO extends DurableObject<Env> {
       rows.push({ label: new Uint8Array(r.label), cls: r.cls, body: new Uint8Array(r.body) });
     }
     return { rows, done: read < limit };
+  }
+
+  // ───────────── paging (§9.1 "Paging") ─────────────
+
+  /** Sealed, holding at least one closed batch, not paged yet, and with a bucket to page into. */
+  private pageable(): boolean {
+    return this.state() === "sealed" && this.meta.num("closed_t") !== null && this.bucket() !== null;
+  }
+
+  private bucket(): R2Bucket | null {
+    return (this.env as { BLOBS?: R2Bucket }).BLOBS ?? null;
+  }
+
+  /** Arms the next paging slice when there is one to run. */
+  private armPaging(now: number): void {
+    if (this.pageable()) this.alarmSlot.arm(now + PAGE_STEP_MS);
+  }
+
+  /** One alarm's worth of paging: at most `pageParts` part uploads. Returns whether the shard is now paged. */
+  private async pageSlice(): Promise<boolean> {
+    const phase = (this.meta.str("pg:phase") ?? "rows") as Phase;
+    switch (phase) {
+      case "rows": {
+        this.sql.exec(PAGE_SCHEMA);
+        // The part size of this paging, for every file and the manifest, whatever a later deploy sets.
+        if (this.meta.num("pg:part") === null) this.ctx.storage.transactionSync(() => this.meta.set("pg:part", this.partSize));
+        const done = await this.uploadFile("rows", (r) => this.rowItems(r as Resume<RowPos> | null), undefined, () => {
+          const n = this.sql.exec<{ n: number }>("SELECT count(*) AS n FROM row").one().n;
+          const nb = this.sql.exec<{ n: number }>("SELECT count(*) AS n FROM batch").one().n;
+          this.meta.set("pg:n", n);
+          this.meta.set("pg:nb", nb);
+          this.meta.set("pg:phase", "idx");
+        });
+        return done ? this.pageSlice() : false;
+      }
+      case "idx": {
+        const n = this.meta.num("pg:n") ?? 0;
+        const b = sealBucketBits(n);
+        const sbits = this.sbits();
+        const counts = this.dirCounts(b);
+        const count = (v: Bytes): void => {
+          counts[sealBucketOf(v, sbits, b)]++;
+        };
+        const done = await this.uploadFile(
+          "idx",
+          (r) => this.idxItems(r as Resume<IdxPos> | null, count),
+          () => this.meta.set("pg:dir", dirBytes(counts)),
+          () => this.meta.set("pg:phase", "batches"),
+        );
+        return done ? this.pageSlice() : false;
+      }
+      case "batches": {
+        const done = await this.uploadFile("batches", (r) => this.batchItems(r as Resume<BatchPos> | null), undefined, () =>
+          this.meta.set("pg:phase", "verify"),
+        );
+        return done ? this.pageSlice() : false;
+      }
+      case "verify":
+        await this.verifyAndPublish();
+        return true;
+      default:
+        throw new Error("shard: unknown paging phase");
+    }
+  }
+
+  /** The part size of the paging in progress (pinned by its first slice), else the instance's. */
+  private pagePart(): number {
+    return this.meta.num("pg:part") ?? this.partSize;
+  }
+
+  private progress(name: PageFile): FileProgress | null {
+    const s = this.meta.str(`pg:${name}`);
+    return s === null ? null : (JSON.parse(s) as FileProgress);
+  }
+
+  /** The bucket counts of the idx phase so far (meta 'pg:dir', big-endian u32 × 2^b), or zeros. */
+  private dirCounts(b: number): Uint32Array {
+    const counts = new Uint32Array(2 ** b);
+    const stored = this.meta.bytes("pg:dir");
+    if (stored && stored.length === counts.length * 4) {
+      const dv = new DataView(stored.buffer, stored.byteOffset, stored.byteLength);
+      for (let k = 0; k < counts.length; k++) counts[k] = dv.getUint32(k * 4);
+    }
+    return counts;
+  }
+
+  /**
+   * Writes one file of the shard, resuming where the last slice stopped (pager.ts), at most `pageParts` parts per
+   * call. Every part's commit runs the side effects of the items that start in it, `extra`, and persists the
+   * progress; `onComplete` runs in the transaction that follows the multipart completion. True once the file is done.
+   */
+  private async uploadFile<P>(
+    name: PageFile,
+    items: (resume: Resume<P> | null) => Iterable<Item<P>>,
+    extra: (() => void) | undefined,
+    onComplete: () => void,
+  ): Promise<boolean> {
+    const bucket = this.bucket();
+    if (!bucket) throw new Error("shard: no bucket to page into");
+    const key = sealKey(this.E, this.i, name);
+    let prog = this.progress(name);
+    let upload: R2MultipartUpload;
+    if (prog === null) {
+      upload = await bucket.createMultipartUpload(key);
+      const fresh: FileProgress = { uploadId: upload.uploadId, parts: [], size: 0, resume: null };
+      prog = fresh;
+      this.ctx.storage.transactionSync(() => this.meta.set(`pg:${name}`, JSON.stringify(fresh)));
+    } else {
+      upload = bucket.resumeMultipartUpload(key, prog.uploadId);
+    }
+    const p = prog;
+    const pending: (() => void)[] = [];
+    const sink = new PartSink<P>(
+      this.pagePart(),
+      p.parts.length,
+      async (partNumber, bytes) => (await upload.uploadPart(partNumber, bytes as Uint8Array<ArrayBuffer>)).etag,
+      (done) => {
+        p.parts.push({ etag: done.etag, sha: b64u(done.sha) });
+        p.size += done.bytes;
+        p.resume = done.resume;
+        this.ctx.storage.transactionSync(() => {
+          for (const s of pending) s();
+          pending.length = 0;
+          extra?.();
+          this.meta.set(`pg:${name}`, JSON.stringify(p));
+        });
+      },
+    );
+    const start = p.resume as Resume<P> | null;
+    let first = true;
+    for (const it of items(start)) {
+      const skip = first && start !== null ? Math.min(start.skip, it.bytes.length) : 0;
+      first = false;
+      if (it.side) {
+        const side = it.side;
+        const off = sink.offset - skip;
+        const fresh = skip === 0;
+        pending.push(() => side(off, fresh));
+      }
+      await sink.write(it.pos, it.bytes, skip);
+      if (sink.uploaded >= this.pageParts) return false;
+    }
+    await sink.flush();
+    try {
+      await upload.complete(p.parts.map((x, k) => ({ partNumber: k + 1, etag: x.etag })));
+    } catch (e) {
+      // Completed by an earlier slice whose commit was lost: the object is there with every byte.
+      const h = await bucket.head(key);
+      if (!h || h.size !== p.size) throw e;
+    }
+    this.ctx.storage.transactionSync(() => {
+      for (const s of pending) s();
+      pending.length = 0;
+      onComplete();
+    });
+    return true;
+  }
+
+  /** `rows`: every closed batch ascending by t, its header then its rows by label (§10.9), from `resume` on. */
+  private *rowItems(resume: Resume<RowPos> | null): Generator<Item<RowPos>> {
+    let fromT = resume?.pos.t ?? 0;
+    /** the row to resume at (inclusive) inside batch fromT; null = at that batch's header, or at the start */
+    let resumeLabel: Bytes | null = resume?.pos.label ? fromB64u(resume.pos.label) : null;
+    for (;;) {
+      const bs = this.sql
+        .exec<{ t: number; n: number; root: ArrayBuffer; head: ArrayBuffer }>(
+          "SELECT t, n, root, head FROM batch WHERE t >= ? ORDER BY t LIMIT ?",
+          fromT,
+          FEED_CHUNK,
+        )
+        .toArray();
+      if (bs.length === 0) return;
+      for (const b of bs) {
+        const t = b.t;
+        let after: Bytes | null = null;
+        let inclusive = false;
+        if (resumeLabel !== null && t === fromT) {
+          after = resumeLabel;
+          inclusive = true;
+        } else {
+          yield {
+            pos: { t, label: null },
+            bytes: batchHeader(t, b.n, new Uint8Array(b.root), new Uint8Array(b.head)),
+            side: (off) => this.sql.exec("INSERT OR REPLACE INTO boff (t, off) VALUES (?, ?)", t, off),
+          };
+        }
+        resumeLabel = null;
+        for (;;) {
+          const rows = this.rowsFrom(t, after, inclusive, PAGE_ROWS_CHUNK);
+          for (const r of rows) {
+            const id = r.id;
+            const label = new Uint8Array(r.label);
+            const bytes = new Uint8Array(FEED_ROW_HDR + r.body.byteLength);
+            bytes.set(label, 0);
+            bytes[16] = r.cls;
+            bytes.set(new Uint8Array(r.body), FEED_ROW_HDR);
+            yield {
+              pos: { t, label: b64u(label) },
+              bytes,
+              side: (off) => this.sql.exec("INSERT OR REPLACE INTO roff (id, off) VALUES (?, ?)", id, off),
+            };
+          }
+          if (rows.length < PAGE_ROWS_CHUNK) break;
+          after = new Uint8Array(rows[rows.length - 1].label);
+          inclusive = false;
+        }
+      }
+      fromT = bs[bs.length - 1].t + 1;
+    }
+  }
+
+  private rowsFrom(
+    t: number,
+    after: Bytes | null,
+    inclusive: boolean,
+    limit: number,
+  ): { id: number; label: ArrayBuffer; cls: number; body: ArrayBuffer }[] {
+    type R = { id: number; label: ArrayBuffer; cls: number; body: ArrayBuffer };
+    if (after === null) {
+      return this.sql.exec<R>("SELECT id, label, cls, body FROM row WHERE t = ? ORDER BY label LIMIT ?", t, limit).toArray();
+    }
+    return this.sql
+      .exec<R>(
+        `SELECT id, label, cls, body FROM row WHERE t = ? AND label ${inclusive ? ">=" : ">"} ? ORDER BY label LIMIT ?`,
+        t,
+        ab(after),
+        limit,
+      )
+      .toArray();
+  }
+
+  /** `idx`: every row by (v, label) with its offset from `roff`, from `resume` on; `count` tallies the buckets. */
+  private *idxItems(resume: Resume<IdxPos> | null, count: (v: Bytes) => void): Generator<Item<IdxPos>> {
+    type R = { v: ArrayBuffer; label: ArrayBuffer; t: number; cls: number; off: number };
+    const select = "SELECT r.v, r.label, r.t, r.cls, o.off FROM row r JOIN roff o ON o.id = r.id";
+    let v: Bytes | null = resume ? fromB64u(resume.pos.v) : null;
+    let label: Bytes | null = resume ? fromB64u(resume.pos.label) : null;
+    let inclusive = true;
+    for (;;) {
+      const rows =
+        v === null || label === null
+          ? this.sql.exec<R>(`${select} ORDER BY r.v, r.label LIMIT ?`, PAGE_ENTRIES_CHUNK).toArray()
+          : this.sql
+              .exec<R>(
+                `${select} WHERE (r.v, r.label) ${inclusive ? ">=" : ">"} (?, ?) ORDER BY r.v, r.label LIMIT ?`,
+                ab(v),
+                ab(label),
+                PAGE_ENTRIES_CHUNK,
+              )
+              .toArray();
+      for (const r of rows) {
+        const rv = new Uint8Array(r.v);
+        const rl = new Uint8Array(r.label);
+        yield {
+          pos: { v: b64u(rv), label: b64u(rl) },
+          bytes: encodeIdxEntry(rl, r.t, r.cls, r.off),
+          side: (_off, fresh) => {
+            if (fresh) count(rv);
+          },
+        };
+      }
+      if (rows.length < PAGE_ENTRIES_CHUNK) return;
+      v = new Uint8Array(rows[rows.length - 1].v);
+      label = new Uint8Array(rows[rows.length - 1].label);
+      inclusive = false;
+    }
+  }
+
+  /** `batches`: every closed batch ascending by t with its offset from `boff`, from `resume` on. */
+  private *batchItems(resume: Resume<BatchPos> | null): Generator<Item<BatchPos>> {
+    type R = { t: number; n: number; root: ArrayBuffer; head: ArrayBuffer; off: number };
+    let fromT = resume?.pos.t ?? 0;
+    for (;;) {
+      const rows = this.sql
+        .exec<R>(
+          "SELECT b.t, b.n, b.root, b.head, o.off FROM batch b JOIN boff o ON o.t = b.t WHERE b.t >= ? ORDER BY b.t LIMIT ?",
+          fromT,
+          PAGE_ENTRIES_CHUNK,
+        )
+        .toArray();
+      for (const r of rows) {
+        yield { pos: { t: r.t }, bytes: encodeBatchEntry(r.t, r.n, new Uint8Array(r.root), new Uint8Array(r.head), r.off) };
+      }
+      if (rows.length < PAGE_ENTRIES_CHUNK) return;
+      fromT = rows[rows.length - 1].t + 1;
+    }
+  }
+
+  /**
+   * The last paging step: the manifest is built and signed, the files are checked the way the Worker reads them
+   * (sizes, the batch table, a sample of rows by label, a label the shard does not hold), the manifest is written,
+   * and the object keeps only its meta: state = paged, the final head, closed_t, last_t, and the Δ and s_E pins.
+   */
+  private async verifyAndPublish(): Promise<void> {
+    const bucket = this.bucket();
+    const keys = serverKeys(this.env);
+    if (!bucket || !keys) throw new Error("shard: cannot page (no bucket, or the server keys are missing)");
+    const s = this.chain.state();
+    const n = this.meta.num("pg:n");
+    const nb = this.meta.num("pg:nb");
+    const files = { rows: this.progress("rows"), idx: this.progress("idx"), batches: this.progress("batches") };
+    if (n === null || nb === null || s.closedT === null || !files.rows || !files.idx || !files.batches) {
+      throw new Error("shard: paging progress is missing");
+    }
+    const b = sealBucketBits(n);
+    const counts = this.dirCounts(b);
+    const dir = new Uint32Array(counts.length + 1);
+    for (let k = 0; k < counts.length; k++) dir[k + 1] = dir[k] + counts[k];
+    const file = (p: FileProgress): { size: number; sha256: Bytes[] } => ({ size: p.size, sha256: p.parts.map((x) => fromB64u(x.sha)) });
+    const summary: SealSummary = {
+      era: this.E,
+      shard: this.i,
+      sbits: this.sbits(),
+      kroute: krouteFor(keys, this.E),
+      head: s.head,
+      tLast: s.closedT,
+      part: this.pagePart(),
+      n,
+      b,
+      dir: dirBytes(dir),
+      nb,
+      rows: file(files.rows),
+      idx: file(files.idx),
+      batches: file(files.batches),
+    };
+    const sig = await srvSign(keys, sealSigMsg(summary));
+    const text = manifestJson(summary, sig);
+    // The round trip through the Worker's parser and verifier: what it will accept is what gets written.
+    const m = await checkManifest(text, keys.srvPk, this.E, this.i);
+    for (const name of ["rows", "idx", "batches"] as const) {
+      const h = await bucket.head(sealKey(this.E, this.i, name));
+      if (!h || h.size !== m[name].size) throw new Error(`shard: the paged ${name} file is missing or has another size`);
+    }
+    await sealBatchTable(bucket, m, false);
+    // A sample of rows through the index, and a label the shard does not hold.
+    const maxId = this.sql.exec<{ m: number | null }>("SELECT max(id) AS m FROM row").one().m ?? 0;
+    type R = { v: ArrayBuffer; label: ArrayBuffer; t: number; cls: number; body: ArrayBuffer };
+    const sample = new Map<string, R>();
+    for (let k = 0; k < VERIFY_SAMPLES * 2 && sample.size < Math.min(VERIFY_SAMPLES, n); k++) {
+      const id = 1 + Math.floor(Math.random() * maxId);
+      const r = this.sql.exec<R>("SELECT v, label, t, cls, body FROM row WHERE id >= ? ORDER BY id LIMIT 1", id).toArray()[0];
+      if (r) sample.set(b64u(new Uint8Array(r.label)), r);
+    }
+    const rows = [...sample.values()];
+    const found = await sealLookup(
+      bucket,
+      m,
+      rows.map((r) => ({ v: new Uint8Array(r.v), label: new Uint8Array(r.label), mode: 0 as const })),
+    );
+    rows.forEach((r, k) => {
+      const f = found[k];
+      const body = new Uint8Array(r.body);
+      if (f.s !== "hit" || f.t !== r.t || f.cls !== r.cls || !f.body || f.body.length !== body.length || !f.body.every((x, j) => x === body[j])) {
+        throw new Error("shard: a paged row does not read back");
+      }
+    });
+    for (let k = 0; k < 64; k++) {
+      const label = random(16);
+      const v = routeV(summary.kroute, label);
+      if (shardOf(v, summary.sbits) !== this.i) continue;
+      const [miss] = await sealLookup(bucket, m, [{ v, label, mode: 1 }]);
+      if (miss.s !== "miss" || !miss.sealed) throw new Error("shard: an absent label reads back as present");
+      break;
+    }
+    await bucket.put(sealKey(this.E, this.i, "manifest"), text, { httpMetadata: { contentType: "application/json" } });
+    if (!(await bucket.head(sealKey(this.E, this.i, "manifest")))) throw new Error("shard: the manifest did not persist");
+    // From here on the files are the truth: drop the tables, then free the storage and keep the meta head() needs.
+    const keep = { head: s.head, closedT: s.closedT, lastT: s.lastT, delta: this.meta.num("delta"), sbits: this.meta.num("sbits") };
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec("DROP TABLE IF EXISTS roff");
+      this.sql.exec("DROP TABLE IF EXISTS boff");
+      this.sql.exec("DROP TABLE IF EXISTS row");
+      this.sql.exec("DROP TABLE IF EXISTS batch");
+      this.sql.exec("DELETE FROM meta WHERE k LIKE 'pg:%'");
+      this.meta.set("state", "paged");
+    });
+    await this.ctx.storage.deleteAll();
+    this.sql.exec(SCHEMA);
+    this.ctx.storage.transactionSync(() => {
+      this.meta.set("state", "paged");
+      this.meta.set("head", keep.head);
+      this.meta.set("closed_t", keep.closedT);
+      this.meta.set("last_t", keep.lastT);
+      if (keep.delta !== null) this.meta.set("delta", keep.delta);
+      if (keep.sbits !== null) this.meta.set("sbits", keep.sbits);
+    });
+    await this.alarmSlot.clear();
+    console.error(JSON.stringify({ msg: "shard: paged into R2", E: this.E, i: this.i, rows: n, bytes: summary.rows.size }));
+  }
+
+  /**
+   * An ended-era object without state: if its manifest exists, its storage was lost after it paged (between
+   * deleteAll() and the meta re-write), and head() must keep answering the final head. Restores the meta from it.
+   */
+  private async recover(): Promise<void> {
+    const bucket = this.bucket();
+    const keys = serverKeys(this.env);
+    if (!bucket || !keys) return;
+    let text: string | null = null;
+    try {
+      const obj = await bucket.get(sealKey(this.E, this.i, "manifest"));
+      text = obj ? await obj.text() : null;
+    } catch (e) {
+      console.error(JSON.stringify({ msg: "shard: could not look for the manifest", E: this.E, i: this.i, error: logErr(e) }));
+      return;
+    }
+    if (text === null) return;
+    const m = await checkManifest(text, keys.srvPk, this.E, this.i);
+    if (!(await ed25519Verify(keys.srvPk, m.sig, sealSigMsg(m)))) throw new Error("shard: the manifest does not verify");
+    this.ctx.storage.transactionSync(() => {
+      this.meta.set("state", "paged");
+      this.meta.set("head", m.head);
+      this.meta.set("closed_t", m.tLast);
+      this.meta.set("last_t", m.tLast);
+      this.meta.set("sbits", m.sbits);
+    });
+    console.error(JSON.stringify({ msg: "shard: meta restored from the manifest", E: this.E, i: this.i }));
   }
 }

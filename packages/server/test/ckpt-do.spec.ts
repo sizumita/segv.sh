@@ -7,7 +7,7 @@
  * tick() by hand (the alarm it re-arms then never fires on its own). Components are reached through the real DOs;
  * the InboxDO may or may not answer yet, so assertions only look at the components a test controls.
  */
-import { evictDurableObject, runInDurableObject } from "cloudflare:test";
+import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import * as P from "@segv/protocol/proto";
@@ -15,6 +15,7 @@ import type { BlobRegDO } from "../src/blobreg-do";
 import type { CheckpointDO } from "../src/ckpt-do";
 import type { ShardDO } from "../src/shard-do";
 import { blobRegStub, ckptStub, shardStub, type CkptRecord } from "../src/types";
+import { spyNamespace } from "./helpers";
 
 const E_NOW = P.era(Date.now());
 let nextEra = E_NOW + 20;
@@ -52,12 +53,11 @@ async function shardClock(E: number, ms: number): Promise<void> {
     (inst as unknown as { clock: () => number }).clock = () => ms;
   });
 }
-const shardRow = () => ({
-  v: P.random(8),
-  label: P.random(16),
-  cls: 0,
-  body: P.random(P.BODY_LENS[0]),
-});
+const shardRow = () => {
+  const v = P.random(8);
+  v[0] &= 0x7f; // a routing value is below 2^63 (§4.4)
+  return { v, label: P.random(16), cls: 0, body: P.random(P.BODY_LENS[0]) };
+};
 /** Puts one row into shard E at `ms` and leaves the shard's clock 3 s later (the next head() closes the batch). */
 async function shardWrite(E: number, ms: number): Promise<void> {
   await shardClock(E, ms);
@@ -423,5 +423,69 @@ describe("CheckpointDO", () => {
       // Park it far away so no tick runs on its own while the rest of the file runs.
       await state.storage.setAlarm(P.eraStart(E_NOW + 1000));
     });
+  });
+});
+
+describe("CheckpointDO sweep (§9.5)", () => {
+  it("wakes the shards of past eras once an hour, marks the eras found paged (or empty) and stops at one that is not", async () => {
+    const [Pe, F] = freshEras();
+    const base = P.eraStart(F) + 10 * 60_000;
+    await ckClock(base);
+    const meta = (k: string): Promise<SqlStorageValue | null> =>
+      runInDurableObject(
+        ck(),
+        (_inst: CheckpointDO, state) =>
+          state.storage.sql
+            .exec<{ v: SqlStorageValue }>("SELECT v FROM meta WHERE k = ?", k)
+            .toArray()[0]?.v ?? null,
+      );
+    await runInDurableObject(ck(), (_inst: CheckpointDO, state) => {
+      state.storage.sql.exec("INSERT OR REPLACE INTO meta (k, v) VALUES ('page:era', ?)", F - 4);
+      state.storage.sql.exec("DELETE FROM meta WHERE k = 'page:hour'");
+    });
+    // F − 4 and F − 2 are empty and over; F − 3 holds a row and has not sealed yet: nobody called it since its era
+    // ended. Each runs on its own clock, past its era (the real clock has not reached these eras).
+    const s3 = shardStub(env, F - 3, 0);
+    await shardWrite(F - 3, P.eraStart(F - 3) + 5000);
+    for (const e of [F - 4, F - 3, F - 2]) await shardClock(e, P.eraEnd(e) + 1000);
+    const calls: string[] = [];
+    const names = () =>
+      calls.filter((c) => c.startsWith("getByName(")).map((c) => c.slice("getByName(".length, -1));
+    await withEnv({ SHARD: spyNamespace(env.SHARD, calls) }, async () => {
+      await tick();
+      const touched = names();
+      for (const e of [F - 4, F - 3, F - 2]) expect(touched).toContain(`shard/v2/${e}/0`);
+      expect(touched).not.toContain(`shard/v2/${F - 5}/0`);
+      // The same hour: no second sweep; only the two live eras are collected.
+      calls.length = 0;
+      await ckClock(base + 60_000);
+      await ck().tick();
+      expect(new Set(names())).toEqual(new Set([`shard/v2/${F}/0`, `shard/v2/${Pe}/0`]));
+    });
+    expect(await meta(`paged:${F - 4}`)).toBe(1);
+    expect(await meta(`paged:${F - 2}`)).toBe(1);
+    expect(await meta(`paged:${F - 3}`)).toBeNull();
+    expect(await meta("page:era")).toBe(F - 3);
+    // The wake sealed F − 3; its earliest pending alarm (the write's batch alarm) stays armed and runs the paging.
+    expect(await s3.head(F - 3, 0)).toMatchObject({ sealed: true, paged: false });
+    const armed = await runInDurableObject(s3, (_inst: ShardDO, state) => state.storage.getAlarm());
+    expect(armed).not.toBeNull();
+    expect(armed!).toBeLessThanOrEqual(P.eraEnd(F - 3) + 2000);
+    // Once it is paged, the next hour marks it and moves on.
+    const paged = () =>
+      runInDurableObject(s3, (_inst: ShardDO, state) => {
+        const v = state.storage.sql
+          .exec<{ v: SqlStorageValue }>("SELECT v FROM meta WHERE k = 'state'")
+          .toArray()[0]?.v;
+        return v === "paged";
+      });
+    for (let k = 0; !(await paged()); k++) {
+      expect(k, "paging alarms").toBeLessThan(40);
+      expect(await runDurableObjectAlarm(s3)).toBe(true);
+    }
+    await ckClock(base + 3_600_000);
+    await ck().tick();
+    expect(await meta(`paged:${F - 3}`)).toBe(1);
+    expect(await meta("page:era")).toBe(F - 1);
   });
 });

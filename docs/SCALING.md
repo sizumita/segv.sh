@@ -59,20 +59,20 @@ PROTOCOL.md §0.3 と §13.1 を基準にして、増やしてはいけないも
 
 **緊急分割は作らない。** 攻撃者はラベルから v を計算できないので 1 つのシャードだけを満杯にはできず、全部を埋めるには S_E 倍の PoW が要る。余裕 4 倍で決め、CheckpointDO の size ログ（いま 4 GiB）を 2 GiB からの警告にして、次の era の `S` を上げる運用にする。§14 の `MOVED`・凍結範囲は保留。もし要るなら「親シャードは時刻 t_s 以降その範囲の put を拒み、Worker は `t_s + SKEW` 以降 親.get → 子.put の 2 段で書く」で CAS を保てる（SKEW の範囲で親の拒否が先に立つ）。
 
-**封印した era を R2 へ。** `end(E) + SKEW` で封印されたシャードは、アラームで（1 回 15 分以内、進み具合を meta に保存しながら）R2 に書き出す：
+**封印した era を R2 へ（PROTOCOL.md §9.1「Paging」に規範を書いた）。** `end(E) + SKEW` で封印され、行を持つシャードは、自分のアラームで（1 回につき数パート、パートごとに進み具合を meta に保存しながら）blob と同じ R2 バケットに書き出す：
 
 ```
-seal/{E}/{i}/rows        行を (t, label) 順に並べた 1 本のファイル = feed のページ列そのもの（§10.9 のバッチ形式）
-seal/{E}/{i}/idx1        1 024 行ごとに先頭の (v, label) と idx2 内のオフセット（2 000 万行で約 600 KB）
-seal/{E}/{i}/idx2        (v, label) 昇順の全行について (rows 内オフセット, t, cls)：28 B/行
-seal/{E}/{i}/manifest    s_E、kroute_E（§14 のとおりここで公開。kcommit_E と照合できる）、バッチ一覧 (t, n, root, head)、
-                         feed ページの境界オフセット、最終 head、各ファイルの SHA-256、SRV_SK の署名
+seal/v2/{E}/{i}/rows      閉じたバッチを t 順に並べた 1 本のファイル = feed のページ列そのもの（§10.9 のバッチ形式）
+seal/v2/{E}/{i}/batches   バッチごとに (t, n, root, head, rows 内オフセット)：80 B/バッチ
+seal/v2/{E}/{i}/idx       (v, label) 昇順の全行について (label, t, cls, rows 内オフセット)：28 B/行。v の上位ビットで
+                          約 1 024 行ずつのバケットに切り、バケット境界（dir）は manifest に載せる
+seal/v2/{E}/{i}/manifest  s_E、kroute_E（kcommit_E と照合できる）、最終 head、各ファイルの大きさとパートごとの SHA-256、
+                          dir、SRV_SK の署名。これがあることが「ページ化済み」の定義
 ```
 
-- 書き出しが終わり、Worker が manifest を検証して読めることを確かめたら、ShardDO は `deleteAll()` して空になる（名前は残るが費用は消える）。行のコピーは 1 つだけ：`rows` は feed の形なので `/api/v2/feed/{E}/{i}` はそのまま R2 の Range から配り、点の検索は `idx1`（キャッシュ）→ `idx2` の 28 KB ブロック（Range、キャッシュ）→ `rows` の Range の 3 読みになる。exists モードの探査は `idx2` までで済む。manifest がある era は R2、ない era は DO、という判定を Worker が isolate ごとにキャッシュする。
+- 書き出しが終わると ShardDO は Worker と同じ読み方で検証し（バッチ表、ラベルで引いた行の標本、持っていないラベル）、manifest を最後に書いてから `state = paged` にし、表を落として `deleteAll()` する（`head()` に要る meta だけ書き戻す。名前は残るが費用は消える）。行のコピーは 1 つだけ：`rows` は feed の形なので `/api/v2/feed/{E}/{i}` はそのまま R2 の Range から配り、点の検索は dir（manifest、isolate にキャッシュ）→ `idx` のバケット 1 回の Range → `rows` の Range の 2 読みになる。exists モードの探査は `idx` までで済む。ページ化済みの DO は get と feed に `shard: paged` を投げ、Worker はそれを合図に R2 へ切り替える（manifest の有無は isolate ごとにキャッシュ）。空のまま封印されたシャードは動かさない。
 - 封印した era の get は復元の探査とスクロールバックだけなので（追いつきは現在と直前の era）、遅延は許容できる。`MISS(sealed = 1)` は manifest が最終なので今までどおり最終。
-- 費用：DO の SQLite 保存（$0.20/GB·月）から R2（$0.015/GB·月）へ。いま DO に残っている過去の era も同じ手順で移す。
-- 段階を分けてもよい：先に本文だけ R2 へ移して索引は DO に残す（保存量の約 85 % が消える）、次に索引も R2 へ移して DO を空にする。
+- 費用：DO の SQLite 保存（$0.20/GB·月）から R2（$0.015/GB·月）へ。いま DO に残っている過去の era は CheckpointDO の毎時の掃除（§9.5「Sweep」）が起こして同じ手順で移す。manifest は `/api/v2/seal/{E}/{i}` で公開し、封印済み era の `kroute_E` はそこで出す。
 
 ### 4.2 リアルタイム：`conn/v2/{c}` × C と `feed/v2/{f}` × F
 
@@ -206,7 +206,7 @@ DO の保存量は、封印した era を R2 に移すことで「現在と直�
 1. **リアルタイムの分割**（ConnDO / FeedDO。PROTOCOL.md §9.4 に規範を書いた）：最初に当たる上限（約 1 万タブ）。状態がないので無停止で切り替わる。
 2. **受信箱の通知トピック**（PROTOCOL.md §9.3・§10.8・§11.5 に規範を書いた）：ポーリングの費用が最大の固定費。クライアントは購読と、追いつき時だけの読み取りに変わった。
 3. **S_E > 1**（PROTOCOL.md §9.1「Shard map」・§9.5・§10.9 に規範を書いた）：次の era から。`SHARD_MAP`（`E:S` の列）、era 情報と params の `shards`、チェックポイントの収集（並列 32）、feed の i、ShardDO の `sbits` ピンと経路の検査。
-4. **封印 era の R2 化**と DO の削除：費用。過去の era にも適用。
+4. **封印 era の R2 化**と DO の削除（PROTOCOL.md §9.1「Paging」・§9.5「Sweep」・§10.4「Paged shards」・§10.9 に規範を書いた）：費用。過去の era にも適用。ShardDO が自分で書き出し・検証し、Worker は `shard: paged` を合図に R2 を読む。
 5. **BlobReg と dirseq**：コピー 1 回と、D1 への書き手の一本化。
 6. **Push を KV + メモリだけの DO + Worker 送信に**（案 B-1。PROTOCOL.md §9.8 に規範を書いた）：固定費も消える。
 7. **受信箱バケット**：N ≥ 2K（約 3 万人）になる era から。案 A / B はここまでに決める（決めておけば β = 0 のまま先に実装できる）。

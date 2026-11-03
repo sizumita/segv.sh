@@ -93,8 +93,8 @@ Not implemented yet:
 
 - self-lane snapshots ([PROTOCOL.md §7.4](docs/PROTOCOL.md#74-snapshots)). Without them a restore reads the account's
   whole self lane, so restoring takes longer as an account accumulates history;
-- the work planned for later stages, such as paging old eras into R2, anonymous write tokens, OHTTP, groups larger than
-  32 members and inclusion proofs ([PROTOCOL.md §14](docs/PROTOCOL.md#14-deferred-to-stage-2--3)).
+- the work planned for later stages, such as anonymous write tokens, OHTTP, groups larger than 32 members and
+  inclusion proofs ([PROTOCOL.md §14](docs/PROTOCOL.md#14-deferred-to-stage-2--3)).
 
 ## Security model
 
@@ -187,18 +187,18 @@ weaker or stronger than v1; [docs/PROTOCOL.md](docs/PROTOCOL.md) §0.3–§0.4 a
 
 The app is a Qwik v2 site with a client engine that runs entirely in the browser, served by one Cloudflare Worker.
 
-| Component                      | Role                                                                                                                                                                                                       |
-| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Worker                         | The binary and JSON API under `/api/v2/*` and the realtime WebSocket; host pinning, proof-of-work checks and per-IP rate limits (IP addresses are never stored); server-side rendering of the app          |
-| `ShardDO` (`S_E` per era)      | Stores rows: create-only, batched every Δ seconds into a hash chain, sealed when the era ends; the count per era is a deployment setting, raised for a future era when the previous one grows              |
-| `InboxDO` (one per era)        | The global inbox for first-contact invites; clients read the last 4 eras, and are told over the realtime socket when a slot closes with rows                                                               |
-| `BlobRegDO`                    | Registers uploads to R2 and their times, which membership changes depend on                                                                                                                                |
-| `ConnDO` (C of them)           | Hibernatable WebSockets; all of a client's connections go to one of them                                                                                                                                   |
-| `FeedDO` (F of them)           | Keeps, per topic, which ConnDOs have a subscriber and forwards new rows to them; stores nothing                                                                                                            |
-| `CheckpointDO`                 | Every 60 seconds, signs the heads of the shard, inbox, upload registry and directory into a checkpoint chain                                                                                               |
-| `BellDO`, `QuietDO` (optional) | Notifications: the sealed registrations live in a KV namespace; these objects only index the bells and keep, in memory, each account's coalescing window, hold and seen marks. The Worker sends the pushes |
-| D1                             | The directory (handle ↔ account id ↔ public keys, key wraps) and its public, hash-chained log                                                                                                              |
-| R2                             | Encrypted images, files and key bundles, content-addressed and immutable                                                                                                                                   |
+| Component                      | Role                                                                                                                                                                                                                              |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Worker                         | The binary and JSON API under `/api/v2/*` and the realtime WebSocket; host pinning, proof-of-work checks and per-IP rate limits (IP addresses are never stored); server-side rendering of the app                                 |
+| `ShardDO` (`S_E` per era)      | Stores rows: create-only, batched every Δ seconds into a hash chain, sealed when the era ends, then written out to R2 and emptied; the count per era is a deployment setting, raised for a future era when the previous one grows |
+| `InboxDO` (one per era)        | The global inbox for first-contact invites; clients read the last 4 eras, and are told over the realtime socket when a slot closes with rows                                                                                      |
+| `BlobRegDO`                    | Registers uploads to R2 and their times, which membership changes depend on                                                                                                                                                       |
+| `ConnDO` (C of them)           | Hibernatable WebSockets; all of a client's connections go to one of them                                                                                                                                                          |
+| `FeedDO` (F of them)           | Keeps, per topic, which ConnDOs have a subscriber and forwards new rows to them; stores nothing                                                                                                                                   |
+| `CheckpointDO`                 | Every 60 seconds, signs the heads of the shard, inbox, upload registry and directory into a checkpoint chain                                                                                                                      |
+| `BellDO`, `QuietDO` (optional) | Notifications: the sealed registrations live in a KV namespace; these objects only index the bells and keep, in memory, each account's coalescing window, hold and seen marks. The Worker sends the pushes                        |
+| D1                             | The directory (handle ↔ account id ↔ public keys, key wraps) and its public, hash-chained log                                                                                                                                     |
+| R2                             | Encrypted images, files and key bundles, content-addressed and immutable; the rows, index and manifest of every sealed era                                                                                                        |
 
 The server keeps no sessions and no login state: signing in means unlocking keys in the browser. Writes are anonymous;
 abuse is limited by proof of work, which grows with the number of bytes stored, and by per-IP rate limits.

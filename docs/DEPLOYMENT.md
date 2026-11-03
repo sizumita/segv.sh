@@ -38,7 +38,9 @@ Run the commands of these steps in `apps/web`, the directory of `wrangler.jsonc`
    pnpm exec wrangler d1 create segv
    ```
 
-2. Create the R2 bucket. If you choose another name, change `r2_buckets[0].bucket_name`.
+2. Create the R2 bucket. It holds the blobs (`b/…`) and, once an era is sealed, its rows, index and manifest
+   (`seal/v2/{E}/{i}/…`, §9.1 of the protocol); the Worker is its only reader. If you choose another name, change
+   `r2_buckets[0].bucket_name`.
 
    ```bash
    pnpm exec wrangler r2 bucket create segv-blobs

@@ -59,7 +59,7 @@ texts.
     subscribed to each topic and forward published rows to them (`C` and `F` are deployment parameters, §9.4);
   - one **CheckpointDO**, which signs the heads of the public data every 60 s;
   - the **directory** in D1 (accounts and key wraps);
-  - R2 for blobs;
+  - R2 for blobs, and for the rows of sealed eras (§9.1 "Paging");
   - optionally, for push, the push store (a KV namespace), `PUSH_SHARDS` **BellDOs** and **QuietDOs**, which hold nothing
     durable, a queue and a daily Cron Trigger (§9.8); the Worker sends the contentless pushes.
 
@@ -2001,16 +2001,17 @@ In every cid, numbers are decimal without padding.
 created by name. Every RPC also carries `E` and `i`; a mismatch is a programming error and throws. The constructor runs
 `blockConcurrencyWhile`: if the era has not ended (the object's state is not sealed (ShardDO) or `ended` is not set
 (InboxDO), and `now < end(E) + SKEW·1000`), it sets the alarm to `min(getAlarm(), due)`, where `due` is the earliest
-of the seal time and an open batch's close time. A DO of an era that has already ended arms nothing; it seals
-synchronously in `prepare()`. Every write that opens a batch arms `min(current alarm, batch due)` in the same
-synchronous block as the commit. An alarm handler that still has work due re-arms at `max(due, now + 1000)` ms; it
-never arms a time in the past, so an early alarm or a clock that steps back cannot make it fire in a loop.
+of the seal time and an open batch's close time. A DO of an era that has already ended arms nothing for the era; it
+seals synchronously in `prepare()` (a sealed ShardDO that still holds rows then arms its paging, §9.1). Every write
+that opens a batch arms `min(current alarm, batch due)` in the same synchronous block as the commit. An alarm handler
+that still has work due re-arms at `max(due, now + 1000)` ms; it never arms a time in the past, so an early alarm or a
+clock that steps back cannot make it fire in a loop.
 
 ### 9.1 ShardDO (`shard/v2/{E}/{i}`, SQLite; S_E per era, 0 ≤ i < S_E)
 
 ```sql
 CREATE TABLE meta  (k TEXT PRIMARY KEY, v BLOB NOT NULL) WITHOUT ROWID;
-  -- 'state' 'open'|'sealed' | 'last_t' u32 | 'open_t' u32 (absent = no open batch)
+  -- 'state' 'open'|'sealed'|'paged' | 'last_t' u32 | 'open_t' u32 (absent = no open batch)
   -- 'closed_t' u32 (t of the newest closed batch; absent = none) | 'head' 32 B (ZERO32 initially)
   -- 'delta' u16 (Δ, pinned by the first put that inserts a row; the deployment Δ applies until then; §3.1)
   -- 'sbits' u8 (s_E, pinned by the same put; "Shard map" below)
@@ -2048,7 +2049,9 @@ and filling every shard of an era costs `S_E` times the proof of work.
 - `prepare()` runs first in every RPC: if `now ≥ end(E) + SKEW·1000` and the state is open, close the open batch and
   persist `state = sealed`, in one transaction.
 - The seal alarm, due at `end(E) + SKEW·1000`, does the same.
-- `MISS(sealed = 1)` is returned only once `state = sealed` is persisted.
+- `MISS(sealed = 1)` is returned only once `state = sealed` (or `paged`) is persisted.
+- A sealed shard that holds rows and is not paged yet arms its paging alarm (`now + 1 s`) whenever its constructor or
+  an RPC finds it so ("Paging" below); `state = paged` is persisted by paging, after the rows left the object.
 - **Accept window.** Writes are accepted while `start(E) − SKEW·1000 ≤ now < end(E)`. Opening SKEW early means two
   shards whose clocks differ by at most SKEW never both refuse a write at an era boundary.
 
@@ -2078,7 +2081,7 @@ if storage.sql.databaseSize > 8 GiB:                                every row �
 t = max(tpub(now), last_t, sec(start(E)), closed_t + Δ if closed_t exists)
 if open_t exists and t > open_t: closeBatch(open_t)
 for each row (in order):
-  if len(body) ≠ CLASSES[cls] + 40 or len(label) ≠ 16 or len(v) ≠ 8:  BAD
+  if len(body) ≠ CLASSES[cls] + 40 or len(label) ≠ 16 or len(v) ≠ 8 or v ≥ 2^63:  BAD
   o = SELECT t, cls, body FROM row WHERE v = ? AND label = ?
   if o:  CONFLICT(o.t, o.cls, o.body)
   else:  INSERT row (v, label, t, cls, bh, body); open_t = t; last_t = t; OK(t)
@@ -2092,16 +2095,18 @@ CONFLICT with the first copy.
 **`get(E, i, keys: {v, label, mode}[])`** calls `prepare()` and then, for each key:
 
 - if the row exists: `HIT(t, cls, body if mode = 0)`;
-- otherwise `MISS(sealed = state = sealed ? 1 : 0)`.
+- otherwise `MISS(sealed = state ≠ open ? 1 : 0)`.
 
-The Worker enforces the response budget (§10.4).
+A paged shard throws `shard: paged` instead ("Paging" below). The Worker enforces the response budget (§10.4).
 
 **`head(E, i)`** calls `prepare()`, closes the open batch if `tpub(now) > open_t`, and returns
-`{head, t_last, sealed, size}`, where `t_last` is `closed_t` or 0 and `size` is `databaseSize`.
+`{head, t_last, sealed, size, paged}`, where `t_last` is `closed_t` or 0, `size` is `databaseSize` and `paged` says
+that nothing is left to page: a paged shard, or a sealed one without rows.
 
 **Feed RPCs** (internal; the HTTP page is §10.9). Both call `prepare()` and only read: they never close an open batch,
 even a due one (the batch alarm, `head()`, a later `put` or sealing does), and the open batch is never readable. No
-result carries more than the caller's `budget` of row bytes, because Workers RPC values are limited to 32 MiB.
+result carries more than the caller's `budget` of row bytes, because Workers RPC values are limited to 32 MiB. A
+paged shard throws `shard: paged` ("Paging" below).
 
 - `feedBatches(E, i, after_t, budget)` returns the closed batches with `t > after_t`, ascending, each with its §10.9
   encoded size `72 + Σ(17 + len(body))`, computed without reading bodies. It stops before the first batch that would
@@ -2113,10 +2118,67 @@ result carries more than the caller's `budget` of row bytes, because Workers RPC
 
 This is the public enumeration of the database.
 
-**Retention and capacity.** Old era DOs are kept and stay readable. Paging into R2 and deletion come in stage 2. A DO
-stores at most 10 GB, and one object handles about 1 000 requests/s, so an era holds `S_E` times that (§13.2 item
-13), set before the era starts. The CheckpointDO logs (§9.7) when a shard's `size` passes 2 GiB: the cue to raise the
-count for the next era ("Shard map" above).
+**Paging.** A sealed shard that holds rows is paged into the deployment's R2 bucket (the one that holds the blobs
+of §8; the keys `b/…` and `seal/…` never meet) and then emptied, so that the Durable Objects hold only the eras that
+still accept writes: the current one and, until it is paged, the previous one. Four objects under `seal/v2/{E}/{i}/`:
+
+```
+rows     = batch × nb                                            the closed batches in ascending t, each as §10.9 encodes it
+batch    = u32 t | u32 n | root[32] | head[32] | (label[16] | u8 cls | body[CLASSES[cls] + 40]) × n      rows by label
+batches  = (u32 t | u32 n | root[32] | head[32] | u64 off) × nb   ascending t; off = the batch's offset in rows
+idx      = (label[16] | u32 t | u8 cls | u8 0 | u48 off) × n      sorted by (v, label) (§4.4); off = the row's offset in rows
+manifest = JSON (below)
+```
+
+`rows` is the feed: a feed page is a 5-byte header followed by a contiguous range of it, and the pages without their
+headers, one after the other, are `rows`. A batch ends where the next one starts, the last at the end of `rows`. `idx`
+is read by **buckets**: with `n` rows, `b = 0` if `n ≤ 1024`, else `min(16, ⌈log2(n / 1024)⌉)`, and the bucket of a
+row is the `b` bits of its `v` below the shard bits, `bucket(v) = (v >> (63 − s_E − b)) mod 2^b`, so that the entries
+of bucket `k` are `idx[28·dir[k] .. 28·dir[k+1])`, with `dir` the `2^b + 1` cumulative counts (`dir[0] = 0`,
+`dir[2^b] = n`). Every stored `v` is below 2^63 (§4.4; `put` refuses any other as BAD), so the order by `v` keeps
+each bucket in one run. Nobody can aim rows at a bucket: `v` is a keyed PRF of the label. The manifest:
+
+```json
+{"v":1, "era":E, "shard":i, "sbits":s_E, "kroute":"<b64u kroute_E>", "head":"<b64u final head>", "tLast":closed_t,
+ "part":16777216,
+ "rows":{"size":<bytes>, "n":n, "sha256":["<b64u>", …]},
+ "idx":{"size":28·n, "b":b, "dir":"<b64u u32 × (2^b + 1)>", "sha256":[…]},
+ "batches":{"size":80·nb, "nb":nb, "sha256":[…]},
+ "sig":"<b64u>"}
+```
+
+Each file is a sequence of parts of `part` bytes (the last one shorter), and `sha256[k]` is the SHA-256 of its part k.
+`kroute_E` (§4.4) is published here, once the era is sealed: with it anyone can check `kcommit_E` of the era info,
+compute `v` and the shard of any label of the era, and rebuild `idx` from `rows`. The signature is
+
+```
+sig = SIG.sign(enc("segv.sh/v2/seal", u16 E, u16 i, u8 s_E, kroute_E, head, u32 closed_t, u32 part, u32 n, u8 b, H(dir),
+                   u32 nb, u64 size(rows), H(sha of rows), u64 size(idx), H(sha of idx), u64 size(batches), H(sha of batches)),
+               SRV_SK)
+```
+
+where `H(dir)` is over the big-endian `u32` counts and each `H(sha of f)` over the file's part hashes, concatenated in
+order.
+
+The object pages itself, alarm by alarm, once it is sealed and has a closed batch: it writes `rows`, then `idx`, then
+`batches`, in parts of `part` bytes, persisting after every part where to resume (a restart repeats at most one part),
+then verifies what it wrote the way the Worker will read it (the batch table; a sample of its rows looked up by label
+through `idx`; a label it does not hold), writes the manifest last, and only then persists `state = paged`, drops its
+row and batch tables and `deleteAll()`s its storage, re-creating the meta it still needs (`state`, `head`, `closed_t`,
+`last_t`, `delta`, `sbits`). The manifest's existence is what "paged" means: until it exists, the shard answers every
+read itself. From `state = paged` on, `head()` answers as before (`sealed`, the final head, `paged = true`), `get`,
+`feedBatches` and `feedRows` throw `shard: paged` (the Worker then reads the files, §10.4, §10.9), and `put` answers
+WRONG_ERA. An object of an ended era that finds no state of its own but a manifest for itself in R2 (its storage was
+lost after the manifest was written) restores that meta from the manifest. A sealed shard without rows is never paged:
+there is nothing to move, and it keeps answering MISS(sealed = 1) and an empty feed; `head()` reports `paged = true`
+for both (nothing is left to page). A failed step is retried by the next alarm, and the CheckpointDO wakes the shards
+of past eras once an hour (§9.5 "Sweep"), so a shard sealed before paging existed, or whose alarm was lost, is paged
+too. The Worker never asks a shard to page.
+
+**Capacity.** A DO stores at most 10 GB, and one object handles about 1 000 requests/s, so an era holds `S_E` times
+that (§13.2 item 13), set before the era starts. The CheckpointDO logs (§9.7) when a shard's `size` passes 2 GiB: the
+cue to raise the count for the next era ("Shard map" above). Paging keeps the objects' storage to about two eras of
+rows.
 
 ### 9.2 BlobRegDO (`blobreg/v2`, SQLite, one instance)
 
@@ -2414,6 +2476,15 @@ Worker calls the DO's `ensure()` at most once per isolate (a module-level flag),
   checkpoint is made, checkpoint q−1, whose list is identical.
 - Sort the list by cid (byte order).
 - Log (§9.7) when a shard reports `size` above 2 GiB.
+
+**Sweep.** Once per UTC hour (`page:hour`), after collecting, the CheckpointDO wakes the shards of past eras so that
+each gets paged (§9.1 "Paging"): from the lowest era not yet known to be paged (`page:era`, initially `E_FIRST`) up to
+`E_now − 2`, it calls `head()` on every shard `i < S_E` of an era, at most 16 shards per hour; an era whose shards all
+answer `paged` is marked (`paged:<E>`) and skipped from then on, and `page:era` moves past the marked eras. A call
+that fails or does not answer in time leaves its era unmarked, and the next hour tries again. (`head()` runs
+`prepare()`, which seals an ended era and makes a sealed shard that holds rows arm its paging.) The eras `E_now` and
+`E_now − 1` are left to their own alarms. The marks and the cursor are written with the checkpoint, like the other
+meta.
 
 **Building and signing.**
 
@@ -3061,8 +3132,18 @@ status   = u8 0 (HIT)     | u32 t | u8 cls | [body[CLASSES[cls] + 40] if mode = 
 
 The Worker groups keys by `(E, shard)` for the DO calls and answers in request order. Keys with `E < E_FIRST` get
 `MISS(sealed = 1)` and keys with `E > era(now + SKEW)` get NO_ERA, both without a DO call (§9.7).
-`MISS(sealed = 1)` is final: era E can no longer gain that row. If any ShardDO `get` call throws, the Worker answers
-503 `{error: "storage unavailable"}` with `retry-after: 5` for the whole request.
+`MISS(sealed = 1)` is final: era E can no longer gain that row. If any ShardDO `get` call throws for a reason other
+than paging (below), or a read of a paged shard's files fails, the Worker answers 503 `{error: "storage unavailable"}`
+with `retry-after: 5` for the whole request.
+
+**Paged shards.** A ShardDO that has been paged (§9.1 "Paging") throws `shard: paged` instead of answering; the Worker
+then answers its keys from the shard's files in R2. It remembers per isolate which shards it found paged, and looks
+for a shard's manifest before the DO call once the era is sealed by its clock. It verifies the manifest (`sig` under
+`SRV_SK`, `era`, `shard`, and `sbits = s_E` of the shard map: a manifest that fails is 503 `storage unavailable`),
+reads the bucket of each key (`bucket(v)`: one Range read of `idx`) and finds the label there: HIT(t, cls) and, in
+body mode, the row at `off` in `rows` (one Range read of `17 + CLASSES[cls] + 40` bytes, whose `label` and `cls` MUST
+match the key's and the entry's), else MISS(sealed = 1): the manifest is complete, so the answer is as final as the
+DO's. The budget below applies as to any other answer.
 
 **Response budget.** The Worker MUST then walk the keys in request order with a budget of 4 194 304 bytes (4 MiB) of
 HIT bodies:
@@ -3374,8 +3455,8 @@ it. `E > era(now + SKEW·1000)` or `E < E_FIRST` → 404 (§9.7); a malformed E 
 SKEW·1000)` by the Worker's clock: by the SKEW bound no component of era E accepts a write from then on, so every field
 is final, and a response with `sealed = true` is `public, max-age=31536000, immutable`; any other is `no-store`.
 `sealed` is informational: it does not mean that the ShardDO has persisted `state = sealed`, and clients MUST NOT use
-it as the finality of a key (only `MISS(sealed = 1)`, §10.4, is). Publishing `kroute_E` for sealed eras belongs to
-stage 2 (paging, §14) and is not part of stage 1.
+it as the finality of a key (only `MISS(sealed = 1)`, §10.4, is). `kroute_E` of a sealed era is published by the
+manifests of its shards (§9.1 "Paging", `/api/v2/seal/{E}/{i}` below), never by the era info.
 
 **`GET /api/v2/ckpt/latest`** returns `{"q", "sec", "hd", "C", "sig", "heads": [{"cid", "head"}]}` (binary fields in
 b64u). 404 when there is none yet.
@@ -3425,12 +3506,23 @@ that took the shard's whole write capacity for a Δ. Page composition is determi
 the response ends abnormally: it is truncated, never altered. Feed readers MUST reject a page whose bytes end before its
 `nb` batches and their `n` rows are complete, and fetch it again.
 
+A paged shard's page (§9.1 "Paging") is served from R2: the Worker composes it from the shard's `batches` table by the
+same rule and sends the 5-byte header followed by one Range of `rows`, so the page is, byte for byte, the one the
+ShardDO served; a ShardDO that answers `shard: paged` is read that way from then on. The tokens, the cache rule and
+the streaming of a page above 4 MiB are the same.
+
 Rows of a batch are strictly ascending by label (bytewise). A feed consumer recomputes each batch's `root` over the rows
 in the order received, and `head` from the previous batch, so misordered rows fail that check and decoders need not
 check the order. Every head in a checkpoint was obtained through `head()`, which closes a due batch first, so its batch
 is already in the feed; the feed may hold later batches. Auditors check that each checkpointed `shard/{E}/{i}` head
 occurs in the feed's head chain (not that it is the last head). Clients never use the feed. It exists so that the
 database stays public and mirrors and auditors can verify batch roots and the head chain against checkpoints.
+
+**`GET /api/v2/seal/{E}/{i}`** (JSON; `RL_READ`) is the manifest of a paged shard (§9.1 "Paging"), as stored, and is
+`public, max-age=31536000, immutable`. 404 `{error: "not paged"}` (`no-store`) while the shard has no manifest (not
+paged yet, or sealed without rows); an `E` outside `E_FIRST..era(now + SKEW·1000)` or an `i ≥ S_E` is 404 like a
+feed's. Clients never use it. It exists for auditors and mirrors: `kroute_E` of the sealed era, the batch table, and the
+hashes of the files whose bytes `/api/v2/feed/{E}/{i}` serves.
 
 ### 10.10 Push: `POST /api/v2/push/sub`, `POST /api/v2/ring` and `POST /api/v2/seen`
 
@@ -4803,6 +4895,10 @@ and inbox notices (§9.3; a notice says only that a slot of a bucket holds rows,
 holds only what §9.8 lists, and never a uid, handle, conversation, topic, IP or sender (§0.1, §13.4). The N column
 applies only to devices that turned notifications on; N sees nothing of the others.
 
+The public data of a sealed era moves to R2 (§9.1 "Paging") and is served from there; `kroute_E` of a sealed era is
+published with it (§10.9), which links nothing: labels are independent PRF outputs and `v` is their keyed hash, so a
+public `kroute_E` only lets anyone recompute which shard and bucket a label they already know went to.
+
 ### 13.2 Properties of v1 that stage 1 weakens
 
 Each item is a deliberate trade-off that stage 2 or 3 addresses. None is silent.
@@ -4896,7 +4992,8 @@ Each item is a deliberate trade-off that stage 2 or 3 addresses. None is silent.
     about 1 000 requests/s; an era has `S_E` of them (§9.1), chosen before it starts, so its capacity cannot grow
     within the week, and one current InboxDO takes every client (the realtime path is spread over the `C` ConnDOs and
     `F` FeedDOs of the deployment, §9.4). When every shard of an era fills, writes fail with FULL until the next era
-    (§9.1).
+    (§9.1). Paging (§9.1) moves a sealed era's rows into R2 and empties its shards, so the objects hold about two eras
+    of rows at a time.
 14. **A wrong key entry freezes everyone, and a freeze with a removal stops messaging.** Two deliberate changes to v1's
     freezes (§6.6, §6.10):
     - v1 froze only the members whose invite was missing, and the others kept changing membership. Stage 1 derives
@@ -5120,9 +5217,6 @@ A native app (§11.14) changes whom a user trusts for the client's code, and add
 
 **Storage and routing:**
 
-- paging sealed eras into R2 (`.idx`/`.dat`), `seal/{E}` objects, manifests, publishing `kroute_E` of sealed eras,
-  deleting old ShardDOs;
-- the public label-ordered page reads;
 - emergency splitting of a shard within an era (`MOVED`, frozen ranges);
 - R2 Range reads of bundle entries.
 
