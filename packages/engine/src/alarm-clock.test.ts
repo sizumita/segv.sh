@@ -140,6 +140,21 @@ describe("alarm clock", () => {
     expect(arms).toEqual([1_250, null]);
   });
 
+  it("asks for alarms in whole milliseconds, rounded up, from a clock with fractions", () => {
+    page.t = 1234.5678; // performance.now() in Chromium
+    const ran: string[] = [];
+    c.clock.setTimer(() => ran.push("ping"), 30_000);
+    expect(arms).toEqual([30_250]);
+    page.advance(0.4, false);
+    c.clock.setTimer(() => ran.push("probe"), 10_000);
+    expect(arms).toEqual([30_250, 10_250]);
+    expect(arms.every((ms) => ms === null || Number.isInteger(ms))).toBe(true);
+    page.advance(10_250, false); // the alarm of 10 250 ms, which the page asked for rounded up
+    c.alarm();
+    expect(ran).toEqual(["probe"]);
+    expect(arms.every((ms) => ms === null || Number.isInteger(ms))).toBe(true);
+  });
+
   it("asks again when the pending alarm never came", () => {
     c.clock.setTimer(() => {}, 1_000);
     page.advance(10_000, false); // the alarm at 1 250 was lost

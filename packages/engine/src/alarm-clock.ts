@@ -7,7 +7,7 @@
 import { systemClock, type EngineClock, type EngineTimer } from "./options";
 
 export interface AlarmClockOptions {
-  /** asks the native code for one alarm `ms` from now, replacing the pending one; null cancels it */
+  /** asks the native code for one alarm `ms` (whole milliseconds) from now, replacing the pending one; null cancels it */
   arm(ms: number | null): void;
   /** whether the page is hidden, and so may be throttled: alarms are asked for only then */
   hidden(): boolean;
@@ -64,7 +64,8 @@ export function alarmClock(o: AlarmClockOptions): AlarmClock {
     const now = base.mono();
     if (armedAt !== null && armedAt <= at && armedAt > now - LOST_MS) return;
     armedAt = at;
-    o.arm(Math.max(0, at - now));
+    // In whole milliseconds, rounded up: the native command takes no fraction, and a timer is never run early.
+    o.arm(Math.max(0, Math.ceil(at - now)));
   };
 
   const clock: EngineClock = {

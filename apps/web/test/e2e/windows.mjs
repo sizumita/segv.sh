@@ -14,7 +14,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { chromium } from "playwright";
 import { kill } from "./lib/server.mjs";
-import { check, note, problems, step, unwatch, watch } from "./lib/harness.mjs";
+import { T, check, note, problems, step, unwatch, watch } from "./lib/harness.mjs";
 import {
   accept,
   closeImage,
