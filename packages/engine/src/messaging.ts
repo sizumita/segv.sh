@@ -2047,26 +2047,53 @@ export class Messaging {
     throw new ApiError(0, `no inbox bucket of era ${E} for the recipient`);
   }
 
+  /** the slots announced by the notices that wait for one poll (§10.8), era → largest rel; null when none waits */
+  private inboxNotice: Map<number, number> | null = null;
+
   /**
-   * An INBOX notice (§10.8): slot `rel` of bucket `g` of era `E` closed with rows. Poll the inbox; when the read of E
-   * did not reach `rel` (a response cached before the close, or an era this device does not read yet), poll once more
-   * after Δin. The catch-up every 300 s covers whatever these two miss.
+   * An INBOX notice (§10.8): slot `rel` of bucket `g` of era `E` closed with rows. Poll the inbox after a uniform
+   * random delay of up to `max(0, Δin − SKEW − 2)` s, so that the devices that get the same notice spread their reads
+   * over the rest of the slot, where the edge cache serves all but the first of them (§10.5); a notice that comes
+   * while a poll waits joins it. When the read of an announced era did not reach its `rel` (a response cached before
+   * the close, or an era this device does not read yet), poll once more after Δin. The catch-up every 300 s covers
+   * whatever these miss.
    */
   private onInbox(E: number, g: number, rel: number): void {
     if (this.ownBuckets.get(E) !== g || !this.live || this.stopped) return;
-    void this.h
-      .track(
-        this.h.enqueue(async () => {
-          const closed = await this.pollInbox();
-          if ((closed.get(E) ?? -1) >= rel || this.inboxRetry) return;
-          this.inboxRetry = this.h.clock.setTimer(() => {
-            this.inboxRetry = null;
-            if (!this.live || this.stopped) return;
-            void this.h.track(this.h.enqueue(() => this.pollInbox())).catch(() => {});
-          }, this.params().inboxSlot * 1000);
-        }),
-      )
-      .catch(() => {});
+    const waiting = this.inboxNotice;
+    if (waiting) {
+      waiting.set(E, Math.max(waiting.get(E) ?? -1, rel));
+      return;
+    }
+    const want = new Map([[E, rel]]);
+    this.inboxNotice = want;
+    const run = (): void => {
+      if (!this.live || this.stopped) {
+        if (this.inboxNotice === want) this.inboxNotice = null;
+        return;
+      }
+      void this.h
+        .track(
+          this.h.enqueue(async () => {
+            if (this.inboxNotice === want) this.inboxNotice = null; // from here on a notice waits for the next poll
+            const closed = await this.pollInbox();
+            if (this.inboxRetry || [...want].every(([e, r]) => (closed.get(e) ?? -1) >= r)) return;
+            this.inboxRetry = this.h.clock.setTimer(() => {
+              this.inboxRetry = null;
+              if (!this.live || this.stopped) return;
+              void this.h.track(this.h.enqueue(() => this.pollInbox())).catch(() => {});
+            }, this.params().inboxSlot * 1000);
+          }),
+        )
+        .catch(() => {})
+        .finally(() => {
+          if (this.inboxNotice === want) this.inboxNotice = null;
+        });
+    };
+    const p = this.params();
+    const spread = Math.max(0, (p.inboxSlot - p.skew - 2) * 1000);
+    if (spread === 0) run();
+    else this.h.clock.setTimer(run, Math.floor(Math.random() * (spread + 1)));
   }
 
   /**

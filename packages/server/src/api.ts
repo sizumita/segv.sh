@@ -130,7 +130,7 @@ import {
   sealPage,
   type SealManifest,
 } from "./seal";
-import { PUSH_TOKENS, PUSH_WINDOW, epOf, ownerByRecord, pushRing, qkOf, quietShard } from "./push";
+import { PUSH_TOKENS, PUSH_WINDOW, epOf, ownerByRecord, pushRing, qkOf, quietShard, sameBytes } from "./push";
 export { _setRingSleepForTests } from "./push";
 import {
   blobRegStub,
@@ -1066,28 +1066,35 @@ async function postWrap(c: Ctx): Promise<Response> {
   return json(await dirAddWrap(c.env, parseJsonObject(bytes)));
 }
 
-/** kbucket_E per isolate (§9.3 "Buckets"): a key never changes once the KeyDO made it. */
-const bucketKeys = new Map<number, Bytes>();
+/**
+ * kbucket_E per isolate and β_E (§9.3 "Buckets"): a key never changes once the KeyDO made it. Every era the directory
+ * lists is asked once per isolate with its β_E, β_E = 0 included (null: no key), so that the KeyDO pins each listed
+ * era's β and refuses a changed one.
+ */
+const bucketKeys = new Map<string, Bytes | null>();
 const BUCKET_KEYS_MAX = 16;
 
-async function bucketKeyFor(c: Ctx, E: number): Promise<Bytes> {
-  const hit = bucketKeys.get(E);
-  if (hit) return hit;
-  let key: Bytes;
+async function bucketKeyFor(c: Ctx, E: number, bits: number): Promise<Bytes | null> {
+  const id = `${E}:${bits}`;
+  const hit = bucketKeys.get(id);
+  if (hit !== undefined) return hit;
+  let key: Bytes | null;
   try {
-    key = new Uint8Array(await keyStub(c.env).bucketKey(E));
+    const k = await keyStub(c.env).bucketKey(E, bits);
+    key = k === null ? null : new Uint8Array(k);
+    if ((key === null) !== (bits === 0)) throw new Error("keys: unexpected answer");
   } catch (e) {
     console.error(JSON.stringify({ msg: "inbox bucket key failed", error: logErr(e) }));
     throw unavailable();
   }
   if (bucketKeys.size >= BUCKET_KEYS_MAX) bucketKeys.clear();
-  bucketKeys.set(E, key);
+  bucketKeys.set(id, key);
   return key;
 }
 
 /**
  * §10.6: each user's inbox bucket of E_now − 3 .. E_now + 1 (within E_FIRST..0xFFFE: the eras a reader reads and a
- * sender posts into), `bucket(E, handle)` of §9.3. An era with one bucket needs no key.
+ * sender posts into), `bucket(E, handle)` of §9.3. An era with one bucket has no key, but its β is pinned all the same.
  */
 async function withInboxBuckets(c: Ctx, users: DirUser[]): Promise<(DirUser & { inbox: { E: number; g: number }[] })[]> {
   const Enow = era(c.now);
@@ -1095,7 +1102,7 @@ async function withInboxBuckets(c: Ctx, users: DirUser[]): Promise<(DirUser & { 
   const keys = await Promise.all(
     eras.map(async (E) => {
       const bits = inboxBitsOf(c.params.inboxMap, E);
-      return { E, bits, key: bits === 0 ? null : await bucketKeyFor(c, E) };
+      return { E, bits, key: await bucketKeyFor(c, E, bits) };
     }),
   );
   return users.map((u) => {
@@ -1208,12 +1215,16 @@ async function pushSub(c: Ctx, cfg: PushConfig): Promise<Response> {
   // The tokens are bell secrets (§4.1): the endpoint is registered under their bells, which only the Worker computes.
   const bells = [...seen.values()].map((s) => bellOf(s));
   // The endpoint's QuietDO is its owner's: its account's quiet tag, or, for a deletion without one, the owner its record
-  // names (§9.8, §10.10).
+  // names. When the record names another owner, that owner's QuietDO, the writer of its bells, drops the endpoint
+  // first: the registration passes to the new owner (§9.8, §10.10).
   const ep = epOf(cfg.pushKey, endpoint);
-  const owner = quiet ? qkOf(cfg.pushKey, quiet) : await ownerByRecord(c.env, ep);
-  const k = quietShard(owner, cfg.shards);
   try {
-    await quietStub(c.env, k).sub(endpoint, p256dh, auth, bells, quiet);
+    const had = await ownerByRecord(c.env, ep);
+    const owner = quiet ? qkOf(cfg.pushKey, quiet) : had;
+    // A deletion without a quiet tag of an endpoint that has no record changes nothing.
+    if (owner === null) return noContent();
+    if (had && !sameBytes(had, owner)) await quietStub(c.env, quietShard(had, cfg.shards)).drop(ep);
+    await quietStub(c.env, quietShard(owner, cfg.shards)).sub(endpoint, p256dh, auth, bells, quiet);
   } catch (e) {
     console.error(JSON.stringify({ msg: "push sub failed", error: logErr(e) }));
     throw new HttpError(503, "storage unavailable", { "retry-after": "5" });
@@ -1260,11 +1271,12 @@ async function ringAfter(c: Ctx, E: number, label: Bytes, tokens: Bytes[]): Prom
     if (!ringEraOk(E, c.now, c.params)) return;
     const v = routeV(krouteFor(c.keys, E), label);
     const i = shardOf(v, shardBitsOf(c.params.shardMap, E));
-    const [r] = (await shardStub(c.env, E, i).get(E, i, [{ v, label, mode: 1 } as ShardGetKey])) as ShardGetResult[];
+    // Through the R2 files once the shard is paged: a ring in an era's last seconds may come after it was.
+    const [r] = await shardGet(c, E, i, [{ v, label, mode: 1 } as ShardGetKey]);
     if (!r || r.s !== "hit" || !ringRowFresh(r.t, c.now, c.params.delta)) return;
     const cfg = pushConfig(c.env);
     if (!cfg) return;
-    await pushRing(c.env, cfg, E, label, tokens);
+    await pushRing(c.env, cfg, E, label, tokens, c.now);
   } catch (e) {
     console.error(JSON.stringify({ msg: "ring failed", error: logErr(e) }));
   }

@@ -147,8 +147,24 @@ export class FakeDirectory {
       if (recs.some((p) => b64u(p.id) === b64u(r.id))) return err(400, `wraps[${i}]: duplicate id`);
       recs.push(r);
     }
-    if (this.byHandle.has(u.handle) || this.users.has(u.uid))
+    if (this.byHandle.has(u.handle) || this.users.has(u.uid)) {
+      // The same registration sent again (§2.5 step 8, §9.6 step 2): the same uid, handle, bundle and signature, and
+      // every wrap record of the body registered for it. It answers as the first send did and writes nothing.
+      const row = this.users.get(u.uid);
+      const same =
+        row !== undefined &&
+        row.handle === u.handle &&
+        row.bundle === u.bundle &&
+        row.sig === u.bundleSig &&
+        recs.every((r) =>
+          this.wraps.some(
+            (x) =>
+              x.uid === r.uid && x.id === b64u(r.id) && x.record === r.record && x.sig === r.sig,
+          ),
+        );
+      if (same) return json(200, { dirseq: row.dirseq });
       return err(409, "handle or uid already taken");
+    }
     const dirseq = this.append(DIRLOG_USER, dirlogRefUser(u.bundle, fromB64u(u.bundleSig)));
     const row: DirUserRow = {
       uid: u.uid,

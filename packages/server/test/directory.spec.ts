@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as P from "@segv/protocol/proto";
 import { HttpError, ed25519Verify } from "../src/http";
 import {
+  DIR_RETRY_AFTER_S,
   MAX_WRAPS_PER_ID,
   MAX_WRAPS_PER_UID,
   PREFIX_PAGE,
@@ -1348,9 +1349,9 @@ describe("D1 failures", () => {
     for (const r of results.slice(2)) expect(r).toMatchObject({ ok: true });
     const seqs = results.flatMap((r) => (r.ok ? r.seqs : []));
     expect(seqs).toEqual(seqs.map((_, i) => s0.head + 1 + i)); // contiguous, in order
-    // The first write went alone (the loop started on it); the other six queued behind its D1 round trip and were
-    // one round, whose checks refused the duplicate before the dirlog batch: two batches in all.
-    expect(writes).toBe(2);
+    // The round takes its writes when its turn starts, after the appends made in the same task: all seven are one
+    // round, whose checks refused the duplicate before the dirlog batch: one batch in all.
+    expect(writes).toBe(1);
     expect(await dirState()).toEqual({
       users: s0.users + 6,
       wraps: s0.wraps + 12,
@@ -1488,10 +1489,17 @@ describe("user databases (§9.6)", () => {
     // Database 1 loses its wrap table: a registration's batch there fails as a whole, after the dirlog batch.
     await env.DB1.prepare("ALTER TABLE wrap RENAME TO wrap_off").run();
     try {
-      await rejects(register(b), 503, /directory unavailable/);
+      const e = await rejects(register(b), 503, /directory unavailable/);
+      expect(e.headers).toEqual({ "retry-after": String(DIR_RETRY_AFTER_S) });
       expect(await dirlogHead(env)).toMatchObject({ seq: s0.head + 3 });
-      expect(await dirByUid(env, b.uidB64)).toBeNull();
       expect(await walSeqs()).toEqual([s0.head + 1]);
+      expect(await dirByUid(env, b.uidB64)).toBeNull(); // lookups read the user databases only
+      // The same registration sent again answers as the logged one, with its seqs, and logs nothing (§2.5 step 8).
+      expect(await register(b)).toEqual({ dirseq: s0.head + 1 });
+      expect(await dirlogHead(env)).toMatchObject({ seq: s0.head + 3 });
+      expect(await walSeqs()).toEqual([s0.head + 1]);
+      // The same bundle with other wrap records is another body: 409.
+      await rejects(register(b, [b.passkey]), 409, /handle already taken/);
       expect(
         await runInDurableObject(dirSeqStub(env), (_i: DirSeqDO, state) =>
           state.storage.getAlarm(),
@@ -1500,13 +1508,16 @@ describe("user databases (§9.6)", () => {
       // Database 0 is unaffected: a registration there lands, behind the waiting one in the log.
       expect((await register(a)).dirseq).toBe(s0.head + 4);
       expect(await walSeqs()).toEqual([s0.head + 1]);
-      await rejects(register(makeAccount(b.handle, uidIn(0))), 409, /handle already taken/); // the waiting row counts
+      // The handle is b's: another account's registration of it answers 409 (the waiting row counts).
+      await rejects(register(makeAccount(b.handle, uidIn(0))), 409, /handle already taken/);
     } finally {
       await env.DB1.prepare("ALTER TABLE wrap_off RENAME TO wrap").run();
     }
     // The replay (the alarm) lands the rows; the chain is intact.
     expect(await runDurableObjectAlarm(dirSeqStub(env))).toBe(true);
     expect(await walSeqs()).toEqual([]);
+    // Sent again once landed, the registration still answers with its seqs and writes nothing.
+    expect(await register(b)).toEqual({ dirseq: s0.head + 1 });
     expect((await dirByUid(env, b.uidB64))!.dirseq).toBe(s0.head + 1);
     expect((await dirWrapsById(env, P.b64u(b.credId), b.uidB64)).map((w) => w.dirseq)).toEqual([
       s0.head + 2,
@@ -1530,6 +1541,68 @@ describe("user databases (§9.6)", () => {
     expect(errors.mock.calls.some((c) => /user database write failed/.test(String(c[0])))).toBe(
       true,
     );
+  });
+
+  it("an alarm while a round's log batch is in flight waits for the round: its rows stay in the write-ahead log and land", async () => {
+    const b = makeAccount(freshHandle(), uidIn(1));
+    const s0 = await dirState();
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    // The log database holds the round's batch until released.
+    let entered!: () => void;
+    const inFlight = new Promise<void>((r) => (entered = r));
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const log = new Proxy(env.DIRLOG, {
+      get: (t, k) => {
+        if (k === "batch") {
+          return async (stmts: D1PreparedStatement[]) => {
+            if (stmts.length > 1) {
+              entered();
+              await gate;
+            }
+            return t.batch(stmts);
+          };
+        }
+        const v = Reflect.get(t, k) as unknown;
+        return typeof v === "function" ? (v as (...x: unknown[]) => unknown).bind(t) : v;
+      },
+    });
+    await runInDurableObject(dirSeqStub(env), (_i: DirSeqDO, state) =>
+      state.storage.setAlarm(Date.now() + 60_000),
+    );
+    // Database 1 refuses the rows, so they must survive in the write-ahead log.
+    await env.DB1.prepare("ALTER TABLE wrap RENAME TO wrap_off").run();
+    try {
+      await withDirSeqEnv(envWith({ DIRLOG: log }), async () => {
+        const reg = register(b).then(
+          () => null,
+          (e: unknown) => e,
+        );
+        await inFlight;
+        // The alarm fires while the round awaits its log batch: it must not judge the round's rows.
+        const alarm = runDurableObjectAlarm(dirSeqStub(env));
+        await new Promise((r) => setTimeout(r, 100));
+        release();
+        expect((await reg) as HttpError).toMatchObject({ status: 503 });
+        expect(await alarm).toBe(true);
+      });
+      expect(await walSeqs()).toEqual([s0.head + 1]);
+      expect(await register(b)).toEqual({ dirseq: s0.head + 1 }); // the logged registration, sent again
+    } finally {
+      await env.DB1.prepare("ALTER TABLE wrap_off RENAME TO wrap").run();
+    }
+    expect(await runDurableObjectAlarm(dirSeqStub(env))).toBe(true);
+    expect(await walSeqs()).toEqual([]);
+    expect(await countIn(env.DB1, "SELECT count(*) AS n FROM wrap WHERE uid = ?1", b.uidB64)).toBe(
+      2,
+    );
+    expect(await dirState()).toEqual({
+      users: s0.users + 1,
+      wraps: s0.wraps + 2,
+      head: s0.head + 3,
+      meta: s0.meta + 1,
+    });
+    expect(errors.mock.calls.some((c) => /dirlog write failed/.test(String(c[0])))).toBe(false);
   });
 
   it("DIR_SHARDS below the pinned value: writes answer 503, logged once, until it is restored", async () => {
@@ -1628,6 +1701,53 @@ describe("user databases (§9.6)", () => {
       meta: s0.meta + 1,
     });
     expect(errors.mock.calls.some((c) => /rows are in their databases/.test(String(c[0])))).toBe(
+      true,
+    );
+  });
+
+  it("a row that waits in the write-ahead log across a raise of DIR_SHARDS lands in its new database", async () => {
+    // One database pinned; the deployment runs with one while the row is written, and database 0 refuses it.
+    await runInDurableObject(dirSeqStub(env), (_i: DirSeqDO, state) => {
+      state.storage.sql.exec("INSERT OR REPLACE INTO meta (k, v) VALUES ('dbits', 0)");
+      state.storage.sql.exec("DELETE FROM meta WHERE k = 'tobits'");
+      state.storage.sql.exec("DELETE FROM mv");
+    });
+    const a = makeAccount(freshHandle(), uidIn(1));
+    const s0 = await dirState();
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    await env.DB.prepare("ALTER TABLE wrap RENAME TO wrap_off").run();
+    try {
+      await withDirSeqEnv(envWith({ DIR_SHARDS: "1" }), async () => {
+        await rejects(register(a), 503, /directory unavailable/);
+      });
+      expect(await walSeqs()).toEqual([s0.head + 1]);
+    } finally {
+      await env.DB.prepare("ALTER TABLE wrap_off RENAME TO wrap").run();
+    }
+    // The deployment is back at two databases: the alarm starts the move, and the replay places the row by it.
+    expect(await runDurableObjectAlarm(dirSeqStub(env))).toBe(true);
+    expect(await walSeqs()).toEqual([]);
+    expect(await countIn(env.DB1, "SELECT count(*) AS n FROM user WHERE uid = ?1", a.uidB64)).toBe(
+      1,
+    );
+    expect(await countIn(env.DB1, "SELECT count(*) AS n FROM wrap WHERE uid = ?1", a.uidB64)).toBe(
+      2,
+    );
+    expect(await countIn(env.DB, "SELECT count(*) AS n FROM user WHERE uid = ?1", a.uidB64)).toBe(
+      0,
+    );
+    expect(await countIn(env.DB, "SELECT count(*) AS n FROM wrap WHERE uid = ?1", a.uidB64)).toBe(
+      0,
+    );
+    for (let i = 0; i < 64; i++) if (!(await runDurableObjectAlarm(dirSeqStub(env)))) break;
+    const meta = await runInDurableObject(dirSeqStub(env), (_i: DirSeqDO, state) =>
+      state.storage.sql
+        .exec<{ k: string; v: number }>("SELECT k, v FROM meta ORDER BY k")
+        .toArray(),
+    );
+    expect(meta).toEqual([{ k: "dbits", v: 1 }]);
+    expect((await dirByUid(env, a.uidB64))!.dirseq).toBe(s0.head + 1);
+    expect(errors.mock.calls.some((c) => /user database write failed/.test(String(c[0])))).toBe(
       true,
     );
   });

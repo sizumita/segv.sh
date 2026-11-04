@@ -14,6 +14,7 @@
  *   CheckpointDO "ckpt/v2"
  *   QuietDO      "quiet/v2/{k}"       (k = quietShard(owner) of an endpoint, §9.8; PUSH_SHARDS of them)
  */
+import { BODY_LENS } from "@segv/protocol/proto";
 import type { BlobRegDO } from "./blobreg-do";
 import type { CheckpointDO } from "./ckpt-do";
 import type { ConnDO } from "./conn-do";
@@ -258,7 +259,6 @@ export function parseIndexName(name: string | undefined, kind: "conn" | "feed" |
   return c;
 }
 
-/** Parses "shard/v2/{E}/{i}" / "inbox/v2/{E}/{g}" (decimal, no padding). */
 /** Validates the (E, g, rel) of an inbox notice (§9.3): E a u16 below 0xFFFF, g and rel u32s. */
 export function checkNotice(E: unknown, g: unknown, rel: unknown): void {
   if (!Number.isInteger(E) || (E as number) < 0 || (E as number) > 0xfffe) throw new TypeError("notice: bad era");
@@ -267,6 +267,25 @@ export function checkNotice(E: unknown, g: unknown, rel: unknown): void {
   }
 }
 
+/**
+ * Validates realtime rows (§9.4 publish / deliver) as they cross an RPC boundary; `what` prefixes the error message.
+ * The Worker validates them before the first call; the FeedDO and the ConnDO check them again.
+ */
+export function checkRtRows(input: unknown, what: string): RtPublishRow[] {
+  if (!Array.isArray(input)) throw new TypeError(`${what}: bad rows`);
+  return input.map((r: unknown) => {
+    const { topic, E, label, t, cls, body } = (typeof r === "object" && r !== null ? r : {}) as Record<string, unknown>;
+    if (!(topic instanceof Uint8Array) || topic.length !== 16) throw new TypeError(`${what}: bad topic`);
+    if (!Number.isInteger(E) || (E as number) < 0 || (E as number) > 0xffff) throw new TypeError(`${what}: bad era`);
+    if (!(label instanceof Uint8Array) || label.length !== 16) throw new TypeError(`${what}: bad label`);
+    if (!Number.isInteger(t) || (t as number) < 0 || (t as number) > 0xffffffff) throw new TypeError(`${what}: bad t`);
+    if (!Number.isInteger(cls) || BODY_LENS[cls as number] === undefined) throw new TypeError(`${what}: bad class`);
+    if (!(body instanceof Uint8Array) || body.length !== BODY_LENS[cls as number]) throw new TypeError(`${what}: bad body`);
+    return { topic, E: E as number, label, t: t as number, cls: cls as number, body };
+  });
+}
+
+/** Parses "shard/v2/{E}/{i}" / "inbox/v2/{E}/{g}" (decimal, no padding). */
 export function parseEraName(name: string | undefined, kind: "shard" | "inbox"): { E: number; i: number } {
   const m = name ? new RegExp(`^${kind}/v2/(0|[1-9]\\d{0,4})/(0|[1-9]\\d{0,4})$`).exec(name) : null;
   if (!m) throw new Error(`${kind} DO: unexpected name`);

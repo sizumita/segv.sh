@@ -335,6 +335,11 @@ async function readError(res: Response): Promise<ApiError> {
   return new ApiError(res.status, msg, body, Number.isFinite(ra) && ra >= 0 ? ra : null);
 }
 
+/** The longest wait before a registration is sent again (s), whatever its `retry-after` (§2.5 step 8). */
+export const REGISTER_WAIT_MAX_S = 10;
+/** Sends of one registration: the first and the identical ones after a network error, a 429 or a 5xx. */
+export const REGISTER_SENDS = 5;
+
 export class Api {
   readonly time: ServerClock;
   /** every row this session fetched, received or wrote (§12.1) */
@@ -819,23 +824,58 @@ export class Api {
 
   /**
    * `POST /api/v2/register`. `now` is the response's `x-segv-now`: the server time of the registration, from which
-   * the first inbox cursor is computed (§11.1), or null when absent.
+   * the first inbox cursor is computed (§11.1), or null when absent. After a network error, a 429 or a 5xx the
+   * identical body is sent again (§2.5 step 8), after the answer's `retry-after` or a backoff from 1 s, whichever is
+   * longer, at most REGISTER_WAIT_MAX_S, up to REGISTER_SENDS sends: the directory answers a registration it already
+   * logged as it answered the first time, so a 200 means registered and a 409 that another account holds the handle.
+   * The proof of work is reused while its window is accepted (§10.2) and solved again otherwise; a 403 refreshes the
+   * params and solves it again, once. The last error is thrown.
    */
   async register(
     body: { bundle: string; sig: string; wraps: WrapJson[] },
     onProgress?: Progress,
   ): Promise<{ dirseq: number; now: number | null }> {
-    const res = await this.postPow(
-      "/api/v2/register",
-      "register",
-      P.utf8(JSON.stringify(body)),
-      "application/json",
-      onProgress,
-    );
-    const h = res.headers.get("x-segv-now");
-    const j = await this.json<{ dirseq: number }>(res);
-    const now = h !== null && /^\d{1,16}$/.test(h) ? Number(h) : null;
-    return { dirseq: j.dirseq, now: now !== null && Number.isSafeInteger(now) ? now : null };
+    const bytes = P.utf8(JSON.stringify(body));
+    const digest = P.H(bytes);
+    let pow: string | null = null;
+    let refreshed = false;
+    for (let send = 1; ; send++) {
+      // A proof is accepted while its window is the current or the previous one (§10.2).
+      if (
+        pow === null ||
+        Math.floor(this.serverNow() / P.POW_WINDOW_MS) - Number(pow.slice(0, pow.indexOf("."))) > 1
+      )
+        pow = await this.powHeader("register", digest, bytes.length, onProgress);
+      let err: ApiError;
+      try {
+        const res = await this.request("/api/v2/register", {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-segv-pow": pow },
+          body: bytes as BodyInit,
+        });
+        if (res.ok) {
+          const h = res.headers.get("x-segv-now");
+          const j = await this.json<{ dirseq: number }>(res);
+          const now = h !== null && /^\d{1,16}$/.test(h) ? Number(h) : null;
+          return { dirseq: j.dirseq, now: now !== null && Number.isSafeInteger(now) ? now : null };
+        }
+        err = await readError(res);
+      } catch (e) {
+        if (!(e instanceof ApiError)) throw e;
+        err = e;
+      }
+      if (err.status === 403 && !refreshed) {
+        refreshed = true;
+        await this.params(true);
+        pow = null;
+        send--;
+        continue;
+      }
+      if (!err.transient || send >= REGISTER_SENDS) throw err;
+      onProgress?.("the server did not answer; sending the registration again…");
+      const wait = Math.min(Math.max(err.retryAfter ?? 0, 2 ** (send - 1)), REGISTER_WAIT_MAX_S);
+      await new Promise<void>((resolve) => this.clock.setTimer(resolve, wait * 1000));
+    }
   }
 
   // ── Web Push (§10.10) ──

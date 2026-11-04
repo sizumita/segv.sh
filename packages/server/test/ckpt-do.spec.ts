@@ -1,7 +1,8 @@
 /**
  * CheckpointDO (docs/PROTOCOL.md §9.5, §10.9): the C_q chain and its signatures, no new q for
  * unchanged heads, the previous era's sealed shard (once more, then dropped), failing components (and ones that
- * never answered, which are left out), the sec clamp, the hourly blob registry head, alarm arming and ensure().
+ * never answered, which are left out), the sec clamp, the hourly blob registry head, alarm arming and ensure(), the
+ * lists in R2 (and rows that still hold theirs), and the hourly paging sweep.
  *
  * The checkpoint object is one instance: each test moves its clock to a fresh era further in the future and drives
  * tick() by hand (the alarm it re-arms then never fires on its own). Components are reached through the real DOs;
@@ -42,6 +43,8 @@ type CkInternals = {
   env: Env;
   sizeWarnBytes: number;
   shardsOf: (E: number) => number;
+  sweepShards: number;
+  latestHeads: unknown;
 };
 async function ckClock(ms: number): Promise<void> {
   await runInDurableObject(ck(), (inst: CheckpointDO) => {
@@ -469,7 +472,7 @@ describe("CheckpointDO sweep (§9.5)", () => {
       );
     await runInDurableObject(ck(), (_inst: CheckpointDO, state) => {
       state.storage.sql.exec("INSERT OR REPLACE INTO meta (k, v) VALUES ('page:era', ?)", F - 4);
-      state.storage.sql.exec("DELETE FROM meta WHERE k = 'page:hour'");
+      state.storage.sql.exec("DELETE FROM meta WHERE k IN ('page:hour', 'page:at')");
     });
     // F − 4 and F − 2 are empty and over; F − 3 holds a row and has not sealed yet: nobody called it since its era
     // ended. Each runs on its own clock, past its era (the real clock has not reached these eras).
@@ -515,5 +518,242 @@ describe("CheckpointDO sweep (§9.5)", () => {
     await ck().tick();
     expect(await meta(`paged:${F - 3}`)).toBe(1);
     expect(await meta("page:era")).toBe(F - 1);
+  });
+});
+
+/** Reads one meta value of the checkpoint object. */
+const ckMeta = (k: string): Promise<SqlStorageValue | null> =>
+  runInDurableObject(
+    ck(),
+    (_inst: CheckpointDO, state) =>
+      state.storage.sql
+        .exec<{ v: SqlStorageValue }>("SELECT v FROM meta WHERE k = ?", k)
+        .toArray()[0]?.v ?? null,
+  );
+/** Sets the clock of shard (E, i). */
+const shardClockAt = (E: number, i: number, ms: number) =>
+  runInDurableObject(shardStub(env, E, i), (inst: ShardDO) => {
+    (inst as unknown as { clock: () => number }).clock = () => ms;
+  });
+/** Starts the sweep afresh from era `from` at the next hourly tick. */
+const sweepFrom = (from: number) =>
+  runInDurableObject(ck(), (_inst: CheckpointDO, state) => {
+    state.storage.sql.exec("INSERT OR REPLACE INTO meta (k, v) VALUES ('page:era', ?)", from);
+    state.storage.sql.exec("DELETE FROM meta WHERE k IN ('page:hour', 'page:at')");
+  });
+const setCk = (f: (x: CkInternals) => void) =>
+  runInDurableObject(ck(), (inst: CheckpointDO) => f(inst as unknown as CkInternals));
+
+describe("CheckpointDO sweep: one shard at a time (§9.5)", () => {
+  it("round-robins over the unpaged shards: a shard that never answers costs one call per round and never holds up a later era", async () => {
+    const [, F] = freshEras();
+    const A = F - 3; // its one shard never answers
+    const B = F - 2; // empty and over: answers paged
+    const base = P.eraStart(F) + 10 * 60_000;
+    await ckClock(base);
+    await sweepFrom(A);
+    await shardClockAt(B, 0, P.eraEnd(B) + 1000);
+    const dead = `shard/v2/${A}/0`;
+    const calls: string[] = [];
+    const SHARD = {
+      getByName: (n: string) => {
+        calls.push(n);
+        return n === dead ? deadNs.getByName() : env.SHARD.getByName(n);
+      },
+    };
+    const sweptAt = async (ms: number): Promise<string[]> => {
+      calls.length = 0;
+      await ckClock(ms);
+      await ck().tick();
+      return calls.filter((n) => n === dead || n === `shard/v2/${B}/0`);
+    };
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    await setCk((x) => {
+      x.sweepShards = 1;
+    });
+    try {
+      await withEnv({ SHARD }, async () => {
+        expect(await sweptAt(base)).toEqual([dead]);
+        expect(await sweptAt(base + 60_000)).toEqual([]); // the same hour: no sweep
+        expect(await sweptAt(base + 3_600_000)).toEqual([`shard/v2/${B}/0`]);
+        expect(await ckMeta(`paged:${B}`)).toBe(1);
+        expect(await ckMeta(`paged:${A}`)).toBeNull();
+        expect(await ckMeta("page:era")).toBe(A);
+        // B is marked: every later round is the one shard left.
+        expect(await sweptAt(base + 2 * 3_600_000)).toEqual([dead]);
+        expect(await sweptAt(base + 3 * 3_600_000)).toEqual([dead]);
+      });
+    } finally {
+      errors.mockRestore();
+      await setCk((x) => {
+        x.sweepShards = 16;
+      });
+    }
+  });
+
+  it("counts its budget in shards, not eras: an era of four shards takes two hours at two shards per hour", async () => {
+    const [, F] = freshEras();
+    const D = F - 2;
+    const base = P.eraStart(F) + 10 * 60_000;
+    await ckClock(base);
+    await sweepFrom(D);
+    for (let i = 0; i < 4; i++) await shardClockAt(D, i, P.eraEnd(D) + 1000);
+    const calls: string[] = [];
+    await setCk((x) => {
+      x.sweepShards = 2;
+      x.shardsOf = (E) => (E === D ? 4 : 1);
+    });
+    try {
+      await withEnv({ SHARD: spyNamespace(env.SHARD, calls) }, async () => {
+        const swept = async (ms: number): Promise<string[]> => {
+          calls.length = 0;
+          await ckClock(ms);
+          await ck().tick();
+          return calls
+            .filter((c) => c.startsWith(`getByName(shard/v2/${D}/`))
+            .map((c) => c.slice("getByName(".length, -1))
+            .sort();
+        };
+        expect(await swept(base)).toEqual([`shard/v2/${D}/0`, `shard/v2/${D}/1`]);
+        expect(await ckMeta(`paged:${D}:0`)).toBe(1);
+        expect(await ckMeta(`paged:${D}:1`)).toBe(1);
+        expect(await ckMeta(`paged:${D}`)).toBeNull();
+        expect(await swept(base + 3_600_000)).toEqual([`shard/v2/${D}/2`, `shard/v2/${D}/3`]);
+        // Every shard answered paged: the era is marked, its shard marks are gone, and the cursor moves on.
+        expect(await ckMeta(`paged:${D}`)).toBe(1);
+        for (let i = 0; i < 4; i++) expect(await ckMeta(`paged:${D}:${i}`)).toBeNull();
+        expect(await ckMeta("page:era")).toBe(F - 1);
+        expect(await swept(base + 2 * 3_600_000)).toEqual([]);
+      });
+    } finally {
+      await setCk((x) => {
+        x.sweepShards = 16;
+        x.shardsOf = () => 1;
+      });
+    }
+  });
+});
+
+describe("CheckpointDO lists in R2 (§9.5)", () => {
+  const cpHeadsLen = (q: number) =>
+    runInDurableObject(
+      ck(),
+      (_inst: CheckpointDO, state) =>
+        state.storage.sql
+          .exec<{ n: number }>("SELECT length(heads) AS n FROM cp WHERE q = ?", q)
+          .one().n,
+    );
+  const forgetLatest = () =>
+    setCk((x) => {
+      x.latestHeads = null;
+    });
+
+  it("writes each checkpoint's list to R2 under ckpt/v2/{q} and keeps its row without it; get and latest read it back", async () => {
+    const [, F] = freshEras();
+    const base = P.eraStart(F) + 10 * 60_000;
+    await ckClock(base);
+    await shardWrite(F, base);
+    const r = await tick();
+    const obj = await env.BLOBS.get(`ckpt/v2/${r.q}`);
+    expect(obj).not.toBeNull();
+    const bytes = new Uint8Array(await obj!.arrayBuffer());
+    expect(P.H(bytes)).toEqual(r.hd);
+    expect(bytes).toEqual(
+      P.enc("segv.sh/v2/ckpt/heads", ...r.heads.flatMap((h) => [h.cid, h.head])),
+    );
+    expect(await cpHeadsLen(r.q)).toBe(0);
+    // Without the copy in memory, both reads go to R2.
+    await forgetLatest();
+    expect(await ck().get(r.q)).toEqual(r);
+    await forgetLatest();
+    expect(await ck().latest()).toEqual(r);
+    // A list in R2 that does not hash to hd is never served.
+    await env.BLOBS.put(`ckpt/v2/${r.q}`, P.random(64));
+    try {
+      await forgetLatest();
+      await runInDurableObject(ck(), async (inst: CheckpointDO) => {
+        await expect(inst.get(r.q)).rejects.toThrow(/does not match hd/);
+      });
+    } finally {
+      await env.BLOBS.put(`ckpt/v2/${r.q}`, bytes);
+    }
+    expect(await ck().get(r.q)).toEqual(r);
+  });
+
+  it("commits no checkpoint (and no final mark) while the list cannot be written to R2, and builds it at the next tick", async () => {
+    const [Pe, F] = freshEras();
+    await ckClock(P.eraStart(F) + 5 * 60_000);
+    await shardWrite(Pe, P.eraStart(Pe) + 5000);
+    const r1 = await tick();
+    // Another row is open when the era ends; the next head() seals the shard: its final head is due in the next
+    // checkpoint.
+    await shardClock(Pe, P.eraStart(Pe) + 10_000);
+    expect((await shardStub(env, Pe, 0).put(Pe, 0, [shardRow()]))[0].s).toBe("ok");
+    await shardClock(Pe, P.eraEnd(Pe) + 1000);
+    const failing = {
+      put: () => Promise.reject(new Error("R2 unavailable")),
+      get: (k: string) => env.BLOBS.get(k),
+    };
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await withEnv({ BLOBS: failing }, async () => {
+        await ck().tick();
+      });
+      expect(errors.mock.calls.some((c) => String(c[0]).includes("did not reach R2"))).toBe(true);
+    } finally {
+      errors.mockRestore();
+    }
+    expect((await ck().latest())!.q).toBe(r1.q);
+    expect(await ckMeta(`final:${P.shardCid(Pe, 0)}`)).toBeNull();
+    const final = await shardStub(env, Pe, 0).head(Pe, 0);
+    expect(final.sealed).toBe(true);
+    const r2 = await tick();
+    expect(r2.q).toBe(r1.q + 1);
+    checkRecord(r2, r1.C);
+    expect(headOf(r2, P.shardCid(Pe, 0))).toEqual(final.head);
+    expect(await ckMeta(`final:${P.shardCid(Pe, 0)}`)).toBe(1);
+    expect(headOf(await tick(), P.shardCid(Pe, 0))).toBeUndefined();
+  });
+
+  it("serves a row written before the lists moved to R2 from its own heads column, and chains on from it", async () => {
+    const [, F] = freshEras();
+    const base = P.eraStart(F) + 10 * 60_000;
+    await ckClock(base);
+    const r1 = await tick();
+    // A row in the earlier format: the encoded list in `heads`, no R2 object.
+    const heads = [...r1.heads, { cid: "zz:legacy", head: P.random(32) }];
+    const enc = P.enc("segv.sh/v2/ckpt/heads", ...heads.flatMap((h) => [h.cid, h.head]));
+    const q = r1.q + 1;
+    const sec = r1.sec + 1;
+    const hd = P.H(enc);
+    const C = P.ckptC(r1.C, q, sec, hd);
+    const sig = P.sign(
+      P.ckptSigMsg(q, C),
+      P.fromB64u((env as unknown as { SRV_KEY: string }).SRV_KEY),
+    );
+    const ab = (b: Uint8Array) => b.slice().buffer;
+    await runInDurableObject(ck(), (_inst: CheckpointDO, state) => {
+      state.storage.sql.exec(
+        "INSERT INTO cp (q, sec, hd, heads, C, sig) VALUES (?, ?, ?, ?, ?, ?)",
+        q,
+        sec,
+        ab(hd),
+        ab(enc),
+        ab(C),
+        ab(sig),
+      );
+    });
+    expect(await env.BLOBS.head(`ckpt/v2/${q}`)).toBeNull();
+    const old = { q, sec, hd, C, sig, heads };
+    expect(await ck().get(q)).toEqual(old);
+    expect(await ck().latest()).toEqual(old);
+    checkRecord((await ck().get(q))!, r1.C);
+    // The next checkpoint drops the made-up cid (nothing answers for it) and goes to R2.
+    await ckClock(base + 60_000);
+    const r3 = await tick();
+    expect(r3.q).toBe(q + 1);
+    checkRecord(r3, C);
+    expect(headOf(r3, "zz:legacy")).toBeUndefined();
+    expect(await cpHeadsLen(r3.q)).toBe(0);
   });
 });

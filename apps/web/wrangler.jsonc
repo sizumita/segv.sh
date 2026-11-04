@@ -81,21 +81,18 @@
     },
     // Web Push (§9.8).
     { "tag": "v2", "new_sqlite_classes": ["PushDO"] },
-    // The realtime path split into ConnDOs and FeedDOs (§9.4), and push moved to the KV store with memory-only BellDOs
-    // and QuietDOs (§9.8). The RealtimeDO (a tag key) and the PushDO (registrations, which devices make again at their
-    // next start or within a day) are gone.
+    // The realtime path split into ConnDOs and FeedDOs (§9.4), and push moved to the KV store with memory-only QuietDOs
+    // (§9.8). The RealtimeDO (a tag key) and the PushDO (registrations, which devices make again at their next start or
+    // within a day) are gone.
     {
       "tag": "v3",
-      "new_sqlite_classes": ["ConnDO", "FeedDO", "BellDO", "QuietDO"],
+      "new_sqlite_classes": ["ConnDO", "FeedDO", "QuietDO"],
       "deleted_classes": ["RealtimeDO", "PushDO"],
     },
     // The directory's single writer (§9.6). The blob registry's shards are more objects of the existing BlobRegDO.
     { "tag": "v4", "new_sqlite_classes": ["DirSeqDO"] },
     // The per-era inbox bucket keys (§9.3 "Buckets").
     { "tag": "v5", "new_sqlite_classes": ["KeyDO"] },
-    // Bells chosen by their owners (§4.1, §11.13): the QuietDO of an account writes its bells' keys itself, so the
-    // bell index (BellDO, which stored nothing) is gone.
-    { "tag": "v6", "deleted_classes": ["BellDO"] },
   ],
   // Per-IP (IPv6 /64) abuse limits. Keys are never persisted. Period must be 10 or 60 seconds.
   "ratelimits": [

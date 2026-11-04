@@ -397,6 +397,8 @@ describe("ConnDO RESUME", () => {
     const [T1, T2] = [topic(), topic()];
     const a = await connect(stub);
     const { boot } = await a.hello();
+    a.send({ f: "sub", topics: [T1, T2] }); // the topics are in the interest before the rows
+    await pairsAre(stub, 2);
     const x1 = row(T1);
     const x2 = row(T2);
     const x3 = row(T1);
@@ -429,6 +431,8 @@ describe("ConnDO RESUME", () => {
     const T = topic();
     const a = await connect(stub);
     const { boot, seq } = await a.hello();
+    a.send({ f: "sub", topics: [T] });
+    await pairsAre(stub, 1);
     const x = row(T);
     const y = row(T);
     await stub.deliver([x]);
@@ -465,6 +469,8 @@ describe("ConnDO RESUME", () => {
     await setLimits(stub, { ringRows: 2 });
     let a = await connect(stub);
     const { boot } = await a.hello();
+    a.send({ f: "sub", topics: [T] });
+    await pairsAre(stub, 1);
     await stub.deliver([row(T), row(T), row(T)]); // seq 1 is dropped
     const gap = await connect(stub);
     gap.send({ f: "resume", boot, since: 0, topics: [T] });
@@ -485,6 +491,8 @@ describe("ConnDO RESUME", () => {
     await setLimits(stub, { ringBytes: 2 * (47 + P.BODY_LENS[0]) });
     a = await connect(stub);
     const h2 = await a.hello();
+    a.send({ f: "sub", topics: [T] });
+    await pairsAre(stub, 1);
     await stub.deliver([row(T), row(T), row(T)]);
     let b = await connect(stub);
     b.send({ f: "resume", boot: h2.boot, since: 0, topics: [T] });
@@ -499,6 +507,8 @@ describe("ConnDO RESUME", () => {
     await setClock(stub, t0);
     a = await connect(stub);
     const h3 = await a.hello();
+    a.send({ f: "sub", topics: [T] });
+    await pairsAre(stub, 1);
     await stub.deliver([row(T)]);
     await setClock(stub, t0 + 10 * 60_000);
     await stub.deliver([row(T)]);
@@ -552,6 +562,8 @@ describe("ConnDO RESUME", () => {
     const [T, U] = [topic(), topic()];
     const a = await connect(stub);
     const { boot } = await a.hello();
+    a.send({ f: "sub", topics: [T, U] });
+    await pairsAre(stub, 2);
     await stub.deliver([row(T), row(U), row(U), row(T), row(T)]); // T at seq 1, 4, 5
 
     // since 0 on T: three rows (3 · size) are over the budget.
@@ -560,7 +572,7 @@ describe("ConnDO RESUME", () => {
     await b.until(() => b.frames.length >= 2, "GAP");
     expect(b.frames.map((f) => f.f)).toEqual(["hello", "gap"]);
     expect(b.frames[1]).toEqual({ f: "gap", since: 0 });
-    await pairsAre(stub, 1);
+    await pairsAre(stub, 3);
 
     // since 1 on T: two rows, exactly the budget (rows on other topics do not count).
     const c = await connect(stub);
@@ -568,7 +580,7 @@ describe("ConnDO RESUME", () => {
     await c.until(() => c.frames.some((f) => f.f === "resumed"), "RESUMED");
     expect(c.frames.map((f) => f.f)).toEqual(["hello", "rows", "resumed"]);
     expect(c.rows().map((r) => r.seq)).toEqual([4, 5]);
-    await pairsAre(stub, 2);
+    await pairsAre(stub, 4);
 
     const y = row(T);
     await stub.deliver([y]);
@@ -624,7 +636,7 @@ describe("ConnDO protocol violations", () => {
   it("closes with 1008: a second RESUME, or a RESUME after another binary frame", async () => {
     await closes(async (s) => {
       const { boot, seq } = await s.hello();
-      s.send({ f: "resume", boot, since: seq, topics: [topic()] });
+      s.send({ f: "resume", boot, since: seq, topics: [] });
       await s.until(() => s.frames.some((f) => f.f === "resumed"), "RESUMED");
       s.send({ f: "resume", boot, since: seq, topics: [topic()] });
     });
@@ -905,6 +917,7 @@ describe("ConnDO interest (§9.4)", () => {
   it("a SUB puts the topic into the FeedDO's interest, which then delivers; an UNSUB and a close take it out", async () => {
     const c = randomC();
     const stub = fresh(c);
+    await setLimits(stub, { lingerMs: 0 }); // withdrawn as soon as the last socket gives it up
     const T = topic();
     const a = await connect(stub);
     const b = await connect(stub);
@@ -945,6 +958,7 @@ describe("ConnDO interest (§9.4)", () => {
 
   it("topicsFor(j) answers the distinct topics at that FeedDO, whichever sockets hold them", async () => {
     const stub = fresh();
+    await setLimits(stub, { lingerMs: 0 });
     const [T1, T2] = [topic(), topic()];
     const a = await connect(stub);
     const b = await connect(stub);
@@ -978,6 +992,7 @@ describe("ConnDO interest (§9.4)", () => {
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       await inside(stub, (i) => {
+        i.limits.lingerMs = 0;
         i.feeds = {
           interest: async (j, cc, added, removed) => {
             calls.push(`interest:${j}:${cc}:${added.length}:${removed.length}`);
@@ -1003,6 +1018,9 @@ describe("ConnDO interest (§9.4)", () => {
       // Repaired: the next alarm is the regular resync, about 300 s out, and sends the full set again.
       const next = await inside(stub, (_i, state) => state.storage.getAlarm());
       expect(next! - Date.now()).toBeGreaterThan(290_000);
+      await inside(stub, (i) => i.alarm()); // early (by hand): nothing is due
+      expect(calls).toHaveLength(2);
+      await setClock(stub, next!);
       await inside(stub, (i) => i.alarm());
       expect(calls).toHaveLength(3);
       expect(calls[2]).toBe(`replace:${jOf(T)}:${c}:${P.hex(T)}`);
@@ -1046,5 +1064,151 @@ describe("ConnDO interest (§9.4)", () => {
     await b.rowsAre(1);
     expect(sameRow(b.rows()[0], y)).toBe(true);
     b.ws.close(1000);
+  });
+});
+
+describe("ConnDO linger and RESUME after a close (§9.4, §10.8)", () => {
+  /** A client that subscribed T on its only socket and closed it; what it would RESUME with. */
+  async function closedClient(stub: Stub, c: number, T: Uint8Array) {
+    const a = await connect(stub);
+    const { boot, seq } = await a.hello();
+    a.send({ f: "sub", topics: [T] });
+    await pairsAre(stub, 1);
+    await settled(stub);
+    expect(await feedHas(T, c)).toBe(true);
+    a.ws.close(1000);
+    await pairsAre(stub, 0);
+    await settled(stub);
+    return { boot, since: seq };
+  }
+  const resumed = (s: Sock) =>
+    s.until(() => s.frames.some((f) => f.f === "resumed" || f.f === "gap"), "RESUMED or GAP");
+
+  it("the topics of a closed socket linger: a row published meanwhile is replayed by the RESUME", async () => {
+    const c = randomC();
+    const stub = fresh(c);
+    const T = topic();
+    const { boot, since } = await closedClient(stub, c, T);
+    expect(await feedHas(T, c)).toBe(true); // still in the interest at the FeedDO
+    const x = row(T);
+    await feedOf(T).publish([x]);
+    const b = await connect(stub);
+    b.send({ f: "resume", boot, since, topics: [T] });
+    await resumed(b);
+    expect(b.frames.map((f) => f.f)).toEqual(["hello", "rows", "resumed"]);
+    expect(sameRow(b.rows()[0], x)).toBe(true);
+    b.ws.close(1000);
+  });
+
+  it("with no row published while it was away, the RESUME is RESUMED with nothing to replay", async () => {
+    const c = randomC();
+    const stub = fresh(c);
+    const T = topic();
+    const { boot, since } = await closedClient(stub, c, T);
+    const b = await connect(stub);
+    b.send({ f: "resume", boot, since, topics: [T] });
+    await resumed(b);
+    expect(b.frames.map((f) => f.f)).toEqual(["hello", "resumed"]);
+    b.ws.close(1000);
+  });
+
+  it("after the linger the topic is withdrawn: a row published then never arrives, and the RESUME gets GAP", async () => {
+    const c = randomC();
+    const stub = fresh(c);
+    const t0 = Date.now();
+    await setClock(stub, t0);
+    const L = await inside(stub, (i) => i.limits.lingerMs);
+    expect(L).toBe(120_000);
+    const T = topic();
+    const { boot, since } = await closedClient(stub, c, T);
+    // The alarm for it is armed, a quarter of the linger late at most.
+    const at = await inside(stub, (_i, state) => state.storage.getAlarm());
+    expect(at).toBeGreaterThanOrEqual(t0 + L);
+    expect(at).toBeLessThanOrEqual(t0 + L + L / 4 + 1_000);
+    await setClock(stub, t0 + L + 1);
+    // The next event withdraws it (here an upgrade; otherwise the alarm), and seq moves past the withdrawal.
+    const other = await connect(stub);
+    expect((await other.hello()).seq).toBe(since + 1);
+    await settled(stub);
+    expect(await feedHas(T, c)).toBe(false);
+    await feedOf(T).publish([row(T)]);
+    const b = await connect(stub);
+    b.send({ f: "resume", boot, since, topics: [T] });
+    await resumed(b);
+    expect(b.frames.map((f) => f.f)).toEqual(["hello", "gap"]);
+    expect(b.frames[1]).toEqual({ f: "gap", since });
+    await settled(stub);
+    expect(await feedHas(T, c)).toBe(true); // b's RESUME installed it again
+
+    // Back in the interest from above every earlier since: a RESUME from before the withdrawal still gets GAP,
+    // one from after it is replayed.
+    const y = row(T);
+    await feedOf(T).publish([y]);
+    await b.rowsAre(1);
+    const late = await connect(stub);
+    late.send({ f: "resume", boot, since, topics: [T] });
+    await resumed(late);
+    expect(late.frames.map((f) => f.f)).toEqual(["hello", "gap"]);
+    const now = await connect(stub);
+    now.send({ f: "resume", boot, since: since + 1, topics: [T] });
+    await resumed(now);
+    expect(now.frames.map((f) => f.f)).toEqual(["hello", "rows", "resumed"]);
+    expect(sameRow(now.rows()[0], y)).toBe(true);
+    for (const s of [other, b, late, now]) s.ws.close(1000);
+  });
+
+  it("an alarm that fires for a linger withdraws it and sends no resync", async () => {
+    const c = randomC();
+    const stub = fresh(c);
+    const T = topic();
+    const U = topic();
+    const t0 = Date.now();
+    await setClock(stub, t0);
+    const calls: string[] = [];
+    await inside(stub, (i) => {
+      i.feeds = {
+        interest: async (_j, _c, added, removed) => {
+          calls.push(`interest:${added.map(P.hex).join("+")}:${removed.map(P.hex).join("+")}`);
+        },
+        replace: async () => {
+          calls.push("replace");
+        },
+      };
+    });
+    const keep = await connect(stub);
+    keep.send({ f: "sub", topics: [U] });
+    const a = await connect(stub);
+    a.send({ f: "sub", topics: [T] });
+    await pairsAre(stub, 2);
+    await inside(stub, (i) => i.alarm()); // the first alarm of an object resyncs
+    a.ws.close(1000);
+    await pairsAre(stub, 1);
+    await settled(stub);
+    calls.length = 0;
+    await setClock(stub, t0 + 120_001);
+    await inside(stub, (i) => i.alarm());
+    expect(calls).toEqual([`interest::${P.hex(T)}`]);
+    keep.ws.close(1000);
+  });
+
+  it("a RESUME naming a topic that was not in the interest gets GAP; one held by another socket since before is replayed", async () => {
+    const stub = fresh();
+    const [T, U] = [topic(), topic()];
+    const a = await connect(stub);
+    const { boot, seq } = await a.hello();
+    a.send({ f: "sub", topics: [T] });
+    await pairsAre(stub, 1);
+    const x = row(T);
+    await stub.deliver([x, row(U)]); // U reached the ring, but nothing held it: its earlier rows never would have
+    const b = await connect(stub);
+    b.send({ f: "resume", boot, since: seq, topics: [T, U] });
+    await resumed(b);
+    expect(b.frames.map((f) => f.f)).toEqual(["hello", "gap"]);
+    const c = await connect(stub);
+    c.send({ f: "resume", boot, since: seq, topics: [T] });
+    await resumed(c);
+    expect(c.frames.map((f) => f.f)).toEqual(["hello", "rows", "resumed"]);
+    expect(c.rows().map((r) => r.seq)).toEqual([seq + 1]);
+    for (const s of [a, b, c]) s.ws.close(1000);
   });
 });

@@ -17,9 +17,12 @@
  *    storage, keeping only the meta it still answers head() from. From then on get and the feed RPCs throw
  *    "shard: paged" and the Worker reads R2. A sealed shard without rows never pages. An ended-era object that finds
  *    no state but its manifest in R2 restores its meta from it.
- *  - s_E (the shard map, §9.1) is pinned in meta 'sbits' by the first put that inserts a row; a put or get of a
- *    well-formed key that routes to another shard under it throws, so a SHARD_MAP changed within an era fails loudly
- *    (the Worker answers 503) instead of storing or missing rows.
+ *  - s_E (the shard map, §9.1) is pinned in meta 'sbits' by the first put that inserts a row, and for the whole era
+ *    by shard 0: a shard i > 0 without a pin of its own asks shard 0 (pinShards) before its first put or get in the
+ *    accept window or later, and shard 0 pins the count it is offered when it has none. put, get and the feed RPCs
+ *    throw when the deployment's s_E differs from the pin, and put and get throw for a well-formed key that routes to
+ *    another shard, so a SHARD_MAP changed for an era that has rows fails loudly (the Worker answers 503) instead of
+ *    storing or missing rows. head() and paging use the pin.
  *  - Δ is pinned in meta 'delta' by the first put that inserts a row (§3.1); a deployment Δ that differs later is
  *    logged once per instance and ignored for this era.
  *  - get / head / feedBatches / feedRows are the reads. The feed (public enumeration, closed batches only) is two
@@ -39,7 +42,6 @@ import {
   eraStart,
   fromB64u,
   random,
-  routeV,
   sealBucketBits,
   sealBucketOf,
   sealSigMsg,
@@ -71,6 +73,7 @@ import {
 } from "./seal";
 import {
   parseEraName,
+  shardStub,
   type ShardFeedBatch,
   type ShardFeedBatches,
   type ShardFeedRows,
@@ -122,6 +125,15 @@ const isBytes = (x: unknown, len: number): x is Uint8Array => x instanceof Uint8
 /** A routing value (§4.4): 8 bytes below 2^63. Paging sorts rows by v and cuts buckets from its top bits. */
 const isRoutingValue = (x: unknown): x is Uint8Array => isBytes(x, 8) && (x[0] & 0x80) === 0;
 
+/** A routing value whose top s bits (below the clear top bit) are i, the rest random (§4.4): shard(E, ·) = i. */
+function routingIn(i: number, s: number): Uint8Array {
+  const v = random(8);
+  const dv = new DataView(v.buffer, v.byteOffset, 8);
+  const low = dv.getBigUint64(0) & ((BigInt(1) << BigInt(63 - s)) - BigInt(1));
+  dv.setBigUint64(0, (BigInt(i) << BigInt(63 - s)) | low);
+  return v;
+}
+
 /** BAD check of §9.1: len(body) = CLASSES[cls] + 40, len(label) = 16, v a routing value. */
 function wellFormed(r: unknown): r is ShardPutRow {
   if (typeof r !== "object" || r === null) return false;
@@ -170,13 +182,16 @@ export class ShardDO extends DurableObject<Env> {
   /** Instance fields (not constants) so tests can override them with runInDurableObject. */
   protected clock = (): number => Date.now();
   protected params: { delta: number; skew: number };
-  /** s_E of the deployment for this era (§9.1); the pin in meta 'sbits' wins once it exists. */
+  /** s_E of the deployment for this era (§9.1); it must equal the pin in meta 'sbits' once that exists. */
   protected shardBits: number;
-  private sbitsLogged = false;
+  /** Shard 0 confirmed the deployment's s_E for this era (shards i > 0, per instance). */
+  private eraPinOk = false;
   protected fullBytes = FULL_BYTES;
   /** Paging: the part size of the files (R2 needs at least 5 MiB) and the parts uploaded per alarm. */
   protected partSize = SEAL_PART;
   protected pageParts = PAGE_PARTS;
+  /** The lookup through the paged files that the paging check uses (an instance field so tests can watch it). */
+  protected lookup = sealLookup;
 
   private readonly E: number;
   private readonly i: number;
@@ -227,6 +242,7 @@ export class ShardDO extends DurableObject<Env> {
       rows.map(async (r) => (wellFormed(r) ? await sha256(r.body) : null)),
     );
     const now = this.clock();
+    const sbits = await this.routeBits(now);
     let wrote = false;
     const out = this.ctx.storage.transactionSync((): ShardPutResult[] => {
       this.prepare(now);
@@ -237,7 +253,6 @@ export class ShardDO extends DurableObject<Env> {
       }
       if (this.sql.databaseSize > this.fullBytes) return rows.map(() => ({ s: "full" }));
       const delta = this.delta();
-      const sbits = this.sbits();
       for (const r of rows) if (wellFormed(r)) this.checkRoute(r.v, sbits);
       const t = this.chain.nextT(Math.max(tpub(now, delta), secOf(eraStart(this.E))), delta);
       this.chain.rollTo(t);
@@ -278,15 +293,17 @@ export class ShardDO extends DurableObject<Env> {
     return out;
   }
 
-  get(E: number, i: number, keys: ShardGetKey[]): ShardGetResult[] {
+  async get(E: number, i: number, keys: ShardGetKey[]): Promise<ShardGetResult[]> {
     this.checkId(E, i);
     if (!Array.isArray(keys)) throw new TypeError("get: keys must be an array");
     if (this.paged()) throw new ShardPagedError();
     const now = this.clock();
+    const sbits = await this.routeBits(now);
+    // Paging may have finished while shard 0 answered: its emptied tables must never answer MISS.
+    if (this.paged()) throw new ShardPagedError();
     this.ctx.storage.transactionSync(() => this.prepare(now));
     this.armPaging(now);
     const sealed = this.sealed();
-    const sbits = this.sbits();
     return keys.map((k): ShardGetResult => {
       if (typeof k !== "object" || k === null || !isRoutingValue(k.v) || !isBytes(k.label, 16)) return { s: "miss", sealed };
       this.checkRoute(k.v, sbits);
@@ -304,6 +321,22 @@ export class ShardDO extends DurableObject<Env> {
         .exec<{ t: number; cls: number }>("SELECT t, cls FROM row WHERE v = ? AND label = ?", ab(k.v), ab(k.label))
         .toArray()[0];
       return o ? { s: "hit", t: o.t, cls: o.cls } : { s: "miss", sealed };
+    });
+  }
+
+  /**
+   * §9.1 "Shard map": the era's count, held by shard 0. Pins `bits` when no count is pinned yet and returns the
+   * pinned one; the caller compares it with its deployment's.
+   */
+  pinShards(E: number, i: number, bits: number): number {
+    this.checkId(E, i);
+    if (this.i !== 0) throw new Error("shard: only shard 0 holds the era's count");
+    if (!Number.isInteger(bits) || bits < 0 || bits > 16) throw new RangeError("pinShards: bad bits");
+    return this.ctx.storage.transactionSync((): number => {
+      const pinned = this.meta.num("sbits");
+      if (pinned !== null) return pinned;
+      this.meta.set("sbits", bits);
+      return bits;
     });
   }
 
@@ -339,6 +372,7 @@ export class ShardDO extends DurableObject<Env> {
     if (!Number.isSafeInteger(afterT) || afterT < 0) throw new RangeError("feedBatches: bad afterT");
     if (!Number.isSafeInteger(budget) || budget < 1) throw new RangeError("feedBatches: bad budget");
     if (this.paged()) throw new ShardPagedError();
+    this.checkPin();
     const now = this.clock();
     this.ctx.storage.transactionSync(() => this.prepare(now));
     this.armPaging(now);
@@ -376,6 +410,7 @@ export class ShardDO extends DurableObject<Env> {
     if (afterLabel !== null && !isBytes(afterLabel, 16)) throw new RangeError("feedRows: bad afterLabel");
     if (!Number.isSafeInteger(budget) || budget < 1) throw new RangeError("feedRows: bad budget");
     if (this.paged()) throw new ShardPagedError();
+    this.checkPin();
     const now = this.clock();
     this.ctx.storage.transactionSync(() => this.prepare(now));
     this.armPaging(now);
@@ -435,16 +470,31 @@ export class ShardDO extends DurableObject<Env> {
     return this.state() === "paged";
   }
 
-  /** s_E of this era: the pinned value, or the deployment's until the first write pins it (§9.1 "Shard map"). */
+  /** s_E of this era for head() and paging: the pinned value, else the deployment's (§9.1 "Shard map"). */
   private sbits(): number {
+    return this.meta.num("sbits") ?? this.shardBits;
+  }
+
+  /** §9.1 "Shard map": the deployment's s_E, which must equal this object's pin when there is one. */
+  private checkPin(): number {
     const pinned = this.meta.num("sbits");
-    if (pinned === null) return this.shardBits;
-    if (pinned !== this.shardBits && !this.sbitsLogged) {
-      this.sbitsLogged = true;
-      const msg = "shard: SHARD_MAP differs from the shard count pinned for this era; keeping the pinned value";
-      console.error(JSON.stringify({ msg, E: this.E, pinned, env: this.shardBits }));
-    }
-    return pinned;
+    if (pinned !== null && pinned !== this.shardBits) throw new Error("shard: SHARD_MAP differs from the shard count pinned for this era");
+    return this.shardBits;
+  }
+
+  /**
+   * The s_E that put and get route by: the deployment's, once it agrees with the era's pin. A shard i > 0 without a
+   * pin of its own asks shard 0 for the era's count (once per instance while they agree). Before the accept window
+   * no row of the era can exist anywhere, so it does not ask.
+   */
+  private async routeBits(now: number): Promise<number> {
+    const s = this.checkPin();
+    if (this.i === 0 || this.eraPinOk || this.meta.num("sbits") !== null) return s;
+    if (now < eraStart(this.E) - this.params.skew * 1000) return s;
+    const pinned = await shardStub(this.env, this.E, 0).pinShards(this.E, 0, s);
+    if (pinned !== s) throw new Error("shard: SHARD_MAP differs from the shard count pinned for this era");
+    this.eraPinOk = true;
+    return s;
   }
 
   /** §9.1 "Shard map": a well-formed key that routes to another shard is a configuration error, never served. */
@@ -883,7 +933,7 @@ export class ShardDO extends DurableObject<Env> {
       if (r) sample.set(b64u(new Uint8Array(r.label)), r);
     }
     const rows = [...sample.values()];
-    const found = await sealLookup(
+    const found = await this.lookup(
       bucket,
       m,
       rows.map((r) => ({ v: new Uint8Array(r.v), label: new Uint8Array(r.label), mode: 0 as const })),
@@ -895,14 +945,9 @@ export class ShardDO extends DurableObject<Env> {
         throw new Error("shard: a paged row does not read back");
       }
     });
-    for (let k = 0; k < 64; k++) {
-      const label = random(16);
-      const v = routeV(summary.kroute, label);
-      if (shardOf(v, summary.sbits) !== this.i) continue;
-      const [miss] = await sealLookup(bucket, m, [{ v, label, mode: 1 }]);
-      if (miss.s !== "miss" || !miss.sealed) throw new Error("shard: an absent label reads back as present");
-      break;
-    }
+    // A routing value of this shard with a random label: whatever its bucket, the label is not in it.
+    const [miss] = await this.lookup(bucket, m, [{ v: routingIn(this.i, summary.sbits), label: random(16), mode: 1 }]);
+    if (miss.s !== "miss" || !miss.sealed) throw new Error("shard: an absent label reads back as present");
     await bucket.put(sealKey(this.E, this.i, "manifest"), text, { httpMetadata: { contentType: "application/json" } });
     if (!(await bucket.head(sealKey(this.E, this.i, "manifest")))) throw new Error("shard: the manifest did not persist");
     // From here on the files are the truth: drop the tables, then free the storage and keep the meta head() needs.

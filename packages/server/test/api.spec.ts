@@ -3462,7 +3462,11 @@ describe("inbox buckets (§9.3, §10.5, §10.6)", () => {
     await registerOk(a);
     const bucketKey = (e: number) => keyStub(env).bucketKey(e);
     const expected = async (e: number) =>
-      P.inboxBucketOf(new Uint8Array(await bucketKey(e)), 2, P.inboxPrefixOf(P.hpre(a.handle), 2));
+      P.inboxBucketOf(
+        new Uint8Array((await bucketKey(e))!),
+        2,
+        P.inboxPrefixOf(P.hpre(a.handle), 2),
+      );
     const want = []; // the eras a reader reads (E_now − 3 ..) and a sender posts into (.. E_now + 1), §10.6
     for (const e of [E - 3, E - 2, E - 1, E, E + 1])
       if (e >= E_FIRST) want.push({ E: e, g: await expected(e) });
@@ -3485,5 +3489,27 @@ describe("inbox buckets (§9.3, §10.5, §10.6)", () => {
       user: DirUserJson;
     };
     expect(again.user.inbox).toEqual(want);
+  });
+
+  it("refuses a directory answer once INBOX_MAP changes the count of an era it already listed (503), one bucket included", async () => {
+    const E = eraNow();
+    const a = makeAccount();
+    await registerOk(a);
+    // Listing E_now − 3 .. E_now + 1 pins their β (2: the test deployment's "0:4") in the KeyDO.
+    expect((await api(`/api/v2/dir/uid/${a.uidB64}`)).status).toBe(200);
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // Raised from E_now on (E_now and E_now + 1 are listed already), or lowered to one bucket everywhere: the
+      // eras of one bucket are asked about as well.
+      for (const INBOX_MAP of [`0:4,${E}:8`, "0:1"]) {
+        const res = await direct(`/api/v2/dir/uid/${a.uidB64}`, {}, { INBOX_MAP });
+        expect(res.status, INBOX_MAP).toBe(503);
+        expect(await errorOf(res)).toBe("storage unavailable");
+        expect((await direct("/api/v2/dir/h/0/0", {}, { INBOX_MAP })).status, INBOX_MAP).toBe(503);
+      }
+    } finally {
+      errors.mockRestore();
+    }
+    expect((await api(`/api/v2/dir/uid/${a.uidB64}`)).status).toBe(200);
   });
 });

@@ -14,9 +14,13 @@
  *    are in flight at a time. A component that fails keeps its previous head. The list is sorted by cid,
  *    hd = H(heads), C_q = H(enc("segv.sh/v2/ckpt", C_{q−1}, u32 q, u32 sec, hd)), sig = Sign(SRV_SK, enc(…, q, C_q)).
  *    An unchanged hd makes no new checkpoint.
- *  - Once per UTC hour it also wakes a few shards of past eras (head(), from 'page:era' up to E_now − 2) so that
- *    every sealed shard gets paged into R2 (§9.1 "Paging", §9.5 "Sweep"); eras found paged are marked 'paged:<E>'.
- *  - latest() / get(q) / range(after, limit) are the §10.9 reads.
+ *  - The encoded list of a checkpoint is written to R2 (BLOBS, "ckpt/v2/{q}", immutable) before its row is committed;
+ *    the row keeps (q, sec, hd, C, sig) and an empty `heads`. A failed R2 write commits no checkpoint (the next tick
+ *    builds it again). Rows written before the move to R2 keep their list in `heads` and are served from it.
+ *  - Once per UTC hour it also wakes up to 16 shards of past eras (head()), round-robin over the shards not known to
+ *    be paged, from 'page:era' up to E_now − 2 and resuming at 'page:at', so that every sealed shard gets paged into
+ *    R2 (§9.1 "Paging", §9.5 "Sweep"); shards found paged are marked 'paged:<E>:<i>', eras 'paged:<E>'.
+ *  - latest() / get(q) / range(after, limit) are the §10.9 reads; the latest list is also kept in memory.
  *
  * Time is read through the protected `clock` field so tests can override it.
  */
@@ -56,6 +60,8 @@ const COMPONENT_TIMEOUT_MS = 10_000;
 const COLLECT_CONCURRENCY = 32;
 /** Shards of past eras woken per hour so that each gets paged (§9.5 "Sweep"). */
 const SWEEP_SHARDS = 16;
+/** 'page:at' is E · 65536 + i: shard indices stay below 2^16 (§9.1). */
+const SHARD_SPAN = 65536;
 
 /** Runs the jobs with at most `n` in flight. The jobs never throw (each catches its own failure). */
 async function pool(jobs: readonly (() => Promise<void>)[], n: number): Promise<void> {
@@ -67,7 +73,10 @@ async function pool(jobs: readonly (() => Promise<void>)[], n: number): Promise<
 }
 const RANGE_MAX = 1440;
 const HEADS_LABEL = "segv.sh/v2/ckpt/heads";
+/** The R2 key of checkpoint q's encoded list (§9.5). */
+const headsKey = (q: number): string => `ckpt/v2/${q}`;
 
+/** `heads` is empty in every row since the lists moved to R2 (§9.5); older rows hold their encoded list there. */
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS cp (
   q INTEGER PRIMARY KEY,
@@ -81,6 +90,8 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v BLOB NOT NULL) WITHOUT RO
 `;
 
 type Head = { cid: string; head: Uint8Array };
+/** A meta value to write with the checkpoint, or null to delete the key. */
+type MetaWrites = Map<string, number | Uint8Array | null>;
 type CpRow = { q: number; sec: number; hd: ArrayBuffer; heads: ArrayBuffer; C: ArrayBuffer; sig: ArrayBuffer };
 interface Checkpoint {
   q: number;
@@ -91,7 +102,10 @@ interface Checkpoint {
   sig: Uint8Array;
 }
 
-/** The stored `heads` column: enc("segv.sh/v2/ckpt/heads", cid_1, head_1, …) over the list sorted by cid. */
+/**
+ * The encoded list: enc("segv.sh/v2/ckpt/heads", cid_1, head_1, …) over the list sorted by cid. It is the R2 object
+ * "ckpt/v2/{q}"; the `heads` column holds it only in rows written before the lists moved to R2 (empty otherwise).
+ */
 const encodeHeads = (list: readonly Head[]): Uint8Array => enc(HEADS_LABEL, ...list.flatMap((h) => [h.cid, h.head]));
 
 function decodeHeads(b: Uint8Array): Head[] {
@@ -137,6 +151,8 @@ export class CheckpointDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   private readonly kv: Meta;
   private ticking: Promise<void> | null = null;
+  /** The list of the latest checkpoint this instance committed or read. */
+  private latestHeads: { q: number; list: Head[] } | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -172,15 +188,15 @@ export class CheckpointDO extends DurableObject<Env> {
     return this.ticking;
   }
 
-  latest(): CkptRecord | null {
+  async latest(): Promise<CkptRecord | null> {
     const r = this.latestRow();
-    return r ? this.record(r) : null;
+    return r ? await this.record(r) : null;
   }
 
-  get(q: number): CkptRecord | null {
+  async get(q: number): Promise<CkptRecord | null> {
     if (!Number.isSafeInteger(q) || q < 1) return null;
     const r = this.sql.exec<CpRow>("SELECT q, sec, hd, heads, C, sig FROM cp WHERE q = ?", q).toArray()[0];
-    return r ? this.record(toCheckpoint(r)) : null;
+    return r ? await this.record(toCheckpoint(r)) : null;
   }
 
   /** §10.9 range: entries with q > after (ascending, at most `limit`), C_after, and the latest {q, C, sig}. */
@@ -213,8 +229,24 @@ export class CheckpointDO extends DurableObject<Env> {
     return r ? toCheckpoint(r) : null;
   }
 
-  private record(c: Checkpoint): CkptRecord {
-    return { q: c.q, sec: c.sec, hd: c.hd, C: c.C, sig: c.sig, heads: decodeHeads(c.heads) };
+  private async record(c: Checkpoint): Promise<CkptRecord> {
+    return { q: c.q, sec: c.sec, hd: c.hd, C: c.C, sig: c.sig, heads: await this.headsOf(c) };
+  }
+
+  /**
+   * The list of checkpoint c: from its row when the row still holds it, else from memory or R2 ("ckpt/v2/{q}"), whose
+   * bytes must hash to hd. A list that is missing or does not match throws (the Worker answers 5xx), never a guess.
+   */
+  private async headsOf(c: Checkpoint): Promise<Head[]> {
+    if (c.heads.length > 0) return decodeHeads(c.heads);
+    if (this.latestHeads?.q === c.q) return this.latestHeads.list;
+    const obj = await this.env.BLOBS.get(headsKey(c.q));
+    if (!obj) throw new Error("checkpoint: the list of a checkpoint is missing from R2");
+    const bytes = new Uint8Array(await obj.arrayBuffer());
+    if (!equalBytes(H(bytes), c.hd)) throw new Error("checkpoint: the list in R2 does not match hd");
+    const list = decodeHeads(bytes);
+    if (c.q === this.latestRow()?.q) this.latestHeads = { q: c.q, list };
+    return list;
   }
 
   /** Not awaited on purpose: called in the same synchronous block as the commit it belongs to. */
@@ -235,10 +267,10 @@ export class CheckpointDO extends DurableObject<Env> {
   private async checkpoint(): Promise<void> {
     const now = this.clock();
     const prev = this.latestRow();
-    const prevHeads = new Map((prev ? decodeHeads(prev.heads) : []).map((h) => [h.cid, h.head] as const));
+    const prevHeads = new Map((prev ? await this.headsOf(prev) : []).map((h) => [h.cid, h.head] as const));
     const heads = new Map<string, Uint8Array>();
     /** Meta written with the checkpoint (or alone when hd is unchanged): final marks, the hourly blobreg head. */
-    const metaWrites = new Map<string, number | Uint8Array>();
+    const metaWrites: MetaWrites = new Map();
     const E = era(now);
     const { eFirst } = v2Params(this.env);
 
@@ -348,66 +380,125 @@ export class CheckpointDO extends DurableObject<Env> {
     const sec = Math.max(secOf(now), prev?.sec ?? 0);
     const C = ckptC(prev?.C ?? ZERO32, q, sec, hd);
     const sig = await srvSign(keys, ckptSigMsg(q, C));
+    // The list goes to R2 first: a row is never committed without it. An object left by a commit that failed
+    // afterwards was never served (no row named it) and is overwritten when q is built again.
+    try {
+      await this.env.BLOBS.put(headsKey(q), headsEnc, { httpMetadata: { contentType: "application/octet-stream" } });
+    } catch (e) {
+      console.error(JSON.stringify({ msg: "checkpoint: the list did not reach R2; no checkpoint this tick", error: logErr(e) }));
+      // The other meta stands; a final mark waits for the checkpoint that carries its head.
+      for (const k of metaWrites.keys()) if (k.startsWith("final:")) metaWrites.delete(k);
+      this.commit(null, metaWrites);
+      return;
+    }
     if ((this.latestRow()?.q ?? 0) !== q - 1) throw new Error("checkpoint: concurrent writer"); // single-flight: unreachable
-    this.commit({ q, sec, hd, heads: headsEnc, C, sig }, metaWrites);
+    this.commit({ q, sec, hd, heads: new Uint8Array(0), C, sig }, metaWrites);
+    this.latestHeads = { q, list };
   }
 
   /**
-   * §9.5 "Sweep": once per UTC hour, head() on the shards of past eras from `page:era` (the lowest era not known to
-   * be paged) up to E_now − 2, at most `sweepShards` of them, so that a sealed shard that still holds rows arms its
-   * paging (§9.1). An era whose shards all answer `paged` is marked and never asked again; the cursor skips marks.
+   * §9.5 "Sweep": once per UTC hour, head() on at most `sweepShards` shards of past eras, so that a sealed shard that
+   * still holds rows arms its paging (§9.1). The shards (E, i) of the eras from `page:era` (the lowest era not known
+   * to be paged) up to E_now − 2 are walked in order, resuming at `page:at` and wrapping around, skipping the shards
+   * marked `paged:<E>:<i>` and the eras marked `paged:<E>`. A shard that answers `paged` is marked; an era whose
+   * shards are all marked is marked instead (its shard marks deleted). A shard that fails stays unmarked and comes
+   * round again after every other unpaged shard, so it never holds up the others.
    */
-  private async sweep(now: number, E: number, eFirst: number, metaWrites: Map<string, number | Uint8Array>): Promise<void> {
+  private async sweep(now: number, E: number, eFirst: number, metaWrites: MetaWrites): Promise<void> {
     const hour = Math.floor(now / HOUR_MS);
     if ((this.kv.num("page:hour") ?? -1) >= hour) return;
     metaWrites.set("page:hour", hour);
-    let cursor = this.kv.num("page:era") ?? Math.max(eFirst, 0);
-    let calls = 0;
-    for (let e = cursor; e <= E - 2 && calls < this.sweepShards; e++) {
-      if (this.kv.num(`paged:${e}`) !== null) {
-        if (e === cursor) cursor = e + 1;
-        continue;
+    const top = E - 2;
+    const eraMarked = (e: number): boolean => this.kv.num(`paged:${e}`) !== null || metaWrites.get(`paged:${e}`) === 1;
+    const storedLo = this.kv.num("page:era");
+    let lo = storedLo ?? Math.max(eFirst, 0);
+    while (lo <= top && eraMarked(lo)) lo++;
+    const picked: [number, number][] = [];
+    const storedAt = this.kv.num("page:at");
+    if (lo <= top && this.sweepShards > 0) {
+      let e0 = storedAt === null ? lo : Math.floor(storedAt / SHARD_SPAN);
+      let i0 = storedAt === null ? 0 : storedAt % SHARD_SPAN;
+      if (e0 < lo || e0 > top) {
+        e0 = lo;
+        i0 = 0;
       }
-      const S = this.shardsOf(e);
-      let all = true;
-      const jobs: (() => Promise<void>)[] = [];
-      for (let i = 0; i < S; i++) {
-        jobs.push(async () => {
-          try {
-            const h = await this.timed(Promise.resolve(shardStub(this.env, e, i).head(e, i)));
-            if (!h.paged) all = false;
-          } catch (err) {
-            all = false;
-            console.error(JSON.stringify({ msg: "sweep: shard unreachable", E: e, error: logErr(err) }));
-          }
-        });
-      }
-      calls += S;
-      await pool(jobs, COLLECT_CONCURRENCY);
-      if (all) {
-        metaWrites.set(`paged:${e}`, 1);
-        if (e === cursor) cursor = e + 1;
+      for (const pos of this.sweepOrder(lo, top, e0, i0)) {
+        picked.push(pos);
+        if (picked.length >= this.sweepShards) break;
       }
     }
-    if (cursor !== (this.kv.num("page:era") ?? -1)) metaWrites.set("page:era", cursor);
+    const pagedNow = new Set<string>();
+    await pool(
+      picked.map(([e, i]) => async () => {
+        try {
+          const h = await this.timed(Promise.resolve(shardStub(this.env, e, i).head(e, i)));
+          if (h.paged) pagedNow.add(`${e}:${i}`);
+        } catch (err) {
+          console.error(JSON.stringify({ msg: "sweep: shard unreachable", E: e, error: logErr(err) }));
+        }
+      }),
+      COLLECT_CONCURRENCY,
+    );
+    for (const e of new Set(picked.map(([pe]) => pe))) {
+      const marked = this.markedShards(e);
+      const S = this.shardsOf(e);
+      let all = true;
+      for (let i = 0; i < S && all; i++) if (!marked.has(i) && !pagedNow.has(`${e}:${i}`)) all = false;
+      if (all) {
+        metaWrites.set(`paged:${e}`, 1);
+        for (const i of marked) metaWrites.set(`paged:${e}:${i}`, null);
+      } else {
+        for (const [pe, i] of picked) if (pe === e && pagedNow.has(`${e}:${i}`)) metaWrites.set(`paged:${e}:${i}`, 1);
+      }
+    }
+    while (lo <= top && eraMarked(lo)) lo++;
+    if (lo !== storedLo) metaWrites.set("page:era", lo);
+    if (picked.length > 0) {
+      const [e, i] = picked[picked.length - 1];
+      const at = e * SHARD_SPAN + i + 1;
+      if (at !== storedAt) metaWrites.set("page:at", at);
+    }
+  }
+
+  /** The unpaged shards from (e0, i0) to the end of E_now − 2, then from `lo` round to just before (e0, i0). */
+  private *sweepOrder(lo: number, top: number, e0: number, i0: number): Generator<[number, number]> {
+    for (let e = e0; e <= top; e++) yield* this.unpagedShards(e, e === e0 ? i0 : 0, Infinity);
+    for (let e = lo; e <= e0; e++) yield* this.unpagedShards(e, 0, e === e0 ? i0 : Infinity);
+  }
+
+  private *unpagedShards(e: number, from: number, to: number): Generator<[number, number]> {
+    if (this.kv.num(`paged:${e}`) !== null) return;
+    const marked = this.markedShards(e);
+    const end = Math.min(to, this.shardsOf(e));
+    for (let i = from; i < end; i++) if (!marked.has(i)) yield [e, i];
+  }
+
+  /** The shards of era e marked `paged:<e>:<i>` ( ':' < ';' bounds the keys of the era). */
+  private markedShards(e: number): Set<number> {
+    const rows = this.sql
+      .exec<{ k: string }>("SELECT k FROM meta WHERE k > ? AND k < ?", `paged:${e}:`, `paged:${e};`)
+      .toArray();
+    return new Set(rows.map((r) => Number(r.k.slice(`paged:${e}:`.length))));
   }
 
   /** One transaction for the checkpoint row and its meta, and the next alarm in the same synchronous block. */
-  private commit(cp: Checkpoint | null, metaWrites: Map<string, number | Uint8Array>): void {
+  private commit(cp: Checkpoint | null, metaWrites: MetaWrites): void {
     if (cp || metaWrites.size > 0) {
       this.ctx.storage.transactionSync(() => {
         if (cp) {
           this.sql.exec(
-            "INSERT INTO cp (q, sec, hd, heads, C, sig) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO cp (q, sec, hd, heads, C, sig) VALUES (?, ?, ?, x'', ?, ?)",
             cp.q,
             cp.sec,
             ab(cp.hd),
-            ab(cp.heads),
             ab(cp.C),
             ab(cp.sig),
           );
         }
-        for (const [k, v] of metaWrites) this.kv.set(k, v);
+        for (const [k, v] of metaWrites) {
+          if (v === null) this.kv.del(k);
+          else this.kv.set(k, v);
+        }
       });
     }
     this.armNext();

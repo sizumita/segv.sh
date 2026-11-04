@@ -76,27 +76,18 @@ export async function registerAccount(
   // The registration's server time, when its response arrived: the first inbox cursor starts there (§11.1).
   let regNow: number | null = null;
   try {
+    // A network error, a 429 or a 5xx is answered by sending the identical registration again (§2.5 step 8): the
+    // directory answers one it already logged as it did the first time.
     regNow = (await api.register({ bundle, sig, wraps }, progress)).now;
   } catch (e) {
-    // A definitive rejection (4xx): the account does not exist, so the new passkey is useless (§2.5 step 7).
+    // A definitive rejection (4xx): the account does not exist, so the new passkey is useless (§2.5 steps 7, 8).
     if (e instanceof ApiError && !e.transient) {
       await pk.platform.forget(pk.rpId, credId);
       if (e.status === 409) throw new UserError(`@${handle} is taken`);
       throw e;
     }
-    // A network error or 5xx: the server may have committed before the response was lost (§2.5 step 8). It landed
-    // only if the directory returns exactly this bundle for the handle.
-    progress("checking whether the account was created…");
-    let landed: Awaited<ReturnType<Api["userByHandle"]>>;
-    try {
-      landed = await api.userByHandle(handle, true);
-    } catch {
-      throw e;
-    }
-    if (!landed || landed.bundle !== bundle) {
-      if (landed) await pk.platform.forget(pk.rpId, credId);
-      throw e;
-    }
+    // Still no answer after the last send: whether the account exists is unknown, so the passkey stays.
+    throw e;
   }
   return { AK, uid, handle, recoveryCode: P.formatRecoveryCode(code), regNow };
 }

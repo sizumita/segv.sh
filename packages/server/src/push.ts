@@ -3,10 +3,11 @@
  * QuietDO), the ring (the bells' entries read from the store, `ring` at the QuietDOs, the hold, `due`, sending,
  * `sent`), the queue consumer for pushes due later than a Worker can wait, and the daily expiry.
  *
- * Nothing here writes: the Worker reads the store at a ring (the `b/` key of each bell), for a deletion without a
- * quiet tag (the endpoint's owner, from its record's metadata) and in the daily expiry (key names and metadata), and
- * sends the pushes that a QuietDO hands it. The store is written by the QuietDOs alone, one writer per key.
+ * Nothing here writes the store: the Worker reads it at a ring (the `b/` key of each bell), at a registration (the
+ * owner its record's metadata names) and in the daily expiry (key names and metadata), and sends the pushes that a
+ * QuietDO hands it. The store is written by the QuietDOs alone, one writer per key.
  */
+import { hexToBytes } from "@noble/hashes/utils.js";
 import { H, HMAC, aeadOpen, aeadSeal, concat, dec, enc, hex, t16, u16, u32, type Bytes } from "@segv/protocol/proto";
 import { pushConfig, pushHostAllowed, pushShardsOf, type PushConfig } from "./env";
 import { logErr } from "./http";
@@ -33,15 +34,27 @@ export const PUSH_PENDING = 16;
 export const SEEN_TTL = 120;
 /** Rows marked seen kept per account (a mark beyond them drops the one that expires first). */
 export const PUSH_SEEN = 64;
-/** `ring` answers a wait the Worker takes in `waitUntil` (≤ 30 s) only up to this; later pushes go through the queue. */
-export const RING_WAIT = 20_000;
+/**
+ * A ring's Worker waits in `waitUntil` (cancelled 30 s after the answer) only while the wait ends within this of the
+ * answer, and then sends one round of pushes (each ≤ PUSH_TIMEOUT_MS); anything later goes through the queue.
+ */
+export const RING_WAIT = 15_000;
 /** A failed attempt is retried once after this long, unless the answer's retry-after (≤ 60 s) says otherwise. */
 export const RETRY_MS = 10_000;
-/** A push in flight whose Worker never reported back is given up after this long. */
-export const INFLIGHT_MS = 30_000;
 const PUSH_TIMEOUT_MS = 10_000;
-/** Pushes a Worker sends at the same time. */
-const SEND_PARALLEL = 16;
+/** Pushes a Worker sends at the same time (an invocation waits for the headers of at most 6 requests at once). */
+export const SEND_PARALLEL = 6;
+/** The most pushes one `due` hands out: what SEND_PARALLEL requests send in 4 rounds. */
+export const DUE_BATCH = 24;
+/** The pushes the Worker of a ring takes for its one round in `waitUntil`. */
+export const IN_PLACE_BATCH = SEND_PARALLEL;
+/**
+ * A push handed out by `due` whose Worker never reported back (it was stopped) is due again after this long: longer
+ * than a batch of DUE_BATCH takes to send.
+ */
+export const INFLIGHT_MS = 60_000;
+/** A queue consumer goes on asking a QuietDO for more pushes due now for this long, then queues the rest. */
+const CONSUME_MS = 60_000;
 const DAY_MS = 86_400_000;
 
 export const dayOf = (ms: number): number => Math.floor(ms / DAY_MS);
@@ -85,12 +98,15 @@ export const EP_PREFIX = "e/";
  * none, the endpoint's own hash.
  */
 export const ownerOf = (ep: Bytes, qh: Bytes | null): Bytes => qh ?? ep;
-const u32be = (b: Bytes): number => ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0;
 /** `k = u32(owner[0..4]) mod PUSH_SHARDS`: the QuietDO of an endpoint. */
-export const quietShard = (owner: Bytes, shards: number): number => u32be(owner) % shards;
+export function quietShard(owner: Bytes, shards: number): number {
+  if (!(owner instanceof Uint8Array) || owner.length < 4) throw new Error("owner must be at least 4 bytes");
+  if (!Number.isInteger(shards) || shards < 1 || shards > 4096) throw new Error("bad quiet shard count");
+  return new DataView(owner.buffer, owner.byteOffset, 4).getUint32(0) % shards;
+}
 
 export const ZERO16: Bytes = new Uint8Array(16);
-const isZero = (b: Bytes): boolean => b.every((x) => x === 0);
+export const isZero = (b: Bytes): boolean => b.every((x) => x === 0);
 const cmp = (a: Bytes, b: Bytes): number => {
   const n = Math.min(a.length, b.length);
   for (let i = 0; i < n; i++) if (a[i] !== b[i]) return a[i] - b[i];
@@ -176,6 +192,12 @@ export interface DuePush {
   rang: Bytes[];
 }
 
+/** What `due` answers: the pushes handed out, and the time until the Worker is to ask again (null: no need). */
+export interface DueBatch {
+  pushes: DuePush[];
+  next: number | null;
+}
+
 export type SentOutcome = "sent" | "retry" | "gone";
 
 /** What the Worker reports for a push it sent (§9.8 `sent`). */
@@ -187,10 +209,12 @@ export interface SentReport {
   retryAfterS: number | null;
 }
 
-/** A queue message: the QuietDO to ask, and nothing else (§9.8 "The Worker's part"). */
-export interface PushQueueMessage {
-  k: number;
-}
+/**
+ * A message on the push queue (§9.8 "The Worker's part", "Expiry"): `{k}` names a QuietDO to ask for its due pushes;
+ * `{k, expire, day}` names endpoints (hex ep) the daily expiry of `day` found expired among those QuietDO k owns;
+ * `{list, day}` is where that expiry's listing goes on (a cursor of the store's listing).
+ */
+export type PushQueueMessage = { k: number } | { k: number; expire: string[]; day: number } | { list: string; day: number };
 
 // ───────────── the ring (§10.10 steps 3–4) ─────────────
 
@@ -222,9 +246,10 @@ async function entriesOf(env: Env, tk: Bytes): Promise<BellEntry[]> {
 
 /**
  * Reads the ring's bells' entries from the store, calls `ring` on the QuietDO of each endpoint found, and for each
- * time answered waits in place (≤ RING_WAIT) and sends, or queues a message for later (§9.8 "The Worker's part").
+ * time answered waits in place and sends one round, when the wait ends within RING_WAIT of `answeredAt` (when the
+ * Worker answered the ring), or else queues a message for then (§9.8 "The Worker's part").
  */
-export async function pushRing(env: Env, cfg: PushConfig, E: number, label: Bytes, ringBells: Bytes[]): Promise<void> {
+export async function pushRing(env: Env, cfg: PushConfig, E: number, label: Bytes, ringBells: Bytes[], answeredAt = Date.now()): Promise<void> {
   const shards = cfg.shards;
   const bells = new Map<string, Bytes>();
   for (const b of ringBells) bells.set(hex(b), b);
@@ -255,57 +280,93 @@ export async function pushRing(env: Env, cfg: PushConfig, E: number, label: Byte
   await Promise.all(
     [...byOwner].map(async ([k, list]) => {
       const wait = await quietStub(env, k).ring(list, row);
-      if (wait !== null) await schedule(env, k, wait, false);
+      if (wait === null) return;
+      if (Date.now() - answeredAt + wait <= RING_WAIT) {
+        await ringSleep(wait);
+        await sendDue(env, k, true);
+      } else await enqueue(env, k, wait);
     }),
   );
 }
 
-/** Sends after `waitMs` in place when that fits `waitUntil` and `inPlace` allows, else from a queue message then. */
-async function schedule(env: Env, k: number, waitMs: number, retry: boolean): Promise<void> {
-  if (!retry && waitMs <= RING_WAIT) {
-    await ringSleep(waitMs);
-    await sendDue(env, k);
-    return;
-  }
+/** A message asking QuietDO k for its due pushes after `waitMs` (at least a second: the queue's unit). */
+async function enqueue(env: Env, k: number, waitMs: number): Promise<void> {
   const msg: PushQueueMessage = { k };
   await env.PUSH_QUEUE.send(msg, { delaySeconds: Math.max(1, Math.ceil(waitMs / 1000)) });
 }
 
-/** Asks QuietDO k for the pushes due now, sends them, and reports; a retry that `sent` answers is queued. */
-export async function sendDue(env: Env, k: number): Promise<void> {
+const later = (a: number | null, b: number | null): number | null => (a === null ? b : b === null ? a : Math.min(a, b));
+
+/**
+ * Asks QuietDO k for the pushes due now, sends them, and reports them, one batch at a time, so that a Worker stopped
+ * midway leaves at most one batch unreported. In place (the Worker of a ring, in `waitUntil`), one round of
+ * IN_PLACE_BATCH; from the queue, batches of DUE_BATCH for up to CONSUME_MS. Whatever the QuietDO then still answers a
+ * time for (more pushes due, a retry, a push due later) is asked for again through the queue.
+ */
+export async function sendDue(env: Env, k: number, inPlace = false): Promise<void> {
   const cfg = pushConfig(env);
   if (!cfg) return;
   const stub = quietStub(env, k);
-  const due = await stub.due();
-  if (due.length === 0) return;
-  const reports: SentReport[] = [];
-  let next = 0;
-  const worker = async (): Promise<void> => {
-    while (next < due.length) reports.push(await sendOne(cfg, due[next++]));
-  };
-  await Promise.all(Array.from({ length: Math.min(SEND_PARALLEL, due.length) }, worker));
-  const tally = { sent: 0, retry: 0, gone: 0 };
-  for (const r of reports) tally[r.outcome]++;
-  if (tally.retry + tally.gone > 0) console.error(JSON.stringify({ msg: "push results", ...tally }));
-  const retryWait = await stub.sent(reports);
-  if (retryWait !== null) await schedule(env, k, retryWait, true);
+  const start = Date.now();
+  for (;;) {
+    const { pushes, next } = await stub.due(inPlace ? IN_PLACE_BATCH : DUE_BATCH);
+    let after = next;
+    if (pushes.length > 0) {
+      const reports: SentReport[] = [];
+      let i = 0;
+      const worker = async (): Promise<void> => {
+        while (i < pushes.length) reports.push(await sendOne(cfg, pushes[i++]));
+      };
+      await Promise.all(Array.from({ length: Math.min(SEND_PARALLEL, pushes.length) }, worker));
+      const tally = { sent: 0, retry: 0, gone: 0 };
+      for (const r of reports) tally[r.outcome]++;
+      if (tally.retry + tally.gone > 0) console.error(JSON.stringify({ msg: "push results", ...tally }));
+      after = later(after, await stub.sent(reports));
+    }
+    if (after === null) return;
+    if (!inPlace && after === 0 && Date.now() - start < CONSUME_MS) continue;
+    await enqueue(env, k, after);
+    return;
+  }
 }
 
-/** The queue consumer: every message names a QuietDO whose due pushes are sent (§9.8 "The Worker's part"). */
+/**
+ * The queue consumer: a `{k}` message names a QuietDO whose due pushes are sent; an expiry message drops the expired
+ * endpoints it names at their QuietDO, or goes on with the expiry's listing (§9.8 "The Worker's part", "Expiry").
+ */
 export async function pushQueue(batch: MessageBatch<unknown>, env: Env): Promise<void> {
   const ks = new Map<number, Message<unknown>[]>();
+  const other: Promise<void>[] = [];
+  const isK = (k: unknown): k is number => Number.isInteger(k) && (k as number) >= 0 && (k as number) < 4096;
+  const isDay = (d: unknown): d is number => Number.isInteger(d) && (d as number) >= 0 && (d as number) < 2 ** 32;
+  const attempt = (m: Message<unknown>, what: string, f: () => Promise<void>): Promise<void> =>
+    f().then(
+      () => m.ack(),
+      (e: unknown) => {
+        console.error(JSON.stringify({ msg: what, error: logErr(e) }));
+        m.retry({ delaySeconds: 10 });
+      },
+    );
   for (const m of batch.messages) {
-    const k = (m.body as { k?: unknown } | null)?.k;
-    if (!Number.isInteger(k) || (k as number) < 0 || (k as number) >= 4096) {
-      m.ack(); // not one of ours: never retried
-      continue;
-    }
-    const list = ks.get(k as number);
-    if (list) list.push(m);
-    else ks.set(k as number, [m]);
+    const b = (typeof m.body === "object" && m.body !== null ? m.body : {}) as Record<string, unknown>;
+    if (Array.isArray(b.expire) && isK(b.k) && isDay(b.day)) {
+      const eps = b.expire.filter((h): h is string => typeof h === "string" && /^[0-9a-f]{32}$/.test(h)).slice(0, EXPIRE_BATCH);
+      const k = b.k;
+      const day = b.day;
+      other.push(attempt(m, "push expiry failed", () => quietStub(env, k).expire(eps.map(fromHex), day).then(() => {})));
+    } else if (typeof b.list === "string" && b.list.length <= 4096 && isDay(b.day)) {
+      const cursor = b.list;
+      const day = b.day;
+      other.push(attempt(m, "push expiry failed", () => expiryRun(env, day, cursor).then(() => {})));
+    } else if (isK(b.k)) {
+      const list = ks.get(b.k);
+      if (list) list.push(m);
+      else ks.set(b.k, [m]);
+    } else m.ack(); // not one of ours: never retried
   }
-  await Promise.all(
-    [...ks].map(async ([k, msgs]) => {
+  await Promise.all([
+    ...other,
+    ...[...ks].map(async ([k, msgs]) => {
       try {
         await sendDue(env, k);
         for (const m of msgs) m.ack();
@@ -314,54 +375,88 @@ export async function pushQueue(batch: MessageBatch<unknown>, env: Env): Promise
         for (const m of msgs) m.retry({ delaySeconds: 10 });
       }
     }),
-  );
+  ]);
 }
 
-/** The daily expiry (§9.8 "Expiry"): endpoints whose day lies more than PUSH_EXPIRY days back are deleted by their owners. */
+// ───────────── the daily expiry (§9.8 "Expiry") ─────────────
+
+/** Endpoints named per expiry message. */
+export const EXPIRE_BATCH = 64;
+const expiryLimits = { pageSize: 1000, pages: 50 };
+/** Test hook: the keys per page of the listing, and the pages one run lists before it hands the rest to the queue. */
+export function _setExpiryLimitsForTests(l: { pageSize: number; pages: number } | null): void {
+  Object.assign(expiryLimits, l ?? { pageSize: 1000, pages: 50 });
+}
+
+/**
+ * The daily expiry (§9.8 "Expiry"), run by the Cron Trigger: lists the `e/` keys with their metadata and, for the
+ * endpoints whose day lies more than PUSH_EXPIRY days back, puts messages on the queue naming them to their owners'
+ * QuietDOs, which check each record again and delete it. One run lists a bounded number of pages and then puts the
+ * listing's cursor on the queue, whose consumer goes on from there; so a run that is stopped loses nothing that it has
+ * queued, and the next day's run lists again from the start.
+ */
 export async function pushCleanup(env: Env, now = Date.now()): Promise<{ scanned: number; expired: number }> {
-  const today = dayOf(now);
+  return expiryRun(env, dayOf(now), undefined);
+}
+
+async function expiryRun(env: Env, today: number, cursor: string | undefined): Promise<{ scanned: number; expired: number }> {
   const shards = pushShardsOf(env) ?? 1;
-  let cursor: string | undefined;
   let scanned = 0;
   let expired = 0;
-  do {
-    const page = await env.PUSH_KV.list<{ d?: unknown; o?: unknown }>({ prefix: EP_PREFIX, cursor, limit: 1000 });
-    for (const key of page.keys) {
+  const byK = new Map<number, string[]>();
+  const flush = async (k: number, eps: string[]): Promise<void> => {
+    const msg: PushQueueMessage = { k, expire: eps, day: today };
+    await env.PUSH_QUEUE.send(msg);
+  };
+  for (let page = 0; page < expiryLimits.pages; page++) {
+    const res = await env.PUSH_KV.list<{ d?: unknown; o?: unknown }>({ prefix: EP_PREFIX, cursor, limit: expiryLimits.pageSize });
+    for (const key of res.keys) {
       scanned++;
       const d = key.metadata?.d;
       const o = key.metadata?.o;
       const epHex = key.name.slice(EP_PREFIX.length);
       if (typeof d !== "number" || typeof o !== "string" || !/^[0-9a-f]{32}$/.test(o) || !/^[0-9a-f]{32}$/.test(epHex)) continue;
       if (today - d <= PUSH_EXPIRY) continue;
-      const owner = fromHex(o);
-      try {
-        await quietStub(env, quietShard(owner, shards)).drop(fromHex(epHex));
-        expired++;
-      } catch (e) {
-        console.error(JSON.stringify({ msg: "push expiry failed", error: logErr(e) }));
+      const k = quietShard(fromHex(o), shards);
+      const list = byK.get(k) ?? [];
+      list.push(epHex);
+      byK.set(k, list);
+      expired++;
+      if (list.length === EXPIRE_BATCH) {
+        byK.delete(k);
+        await flush(k, list);
       }
     }
-    cursor = page.list_complete ? undefined : page.cursor;
-  } while (cursor);
+    cursor = res.list_complete ? undefined : res.cursor;
+    if (!cursor) break;
+  }
+  for (const [k, list] of byK) await flush(k, list);
+  if (cursor) {
+    const msg: PushQueueMessage = { list: cursor, day: today };
+    await env.PUSH_QUEUE.send(msg);
+  }
   if (expired > 0) console.error(JSON.stringify({ msg: "push expiry", scanned, expired }));
   return { scanned, expired };
 }
 
-export const fromHex = (h: string): Bytes => Uint8Array.from(h.match(/../g)!.map((x) => parseInt(x, 16)));
+/** 32 lowercase hex digits, or anything `hexToBytes` takes (an even number of hex digits); throws otherwise. */
+export const fromHex = (h: string): Bytes => hexToBytes(h);
 
 /**
- * The owner of an endpoint by its record's metadata (`o`), for a deletion that carries no quiet tag (§10.10): the
- * endpoint itself when the store has no record, or the read fails (the QuietDO then finds nothing to delete, or 503s).
+ * The owner of an endpoint by its record's metadata (`o`), or null when the store has no record (§10.10). A failed read
+ * throws, so that the call answers 503.
  */
-export async function ownerByRecord(env: Env, ep: Bytes): Promise<Bytes> {
+export async function ownerByRecord(env: Env, ep: Bytes): Promise<Bytes | null> {
+  let o: unknown;
   try {
-    const r = await env.PUSH_KV.getWithMetadata<{ o?: unknown }>(keyEp(ep));
-    const o = r.metadata?.o;
-    return typeof o === "string" && /^[0-9a-f]{32}$/.test(o) ? fromHex(o) : ep;
+    const r = await env.PUSH_KV.getWithMetadata<{ o?: unknown }>(keyEp(ep), "arrayBuffer");
+    if (r.value === null) return null;
+    o = r.metadata?.o;
   } catch (e) {
     console.error(JSON.stringify({ msg: "push store read failed", error: logErr(e) }));
-    return ep;
+    throw e;
   }
+  return typeof o === "string" && /^[0-9a-f]{32}$/.test(o) ? fromHex(o) : ep;
 }
 
 // ───────────── sending (§9.8 "Sending a push") ─────────────

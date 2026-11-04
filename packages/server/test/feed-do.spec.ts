@@ -1,4 +1,7 @@
-/** FeedDO (docs/PROTOCOL.md §9.4): the pull at start, interest / replace, expiry, fan-out with one retry, validation. */
+/**
+ * FeedDO (docs/PROTOCOL.md §9.4): the pull at start (in the background, rows held for the ConnDOs not pulled yet),
+ * interest / replace, expiry, fan-out with one retry, validation.
+ */
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
@@ -101,12 +104,15 @@ describe("FeedDO", () => {
       (x) => x.includes(P.hex(T)),
       "interest",
     );
-    // A fresh construction: the index is gone until the pull brings it back.
+    // A fresh construction: the index is gone until the pull brings it back. A publish at once is held for the
+    // ConnDOs not pulled yet and delivered when their pull answers.
     await evictDurableObject(feedOf(T));
     const x = row(T);
     await feedOf(T).publish([x]);
     await s.rowsAre(1);
     expect(P.equalBytes(s.rows[0].label, x.label)).toBe(true);
+    await sleep(50);
+    expect(s.rows).toHaveLength(1); // once
     // A ConnDO above C is not pulled: it reports itself (its resync or its next change).
     const far = randomC();
     const sf = await socket(connAt(far));
@@ -118,7 +124,12 @@ describe("FeedDO", () => {
     );
     await evictDurableObject(feedOf(T));
     expect(await feedOf(T).topicsOf(far)).toEqual([]);
-    expect(await feedOf(T).topicsOf(C - 1)).toEqual([P.hex(T)]);
+    await eventually(
+      () => feedOf(T).topicsOf(C - 1),
+      (x) => x.includes(P.hex(T)),
+      "pulled again",
+    );
+    expect(await feedOf(T).topicsOf(far)).toEqual([]);
     s.close();
     sf.close();
   });
@@ -275,6 +286,103 @@ describe("FeedDO", () => {
     });
     s.close();
     other.close();
+  });
+
+  it("serves a publish while a ConnDO's pull is still outstanding, and gives that ConnDO the held rows when it answers", async () => {
+    const [T, U] = [topic(), topic()];
+    // A FeedDO of its own (j far above F): nothing else calls it, and its start pull goes to the fakes below.
+    const feed = feedNs.getByName(feedName(2 ** 20 + Math.floor(Math.random() * 2 ** 30)));
+    const got: string[] = [];
+    let answer!: (topics: Uint8Array[]) => void;
+    const slow = new Promise<Uint8Array[]>((r) => (answer = r));
+    const pulls: number[] = [];
+    await feedInside(feed, (i) => {
+      i.limits.pullTimeoutMs = 60_000;
+      i.limits.holdMs = 60_000;
+      i.conns = (c) => ({
+        topicsFor: async () => {
+          pulls.push(c);
+          return c === 0 ? [T] : slow; // ConnDO 1 does not answer yet
+        },
+        deliver: async (rows) => {
+          got.push(`${c}:${rows.map((r) => (P.equalBytes(r.topic, T) ? "T" : "U")).join("")}`);
+        },
+        deliverInbox: async (E, g, rel) => {
+          got.push(`${c}:inbox:${E}:${g}:${rel}`);
+        },
+      });
+    });
+    expect(C).toBe(2);
+    // The first request starts the pull. A publish made while pulls are out returns once they have answered.
+    const calls = [feed.publish([row(T), row(U)])];
+    await eventually(
+      () => got.slice(),
+      (x) => x.includes("0:T"),
+      "ConnDO 0 served",
+    );
+    expect(pulls.sort()).toEqual([0, 1]);
+    // ConnDO 1 is still pending: the FeedDO answers calls and serves the other ConnDOs meanwhile.
+    await feed.interest(5, [U], []);
+    calls.push(feed.publish([row(U)]));
+    await eventually(
+      () => got.slice(),
+      (x) => x.includes("5:U"),
+      "ConnDO 5 served",
+    );
+    // A call from ConnDO 1 while its pull is out: the late answer only adds to it.
+    await feed.interest(1, [U], []);
+    answer([T]);
+    await Promise.all(calls);
+    expect((await feed.topicsOf(1)).sort()).toEqual([P.hex(T), P.hex(U)].sort());
+    // ConnDO 1 gets, once, every held row of its topics that it had not had: published while it was pending.
+    expect(got.filter((x) => x.startsWith("1:"))).toEqual(["1:TUU"]);
+    expect(got.filter((x) => x.startsWith("0:"))).toEqual(["0:T"]);
+    // Nothing is pending any more: a publish goes out at once and nothing is held.
+    got.length = 0;
+    await feed.publish([row(T)]);
+    expect(got.sort()).toEqual(["0:T", "1:T"]);
+  });
+
+  it("a pull that fails leaves the ConnDO pending and is made again at a later request, at most once per repullMs", async () => {
+    const T = topic();
+    const feed = feedNs.getByName(feedName(2 ** 20 + Math.floor(Math.random() * 2 ** 30)));
+    const pulls: number[] = [];
+    const got: string[] = [];
+    let down = true;
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await feedInside(feed, (i) => {
+        i.conns = (c) => ({
+          topicsFor: async () => {
+            pulls.push(c);
+            if (c === 1 && down) throw new Error("conn down");
+            return [T];
+          },
+          deliver: async () => void got.push(`${c}`),
+          deliverInbox: async () => {},
+        });
+      });
+      await feed.publish([row(T)]);
+      await eventually(
+        () => pulls.length,
+        (n) => n >= 2,
+        "the first pulls",
+      );
+      expect(got).toEqual(["0"]);
+      await feed.publish([row(T)]); // within repullMs: no new pull of 1
+      expect(pulls.filter((c) => c === 1)).toHaveLength(1);
+      down = false;
+      await feedInside(feed, (i) => void (i.limits.repullMs = 0));
+      await feed.publish([row(T)]); // pulls 1 again; the rows held since it failed reach it once it answers
+      await eventually(
+        () => got.filter((c) => c === "1").length,
+        (n) => n >= 1,
+        "ConnDO 1",
+      );
+      expect(await feed.topicsOf(1)).toEqual([P.hex(T)]);
+    } finally {
+      errors.mockRestore();
+    }
   });
 
   it("rejects malformed rows, topics and indexes", async () => {

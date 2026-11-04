@@ -1,8 +1,9 @@
 /**
  * Push (docs/PROTOCOL.md §9.8, §10.10): the configuration, the three endpoints, the registrations in the push store
  * through the QuietDOs (bell secrets in, bells and their entries out), rings (the Worker reads the bells from the
- * store), the hold, the window, the pushes the Worker sends, marks of rows seen, the queue for pushes due later, and
- * the daily expiry.
+ * store), the hold, the window, the pushes the Worker sends, marks of rows seen, the queue for pushes due later, the
+ * batches `due` hands out and the pushes in flight, the store's one writer per key (a failed write, a change of owner),
+ * and the daily expiry through the queue.
  *
  * The objects hold nothing durable: each test starts from an empty store and evicted objects (reset()), replaces the
  * objects' clocks, randomness and sleeps, the Worker's wait and its push fetch. The objects' clock runs days ahead of
@@ -10,13 +11,18 @@
  */
 import { gcm } from "@noble/ciphers/aes.js";
 import { p256 } from "@noble/curves/nist.js";
-import { createMessageBatch, evictDurableObject, runInDurableObject } from "cloudflare:test";
+import {
+  createMessageBatch,
+  evictDurableObject,
+  runDurableObjectAlarm,
+  runInDurableObject,
+} from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as P from "@segv/protocol/proto";
 import * as W from "@segv/protocol/wire";
 import { MAX_RING_BODY, MAX_SEEN_BODY, RING_FRESH, ringEraOk, ringRowFresh } from "../src/api";
-import { _resetPushConfigForTests } from "../src/env";
+import { _resetPushConfigForTests, shardBitsOf, v2Params } from "../src/env";
 import {
   PUSH_EXPIRY,
   PUSH_HOLD,
@@ -25,6 +31,10 @@ import {
   PUSH_WINDOW,
   RING_WAIT,
   SEEN_TTL,
+  DUE_BATCH,
+  INFLIGHT_MS,
+  IN_PLACE_BATCH,
+  _setExpiryLimitsForTests,
   _setPushFetchForTests,
   _setRingSleepForTests,
   dayOf,
@@ -45,7 +55,8 @@ import {
   type RingTarget,
 } from "../src/push";
 import type { PushState, QuietDO } from "../src/quiet-do";
-import { quietStub } from "../src/types";
+import type { ShardDO } from "../src/shard-do";
+import { quietStub, shardStub } from "../src/types";
 import { vapidPublicKey } from "../src/webpush";
 import {
   DELTA,
@@ -57,6 +68,7 @@ import {
   makeRow,
   powHeader,
   putOk,
+  testKroute,
   type Bytes,
 } from "./helpers";
 
@@ -148,8 +160,8 @@ const fake = {
   respond: ((): Response => new Response(null, { status: 201 })) as (
     c: Call,
   ) => Response | Promise<Response>,
-  /** the messages the Worker put on the push queue */
-  queued: [] as { k: number; delaySeconds: number }[],
+  /** the messages the Worker put on the push queue, each with its delay */
+  queued: [] as ({ delaySeconds: number } & Record<string, unknown>)[],
 };
 const nowOf = (): number => fake.now ?? Date.now();
 /** A UTC midnight well after real time. */
@@ -169,8 +181,8 @@ const hook = async (): Promise<void> => {
 
 /** The fake queue binding the tests give the Worker: it records, and the tests run the consumer by hand. */
 const QUEUE = {
-  send: async (body: { k: number }, opts?: { delaySeconds?: number }) => {
-    fake.queued.push({ k: body.k, delaySeconds: opts?.delaySeconds ?? 0 });
+  send: async (body: Record<string, unknown>, opts?: { delaySeconds?: number }) => {
+    fake.queued.push({ ...body, delaySeconds: opts?.delaySeconds ?? 0 });
   },
 };
 const OVER = { PUSH_QUEUE: QUEUE };
@@ -315,13 +327,18 @@ const seenBody = (qS: Bytes, rows: RowRef[], ver = 1): Bytes =>
     Uint8Array.of(rows.length),
     ...rows.flatMap((r) => [P.u16(r.E), r.label]),
   );
-/** Runs the queue consumer for the messages queued so far (or the given ones), as the platform would when they come. */
+/**
+ * Runs the queue consumer for the messages queued so far (or `{k}` messages for the given QuietDOs), as the platform
+ * would when they come.
+ */
 async function drainQueue(ks?: number[]): Promise<void> {
-  const list = ks ?? fake.queued.map((m) => m.k);
+  const list = ks
+    ? ks.map((k) => ({ k }))
+    : fake.queued.map(({ delaySeconds: _delay, ...body }) => body);
   fake.queued = [];
   const batch = createMessageBatch(
     "segv-push-test",
-    list.map((k, i) => ({ id: `m${i}`, timestamp: new Date(nowOf()), attempts: 1, body: { k } })),
+    list.map((body, i) => ({ id: `m${i}`, timestamp: new Date(nowOf()), attempts: 1, body })),
   );
   await pushQueue(batch, envOf(OVER));
 }
@@ -689,6 +706,121 @@ describe("registrations in the store (§9.8 `sub`)", () => {
     expect((await stateOf(d))!.recent).toHaveLength(before);
   });
 
+  it("a bell changed in a cache with no room waits there for its write: registrations made at once all land", async () => {
+    const q = P.random(16);
+    const ds = Array.from({ length: 4 }, () => dev());
+    const k = quietShard(qk(q), SHARDS);
+    // Caches with no room at all: every key goes as soon as nothing waits on it.
+    await runInDurableObject(quiet(k), (inst: QuietDO) => {
+      for (const c of ["records", "bells"])
+        (inst as unknown as Record<string, { budget: number }>)[c].budget = 0;
+    });
+    const b = P.random(16);
+    const statuses = await Promise.all(ds.map(async (d) => (await subApi(d, [b], q)).status));
+    expect(statuses).toEqual([204, 204, 204, 204]);
+    expect((await holders(b)).sort()).toEqual(ds.map((d) => P.hex(d.ep)).sort());
+    for (const d of ds) expect((await record(d))!.tks.map(P.hex)).toEqual([P.hex(tk(b))]);
+    // Leaving at once as well: the key goes only with the last of them, and is never written back empty before.
+    await Promise.all(ds.slice(0, 3).map((d) => sub(d, [])));
+    expect(await holders(b)).toEqual([P.hex(ds[3].ep)]);
+    await sub(ds[3], []);
+    expect(await env.PUSH_KV.get(keyBell(tk(b)))).toBeNull();
+  });
+
+  it("a write the store refuses twice answers 503 and leaves no record claiming the bell; a retry lands", async () => {
+    const d = dev();
+    const [b1, b2] = bells(2);
+    await sub(d, [b1]);
+    const k = kOf(d);
+    const before = await record(d);
+    // The store refuses every write of b2's key from here on, the retry after a second included.
+    let refused = 0;
+    await runInDurableObject(quiet(k), (inst: QuietDO) => {
+      const real = env.PUSH_KV;
+      const kv = {
+        get: real.get.bind(real),
+        getWithMetadata: real.getWithMetadata.bind(real),
+        list: real.list.bind(real),
+        delete: real.delete.bind(real),
+        put: (key: string, value: ArrayBuffer, opts?: KVNamespacePutOptions) => {
+          if (key !== keyBell(tk(b2))) return real.put(key, value, opts);
+          // A write the store itself refuses (a TTL below its minimum).
+          refused++;
+          return real.put(key, value, { expirationTtl: 1 });
+        },
+      };
+      (inst as unknown as { env: Env }).env = new Proxy(env, {
+        get: (t, p) => (p === "PUSH_KV" ? kv : Reflect.get(t, p)),
+      });
+    });
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const r = await subApi(d, [b1, b2]);
+      expect(r.status).toBe(503);
+      expect(r.headers.get("retry-after")).toBe("5");
+      expect(await errorOf(r)).toBe("storage unavailable");
+    } finally {
+      log.mockRestore();
+    }
+    expect(refused).toBe(2); // one spaced retry, no loop
+    expect(await record(d)).toEqual(before);
+    expect(await holders(b2)).toEqual([]);
+    expect((await quiet(k).entriesOf(tk(b2))).map((e) => P.hex(e.ep))).toEqual([]); // the cache holds what the store does
+    await runInDurableObject(quiet(k), (inst: QuietDO) => {
+      (inst as unknown as { env: Env }).env = env;
+    });
+    await sub(d, [b1, b2]);
+    expect(refused).toBe(2);
+    expect((await record(d))!.tks.map(P.hex).sort()).toEqual([tk(b1), tk(b2)].map(P.hex).sort());
+    expect(await holders(b2)).toEqual([P.hex(d.ep)]);
+  });
+
+  it("an endpoint registered for another account passes to that account's QuietDO, which alone writes its bells", async () => {
+    const d = dev();
+    const [b1, b2] = bells(2);
+    const q1 = P.random(16);
+    let q2 = P.random(16);
+    while (quietShard(qk(q2), SHARDS) === quietShard(qk(q1), SHARDS)) q2 = P.random(16);
+    await sub(d, [b1], q1);
+    const k1 = kOf(d);
+    expect((await quiet(k1).entriesOf(tk(b1))).map((e) => P.hex(e.ep))).toEqual([P.hex(d.ep)]);
+    // A second account signs in on the same browser: same endpoint, another quiet tag.
+    await sub(d, [b2], q2);
+    const k2 = kOf(d);
+    expect(k2).not.toBe(k1);
+    expect(await holders(b1)).toEqual([]);
+    expect(await quiet(k1).entriesOf(tk(b1))).toEqual([]); // the old owner's cache, too
+    expect(await holders(b2)).toEqual([P.hex(d.ep)]);
+    expect((await record(d))!.qh).toEqual(qk(q2));
+    expect((await env.PUSH_KV.getWithMetadata<{ o: string }>(keyEp(d.ep))).metadata?.o).toBe(
+      P.hex(qk(q2)),
+    );
+    expect(await reaches(d, [b1])).toBe(false);
+    expect(await reaches(d, [b2])).toBe(true);
+    // The old owner never touches the record or its bells again, cached or read back after a restart.
+    await quiet(k1).drop(d.ep);
+    await restart();
+    await quiet(k1).drop(d.ep);
+    expect(await quiet(k1).expire([d.ep], dayOf(BASE) + 99)).toBe(0);
+    expect((await record(d))!.qh).toEqual(qk(q2));
+    expect(await holders(b2)).toEqual([P.hex(d.ep)]);
+    // Back to the first account; then a registration that reaches the second account's QuietDO directly (as when the
+    // Worker's read of the record was stale): that object has the first one drop the endpoint before it takes it.
+    await sub(d, [b1], q1);
+    expect(await holders(b1)).toEqual([P.hex(d.ep)]);
+    expect(await holders(b2)).toEqual([]);
+    await quiet(k2).sub(d.endpoint, d.p256dh, d.auth, [P.bellOf(b2)], q2);
+    d.quiet = q2;
+    expect(await holders(b1)).toEqual([]);
+    expect(await quiet(k1).entriesOf(tk(b1))).toEqual([]);
+    expect(await holders(b2)).toEqual([P.hex(d.ep)]);
+    expect((await record(d))!.qh).toEqual(qk(q2));
+    // A deletion without a quiet tag reaches the new owner.
+    expect((await subApi(d, [], null, {}, false)).status).toBe(204);
+    expect(await record(d)).toBeNull();
+    expect(await holders(b2)).toEqual([]);
+  });
+
   it("a restart keeps every registration: the objects read the store back", async () => {
     const d = dev();
     const b = P.random(16);
@@ -764,6 +896,47 @@ describe("POST /api/v2/ring (§10.10)", () => {
     expect(callsTo(d)).toHaveLength(2);
     expect(callsTo(d)[1].at).toBe(due);
   });
+
+  it("rings a row whose shard was sealed and paged to R2 seconds ago", async () => {
+    const d = dev();
+    const b = P.random(16);
+    await sub(d, [b]);
+    // A future era, so that nothing fires on its own: the shard runs on its own clock, the Worker's is mocked.
+    const E = P.era(Date.now()) + 30;
+    const kr = testKroute(E);
+    const row = makeRow({ E, cls: 0 });
+    const v = P.routeV(kr, row.label);
+    const i = P.shardOf(v, shardBitsOf(v2Params(env).shardMap, E));
+    const s = shardStub(env, E, i);
+    const clock = (ms: number) =>
+      runInDurableObject(s, (inst: ShardDO) => {
+        (inst as unknown as { clock: () => number }).clock = () => ms;
+      });
+    await clock(P.eraEnd(E) - 2000);
+    for (const r of await s.put(E, i, [{ v, label: row.label, cls: row.cls, body: row.body }]))
+      expect(r.s).toBe("ok");
+    const at = P.eraEnd(E) + 5000;
+    await clock(at);
+    const paged = () =>
+      runInDurableObject(s, (_inst: ShardDO, state) => {
+        const st = state.storage.sql
+          .exec<{ v: SqlStorageValue }>("SELECT v FROM meta WHERE k = 'state'")
+          .toArray()[0]?.v;
+        return st === "paged";
+      });
+    for (let k = 0; !(await paged()); k++) {
+      expect(k, "paging alarms").toBeLessThan(40);
+      expect(await runDurableObjectAlarm(s)).toBe(true);
+    }
+    fake.now = at;
+    const now = vi.spyOn(Date, "now").mockReturnValue(at);
+    try {
+      await ringApi([b], { E, label: row.label });
+    } finally {
+      now.mockRestore();
+    }
+    expect(callsTo(d)).toHaveLength(1);
+  }, 60_000);
 
   it("400 for ver 2, n 0, n 65 or a length mismatch; 413 above 1044 bytes; 429 from RL_RING; no proof of work", async () => {
     const l = { E: 1, label: P.random(16) };
@@ -948,6 +1121,38 @@ describe("the bells a push names (§9.8 `rang`)", () => {
     expect((await stateOf(d))!.rang).toEqual([]);
   });
 
+  it("a ring while a push is in flight is due after it, at the window's end, naming only its own bells", async () => {
+    await reset(BASE);
+    const d = dev();
+    const [b1, b2] = bells(2);
+    await sub(d, [b1, b2]);
+    let rung = false;
+    fake.respond = async () => {
+      // Another row rings the endpoint while the first push is out.
+      if (!rung) {
+        rung = true;
+        await ringState([b2]);
+      }
+      return new Response(null, { status: 201 });
+    };
+    await ringApi([b1]);
+    expect(callsTo(d)).toHaveLength(1);
+    expect(named(callsTo(d)[0], d)).toEqual([P.hex(P.bellOf(b1))]);
+    const sent1 = callsTo(d)[0].at;
+    const st = (await stateOf(d))!;
+    expect(st).toMatchObject({ last: sent1, due: sent1 + PUSH_WINDOW * 1000, later: null });
+    expect(st.rang.map(P.hex)).toEqual([P.hex(P.bellOf(b2))]);
+    expect(st.rows?.size).toBe(1);
+    expect(fake.queued).toEqual([{ k: kOf(d), delaySeconds: PUSH_WINDOW }]);
+    // The sender's retry of that ring changes nothing; at the window's end the second push names b2 alone.
+    fake.now = st.due!;
+    await drainQueue();
+    expect(callsTo(d)).toHaveLength(2);
+    expect(callsTo(d)[1].at).toBe(sent1 + PUSH_WINDOW * 1000);
+    expect(named(callsTo(d)[1], d)).toEqual([P.hex(P.bellOf(b2))]);
+    expect(await stateOf(d)).toMatchObject({ due: null, rang: [] });
+  });
+
   it("a push with no bell is as long as one with four", async () => {
     await reset(BASE);
     const d = dev();
@@ -1079,6 +1284,84 @@ describe("push service answers (§9.8)", () => {
   });
 });
 
+// ───────────── 8b. pushes in flight and batches ─────────────
+
+describe("pushes in flight and the batches `due` hands out (§9.8 `due`)", () => {
+  /** `n` devices of one account, each under a bell of its own: all in one QuietDO. */
+  async function account(n: number): Promise<{ ds: Dev[]; bs: Bytes[]; k: number }> {
+    const q = P.random(16);
+    const ds = Array.from({ length: n }, () => dev());
+    const bs = bells(n);
+    for (let i = 0; i < n; i++) await sub(ds[i], [bs[i]], q);
+    return { ds, bs, k: kOf(ds[0]) };
+  }
+
+  it("a push whose Worker was stopped is due again after INFLIGHT_MS, once, and the next ring there sends it", async () => {
+    await reset(BASE);
+    const { ds, bs, k } = await account(2);
+    const [d, e] = ds;
+    await ringState([bs[0]]);
+    fake.now = BASE + HOLD + DELTA * 1000;
+    // Taken by a Worker that is then stopped: nothing reports it.
+    expect((await quiet(k).due()).pushes).toHaveLength(1);
+    fake.now += INFLIGHT_MS - 1000;
+    expect((await quiet(k).due()).pushes).toHaveLength(0); // not yet given up
+    fake.now += 2000;
+    // A ring of another endpoint there: the given-up push is due again (one retry) and goes out with it.
+    await ringApi([bs[1]]);
+    expect(callsTo(d)).toHaveLength(1);
+    expect(await stateOf(d)).toMatchObject({ due: null, tries: 0, last: fake.now, inflight: null });
+    expect(callsTo(e)).toHaveLength(0); // its own push waits for the hold
+    expect(fake.queued).toEqual([
+      { k, delaySeconds: Math.ceil(((await dueOf(e))! - fake.now!) / 1000) },
+    ]);
+
+    // A retry that is taken and never reported either: dropped, its first attempt counting as its last push.
+    await reset(BASE);
+    const { ds: ds2, bs: bs2, k: k2 } = await account(1);
+    await ringState([bs2[0]]);
+    fake.now = BASE + HOLD + DELTA * 1000;
+    const first = fake.now;
+    expect((await quiet(k2).due()).pushes).toHaveLength(1);
+    fake.now += INFLIGHT_MS + 1000;
+    expect((await quiet(k2).due()).pushes).toHaveLength(1); // the retry
+    expect(await stateOf(ds2[0])).toMatchObject({ tries: 1, first });
+    fake.now += INFLIGHT_MS + 1000;
+    expect((await quiet(k2).due()).pushes).toHaveLength(0);
+    expect(await stateOf(ds2[0])).toMatchObject({
+      due: null,
+      tries: 0,
+      last: first,
+      inflight: null,
+    });
+  });
+
+  it("`due` hands out a bounded batch and says more are due; the Worker of a ring sends one round and queues the rest", async () => {
+    await reset(BASE);
+    const n = DUE_BATCH + 2;
+    const { ds, bs, k } = await account(n);
+    await ringState(bs);
+    fake.now = BASE + HOLD + DELTA * 1000;
+    const a = await quiet(k).due();
+    expect(a.pushes).toHaveLength(DUE_BATCH);
+    expect(a.next).toBe(0);
+    const b = await quiet(k).due();
+    expect(b.pushes).toHaveLength(2);
+    expect(b.next).toBeNull();
+
+    await reset(BASE);
+    const { ds: ds2, bs: bs2, k: k2 } = await account(n);
+    await ringApi(bs2);
+    expect(fake.calls).toHaveLength(IN_PLACE_BATCH);
+    expect(fake.queued).toEqual([{ k: k2, delaySeconds: 1 }]);
+    await drainQueue();
+    expect(fake.calls).toHaveLength(n);
+    for (const d of ds2) expect(callsTo(d)).toHaveLength(1);
+    expect(fake.queued).toEqual([]);
+    void ds;
+  });
+});
+
 // ───────────── 9. expiry and what is stored ─────────────
 
 describe("expiry and what is stored (§9.8)", () => {
@@ -1090,20 +1373,54 @@ describe("expiry and what is stored (§9.8)", () => {
     await sub(a, [ba]);
     fake.now = BASE + 2 * DAY;
     await sub(b, bells(1));
-    expect(await pushCleanup(env, BASE + 30 * DAY + 1000)).toEqual({ scanned: 2, expired: 0 });
-    expect(await record(a)).not.toBeNull();
-    _resetPushConfigForTests();
-    expect(await pushCleanup(envOf({ PUSH_KEY: undefined }), BASE + 31 * DAY + 1000)).toEqual({
+    expect(await pushCleanup(envOf(OVER), BASE + 30 * DAY + 1000)).toEqual({
       scanned: 2,
-      expired: 1,
+      expired: 0,
     });
+    expect(fake.queued).toEqual([]);
     _resetPushConfigForTests();
+    expect(
+      await pushCleanup(envOf({ ...OVER, PUSH_KEY: undefined }), BASE + 31 * DAY + 1000),
+    ).toEqual({ scanned: 2, expired: 1 });
+    _resetPushConfigForTests();
+    // The run names the endpoint to its owner's QuietDO through the queue, and that object deletes it.
+    expect(fake.queued).toEqual([
+      { k: kOf(a), expire: [P.hex(a.ep)], day: dayOf(BASE) + 31, delaySeconds: 0 },
+    ]);
+    expect(await record(a)).not.toBeNull();
+    await drainQueue();
     expect(await record(a)).toBeNull();
     expect(await holders(ba)).toEqual([]);
     expect(await record(b)).not.toBeNull();
-    expect(await pushCleanup(env, BASE + 33 * DAY)).toEqual({ scanned: 1, expired: 1 });
+    expect(await pushCleanup(envOf(OVER), BASE + 33 * DAY)).toEqual({ scanned: 1, expired: 1 });
+    await drainQueue();
     expect(await record(b)).toBeNull();
     expect(PUSH_EXPIRY).toBe(30);
+  });
+
+  it("the expiry checks each record again before deleting it, and a run goes on from the queue where it stopped", async () => {
+    await reset(BASE);
+    const ds = [dev(), dev(), dev(), dev()];
+    for (const d of ds) await sub(d, bells(1));
+    _setExpiryLimitsForTests({ pageSize: 1, pages: 2 });
+    try {
+      const at = BASE + 31 * DAY + 1000;
+      expect(await pushCleanup(envOf(OVER), at)).toEqual({ scanned: 2, expired: 2 });
+      // Two pages listed, the rest left to the queue: a message with the listing's cursor.
+      expect(fake.queued.filter((m) => "list" in m)).toHaveLength(1);
+      const named = fake.queued.flatMap((m) => (m.expire as string[] | undefined) ?? []);
+      expect(named).toHaveLength(2);
+      // One of them registers again before its message comes: its record is no longer expired, and it stays.
+      const kept = ds.find((d) => P.hex(d.ep) === named[0])!;
+      fake.now = at;
+      await sub(kept, bells(1));
+      for (let i = 0; i < 10 && fake.queued.length > 0; i++) await drainQueue();
+      expect(fake.queued).toEqual([]);
+      for (const d of ds)
+        expect(await record(d), P.hex(d.ep)).toEqual(d === kept ? expect.anything() : null);
+    } finally {
+      _setExpiryLimitsForTests(null);
+    }
   });
 
   it("stores records and bells only: keyed hashes, sealed boxes, no bell in the clear, nothing per ring, nothing in the objects, and logs nothing identifying", async () => {
@@ -1332,7 +1649,7 @@ describe("the QuietDO holds pushes for marks of rows seen (§9.8 `seen`)", () =>
     await ringState([b], row);
     fake.now = BASE + HOLD + DELTA * 1000;
     const k = kOf(d);
-    const due = await quiet(k).due(); // in flight now
+    const { pushes: due } = await quiet(k).due(); // in flight now
     expect(due).toHaveLength(1);
     await seen(q, [row]);
     expect(await dueOf(d)).not.toBeNull(); // not cancelled

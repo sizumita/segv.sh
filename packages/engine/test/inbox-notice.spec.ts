@@ -1,7 +1,8 @@
 // The inbox notice topic (docs/PROTOCOL.md §9.3, §10.8, §11.5): the engine watches Tinbox(E_now − 1 .. E_now + 1) on
-// its first socket, reads the inbox when a notice comes instead of polling every slot, reads once more after Δin when
-// the read did not reach the announced slot, ignores other buckets, and follows the era.
-import { describe, expect, it } from "vite-plus/test";
+// its first socket, reads the inbox when a notice comes instead of polling every slot (after a random delay of up to
+// Δin − SKEW − 2 s, one read for the notices that come meanwhile), reads once more after Δin when the read did not
+// reach the announced slot, ignores other buckets, and follows the era.
+import { describe, expect, it, vi } from "vite-plus/test";
 import * as W from "@segv/protocol/wire";
 import {
   P,
@@ -92,6 +93,42 @@ describe("inbox notices (§10.8, §11.5)", () => {
     server().tick(server().params.inboxSlot * 1000);
     await sleep(30);
     expect(inboxReads("bob").length).toBe(before + 2);
+    expect(B.getState().error).toBe("");
+  });
+
+  it("spreads the read over the slot: a delay of up to Δin − SKEW − 2 s, one read for the notices that come meanwhile", async () => {
+    server().params.inboxSlot = 10; // the production slot and skew: the delay is up to 6 s
+    server().params.skew = 2;
+    const bob = makeUser("bob");
+    const B = await engineFor(bob);
+    await settle(B);
+    const E = server().era;
+    const before = inboxReads("bob").length;
+    const closed = server().inbox.closedNow(E);
+    const random = vi.spyOn(Math, "random").mockReturnValue(0.999_999); // the longest delay: 6 000 ms
+    try {
+      server().rt.inbox(E, 0, closed);
+      await sleep(30);
+      server().rt.inbox(E, 0, closed); // a second notice while the first one's read waits
+      await sleep(30);
+      expect(inboxReads("bob").length).toBe(before);
+      server().tick(5_500); // the test clock also runs in real time: keep clear of the 6 000 ms
+      await sleep(30);
+      expect(inboxReads("bob").length).toBe(before);
+    } finally {
+      random.mockRestore();
+    }
+    server().tick(500);
+    await waitFor(() => inboxReads("bob").length === before + 1, "the read");
+    await sleep(30);
+    server().tick(server().params.inboxSlot * 1000); // the read reached the slot: no second read
+    await sleep(30);
+    expect(inboxReads("bob").length).toBe(before + 1);
+    // Once that read has started, the next notice waits for a read of its own.
+    server().rt.inbox(E, 0, closed);
+    await sleep(30);
+    server().tick(6_000);
+    await waitFor(() => inboxReads("bob").length === before + 2, "the next read");
     expect(B.getState().error).toBe("");
   });
 

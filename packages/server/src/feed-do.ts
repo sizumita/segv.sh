@@ -4,11 +4,15 @@
  * the ConnDOs.
  *
  *  - Index: topic → the ConnDOs with interest in it; per ConnDO its topics and the time of its last call.
- *  - Start: before it answers anything (blockConcurrencyWhile in the constructor), it pulls topicsFor(j) from every
- *    ConnDO c < C, 32 at a time, 5 s each; a ConnDO that fails is pulled again at the next publish, at most once a
- *    second, and gets no delivery until it answers.
+ *  - Start: at its first request it starts pulling topicsFor(j) from every ConnDO c < C in the background,
+ *    `pullConcurrency` at a time, `pullTimeoutMs` each, and answers at once with the interest known so far. A ConnDO
+ *    not pulled yet, or whose pull failed, is **pending**: a failed pull is made again at the next request, at most
+ *    once per `repullMs`. Rows and notices published while any ConnDO is pending are **held** (`holdMs`, `holdRows`,
+ *    `holdBytes`) and delivered to a ConnDO when its pull answers with their topic; a publish made while pulls are
+ *    outstanding returns once they have answered (at most `holdMs` later). Nothing blocks construction.
  *  - interest(c, added, removed) / replace(c, topics): from the ConnDOs. Interest from a ConnDO that has made no
- *    call for RT_FORGET is dropped. `c` is not bounded by C (§9.4).
+ *    call for RT_FORGET is dropped. `c` is not bounded by C (§9.4). A pull that answers after a call from the same
+ *    ConnDO arrived only adds topics (the call is newer than what the pull may have read).
  *  - publish(rows): one deliver per ConnDO with interest in a row's topic, in the order published, retried once, then
  *    dropped for that ConnDO (its clients catch up, §11.6). The ConnDO stubs come from `conns`, an instance field
  *    that tests can replace.
@@ -16,23 +20,41 @@
  *    once.
  */
 import { DurableObject } from "cloudflare:workers";
-import { BODY_LENS, hex, topicInbox } from "@segv/protocol/proto";
+import { hex, topicInbox } from "@segv/protocol/proto";
 import { v2Params } from "./env";
-import { logErr } from "./http";
-import { checkNotice, connStub, parseIndexName, type RtPublishRow } from "./types";
+import { logErr, twice, withTimeout } from "./http";
+import { checkNotice, checkRtRows, connStub, parseIndexName, type RtPublishRow } from "./types";
 
 export interface FeedLimits {
   /** RT_FORGET: interest from a ConnDO silent for this long is dropped */
   forgetMs: number;
   /** a pull (topicsFor) that has not answered within this long counts as failed */
   pullTimeoutMs: number;
-  /** pulls made at the same time when the object starts */
+  /** pulls made at the same time */
   pullConcurrency: number;
-  /** failed pulls are made again at a publish at most this often */
+  /** a failed pull is made again at a request at most this often */
   repullMs: number;
+  /** rows and notices published while a ConnDO is pending are held for it this long, */
+  holdMs: number;
+  /** at most this many of them, */
+  holdRows: number;
+  /** and at most this many bytes (rows as encoded in ROWS frames) */
+  holdBytes: number;
 }
 
-const FEED_LIMITS: Readonly<FeedLimits> = { forgetMs: 900_000, pullTimeoutMs: 5_000, pullConcurrency: 32, repullMs: 1_000 };
+const FEED_LIMITS: Readonly<FeedLimits> = {
+  forgetMs: 900_000,
+  pullTimeoutMs: 5_000,
+  pullConcurrency: 32,
+  repullMs: 1_000,
+  holdMs: 10_000,
+  holdRows: 4096,
+  holdBytes: 8 * 1024 * 1024,
+};
+
+/** Bytes of one row in a ROWS frame besides the body (§10.8), and what a held notice counts. */
+const ROW_WIRE_OVERHEAD = 47;
+const NOTICE_SIZE = 16;
 
 /** What a FeedDO calls on a ConnDO. */
 export interface ConnLink {
@@ -41,12 +63,14 @@ export interface ConnLink {
   topicsFor(j: number): Promise<Uint8Array[]>;
 }
 
-function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const late = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error("timeout")), ms);
-  });
-  return Promise.race([p, late]).finally(() => clearTimeout(timer));
+/** A row or a notice published while some ConnDO was pending, with the ConnDOs it has already gone to. */
+interface Held {
+  k: string;
+  at: number;
+  size: number;
+  sent: Set<number>;
+  row?: RtPublishRow;
+  notice?: { E: number; g: number; rel: number };
 }
 
 function checkConn(c: unknown): number {
@@ -58,21 +82,6 @@ function checkTopics(x: unknown, what: string): Uint8Array[] {
   if (!Array.isArray(x)) throw new TypeError(`${what}: bad topics`);
   for (const t of x) if (!(t instanceof Uint8Array) || t.length !== 16) throw new TypeError(`${what}: bad topic`);
   return x as Uint8Array[];
-}
-
-/** Defensive re-validation of publish() input (the Worker validates too). */
-function checkPublish(input: unknown): RtPublishRow[] {
-  if (!Array.isArray(input)) throw new TypeError("publish: bad rows");
-  return input.map((r: unknown) => {
-    const { topic, E, label, t, cls, body } = (typeof r === "object" && r !== null ? r : {}) as Record<string, unknown>;
-    if (!(topic instanceof Uint8Array) || topic.length !== 16) throw new TypeError("publish: bad topic");
-    if (!Number.isInteger(E) || (E as number) < 0 || (E as number) > 0xffff) throw new TypeError("publish: bad era");
-    if (!(label instanceof Uint8Array) || label.length !== 16) throw new TypeError("publish: bad label");
-    if (!Number.isInteger(t) || (t as number) < 0 || (t as number) > 0xffffffff) throw new TypeError("publish: bad t");
-    if (!Number.isInteger(cls) || BODY_LENS[cls as number] === undefined) throw new TypeError("publish: bad class");
-    if (!(body instanceof Uint8Array) || body.length !== BODY_LENS[cls as number]) throw new TypeError("publish: bad body");
-    return { topic, E: E as number, label, t: t as number, cls: cls as number, body };
-  });
 }
 
 export class FeedDO extends DurableObject<Env> {
@@ -90,48 +99,63 @@ export class FeedDO extends DurableObject<Env> {
   private readonly byTopic = new Map<string, Set<number>>();
   /** ConnDO → its topics (hex) and the time of its last call */
   private readonly byConn = new Map<number, { topics: Set<string>; seen: number }>();
-  /** ConnDOs whose pull failed: pulled again at the next publish. */
+  /** false until the first request starts the pull */
+  private started = false;
+  /** ConnDOs whose interest is not known: not pulled yet, or their pull failed (insertion order = pull order). */
   private readonly pending = new Set<number>();
-  private lastRepull = 0;
+  /** pulls in flight */
+  private readonly pulling = new Set<number>();
+  /** the time of each pending ConnDO's last pull attempt */
+  private readonly tried = new Map<number, number>();
+  /** pull workers running */
+  private workers = 0;
+  /** per ConnDO being pulled: the interest / replace calls received from it since its pull started */
+  private readonly calls = new Map<number, number>();
+  /** rows and notices published while a ConnDO was pending, oldest first */
+  private held: Held[] = [];
+  private heldBytes = 0;
+  /** publishes waiting for the pulls in flight to answer */
+  private readonly idleWaiters = new Set<() => void>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.j = parseIndexName(ctx.id.name, "feed");
     this.C = v2Params(env).rtConns;
-    void ctx.blockConcurrencyWhile(() => this.pullAll());
   }
 
   // ───────────── RPC from the Worker ─────────────
 
   /** §9.4 publish: one deliver per ConnDO with interest in a row's topic; retried once, then dropped for it. */
   async publish(rows: RtPublishRow[]): Promise<void> {
-    const input = checkPublish(rows);
+    const input = checkRtRows(rows, "publish");
     if (input.length === 0) return;
-    const now = this.clock();
-    this.repull(now);
-    this.expire(now);
+    const now = this.begin();
+    const holding = this.pending.size > 0;
     const per = new Map<number, RtPublishRow[]>();
     for (const r of input) {
-      const set = this.byTopic.get(hex(r.topic));
-      if (!set) continue;
-      for (const c of set) {
+      const k = hex(r.topic);
+      const set = this.byTopic.get(k);
+      for (const c of set ?? []) {
         const list = per.get(c);
         if (list) list.push(r);
         else per.set(c, [r]);
       }
+      if (holding) this.hold({ k, at: now, size: ROW_WIRE_OVERHEAD + r.body.length, sent: new Set(set), row: r });
     }
     await Promise.all([...per].map(([c, list]) => this.deliverTo(c, list)));
+    if (holding) await this.pullsAnswered();
   }
 
   /** §9.3 notice from an InboxDO: one deliverInbox per ConnDO with interest in Tinbox(E, g), made once more on failure. */
   async inbox(E: number, g: number, rel: number): Promise<void> {
     checkNotice(E, g, rel);
-    const now = this.clock();
-    this.repull(now);
-    this.expire(now);
-    const set = this.byTopic.get(hex(topicInbox(E, g)));
-    if (!set) return;
-    await Promise.all([...set].map((c) => this.twice(() => this.conns(c).deliverInbox(E, g, rel), "feed inbox failed")));
+    const now = this.begin();
+    const k = hex(topicInbox(E, g));
+    const set = this.byTopic.get(k);
+    const holding = this.pending.size > 0;
+    if (holding) this.hold({ k, at: now, size: NOTICE_SIZE, sent: new Set(set), notice: { E, g, rel } });
+    await Promise.all([...(set ?? [])].map((c) => this.inboxTo(c, E, g, rel)));
+    if (holding) await this.pullsAnswered();
   }
 
   // ───────────── RPC from the ConnDOs ─────────────
@@ -141,64 +165,176 @@ export class FeedDO extends DurableObject<Env> {
     const idx = checkConn(c);
     const add = checkTopics(added, "interest");
     const rem = checkTopics(removed, "interest");
-    const e = this.entry(idx, this.clock());
+    const now = this.begin();
+    this.called(idx);
+    const e = this.entry(idx, now);
     for (const t of rem) this.drop(idx, e, hex(t));
     for (const t of add) this.add(idx, e, hex(t));
+    if (e.topics.size === 0) this.byConn.delete(idx);
   }
 
   /** ConnDO c's full set at this FeedDO (its periodic resync, or a repair after a failed call). */
   replace(c: number, topics: Uint8Array[]): void {
-    this.set(checkConn(c), checkTopics(topics, "replace"), this.clock());
+    const idx = checkConn(c);
+    const list = checkTopics(topics, "replace");
+    const now = this.begin();
+    this.called(idx);
+    this.set(idx, list, now);
   }
 
   /** The topics a ConnDO has interest in here (tests). */
   topicsOf(c: number): string[] {
-    return [...(this.byConn.get(checkConn(c))?.topics ?? [])];
+    const idx = checkConn(c);
+    this.begin();
+    return [...(this.byConn.get(idx)?.topics ?? [])];
   }
 
   // ───────────── internals ─────────────
 
-  /** Pulls every ConnDO below C, `pullConcurrency` at a time (the constructor, before any request is answered). */
-  private async pullAll(): Promise<void> {
-    let next = 0;
-    const worker = async (): Promise<void> => {
-      while (next < this.C) await this.pull(next++);
-    };
-    await Promise.all(Array.from({ length: Math.min(this.limits.pullConcurrency, this.C) }, worker));
+  /** Every request: start the pull (the first), pull pending ConnDOs again, expire silent ones and old held rows. */
+  private begin(): number {
+    const now = this.clock();
+    if (!this.started) {
+      this.started = true;
+      for (let c = 0; c < this.C; c++) this.pending.add(c);
+    }
+    this.pump(now);
+    this.expire(now);
+    this.trimHeld(now);
+    return now;
+  }
+
+  /** Runs pull workers, up to `pullConcurrency`, while some pending ConnDO is due for a pull. */
+  private pump(now: number): void {
+    if (this.pending.size === 0) return;
+    while (this.workers < this.limits.pullConcurrency && this.nextPull(now) !== null) {
+      this.workers++;
+      void this.worker().finally(() => {
+        this.workers--;
+        this.wakeIdle();
+      });
+    }
+  }
+
+  private async worker(): Promise<void> {
+    for (let c = this.nextPull(this.clock()); c !== null; c = this.nextPull(this.clock())) await this.pull(c);
+  }
+
+  /**
+   * The first pending ConnDO that is not being pulled and was not tried within `repullMs`. A failed pull moves its
+   * ConnDO to the back of `pending`, so the scan stops at the first one never tried.
+   */
+  private nextPull(now: number): number | null {
+    for (const c of this.pending) {
+      if (this.pulling.has(c)) continue;
+      const t = this.tried.get(c);
+      if (t !== undefined && now - t < this.limits.repullMs) continue;
+      return c;
+    }
+    return null;
+  }
+
+  /** Counts a call from ConnDO c while its pull is in flight. */
+  private called(c: number): void {
+    const n = this.calls.get(c);
+    if (n !== undefined) this.calls.set(c, n + 1);
   }
 
   private async pull(c: number): Promise<void> {
+    this.pulling.add(c);
+    this.tried.set(c, this.clock());
+    this.calls.set(c, 0);
     try {
       const topics = checkTopics(await withTimeout(this.conns(c).topicsFor(this.j), this.limits.pullTimeoutMs), "pull");
-      this.set(c, topics, this.clock());
+      const now = this.clock();
+      if (this.calls.get(c) === 0) this.set(c, topics, now);
+      else {
+        // A call from c came in while the pull was on its way and may be newer than what the pull read: add only.
+        const e = this.entry(c, now);
+        for (const t of topics) this.add(c, e, hex(t));
+        if (e.topics.size === 0) this.byConn.delete(c);
+      }
       this.pending.delete(c);
+      this.tried.delete(c);
+      await this.flushHeld(c);
     } catch (e) {
-      this.pending.add(c);
+      this.pending.delete(c);
+      this.pending.add(c); // to the back: the ConnDOs never tried come first
       console.error(JSON.stringify({ msg: "feed pull failed", error: logErr(e) }));
-    }
-  }
-
-  /** Pulls the ConnDOs whose pull failed, at most once per `repullMs`, without holding up the publish. */
-  private repull(now: number): void {
-    if (this.pending.size === 0 || now - this.lastRepull < this.limits.repullMs) return;
-    this.lastRepull = now;
-    for (const c of this.pending) void this.pull(c);
-  }
-
-  private deliverTo(c: number, rows: RtPublishRow[]): Promise<void> {
-    return this.twice(() => this.conns(c).deliver(rows), "feed deliver failed");
-  }
-
-  /** A ConnDO call, made once more when it fails, then given up (its clients catch up, §11.6). */
-  private async twice(call: () => Promise<void>, msg: string): Promise<void> {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        await call();
-        return;
-      } catch (e) {
-        if (attempt === 1) console.error(JSON.stringify({ msg, error: logErr(e) }));
+    } finally {
+      this.pulling.delete(c);
+      this.calls.delete(c);
+      if (this.pending.size === 0) {
+        this.held = [];
+        this.heldBytes = 0;
       }
     }
+  }
+
+  /** Keeps a row or notice for the pending ConnDOs. */
+  private hold(h: Held): void {
+    this.held.push(h);
+    this.heldBytes += h.size;
+    this.trimHeld(h.at);
+  }
+
+  /** Drops held rows older than `holdMs` and beyond `holdRows` / `holdBytes`, oldest first. */
+  private trimHeld(now: number): void {
+    const L = this.limits;
+    let n = 0;
+    while (n < this.held.length) {
+      const h = this.held[n];
+      if (now - h.at <= L.holdMs && this.held.length - n <= L.holdRows && this.heldBytes <= L.holdBytes) break;
+      this.heldBytes -= h.size;
+      n++;
+    }
+    if (n > 0) this.held.splice(0, n);
+  }
+
+  /** Delivers to ConnDO c, whose pull just answered, the held rows and notices of its topics it has not had. */
+  private async flushHeld(c: number): Promise<void> {
+    this.trimHeld(this.clock());
+    const e = this.byConn.get(c);
+    if (!e) return;
+    const rows: RtPublishRow[] = [];
+    const notices: { E: number; g: number; rel: number }[] = [];
+    for (const h of this.held) {
+      if (h.sent.has(c) || !e.topics.has(h.k)) continue;
+      h.sent.add(c);
+      if (h.row) rows.push(h.row);
+      if (h.notice) notices.push(h.notice);
+    }
+    await Promise.all([
+      ...(rows.length > 0 ? [this.deliverTo(c, rows)] : []),
+      ...notices.map((n) => this.inboxTo(c, n.E, n.g, n.rel)),
+    ]);
+  }
+
+  /** Resolves once no pull is in flight, or `holdMs` from now. */
+  private pullsAnswered(): Promise<void> {
+    if (this.workers === 0) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const done = (): void => {
+        clearTimeout(timer);
+        this.idleWaiters.delete(done);
+        resolve();
+      };
+      const timer = setTimeout(done, this.limits.holdMs);
+      this.idleWaiters.add(done);
+    });
+  }
+
+  private wakeIdle(): void {
+    if (this.workers > 0) return;
+    for (const done of this.idleWaiters) done(); // each one removes itself: a Set allows that while iterating
+  }
+
+  private deliverTo(c: number, rows: RtPublishRow[]): Promise<boolean> {
+    return twice(() => this.conns(c).deliver(rows), "feed deliver failed");
+  }
+
+  private inboxTo(c: number, E: number, g: number, rel: number): Promise<boolean> {
+    return twice(() => this.conns(c).deliverInbox(E, g, rel), "feed inbox failed");
   }
 
   private entry(c: number, now: number): { topics: Set<string>; seen: number } {

@@ -11,30 +11,35 @@
  *    "ping" auto-answered since (the runtime keeps the time of the last auto-answer), closed with 4001.
  *  - In memory: `boot` (8 random bytes per construction) and `seq` (u64 per boot); a mirror of the attachments with
  *    an index 8-byte topic prefix → sockets (full 16-byte compare on delivery), the (topic, socket) pair count and,
- *    per FeedDO, the interest (the distinct topics with their socket counts), all rebuilt lazily after a wake; a
- *    ring of the last 10 min / 8192 rows / 16 MiB of delivered rows for RESUME.
+ *    per FeedDO, the interest (the distinct topics with their socket counts and the seq at which each entered it),
+ *    all rebuilt lazily after a wake; a ring of the last 10 min / 8192 rows / 16 MiB of delivered rows for RESUME.
+ *  - Linger: a topic whose last socket gives it up stays in the interest for `lingerMs` (rows for it keep arriving
+ *    and enter the ring), so that a client that reconnects within it is replayed what it missed; it is then
+ *    withdrawn, and `seq` is advanced past the withdrawal.
  *  - webSocketMessage(): "ping" (normally auto-answered), SUB / UNSUB / RESUME. Anything else, or a limit
  *    exceeded, closes with 1008; a SUB beyond the global pair budget closes with 1013.
  *  - Interest (§9.4): a change of the distinct-topic set at a FeedDO is reported with interest(c, added, removed),
- *    the calls to one FeedDO made one after the other; every RT_RESYNC while any socket has a topic, and after a
+ *    the calls to one FeedDO made one after the other; every RT_RESYNC while the interest is not empty, and after a
  *    failed call (1 s, doubling to 60 s), replace(c, topics) with the full set; topicsFor(j) answers the full set to
  *    a FeedDO that starts. The calls go through `feeds`, an instance field that tests can replace.
- *  - RESUME: GAP(since) unless the boot is current, `since` ≤ the last assigned seq and the ring still holds every
- *    row after it; also GAP when the rows to replay exceed `replayBytes` (the client catches up instead).
+ *  - RESUME: GAP(since) unless the boot is current, `since` ≤ the last assigned seq, the ring still holds every
+ *    row after it, and every topic of the RESUME was in the interest (held or lingering) since a seq ≤ `since`;
+ *    also GAP when the rows to replay exceed `replayBytes` (the client catches up instead).
  *  - deliver(): from a FeedDO: assigns seqs, appends to the ring, sends one ROWS frame per subscribed socket;
- *    sockets that get the same rows share one encoding.
+ *    sockets that get the same rows share one encoding. A row whose topic is not in the interest has its topic
+ *    withdrawn again at its FeedDO (a stale entry there).
  *  - deliverInbox(): from a FeedDO (§9.3): one INBOX frame to each socket subscribed to Tinbox(E, g); no seq, no ring,
  *    no replay.
  *  - Sockets older than 1 h are closed with 4000 (hour tags older than the previous hour whenever sockets are
  *    counted or sent to, and the exact age before sending).
  */
 import { DurableObject } from "cloudflare:workers";
-import { BODY_LENS, byteCmp, equalBytes, feedBits, feedHash, feedOf, hex, topicInbox } from "@segv/protocol/proto";
+import { byteCmp, equalBytes, feedBits, feedHash, feedOf, hex, topicInbox } from "@segv/protocol/proto";
 import { RT_MAX_CLIENT_FRAME, RT_MAX_TOPICS, decodeClientFrame, encodeServerFrame, type ClientFrame, type RtRow } from "@segv/protocol/wire";
 import { AlarmSlot } from "./batch";
 import { serverKeys, v2Params } from "./env";
 import { logErr } from "./http";
-import { checkNotice, feedStub, parseIndexName, type RtPublishRow } from "./types";
+import { checkNotice, checkRtRows, feedStub, parseIndexName, type RtPublishRow } from "./types";
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 3_600_000;
@@ -75,7 +80,9 @@ export interface RtLimits {
   ringBytes: number;
   /** a RESUME whose replay would exceed this many bytes (rows as encoded in ROWS frames) gets GAP instead */
   replayBytes: number;
-  /** RT_RESYNC: the full interest set is sent to every FeedDO this often while any socket has a topic */
+  /** RT_LINGER: a topic that loses its last socket stays in the interest this long before it is withdrawn */
+  lingerMs: number;
+  /** RT_RESYNC: the full interest set is sent to every FeedDO this often while the interest is not empty */
   resyncMs: number;
   /** the first retry after a failed FeedDO call comes this soon, */
   retryMinMs: number;
@@ -97,6 +104,7 @@ const RT_LIMITS: Readonly<RtLimits> = {
   ringRows: 8192,
   ringBytes: 16 * 1024 * 1024,
   replayBytes: 2 * 1024 * 1024,
+  lingerMs: 120_000,
   resyncMs: 300_000,
   retryMinMs: 1_000,
   retryMaxMs: 60_000,
@@ -136,6 +144,15 @@ interface TopicList {
 
 /** The added and removed topics per FeedDO after a change of this object's distinct-topic set. */
 type Deltas = Map<number, { added: Uint8Array[]; removed: Uint8Array[] }>;
+
+/** A topic of the interest at one FeedDO. */
+interface Interest {
+  t: Uint8Array;
+  /** open sockets that hold it; 0 while it lingers */
+  n: number;
+  /** the seq at which it entered the interest: every row on it with a higher seq was delivered here */
+  from: number;
+}
 
 interface RingRow extends RtRow {
   /** delivery time (ms) */
@@ -240,21 +257,6 @@ function readAtt(ws: WebSocket): Att | null {
   }
 }
 
-/** Defensive re-validation of deliver() input (the Worker and the FeedDO validate too). */
-function checkRows(input: unknown): RtPublishRow[] {
-  if (!Array.isArray(input)) throw new TypeError("deliver: bad rows");
-  return input.map((r: unknown) => {
-    const { topic, E, label, t, cls, body } = (typeof r === "object" && r !== null ? r : {}) as Record<string, unknown>;
-    if (!(topic instanceof Uint8Array) || topic.length !== 16) throw new TypeError("deliver: bad topic");
-    if (!Number.isInteger(E) || (E as number) < 0 || (E as number) > 0xffff) throw new TypeError("deliver: bad era");
-    if (!(label instanceof Uint8Array) || label.length !== 16) throw new TypeError("deliver: bad label");
-    if (!Number.isInteger(t) || (t as number) < 0 || (t as number) > 0xffffffff) throw new TypeError("deliver: bad t");
-    if (!Number.isInteger(cls) || BODY_LENS[cls as number] === undefined) throw new TypeError("deliver: bad class");
-    if (!(body instanceof Uint8Array) || body.length !== BODY_LENS[cls as number]) throw new TypeError("deliver: bad body");
-    return { topic, E: E as number, label, t: t as number, cls: cls as number, body };
-  });
-}
-
 function deltaOf(d: Deltas, j: number): { added: Uint8Array[]; removed: Uint8Array[] } {
   let x = d.get(j);
   if (!x) d.set(j, (x = { added: [], removed: [] }));
@@ -291,8 +293,17 @@ export class ConnDO extends DurableObject<Env> {
   private pairs = 0;
   /** accept hours that may still have sockets (null until enumerated after a wake) */
   private hours: Set<number> | null = null;
-  /** Per FeedDO j: topic (hex) → the topic and the number of open sockets that hold it (the interest, §9.4). */
-  private readonly interest = new Map<number, Map<string, { t: Uint8Array; n: number }>>();
+  /**
+   * Per FeedDO j: topic (hex) → the topic, the number of open sockets that hold it (0 while it lingers) and `from`,
+   * the seq at which it entered the interest (the interest, §9.4).
+   */
+  private readonly interest = new Map<number, Map<string, Interest>>();
+  /** Every topic (hex) of the interest → its FeedDO j. */
+  private readonly where = new Map<string, number>();
+  /** Lingering topics (hex) → their FeedDO and the time they are withdrawn, in the order they began to linger. */
+  private readonly lingering = new Map<string, { j: number; until: number }>();
+  /** the next RT_RESYNC is due at this time (0: at the next alarm) */
+  private resyncAt = 0;
   /** Per FeedDO: the chain of its calls (one after the other, in order). */
   private readonly queue = new Map<number, Promise<void>>();
   /** FeedDOs at which a failed call left a change unreported: they get the full set at the next alarm. */
@@ -399,9 +410,10 @@ export class ConnDO extends DurableObject<Env> {
       const next = listOf(f.topics.map((t) => this.entry(t)));
       if (countOf(next.topics) > L.topics) return this.drop(ws, 1008, "too many topics");
       if (this.pairs - countOf(att.topics) + countOf(next.topics) > L.pairs) return this.drop(ws, 1013, "subscription budget exhausted");
+      const covered = this.coveredSince(entriesOf(next), f.since); // before the RESUME's own topics enter the interest
       this.report(this.setTopics(ws, att, next));
       if (!this.save(ws, att)) return;
-      this.replay(ws, att, f.boot, f.since, now);
+      this.replay(ws, att, f.boot, f.since, covered, now);
       return;
     }
 
@@ -442,11 +454,13 @@ export class ConnDO extends DurableObject<Env> {
   /**
    * RESUME: replay ring rows with seq > since on the socket's topics, then RESUMED. GAP(since) when the ring cannot
    * cover it (another boot, rows after `since` evicted, or a `since` above the last assigned seq, e.g. one kept from
-   * another boot), or when the replay would exceed `replayBytes`: the client then catches up (§11.6) instead.
+   * another boot), when a topic of the RESUME was not in the interest all along since `since` (`covered` false: rows
+   * on it may never have reached this object), or when the replay would exceed `replayBytes`: the client then
+   * catches up (§11.6) instead.
    */
-  private replay(ws: WebSocket, att: Att, boot: Uint8Array, since: number, now: number): void {
+  private replay(ws: WebSocket, att: Att, boot: Uint8Array, since: number, covered: boolean, now: number): void {
     this.trimRing(now);
-    let gap = !equalBytes(boot, this.boot) || since < this.evicted || since > this.seq;
+    let gap = !equalBytes(boot, this.boot) || since < this.evicted || since > this.seq || !covered;
     const rows: RingRow[] = [];
     let bytes = 0;
     for (let i = this.ringStart; i < this.ring.length && !gap; i++) {
@@ -467,18 +481,19 @@ export class ConnDO extends DurableObject<Env> {
    * distinct row list is encoded once and its bytes are sent to every socket that gets it.
    */
   async deliver(rows: RtPublishRow[]): Promise<void> {
-    const input = checkRows(rows);
+    const input = checkRtRows(rows, "deliver");
     if (input.length === 0) return;
     const now = this.clock();
+    this.sweep(now); // a linger that ended is withdrawn (and numbered) before these rows
+    const socks = this.mirror();
     const out: RingRow[] = input.map((r) => ({ seq: ++this.seq, ...r, at: now, size: ROW_WIRE_OVERHEAD + r.body.length }));
     for (const r of out) {
       this.ring.push(r);
       this.ringSize += r.size;
     }
     this.trimRing(now);
+    this.withdrawStale(input.map((r) => r.topic));
 
-    this.sweep(now);
-    const socks = this.mirror();
     const per = new Map<WebSocket, RingRow[]>();
     for (const r of out) {
       const cands = this.index.get(prefixOf(r.topic));
@@ -515,6 +530,7 @@ export class ConnDO extends DurableObject<Env> {
     const now = this.clock();
     this.sweep(now);
     const socks = this.mirror();
+    this.withdrawStale([T]);
     const cands = this.index.get(prefixOf(T));
     if (cands) {
       const frame = encodeServerFrame({ f: "inbox", E, g, rel });
@@ -550,7 +566,7 @@ export class ConnDO extends DurableObject<Env> {
 
   // ───────────── interest (§9.4) ─────────────
 
-  /** The distinct topics of the open sockets at FeedDO j (RPC from a FeedDO that starts). */
+  /** The distinct topics of the open sockets at FeedDO j, lingering ones included (RPC from a FeedDO that starts). */
   topicsFor(j: number): Uint8Array[] {
     if (!Number.isInteger(j) || j < 0) throw new TypeError("topicsFor: bad feed");
     this.mirror();
@@ -558,20 +574,26 @@ export class ConnDO extends DurableObject<Env> {
   }
 
   /**
-   * Every RT_RESYNC while any socket has a topic, and after a failed call: the full set to every FeedDO at which this
-   * object has topics, and to every FeedDO a failed call left behind (§9.4).
+   * Every RT_RESYNC while the interest is not empty, and after a failed call: the full set to every FeedDO at which
+   * this object has topics, and to every FeedDO a failed call left behind (§9.4). An alarm that fires only for a
+   * linger that ended withdraws it and sends nothing else.
    */
   async alarm(): Promise<void> {
     this.alarmSlot.fired();
     const now = this.clock();
-    this.sweep(now);
     this.mirror();
-    const js = new Set([...this.interest.keys(), ...this.dirty]);
-    this.dirty.clear();
-    for (const j of js) this.enqueue(j, () => this.feeds.replace(j, this.c, this.topicsFor(j)));
+    this.sweep(now);
+    const resync = this.dirty.size > 0 || now >= this.resyncAt;
+    if (resync) {
+      const js = new Set([...this.interest.keys(), ...this.dirty]);
+      this.dirty.clear();
+      for (const j of js) this.enqueue(j, () => this.feeds.replace(j, this.c, this.topicsFor(j)));
+      this.resyncAt = now + this.limits.resyncMs;
+    }
     await this.settle();
     if (this.dirty.size === 0) this.retryMs = 0;
-    if (this.interest.size > 0) this.alarmSlot.arm(now + this.limits.resyncMs);
+    if (this.interest.size > 0) this.alarmSlot.arm(this.resyncAt);
+    this.armLinger();
   }
 
   /** Waits for every FeedDO call made so far (handlers end with it, so the object stays up until they are answered). */
@@ -588,7 +610,10 @@ export class ConnDO extends DurableObject<Env> {
     return feedOf(h, this.fbits);
   }
 
-  /** Counts a socket's hold on a topic; true when it is the first (the topic enters the interest). */
+  /**
+   * Counts a socket's hold on a topic; true when it is the first (the topic enters the interest, from the current
+   * seq). A lingering topic is held again without a change at its FeedDO.
+   */
   private hold(e: Entry): boolean {
     const j = this.jOf(e.h);
     let m = this.interest.get(j);
@@ -596,33 +621,92 @@ export class ConnDO extends DurableObject<Env> {
     const k = hex(e.t);
     const cur = m.get(k);
     if (cur) {
-      cur.n++;
+      if (cur.n++ === 0) this.lingering.delete(k);
       return false;
     }
-    m.set(k, { t: e.t.slice(), n: 1 });
+    m.set(k, { t: e.t.slice(), n: 1, from: this.seq });
+    this.where.set(k, j);
     return true;
   }
 
-  /** Releases a socket's hold on a topic; true when it was the last (the topic leaves the interest). */
-  private release(e: Entry): boolean {
-    const j = this.jOf(e.h);
-    const m = this.interest.get(j);
+  /** Releases a socket's hold on a topic; the last one leaves it lingering until `lingerMs` from now. */
+  private release(e: Entry): void {
+    const m = this.interest.get(this.jOf(e.h));
     const k = hex(e.t);
     const cur = m?.get(k);
-    if (!m || !cur) return false;
-    if (--cur.n > 0) return false;
-    m.delete(k);
-    if (m.size === 0) this.interest.delete(j);
+    if (!cur || cur.n === 0) return;
+    if (--cur.n > 0) return;
+    this.lingering.set(k, { j: this.jOf(e.h), until: this.clock() + this.limits.lingerMs });
+  }
+
+  /**
+   * Withdraws into `d` every lingering topic whose time is up. `seq` is advanced past the withdrawal, so that a
+   * topic that enters the interest again starts above every `since` from before it (§10.8 RESUME).
+   */
+  private withdrawDue(now: number, d: Deltas): void {
+    let any = false;
+    for (const [k, x] of this.lingering) {
+      if (x.until > now) break; // in the order they began to linger
+      this.lingering.delete(k);
+      const m = this.interest.get(x.j);
+      const cur = m?.get(k);
+      if (!m || !cur) continue;
+      m.delete(k);
+      if (m.size === 0) this.interest.delete(x.j);
+      this.where.delete(k);
+      deltaOf(d, x.j).removed.push(cur.t);
+      any = true;
+    }
+    if (any) this.seq++;
+  }
+
+  /**
+   * Topics of rows or notices that arrived although they are not in the interest (an entry the FeedDO kept: from
+   * before a wake, or re-added by a late pull) are withdrawn there again. Nothing is numbered: they were not held.
+   */
+  private withdrawStale(topics: Uint8Array[]): void {
+    const d: Deltas = new Map();
+    const seen = new Set<string>();
+    for (const t of topics) {
+      const k = hex(t);
+      if (this.where.has(k) || seen.has(k)) continue;
+      seen.add(k);
+      deltaOf(d, this.jOf(feedHash(this.kfeed, t))).removed.push(t.slice());
+    }
+    if (d.size > 0) this.report(d);
+  }
+
+  /** Whether every topic was in the interest (held or lingering) from a seq at or below `since`. */
+  private coveredSince(entries: Entry[], since: number): boolean {
+    for (const e of entries) {
+      const cur = this.interest.get(this.jOf(e.h))?.get(hex(e.t));
+      if (!cur || cur.from > since) return false;
+    }
     return true;
   }
 
-  /** Sends the deltas of a change to their FeedDOs (one call at a time per FeedDO) and keeps the resync alarm armed. */
-  private report(d: Deltas): void {
+  /**
+   * Withdraws the lingers that ended, sends the deltas to their FeedDOs (one call at a time per FeedDO), and keeps
+   * the resync alarm and the linger alarm armed.
+   */
+  private report(d: Deltas = new Map()): void {
+    const now = this.clock();
+    this.withdrawDue(now, d);
     for (const [j, { added, removed }] of d) {
       if (added.length === 0 && removed.length === 0) continue;
       this.enqueue(j, () => this.feeds.interest(j, this.c, added, removed));
     }
-    if (this.interest.size > 0) this.alarmSlot.arm(this.clock() + this.limits.resyncMs);
+    if (this.interest.size > 0) this.alarmSlot.arm(this.resyncAt > now ? this.resyncAt : now + this.limits.resyncMs);
+    this.armLinger();
+  }
+
+  /**
+   * Arms the alarm for the first linger to end, a quarter of `lingerMs` late at most, so that the withdrawals of
+   * sockets that closed close together share one alarm.
+   */
+  private armLinger(): void {
+    const first = this.lingering.values().next();
+    if (!first.done) this.alarmSlot.arm(first.value.until + Math.floor(this.limits.lingerMs / 4));
   }
 
   /** Appends a call to FeedDO j's chain; a failure marks j dirty and arms the retry alarm. */
@@ -666,6 +750,7 @@ export class ConnDO extends DurableObject<Env> {
       for (const ws of this.ctx.getWebSockets(`h:${x}`)) this.drop(ws, 4000, "max age");
       this.hours.delete(x);
     }
+    if (this.lingering.size > 0) this.report(); // lingers that ended are withdrawn
   }
 
   /**
@@ -689,6 +774,8 @@ export class ConnDO extends DurableObject<Env> {
     this.socks = socks;
     this.index.clear();
     this.interest.clear();
+    this.where.clear();
+    this.lingering.clear();
     this.pairs = 0;
     for (const ws of this.ctx.getWebSockets()) {
       if (ws.readyState !== WebSocket.OPEN) continue;
@@ -757,7 +844,7 @@ export class ConnDO extends DurableObject<Env> {
     att.topics = next.topics;
     att.feeds = next.feeds;
     const d: Deltas = new Map();
-    for (const e of removed) if (this.release(e)) deltaOf(d, this.jOf(e.h)).removed.push(e.t.slice());
+    for (const e of removed) this.release(e);
     for (const e of added) if (this.hold(e)) deltaOf(d, this.jOf(e.h)).added.push(e.t.slice());
     return d;
   }

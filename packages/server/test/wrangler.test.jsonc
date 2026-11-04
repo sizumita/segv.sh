@@ -62,12 +62,11 @@
     { "tag": "v2", "new_sqlite_classes": ["PushDO"] },
     {
       "tag": "v3",
-      "new_sqlite_classes": ["ConnDO", "FeedDO", "BellDO", "QuietDO"],
+      "new_sqlite_classes": ["ConnDO", "FeedDO", "QuietDO"],
       "deleted_classes": ["RealtimeDO", "PushDO"],
     },
     { "tag": "v4", "new_sqlite_classes": ["DirSeqDO"] },
     { "tag": "v5", "new_sqlite_classes": ["KeyDO"] },
-    { "tag": "v6", "deleted_classes": ["BellDO"] },
   ],
   "ratelimits": [
     { "name": "RL_WRITE", "namespace_id": "1001", "simple": { "limit": 60, "period": 60 } },

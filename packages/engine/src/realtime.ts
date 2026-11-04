@@ -41,6 +41,8 @@ export class Realtime {
   private stopped = true;
   private boot: Bytes | null = null;
   private seq = 0;
+  /** the seq of the open socket's HELLO */
+  private helloSeq = 0;
   /** topics wanted, by b64u */
   private readonly want = new Map<string, Bytes>();
   /** topics the server has for the open socket */
@@ -299,6 +301,7 @@ export class Realtime {
         const fresh = !this.boot || !P.equalBytes(this.boot, f.boot);
         this.h.onHello(f.now, this.openedAt, this.clock.mono());
         if (fresh) this.seq = f.seq;
+        this.helloSeq = f.seq;
         this.boot = f.boot;
         return;
       }
@@ -307,6 +310,8 @@ export class Realtime {
         this.h.onRows(f.rows);
         return;
       case "gap":
+        // The catch-up this GAP starts covers every row before it: the next RESUME may start at this socket's HELLO.
+        this.seq = this.helloSeq;
         this.h.onMissed();
         this.sync();
         return;

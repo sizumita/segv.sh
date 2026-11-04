@@ -609,7 +609,7 @@ describe("ShardDO identity and alarms", () => {
     await runInDurableObject(stub(E), async (inst: ShardDO) => {
       await expect(inst.put(E + 1, 0, [])).rejects.toThrow();
       await expect(inst.put(E, 1, [])).rejects.toThrow();
-      expect(() => inst.get(E - 1, 0, [])).toThrow();
+      await expect(inst.get(E - 1, 0, [])).rejects.toThrow();
       expect(() => inst.head(E, 1)).toThrow();
       expect(() => inst.feedBatches(E + 1, 0, 0, 1)).toThrow();
       expect(() => inst.feedBatches(E, 0, -1, 1)).toThrow(RangeError);
@@ -745,51 +745,106 @@ function vFor(i: number, bits: number): Uint8Array {
 }
 
 describe("ShardDO shard map (§9.1)", () => {
-  it("pins s_E at the first write and refuses keys that route to another shard; a changed SHARD_MAP cannot move the pin", async () => {
+  /** Sets shard i's clock and its deployment's s_E (SHARD_MAP). */
+  const set = (E: number, i: number, bits: number, ms: number) =>
+    runInDurableObject(shardStub(env, E, i), (inst: ShardDO) => {
+      const x = inst as unknown as Internals & { shardBits: number };
+      x.clock = () => ms;
+      x.shardBits = bits;
+    });
+  const pinOf = (E: number, i: number) =>
+    runInDurableObject(shardStub(env, E, i), (_inst: ShardDO, state) => metaOf(state, "sbits"));
+
+  it("pins s_E at the first write (and in shard 0 for the era), refuses keys that route to another shard, and refuses a changed SHARD_MAP", async () => {
     const E = freshEra();
     const i = 2;
     const s = shardStub(env, E, i);
-    const set = (bits: number, ms: number) =>
-      runInDurableObject(s, (inst: ShardDO) => {
-        const x = inst as unknown as Internals & { shardBits: number };
-        x.clock = () => ms;
-        x.shardBits = bits;
-      });
     const mine = (): ShardPutRow => ({ ...row(), v: vFor(2, 2) });
     const other: ShardPutRow = { ...row(), v: vFor(1, 2) };
-    await set(2, at(E, 100));
-    expect(
-      await runInDurableObject(s, (_inst: ShardDO, state) => metaOf(state, "sbits")),
-    ).toBeNull();
+    await set(E, i, 2, at(E, 100));
+    expect(await pinOf(E, i)).toBeNull();
+    expect(await pinOf(E, 0)).toBeNull();
     expect((await s.put(E, i, [mine()]))[0].s).toBe("ok");
-    expect(await runInDurableObject(s, (_inst: ShardDO, state) => metaOf(state, "sbits"))).toBe(2);
+    expect(await pinOf(E, i)).toBe(2);
+    expect(await pinOf(E, 0)).toBe(2); // shard 0 holds the era's count, though it has no row
     await runInDurableObject(s, async (inst: ShardDO) => {
       await expect(inst.put(E, i, [other])).rejects.toThrow(/another shard/);
-      expect(() => inst.get(E, i, [{ v: other.v, label: other.label, mode: 1 }])).toThrow(
+      await expect(inst.get(E, i, [{ v: other.v, label: other.label, mode: 1 }])).rejects.toThrow(
         /another shard/,
       );
       // A malformed key is BAD / MISS, never a routing error; a refused put stores nothing.
       expect((await inst.put(E, i, [{ ...mine(), v: P.random(7) }]))[0].s).toBe("bad");
-      expect(inst.get(E, i, [{ v: P.random(7), label: P.random(16), mode: 1 }])[0].s).toBe("miss");
+      expect((await inst.get(E, i, [{ v: P.random(7), label: P.random(16), mode: 1 }]))[0].s).toBe(
+        "miss",
+      );
     });
     expect((await s.get(E, i, [{ v: mine().v, label: P.random(16), mode: 1 }]))[0].s).toBe("miss");
-    // The deployment raises the count mid-era (an operator error): the pin wins, logged once per instance.
-    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
-    try {
-      await evictDurableObject(s);
-      await set(3, at(E, 200));
-      expect((await s.put(E, i, [mine()]))[0].s).toBe("ok"); // routes to 2 under the pinned 2 bits
-      await runInDurableObject(s, async (inst: ShardDO) => {
-        // Shard 2 under 3 bits is shard 1 under the pinned 2 bits: refused.
-        expect(() => inst.get(E, i, [{ v: vFor(2, 3), label: P.random(16), mode: 1 }])).toThrow(
-          /another shard/,
-        );
-      });
-      const logged = errors.mock.calls.filter((c) => String(c[0]).includes("SHARD_MAP"));
-      expect(logged).toHaveLength(1);
-    } finally {
-      errors.mockRestore();
-    }
+    // The deployment raises the count mid-era (an operator error): every read and write of the shard is refused.
+    await evictDurableObject(s);
+    await set(E, i, 3, at(E, 200));
+    await runInDurableObject(s, async (inst: ShardDO) => {
+      await expect(inst.put(E, i, [mine()])).rejects.toThrow(/SHARD_MAP/);
+      await expect(
+        inst.get(E, i, [{ v: vFor(4, 3), label: P.random(16), mode: 1 }]),
+      ).rejects.toThrow(/SHARD_MAP/);
+      expect(() => inst.feedBatches(E, i, 0, 1 << 20)).toThrow(/SHARD_MAP/);
+      // head() still answers (the checkpoint and the sweep), under the pin.
+      expect(inst.head(E, i).sealed).toBe(false);
+    });
+    // The same deployment as the pin works again.
+    await set(E, i, 2, at(E, 300));
+    expect((await s.put(E, i, [mine()]))[0].s).toBe("ok");
+  });
+
+  it("shard 0 pinned at one shard answers 503 under a map of two, and so does a fresh shard 1 (shard 0 holds the count)", async () => {
+    const E = freshEra();
+    await set(E, 0, 0, at(E, 10));
+    expect((await stub(E).put(E, 0, [row()]))[0].s).toBe("ok"); // every key routes to shard 0 under s_E = 0
+    expect(await pinOf(E, 0)).toBe(0);
+    // SHARD_MAP raised to two shards for the era (the raise from the default S = 1).
+    await set(E, 0, 1, at(E, 20));
+    await set(E, 1, 1, at(E, 20));
+    await runInDurableObject(stub(E), async (inst: ShardDO) => {
+      // Keys that route to shard 0 under the new map are refused (the Worker answers 503 storage unavailable) …
+      await expect(inst.put(E, 0, [{ ...row(), v: vFor(0, 1) }])).rejects.toThrow(/SHARD_MAP/);
+      await expect(
+        inst.get(E, 0, [{ v: vFor(0, 1), label: P.random(16), mode: 1 }]),
+      ).rejects.toThrow(/SHARD_MAP/);
+    });
+    // … and so are those that route to the fresh shard 1: it asks shard 0 for the era's count before answering.
+    await runInDurableObject(shardStub(env, E, 1), async (inst: ShardDO) => {
+      await expect(
+        inst.get(E, 1, [{ v: vFor(1, 1), label: P.random(16), mode: 1 }]),
+      ).rejects.toThrow(/SHARD_MAP/);
+      await expect(inst.put(E, 1, [{ ...row(), v: vFor(1, 1) }])).rejects.toThrow(/SHARD_MAP/);
+    });
+    expect(await pinOf(E, 1)).toBeNull(); // nothing stored
+    expect(await pinOf(E, 0)).toBe(0);
+  });
+
+  it("a shard > 0 asks shard 0 only from the accept window on; before it, nothing is pinned", async () => {
+    const E = freshEra();
+    const s1 = shardStub(env, E, 1);
+    await set(E, 1, 1, P.eraStart(E) - 60_000);
+    expect((await s1.get(E, 1, [{ v: vFor(1, 1), label: P.random(16), mode: 1 }]))[0].s).toBe(
+      "miss",
+    );
+    expect((await s1.put(E, 1, [{ ...row(), v: vFor(1, 1) }]))[0].s).toBe("wrong_era");
+    expect(await pinOf(E, 0)).toBeNull();
+    await set(E, 1, 1, at(E, 5));
+    expect((await s1.get(E, 1, [{ v: vFor(1, 1), label: P.random(16), mode: 1 }]))[0].s).toBe(
+      "miss",
+    );
+    expect(await pinOf(E, 0)).toBe(1); // the first get of the window pinned the era's count
+    expect(await pinOf(E, 1)).toBeNull();
+    await runInDurableObject(stub(E), (inst: ShardDO) => {
+      expect(() => inst.pinShards(E, 0, 2)).not.toThrow();
+      expect(inst.pinShards(E, 0, 2)).toBe(1); // the pin wins
+      expect(() => inst.pinShards(E, 0, 17)).toThrow(RangeError);
+    });
+    await runInDurableObject(s1, (inst: ShardDO) => {
+      expect(() => inst.pinShards(E, 1, 1)).toThrow(/shard 0/);
+    });
   });
 });
 
@@ -988,7 +1043,7 @@ describe('ShardDO paging (§9.1 "Paging")', () => {
       expect(state.storage.sql.databaseSize).toBeLessThan(256 * 1024);
       expect(await state.storage.getAlarm()).toBeNull();
       const k = { v: all[0].v, label: all[0].label, mode: 1 as const };
-      expect(() => inst.get(E, 0, [k])).toThrow(/shard: paged/);
+      await expect(inst.get(E, 0, [k])).rejects.toThrow(/shard: paged/);
       expect(() => inst.feedBatches(E, 0, 0, 1 << 20)).toThrow(/shard: paged/);
       expect(() => inst.feedRows(E, 0, batches[0].t, null, 1 << 20)).toThrow(/shard: paged/);
     });
@@ -1100,10 +1155,10 @@ describe('ShardDO paging (§9.1 "Paging")', () => {
         sealed: true,
         paged: true,
       });
-      await runInDurableObject(stub(E), (inst: ShardDO, state) => {
+      await runInDurableObject(stub(E), async (inst: ShardDO, state) => {
         expect(metaOf(state, "state")).toBe("paged");
         expect(metaOf(state, "sbits")).toBe(0);
-        expect(() => inst.get(E, 0, [{ v: rs[0].v, label: rs[0].label, mode: 1 }])).toThrow(
+        await expect(inst.get(E, 0, [{ v: rs[0].v, label: rs[0].label, mode: 1 }])).rejects.toThrow(
           /shard: paged/,
         );
       });
@@ -1159,4 +1214,50 @@ describe('ShardDO paging: buckets (§9.1 "Paging")', () => {
     );
     expect(absent.every((f) => f.s === "miss" && f.sealed)).toBe(true);
   }, 60_000);
+});
+
+describe('ShardDO paging: the absent-label check (§9.1 "Paging")', () => {
+  it("always looks up a label it does not hold through its own bucket, whatever the shard count (s_E = 6)", async () => {
+    const E = freshEra();
+    const i = 37;
+    const bits = 6;
+    const s = shardStub(env, E, i);
+    const seen: { keys: { v: Uint8Array; label: Uint8Array; mode: number }[]; out: unknown[] }[] =
+      [];
+    const setup = (ms: number) =>
+      runInDurableObject(s, (inst: ShardDO) => {
+        const x = inst as unknown as Internals & {
+          shardBits: number;
+          lookup: typeof sealLookup;
+        };
+        x.clock = () => ms;
+        x.shardBits = bits;
+        x.lookup = async (b, m, keys) => {
+          const out = await sealLookup(b, m, keys);
+          seen.push({ keys: [...keys], out });
+          return out;
+        };
+      });
+    await setup(at(E, 1));
+    const rows = Array.from({ length: 5 }, () => ({ ...row(), v: vFor(i, bits) }));
+    for (const r of await s.put(E, i, rows)) expect(r.s).toBe("ok");
+    await setup(P.eraEnd(E) + 5000);
+    expect(await s.head(E, i)).toMatchObject({ sealed: true, paged: false });
+    const paged = () =>
+      runInDurableObject(s, (_inst: ShardDO, state) => metaOf(state, "state") === "paged");
+    for (let k = 0; !(await paged()); k++) {
+      expect(k, "paging alarms").toBeLessThan(40);
+      expect(await runDurableObjectAlarm(s)).toBe(true);
+    }
+    const m = parseManifest(await (await env.BLOBS.get(sealKey(E, i, "manifest")))!.text());
+    expect(m).toMatchObject({ era: E, shard: i, sbits: bits, n: rows.length });
+    const held = new Set(rows.map((r) => P.b64u(r.label)));
+    const absent = seen
+      .flatMap((c) => c.keys.map((k, n) => ({ k, out: c.out[n] })))
+      .filter(({ k }) => !held.has(P.b64u(k.label)));
+    expect(absent).toHaveLength(1);
+    expect(P.shardOf(absent[0].k.v, bits)).toBe(i);
+    expect(absent[0].k.mode).toBe(1);
+    expect(absent[0].out).toEqual({ s: "miss", sealed: true });
+  });
 });

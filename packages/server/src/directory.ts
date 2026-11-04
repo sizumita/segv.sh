@@ -70,6 +70,11 @@ export const MAX_WRAPS_PER_ID = 64;
 export const PREFIX_PAGE = 256;
 /** Largest dirlog page (§10.6). */
 export const DIRLOG_PAGE_MAX = 1000;
+/**
+ * `retry-after` (s) of a directory write's 503 (§9.6): past the replay one second after a failed batch, after which a
+ * registration sent again answers as the logged one (§2.5 step 8).
+ */
+export const DIR_RETRY_AFTER_S = 2;
 /** currentP() cache lifetime per isolate. */
 export const P_CACHE_MS = 60_000;
 /** After a failed dirmeta read, currentP() serves the last good P (0 if none) without asking D1 for this long. */
@@ -135,16 +140,18 @@ export const HEAD_SQL = "SELECT seq, h FROM dirlog ORDER BY seq DESC LIMIT 1";
 /**
  * §9.6 writes: the DirSeqDO appends the write to the dirlog in one atomic D1 batch (with every other write of its
  * round). A refusal (400 over the wrap cap, 409 on a taken handle, uid or wrap) comes back as a result; a failure of
- * the object or of D1 is 503 "directory unavailable".
+ * the object or of D1 is 503 "directory unavailable" with `retry-after`.
  */
 async function dirWrite(env: Env, write: DirWrite): Promise<number[]> {
+  const retry = { "retry-after": String(DIR_RETRY_AFTER_S) };
   let r: DirWriteResult;
   try {
     r = (await dirSeqStub(env).append(write)) as DirWriteResult;
   } catch (e) {
-    throw unavailable("write", e);
+    logFailure("write", e);
+    throw new HttpError(503, "directory unavailable", retry);
   }
-  if (!r.ok) throw new HttpError(r.status, r.error);
+  if (!r.ok) throw new HttpError(r.status, r.error, r.status === 503 ? retry : undefined);
   return r.seqs;
 }
 
@@ -351,11 +358,24 @@ export async function dirByPrefix(
   return { p, users: rows.slice(0, PREFIX_PAGE).map(toDirUser), more: rows.length > PREFIX_PAGE };
 }
 
-/** GET /api/v2/dir/uid/{uid}: null when unknown (→ 404); 400 for a malformed uid. */
+/**
+ * GET /api/v2/dir/uid/{uid}: null when unknown (→ 404); 400 for a malformed uid. The row of whichever user database
+ * answers with it; 503 when none has it and a database did not answer.
+ */
 export async function dirByUid(env: Env, uid: string): Promise<DirUser | null> {
   checkUid(uid, "uid");
-  const row = await d1("uid read", () => userByUid(env, uid));
-  return row ? toDirUser(row) : null;
+  const rows = await d1("uid read", async () =>
+    Promise.allSettled(
+      userDbs(env).map(async (db) => db.prepare(`SELECT ${USER_COLS} FROM user WHERE uid = ?1`).bind(uid).first<UserRow>()),
+    ),
+  );
+  let failure: unknown = null;
+  for (const r of rows) {
+    if (r.status === "fulfilled" && r.value !== null) return toDirUser(r.value);
+    if (r.status === "rejected") failure ??= r.reason;
+  }
+  if (failure !== null) throw unavailable("uid read", failure);
+  return null;
 }
 
 /**
