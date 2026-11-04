@@ -108,6 +108,17 @@ function alignToSecond(world: FakeWorld): void {
   world.advance(1000 - (world.now() % 1000) + 20, { keepSockets: true });
 }
 
+/**
+ * Moves the world clock out of the last 10 minutes of a UTC hour (to the middle of the next one), so a test that runs a
+ * few minutes of clock does not see the checkpoint's hourly blobreg value change under it. Eras start on whole hours,
+ * so the middle of an hour is never an era boundary.
+ */
+function awayFromHourEnd(world: FakeWorld): void {
+  const HOUR = 3_600_000;
+  const into = world.now() % HOUR;
+  if (into > HOUR - 600_000) world.advance(HOUR - into + HOUR / 2, { keepSockets: true });
+}
+
 /** Opens a FakeWebSocket as `who` and decodes everything it receives. */
 function openRt(who: string | null) {
   const WS = server().WebSocketAs(who);
@@ -1795,6 +1806,7 @@ describe("directory", () => {
 describe("checkpoints", () => {
   it("tick() signs C_q over the fake heads; the range recomputes to latest.C; forkAt rewrites the chain", async () => {
     const world = server();
+    awayFromHourEnd(world); // the test runs ~2 min of clock; an hour boundary would add a q
     const E = world.era;
     const srvKey = P.fromB64u((await getJson("/api/v2/params")).j.srvKey);
     expect((await fetch("/api/v2/ckpt/latest")).status).toBe(404);
