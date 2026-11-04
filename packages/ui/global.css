@@ -530,6 +530,62 @@ textarea:focus {
 .m.mine {
   border-left-color: var(--edge);
 }
+/* The message the composer replies to. */
+.m.replying,
+.m.replying:hover {
+  background: color-mix(in srgb, var(--sel) 70%, transparent);
+  border-left-color: var(--dim);
+}
+/* A reply's quote line (reply.tsx): a thin curve from the sender's name up to the target's sender and the start of
+   its text, on one line. A click opens the reply's thread beside the list. */
+.rq {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dim);
+  text-align: left;
+}
+.rq:hover:not(:disabled) {
+  background: none;
+  color: var(--fg);
+}
+.rq-line {
+  flex: none;
+  align-self: stretch;
+  width: 14px;
+  margin: 9px 0 -3px 1px;
+  border: 2px solid var(--edge);
+  border-right: 0;
+  border-bottom: 0;
+  border-top-left-radius: 6px;
+}
+.rq:hover .rq-line {
+  border-color: var(--dim);
+}
+.rq-who {
+  flex: none;
+  color: var(--fg);
+}
+.rq-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rq.gone .rq-text {
+  font-style: italic;
+}
+.m.head:has(> .rq) {
+  margin-top: 8px;
+}
 .m.head {
   margin-top: 10px;
 }
@@ -1072,6 +1128,50 @@ textarea:focus {
 .pending li {
   overflow-wrap: anywhere;
 }
+/* "replying to …" above the message box. */
+.replybar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 3px 4px 3px 10px;
+  font-size: 13px;
+  background: var(--hi);
+  border-radius: var(--r-s);
+}
+.replybar .icon {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  color: var(--dim);
+}
+.rtext {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* An × that stops or closes something: the "replying to" bar's, the reply pane's. */
+.xbtn {
+  flex: none;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--r-s);
+  background: none;
+  font-size: 16px;
+  line-height: 22px;
+  color: var(--dim);
+}
+.xbtn:hover:not(:disabled) {
+  background: var(--sel);
+  color: var(--fg);
+}
+.rtree > header .xbtn {
+  margin-right: -6px;
+  font-size: 18px;
+  line-height: 26px;
+}
 
 .members {
   width: 300px;
@@ -1097,6 +1197,97 @@ textarea:focus {
 .addm {
   display: flex;
   gap: 8px;
+}
+
+/* A message's replies beside the conversation (reply-tree.tsx): the chain above it, the message, the replies below,
+   and a message box at the bottom that replies to the last of them. */
+.rtree {
+  width: 360px;
+  flex: none;
+  min-height: 0;
+  border-left: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+.rtree > header {
+  padding: 8px 12px;
+}
+.tscroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 2px 12px 12px;
+}
+.tlist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+.ttop {
+  padding: 2px 0 4px 10px;
+  font-style: italic;
+}
+/* Every message at the same indent: a reply whose target is not right above it has a quote line (.rq). */
+.ti {
+  display: flex;
+  min-width: 0;
+}
+.tb {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 8px 4px;
+  border-left: 2px solid var(--line);
+  border-radius: 0 var(--r-s) var(--r-s) 0;
+}
+.ti.on .tb {
+  background: var(--hi);
+  border-left-color: var(--dim);
+}
+/* The message the pane's box replies to, once its "reply" was pressed. */
+.ti.to .tb {
+  background: color-mix(in srgb, var(--sel) 70%, transparent);
+  border-left-color: var(--dim);
+}
+.tb .meta {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+.tb .meta b {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.treply {
+  align-self: center;
+  margin-left: auto;
+  padding: 1px 5px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: var(--dim);
+}
+.treply .icon {
+  width: 15px;
+  height: 15px;
+}
+.treply:hover:not(:disabled) {
+  background: var(--sel);
+  color: var(--fg);
+}
+@media (hover: hover) {
+  .treply {
+    visibility: hidden;
+  }
+  .tb:hover .treply,
+  .treply:focus-visible {
+    visibility: visible;
+  }
 }
 
 .viewer {
@@ -1210,7 +1401,8 @@ textarea:focus {
 }
 
 @media (max-width: 1000px) {
-  .members {
+  .members,
+  .rtree {
     position: absolute;
     inset: 0;
     width: auto;

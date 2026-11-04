@@ -4,6 +4,7 @@ import {
   noSerialize,
   sync$,
   useContext,
+  useId,
   useOnDocument,
   useSignal,
   useStore,
@@ -13,6 +14,7 @@ import {
 } from "@qwik.dev/core";
 import type { Blocked } from "@segv/engine/types";
 import { loadEngine } from "./engine-loader";
+import { ReplyIcon } from "./reply";
 import { UiCtx } from "./state";
 import {
   enqueue,
@@ -70,6 +72,9 @@ const Attach = component$<{ onPick$: QRL<(picked: File[], asFiles?: boolean) => 
     const box = useSignal<HTMLElement>();
     const plus = useSignal<HTMLButtonElement>();
     const first = useSignal<HTMLButtonElement>();
+    // the reply pane has a message box of its own: one id per menu
+    const id = useId();
+    const menuId = `attach-menu-${id}`;
 
     useOnDocument(
       "click",
@@ -106,13 +111,13 @@ const Attach = component$<{ onPick$: QRL<(picked: File[], asFiles?: boolean) => 
           ref={plus}
           aria-label="attach"
           aria-expanded={open.value}
-          aria-controls="attach-menu"
+          aria-controls={menuId}
           onClick$={() => (open.value = !open.value)}
         >
           <span aria-hidden="true">+</span>
         </button>
         {open.value && (
-          <div class="menu" id="attach-menu">
+          <div class="menu" id={menuId}>
             <button type="button" ref={first} data-pick="image" onClick$={[PICK, close]}>
               image <span class="small note">metadata removed</span>
             </button>
@@ -170,7 +175,24 @@ const BLOCKED_TEXT: Record<Exclude<Blocked, "">, string> = {
   frozen: "a removed member could still read this conversation; start a new conversation.",
 };
 
-export const Composer = component$<{ convId: string; blocked: Blocked }>((props) => {
+/**
+ * A message box: the conversation's, below its messages, or the reply pane's (reply-tree.tsx). While `replyTo` names
+ * a message (`replyWho` and `replyGist` describe it), what is sent replies to it (§11.17): the text and each
+ * attachment of that send. After a send, and with escape or × where `canStop`, it calls `setReply$("")`.
+ */
+export const Composer = component$<{
+  convId: string;
+  blocked: Blocked;
+  /** the key of the message that what is sent replies to ('' = none) */
+  replyTo: string;
+  replyWho: string;
+  replyGist: string;
+  /** escape and × stop replying */
+  canStop: boolean;
+  setReply$: QRL<(key: string) => void>;
+  /** the box's accessible name */
+  label?: string;
+}>((props) => {
   const ui = useContext(UiCtx);
   const draft = useSignal("");
   const hint = useSignal("");
@@ -223,20 +245,26 @@ export const Composer = component$<{ convId: string; blocked: Blocked }>((props)
       hint.value = "message too long";
       return;
     }
+    const replyTo = props.replyTo;
     draft.value = "";
     files.list = undefined;
     hint.value = "";
     ui.localError = "";
+    await props.setReply$("");
     try {
       const engine = await loadEngine();
+      const to = replyTo || undefined;
       for (const p of picks)
         await enqueue(convId, () =>
-          p.as === "image" ? engine.sendImage(convId, p.f) : engine.sendFile(convId, p.f),
+          p.as === "image" ? engine.sendImage(convId, p.f, to) : engine.sendFile(convId, p.f, to),
         );
-      if (text.trim()) await enqueue(convId, () => engine.sendText(convId, text));
+      if (text.trim()) await enqueue(convId, () => engine.sendText(convId, text, to));
     } catch (e) {
       ui.localError = errMsg(e);
-      if (!draft.value && text) draft.value = text; // give the text back if it never left
+      if (!draft.value && text) {
+        draft.value = text; // give the text back if it never left, with what it replied to
+        if (replyTo) await props.setReply$(replyTo);
+      }
     }
   });
 
@@ -288,18 +316,44 @@ export const Composer = component$<{ convId: string; blocked: Blocked }>((props)
           ))}
         </ul>
       )}
+      {props.replyTo && props.replyWho && (
+        <div class="replybar">
+          <ReplyIcon />
+          <span class="rtext">
+            replying to <b>{props.replyWho}</b> <span class="dim">{props.replyGist}</span>
+          </span>
+          {props.canStop && (
+            <button
+              type="button"
+              class="xbtn"
+              aria-label="stop replying"
+              title="stop replying (esc)"
+              onClick$={async () => {
+                await props.setReply$("");
+                ta.value?.focus();
+              }}
+            >
+              ×
+            </button>
+          )}
+        </div>
+      )}
       <div class="inputrow">
         <Attach onPick$={addFiles} />
         <div class="field">
           <textarea
             ref={ta}
             rows={1}
-            aria-label="message"
-            placeholder="message"
+            aria-label={props.label ?? "message"}
+            placeholder={props.label ?? "message"}
             bind:value={draft}
             onKeyDown$={[
               ENTER_SENDS,
-              $((_: KeyboardEvent, el: HTMLTextAreaElement) => {
+              $((e: KeyboardEvent, el: HTMLTextAreaElement) => {
+                if (e.key === "Escape" && !e.isComposing && props.canStop && props.replyTo) {
+                  void props.setReply$("");
+                  return;
+                }
                 if (el.getAttribute("data-send")) {
                   el.removeAttribute("data-send");
                   return send();

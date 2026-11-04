@@ -205,7 +205,15 @@ class MockEngine implements Engine {
       file: p.file,
       status: p.status ?? "sent",
       reactions: p.reactions ?? [],
+      ...(p.reply ? { reply: p.reply } : {}),
     };
+  }
+  /** What a mock send replies to: a message of the conversation, as the engine checks it. */
+  private replyOf(c: ConversationView, replyTo?: string): MessageView["reply"] {
+    if (!replyTo) return undefined;
+    if (!c.messages.some((m) => m.key === replyTo && m.status === "sent"))
+      this.fail("unknown message");
+    return { key: replyTo, state: "shown" };
   }
 
   // ---- seed data ----
@@ -285,6 +293,57 @@ class MockEngine implements Engine {
         }),
       ],
     };
+    // A thread (§11.17): two replies to "shipping friday?", each with replies of its own, and one to a message that
+    // is not loaded.
+    const ship = m({
+      kind: "text",
+      fromHandle: "carol",
+      text: "shipping friday?",
+      ts: now - 9 * MIN,
+    });
+    const to = (x: MessageView) => ({ reply: { key: x.key, state: "shown" as const } });
+    const works = m({
+      kind: "text",
+      fromHandle: "bob",
+      text: "friday works for me",
+      ts: now - 8 * MIN,
+      ...to(ship),
+    });
+    const thu = m({
+      kind: "text",
+      fromHandle: handle,
+      text: "could we do **thursday** instead?",
+      ts: now - 7 * MIN,
+      ...to(ship),
+    });
+    const fri = m({
+      kind: "text",
+      fromHandle: "carol",
+      text: "friday it is, then. i'll tag the release in the morning",
+      ts: now - 6 * MIN,
+      ...to(works),
+    });
+    const notes = m({
+      kind: "text",
+      fromHandle: "bob",
+      text: "i'll write the release notes",
+      ts: now - 5 * MIN,
+      ...to(fri),
+    });
+    const tight = m({
+      kind: "text",
+      fromHandle: "carol",
+      text: "thursday is tight, the key rotation is not merged yet",
+      ts: now - 5 * MIN + 20_000,
+      ...to(thu),
+    });
+    const lost = m({
+      kind: "text",
+      fromHandle: "bob",
+      text: "about the plan from last month",
+      ts: now - 4 * MIN,
+      reply: { key: "", state: "waiting" },
+    });
     const group: ConversationView = {
       id: randomId(),
       ref: mockRef("group"),
@@ -296,7 +355,7 @@ class MockEngine implements Engine {
       frozen: false,
       request: false,
       byContact: true,
-      lastTs: now - 9 * MIN,
+      lastTs: now - 4 * MIN,
       unread: 3,
       messages: [
         m({ kind: "system", text: `${handle} created "project 夜明け"`, ts: now - 3 * DAY }),
@@ -316,7 +375,13 @@ class MockEngine implements Engine {
           ts: now - 12 * MIN,
         }),
         m({ kind: "text", fromHandle: "carol", text: "ok 👍", ts: now - 10 * MIN }),
-        m({ kind: "text", fromHandle: "carol", text: "shipping friday?", ts: now - 9 * MIN }),
+        ship,
+        works,
+        thu,
+        fri,
+        notes,
+        tight,
+        lost,
         m({
           kind: "text",
           fromHandle: handle,
@@ -565,37 +630,42 @@ class MockEngine implements Engine {
       unread: c.unread + (bumpUnread ? 1 : 0),
     }));
   }
-  private settle(convId: string, key: string, status: "sent" | "failed") {
+  /** Settles an echo; returns the key of the sent message. */
+  private settle(convId: string, key: string, status: "sent" | "failed"): string {
     const seq = status === "sent" ? ++this.seq : 0;
+    const next = status === "sent" ? `tag-${seq}` : key;
     this.updateConv(convId, (c) => ({
       ...c,
-      messages: c.messages.map((x) =>
-        x.key === key ? { ...x, status, seq, key: status === "sent" ? `tag-${seq}` : key } : x,
-      ),
+      messages: c.messages.map((x) => (x.key === key ? { ...x, status, seq, key: next } : x)),
     }));
+    return next;
   }
 
-  async sendText(convId: string, text: string): Promise<void> {
+  async sendText(convId: string, text: string, replyTo?: string): Promise<void> {
     const c = this.conv(convId);
     if (!c.canSend) this.fail(blockedMessage(c));
+    const reply = this.replyOf(c, replyTo);
     const key = `local:${++this.local}`;
     this.pushMessage(
       convId,
-      this.msg({ kind: "text", text, mine: true, status: "sending", seq: 0, key }),
+      this.msg({ kind: "text", text, mine: true, status: "sending", seq: 0, key, reply }),
     );
     await sleep(500);
     const failed = /\bfail\b/i.test(text);
-    this.settle(convId, key, failed ? "failed" : "sent");
+    const sent = this.settle(convId, key, failed ? "failed" : "sent");
     if (failed) return;
     const other = c.members.find((m) => m.uid !== this.state.me?.uid && !m.left);
     if (other) {
-      setTimeout(() => this.incoming(convId, other.handle, `echo: ${text}`), 1200);
+      // a reply is answered with a reply to it, so that a thread grows
+      const to = reply ? { key: sent, state: "shown" as const } : undefined;
+      setTimeout(() => this.incoming(convId, other.handle, `echo: ${text}`, to), 1200);
     }
   }
 
-  async sendImage(convId: string, file: File): Promise<void> {
+  async sendImage(convId: string, file: File, replyTo?: string): Promise<void> {
     const c = this.conv(convId);
     if (!c.canSend) this.fail(blockedMessage(c));
+    const reply = this.replyOf(c, replyTo);
     if (!file.type.startsWith("image/")) this.fail("not an image");
     let w = 0;
     let h = 0;
@@ -613,15 +683,16 @@ class MockEngine implements Engine {
     const image: ImageRef = { id, k: "k", mime: file.type, w, h };
     this.pushMessage(
       convId,
-      this.msg({ kind: "image", image, mine: true, status: "sending", seq: 0, key }),
+      this.msg({ kind: "image", image, mine: true, status: "sending", seq: 0, key, reply }),
     );
     await sleep(700);
     this.settle(convId, key, "sent");
   }
 
-  async sendFile(convId: string, file: File): Promise<void> {
+  async sendFile(convId: string, file: File, replyTo?: string): Promise<void> {
     const c = this.conv(convId);
     if (!c.canSend) this.fail(blockedMessage(c));
+    const reply = this.replyOf(c, replyTo);
     if (file.size > 10 * 1024 * 1024) this.fail("the file is too large");
     const id = `local-file-${++this.local}`;
     this.blobs.set(id, file);
@@ -629,7 +700,7 @@ class MockEngine implements Engine {
     const ref: FileRef = { id, k: "k", name: file.name || "file", size: file.size };
     this.pushMessage(
       convId,
-      this.msg({ kind: "file", file: ref, mine: true, status: "sending", seq: 0, key }),
+      this.msg({ kind: "file", file: ref, mine: true, status: "sending", seq: 0, key, reply }),
     );
     await sleep(700);
     this.settle(convId, key, "sent");
@@ -779,8 +850,12 @@ class MockEngine implements Engine {
   }
 
   // ---- test hooks ----
-  incoming(convId: string, fromHandle: string, text: string) {
-    this.pushMessage(convId, this.msg({ kind: "text", fromHandle, text, mine: false }), true);
+  incoming(convId: string, fromHandle: string, text: string, reply?: MessageView["reply"]) {
+    this.pushMessage(
+      convId,
+      this.msg({ kind: "text", fromHandle, text, mine: false, reply }),
+      true,
+    );
   }
   incomingAt(index: number, text: string) {
     const c = this.state.conversations[index];

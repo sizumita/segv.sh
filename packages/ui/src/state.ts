@@ -64,5 +64,19 @@ export const initialUiState = (): UiState => ({
   leaving: "",
 });
 
+/**
+ * The state of the open conversation's pane (conversation.tsx), which starts empty for each conversation: the pane is
+ * drawn again when another one opens.
+ */
+export interface PaneState {
+  /** the key of the message the composer replies to ('' = none, §11.17) */
+  reply: string;
+  /** the message whose replies the side pane shows: the chain above it and the replies below it ('' = closed) */
+  thread: string;
+  /** the message the side pane's message box replies to ('' = the last message the pane shows) */
+  threadTo: string;
+}
+
 export const StateCtx = createContextId<EngineState>("segv.state");
 export const UiCtx = createContextId<UiState>("segv.ui");
+export const PaneCtx = createContextId<PaneState>("segv.pane");

@@ -2058,7 +2058,17 @@ export function acceptOldRow(row: WalkRow, epochs: readonly WalkEpoch[], selfRem
 export const M_VER = 2;
 export const M_HEADER_LEN = 62;
 /** The types of M (§3.3): every other value is invalid. */
-export const MT = { TEXT: 1, IMAGE: 2, REACTION: 3, FILE: 4, BELL: 5, WELCOME: 8, CLAIM: 16, LEAVE: 17 } as const;
+export const MT = {
+  TEXT: 1,
+  IMAGE: 2,
+  REACTION: 3,
+  FILE: 4,
+  BELL: 5,
+  REPLY: 6,
+  WELCOME: 8,
+  CLAIM: 16,
+  LEAVE: 17,
+} as const;
 export type MsgType = (typeof MT)[keyof typeof MT];
 const MSG_TYPES: readonly number[] = Object.values(MT);
 /** lane of a CLAIM. */
@@ -2233,6 +2243,65 @@ export function encodeReaction(x: Reaction): Bytes {
 export const reactTh = (rk: Bytes, label: Bytes, body: Bytes): Bytes =>
   t16(HMAC(rk, enc("segv.sh/v2/react", label, body)));
 
+/** REPLY content without its message: te, tl, tE, tn, th, kind. */
+export const REPLY_FIXED = 29;
+
+/**
+ * The row a REPLY replies to (§3.3, §11.17): the row at `(tE, tn)` on lane `tl` of epoch `te`, named by the same `th`
+ * as a REACTION's target (`reactTh`). The fields have no parse rule.
+ */
+export interface ReplyTo {
+  te: number;
+  tl: number;
+  tE: number;
+  tn: number;
+  /** reactTh(rk_te, label_T, body_T) */
+  th: Bytes;
+}
+
+/** The message a REPLY carries: a TEXT, IMAGE or FILE (its `kind`). */
+export type ReplyBody =
+  | { type: typeof MT.TEXT; text: string }
+  | { type: typeof MT.IMAGE; image: ImageRef }
+  | { type: typeof MT.FILE; file: FileRef };
+
+const isReplyKind = (k: number): k is ReplyBody["type"] =>
+  k === MT.TEXT || k === MT.IMAGE || k === MT.FILE;
+
+/**
+ * REPLY content (§3.3): `u32 te | u16 tl | u16 tE | u32 tn | th[16] | u8 kind | body`, with `kind` 1, 2 or 4 and
+ * `body` under that type's content rule.
+ */
+export function parseReply(b: Bytes): { to: ReplyTo; body: ReplyBody } {
+  if (b.length < REPLY_FIXED) bad("reply: short");
+  const r = new Rd(b.slice(0, REPLY_FIXED), "reply");
+  const te = r.u32();
+  const tl = r.u16();
+  const tE = r.u16();
+  const tn = r.u32();
+  const th = r.bytes(16);
+  const kind = r.u8();
+  r.end();
+  if (!isReplyKind(kind)) return bad("reply: bad kind");
+  const body = parseContent(kind, b.slice(REPLY_FIXED)) as ReplyBody;
+  return { to: { te, tl, tE, tn, th }, body };
+}
+
+export function encodeReply(to: ReplyTo, body: ReplyBody): Bytes {
+  if (!isReplyKind(body.type)) bad("reply: bad kind");
+  const out = concat(
+    u32(to.te),
+    u16(to.tl),
+    u16(to.tE),
+    u32(to.tn),
+    fixed(to.th, 16, "reply th"),
+    u8(body.type),
+    encodeContent(body),
+  );
+  parseReply(out);
+  return out;
+}
+
 /** The header fields of M other than ver, type and len. */
 export interface MHeader {
   /** The sender's index in D_e. */
@@ -2280,6 +2349,7 @@ export type MBody =
   | { type: typeof MT.REACTION; reaction: Reaction }
   | { type: typeof MT.FILE; file: FileRef }
   | { type: typeof MT.BELL; bell: BellRef }
+  | { type: typeof MT.REPLY; to: ReplyTo; body: ReplyBody }
   | { type: typeof MT.WELCOME; join: Join }
   | { type: typeof MT.CLAIM; claim: Claim }
   | { type: typeof MT.LEAVE };
@@ -2300,6 +2370,8 @@ function encodeContent(m: MBody): Bytes {
       return encodeFile(m.file);
     case MT.BELL:
       return encodeBell(m.bell);
+    case MT.REPLY:
+      return encodeReply(m.to, m.body);
     case MT.WELCOME:
       return encodeJ(m.join);
     case MT.CLAIM:
@@ -2324,6 +2396,8 @@ function parseContent(type: number, c: Bytes): MBody {
       return { type: MT.FILE, file: parseFile(c) };
     case MT.BELL:
       return { type: MT.BELL, bell: parseBell(c) };
+    case MT.REPLY:
+      return { type: MT.REPLY, ...parseReply(c) };
     case MT.WELCOME:
       return { type: MT.WELCOME, join: parseJ(c) };
     case MT.CLAIM:
@@ -2337,7 +2411,7 @@ function parseContent(type: number, c: Bytes): MBody {
 }
 
 /**
- * Parses M and checks every parse rule of §3.3 (none needs epoch context): ver, type ∈ {1, 2, 3, 4, 8, 16, 17}, content,
+ * Parses M and checks every parse rule of §3.3 (none needs epoch context): ver, type ∈ {1, 2, 3, 4, 5, 6, 8, 16, 17}, content,
  * `lane = from` for lane rows and `lane = 0xFFFF` with NONE / ZERO16 prev fields for a CLAIM, `from < 32`, the
  * position rule, prevh = ZERO16 with NONE, ts ≤ 2^53 − 1, ck16 = ZERO16 with ckq = 0, len. `from < |D_e|`, the
  * label, a CLAIM's m = |D_e| and the signature are contextual (acceptRow).

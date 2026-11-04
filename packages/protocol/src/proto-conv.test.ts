@@ -457,6 +457,40 @@ describe("envelope M: layout", () => {
     ],
     ["LEAVE", { ...hdr(), type: P.MT.LEAVE }, { type: 17, content: new Uint8Array(0) }],
     [
+      "REPLY (a TEXT)",
+      {
+        ...hdr(),
+        type: P.MT.REPLY,
+        to: { te: 5, tl: 2, tE: 9, tn: 300, th: fill(16, 0x55) },
+        body: { type: P.MT.TEXT, text: "ramen?" },
+      },
+      {
+        type: 6,
+        content: cat(be32(5), be16(2), be16(9), be32(300), fill(16, 0x55), be8(1), s2b("ramen?")),
+      },
+    ],
+    [
+      "REPLY (an IMAGE)",
+      {
+        ...hdr(),
+        type: P.MT.REPLY,
+        to: { te: 0, tl: 0, tE: 1, tn: 0, th: fill(16, 0x66) },
+        body: { type: P.MT.IMAGE, image },
+      },
+      {
+        type: 6,
+        content: cat(
+          be32(0),
+          be16(0),
+          be16(1),
+          be32(0),
+          fill(16, 0x66),
+          be8(2),
+          cat(fill(32, 0x31), fill(32, 0x32), be8(1), be16(640), be16(480)),
+        ),
+      },
+    ],
+    [
       "BELL",
       { ...hdr(), type: P.MT.BELL, bell: { g: 7, bell: fill(16, 0x55) } },
       { type: 5, content: cat(be32(7), fill(16, 0x55)) },
@@ -892,7 +926,7 @@ describe("conversation rows: seal, sign, open (§3.3)", () => {
       const body = P.sealRow(keys0.mk, E, label, M, P.signRow(bob.id.sigSk, conv, 0, E, label, M)).body;
       expect(P.acceptRow(rowCtx0, E, label, body)).toEqual({ ok: false, why: "malformed" });
     }
-    expect(Object.values(P.MT)).toEqual([1, 2, 3, 4, 5, 8, 16, 17]);
+    expect(Object.values(P.MT)).toEqual([1, 2, 3, 4, 5, 6, 8, 16, 17]);
   });
 
   it("flipping any byte of a body, or changing the label or E, makes the row fail to open", () => {

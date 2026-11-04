@@ -5,7 +5,8 @@ import { EmojiPicker, type Anchor } from "./emoji-picker";
 import { MsgFile } from "./msg-file";
 import { MsgImage } from "./msg-image";
 import { MsgText } from "./msg-text";
-import { UiCtx, type UiState } from "./state";
+import { keyed, ReplyIcon, ReplyQuote, targetIn } from "./reply";
+import { PaneCtx, UiCtx, type UiState } from "./state";
 import { act, clock, dayKey, dayLabel, fullTime } from "./util";
 
 const GROUP_MS = 5 * 60_000;
@@ -57,6 +58,7 @@ const ReactIcon = () => (
 
 export const Messages = component$<{ conv: ConversationView }>((props) => {
   const ui = useContext(UiCtx);
+  const pane = useContext(PaneCtx);
   const box = useSignal<HTMLElement>();
   const stick = useSignal(true); // follow new messages unless the user scrolled up
   const newBelow = useSignal(false);
@@ -103,10 +105,27 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
     newBelow.value = false;
   });
 
-  // One click handler for the list: an "add a reaction" button opens (or closes) the picker beside it, and on a touch
-  // screen a tap on a message shows its actions, or hides them.
+  // One click handler for the list: "reply" makes the composer reply to its message, a reply's quote line opens its
+  // thread beside the list, an "add a reaction" button opens (or closes) the picker beside it, and on a touch screen a
+  // tap on a message shows its actions, or hides them.
   const onClick = $((ev: MouseEvent) => {
     const t = ev.target as Element;
+    const reply = t.closest<HTMLElement>("[data-reply]");
+    if (reply) {
+      pane.reply = reply.dataset.reply ?? "";
+      active.value = "";
+      box.value
+        ?.closest(".thread")
+        ?.querySelector<HTMLTextAreaElement>(".composer textarea")
+        ?.focus();
+      return;
+    }
+    const thread = t.closest<HTMLElement>("[data-thread]");
+    if (thread) {
+      pane.thread = thread.dataset.thread ?? "";
+      ui.members = false; // one side pane at a time
+      return;
+    }
     const open = t.closest<HTMLElement>("[data-react-open]");
     if (open) {
       const key = open.dataset.reactOpen ?? "";
@@ -147,6 +166,7 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
   const canReact = props.conv.canSend && props.conv.byContact;
   const picked = pick.key ? msgs.find((m) => m.key === pick.key) : undefined;
   const pk = picked?.key ?? "";
+  const byKey = msgs.some((m) => m.reply) ? keyed(msgs) : new Map<string, MessageView>();
   return (
     <div class="msgwrap">
       <div
@@ -162,8 +182,14 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
         {msgs.map((m, i) => {
           const prev = i > 0 ? msgs[i - 1] : undefined;
           const newDay = !prev || dayKey(prev.ts) !== dayKey(m.ts);
+          // A reply starts a group of its own: its quote line sits above its sender's name.
           const head =
-            newDay || !prev || isLine(prev) || prev.from !== m.from || m.ts - prev.ts > GROUP_MS;
+            newDay ||
+            !prev ||
+            isLine(prev) ||
+            prev.from !== m.from ||
+            m.ts - prev.ts > GROUP_MS ||
+            !!m.reply;
           const tools = canReact && m.status === "sent";
           return (
             <div key={m.key} class="mrow">
@@ -186,6 +212,7 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
                     m.mine && "mine",
                     head && "head",
                     (active.value === m.key || pk === m.key) && "active",
+                    pane.reply === m.key && "replying",
                   ]}
                   title={fullTime(m.ts)}
                   data-key={m.key}
@@ -193,6 +220,9 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
                   {tools && (
                     <div class="mtools-at">
                       <div class="mtools" role="toolbar" aria-label="message actions">
+                        <button type="button" data-reply={m.key} aria-label="reply" title="reply">
+                          <ReplyIcon />
+                        </button>
                         <button
                           type="button"
                           data-react-open={m.key}
@@ -206,6 +236,7 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
                       </div>
                     </div>
                   )}
+                  {m.reply && <ReplyQuote m={m} target={targetIn(byKey, m)} />}
                   {head && (
                     <p class="meta">
                       <b>{m.fromHandle || "unknown"}</b>
