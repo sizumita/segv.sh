@@ -51,7 +51,7 @@ function forgedJ(by: TestUser, convId: Uint8Array, e: number, members: TestUser[
   const Dbytes = P.encodeD({
     conv: convId,
     e,
-    prev: P.random(32),
+    prev: e === 0 ? P.ZERO32 : P.random(32),
     by: by.uid,
     ts: server().now(),
     members: members.map((u) => ({ uid: u.uid, sigPk: u.id.sigPk, kh: P.kemHash(u.id.kemPk) })),
@@ -250,6 +250,181 @@ describe("forks of an ended copy (§6.7 step 6)", () => {
     expect(isWarned(mustView(B, fork))).toBe(true);
     expect(warnings(B).filter((w) => w === secondCopyWarning("alice"))).toEqual([]);
     void alice;
+  });
+});
+
+describe("Js for epochs a snapshot restore did not load (§6.7 steps 3 and 6, §11.4 step 5, §11.10)", () => {
+  /**
+   * Bob joins g by alice's WELCOME in their 1:1, a commit moves g to e = 1, which then holds 30 rows of `poster`, and
+   * bob's device writes a snapshot: a restore loads g from e = 1 only, while the 1:1's initial history reads the
+   * WELCOME again.
+   */
+  async function restoredAboveRoot(poster: "alice" | "carol") {
+    const [alice, bob, carol] = ["alice", "bob", "carol"].map((h) => makeUser(h));
+    const A = await engineFor(alice);
+    const B = await engineFor(bob);
+    const one = await A.createConversation(["bob"]);
+    await settle(A, B);
+    await B.sendText(one, "hi alice"); // the 1:1 qualifies as bob's WELCOME channel (§6.12 step 1)
+    await settle(A, B);
+    const g = await A.createConversation(["bob", "carol"], "g");
+    await settle(A, B);
+    const C = await engineFor(carol);
+    await C.accept(g);
+    await B.accept(g);
+    await settle(A, B, C);
+    expect(
+      selfRowsOf(bob)
+        .flat()
+        .some((r) => r.rtype === P.RT.CONV_JOIN && r.via === P.VIA.WELCOME),
+    ).toBe(true);
+    await commitChange(alice, epoch(A, g), [alice, bob, carol], "renamed");
+    await settle(A, B, C);
+    const X = poster === "alice" ? A : C;
+    for (let i = 0; i < 30; i++) await X.sendText(g, `text ${i}`);
+    await settle(A, B, C);
+    server().advanceEra(); // bob's device writes the new era's snapshot, at e = 1
+    await settle(A, B, C);
+    await B.logout();
+    return { alice, bob, carol, A, C, one, g };
+  }
+
+  const joinsOf = (u: TestUser, convB: string) =>
+    selfRowsOf(u, 0)
+      .flat()
+      .filter((r) => r.rtype === P.RT.CONV_JOIN && P.b64u(r.conv) === convB).length;
+
+  it("the WELCOME of a confirmed copy's root epoch is a duplicate after a restore: no warning", async () => {
+    const { bob, A, C, g } = await restoredAboveRoot("carol");
+    const B2 = await engineFor(bob);
+    await settle(A, B2, C);
+    expect([...conv(B2, g).epochs.keys()]).toEqual([1]);
+    expect(conv(B2, g).rootE).toBe(0);
+    expect(conv(B2, g).confirmed).toBe(true);
+    expect(warnings(B2)).not.toContain(CONFIRMED_COPY_WARNING);
+    expect(warnings(B2)).toEqual([]);
+  });
+
+  it("an unconfirmed copy gets no new CONV_JOIN on each reload", async () => {
+    const { bob, A, C, g } = await restoredAboveRoot("alice");
+    const convB = P.b64u(conv(A, g).conv);
+    const before = joinsOf(bob, convB);
+    for (let i = 0; i < 2; i++) {
+      const B2 = await engineFor(bob);
+      await settle(A, B2, C);
+      expect([...conv(B2, g).epochs.keys()]).toEqual([1]);
+      expect(conv(B2, g).confirmed).toBe(false);
+      await B2.logout();
+    }
+    expect(joinsOf(bob, convB)).toBe(before);
+  });
+
+  it("a J for an unloaded epoch above the root with its D in another bundle is a duplicate", async () => {
+    const {
+      users: [alice, bob, carol],
+      engines: [A, B, C],
+      id,
+    } = await group(["alice", "bob", "carol"]);
+    await C.sendText(id, "in e0"); // carol's row confirms bob's copy
+    await settle(A, B, C);
+    for (const name of ["x", "y", "z"]) {
+      await commitChange(alice, epoch(A, id), [alice, bob, carol], name);
+      await settle(A, B, C);
+    }
+    for (let i = 0; i < 30; i++) await C.sendText(id, `text ${i}`);
+    await settle(A, B, C);
+    server().advanceEra(); // bob's device writes the new era's snapshot, at e = 3
+    await settle(A, B, C);
+    await B.logout();
+    const B2 = await engineFor(bob);
+    expect([...conv(B2, id).epochs.keys()]).toEqual([3]);
+    expect(conv(B2, id).confirmed).toBe(true);
+    // epoch 1's D, registered again in a bundle of its own (one D can be in several bundles, §5.4)
+    const e1 = conv(A, id).epochs.get(1)!;
+    const b = P.buildBundle({
+      conv: e1.D.conv,
+      e: 1,
+      D: e1.D.bytes,
+      dsig: e1.dsig,
+      EK: e1.EK,
+      pks: [alice, bob, carol].map((u) => u.id.kemPk),
+      prevMembers: conv(A, id)
+        .epochs.get(0)!
+        .D.members.map((m) => m.uid),
+      rm: 0,
+    });
+    const reg = server().putBlob(b.blob);
+    expect(reg.id).not.toBe(P.b64u(e1.bundleId));
+    forgeJoin(bob, {
+      conv: e1.D.conv,
+      e: 1,
+      EK: e1.EK,
+      bundleId: P.fromB64u(reg.id),
+      bundleSize: b.blob.length,
+    });
+    await settle(A, B2, C);
+    expect(warnings(B2)).toEqual([]);
+    expect(
+      I(B2)
+        .views()
+        .map((v) => v.id),
+    ).toEqual([id]);
+  });
+
+  it("an old WELCOME whose J is rejected again after a reload raises no second warning", async () => {
+    const { alice, bob, A, C, one, g } = await restoredAboveRoot("carol");
+    const B2 = await engineFor(bob);
+    await settle(A, B2, C);
+    // alice's WELCOME in the 1:1 with a J that does not match g's history
+    const ep = epoch(A, one);
+    const j = P.memberIndex(ep.D, alice.uid);
+    const E = server().era;
+    let n = 0;
+    while (server().shard.hasLabel(E, P.Lmsg(ep.keys.rk, j, E, n))) n++;
+    const J = forgedJ(alice, conv(A, g).conv, 0, [alice, bob]);
+    postRow(ep, buildMessage(alice, ep, { E, n }, { type: P.MT.WELCOME, join: J } as P.MBody));
+    await settle(A, B2, C);
+    expect(warnings(B2)).toEqual([CONFIRMED_COPY_WARNING]);
+    await B2.logout();
+    // the reload's initial history reads the row again, before the processed position
+    const B3 = await engineFor(bob);
+    await settle(A, B3, C);
+    expect(warnings(B3)).toEqual([]);
+    expect(
+      I(B3)
+        .views()
+        .map((v) => v.id)
+        .sort(),
+    ).toEqual([one, g].sort());
+  });
+
+  it("a fork J for an unloaded epoch of an ended copy is rejected as without the restore", async () => {
+    const {
+      users: [alice, bob, carol, dave],
+      engines: [A, B, C, D],
+      id,
+    } = await group(["alice", "bob", "carol", "dave"]);
+    for (const name of ["x", "y"]) {
+      await commitChange(alice, epoch(A, id), [alice, bob, carol, dave], name);
+      await settle(A, B, C, D);
+    }
+    await C.removeMember(id, bob.uidB);
+    await settle(A, B, C, D);
+    expect(conv(B, id).removed).toBe(true);
+    server().advanceEra();
+    await settle(A, B, C, D); // the new era's snapshot
+    await B.logout();
+    const B2 = await engineFor(bob);
+    expect(conv(B2, id).epochs.has(0)).toBe(false); // its root epoch is not loaded
+    expect(conv(B2, id).confirmed).toBe(true);
+    forgeJoin(bob, forgedJ(dave, conv(B2, id).conv, 0, [bob, dave]));
+    await settle(A, B2, C, D);
+    expect(warnings(B2)).toContain(CONFIRMED_COPY_WARNING);
+    expect(
+      I(B2)
+        .views()
+        .map((v) => v.id),
+    ).toEqual([id]);
   });
 });
 

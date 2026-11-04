@@ -1184,9 +1184,13 @@ is settled.
    unknown member (§11.2). If any check fails, give a noise warning and stop. Whether D's key for `D.by` is the
    directory's is checked in step 6, only where it matters (a first contact, a re-add included, or a separate copy).
 3. **Duplicate.** Ignore the join if any copy, ended or not, already holds `(conv, e)` with the same `H(D)`. Step 4
-   can move a copy to e (it processes the claim that ended e − 1), so this step is applied again after step 4. One D
-   can be registered in several bundles (`descCt` is sealed with a random nonce, §5.4), so no rule here compares
-   `bundleId`.
+   can move a copy to e (it processes the claim that ended e − 1), so this step is applied again after step 4. A copy
+   holds every epoch from its root epoch to its current or last one, also one that a restore did not load (§11.4 step
+   5): the root epoch's `H(D)` is the copy's root, and another epoch's D comes from its DESC record or from the bundle
+   that its EPOCH record names. One D can be registered in several bundles (`descCt` is sealed with a random nonce,
+   §5.4), so another `bundleId` does not make a join new; but a bundle holds one D, so a J whose `bundleId` is the
+   bundle of `(conv, e)` in a held copy (the one its CONV_JOIN, REQUEST or EPOCH record names, or that of the claim it
+   processed to reach e) is ignored before step 1 fetches anything.
 4. **Settle the held copies.** For each held copy of `conv`, catch up the control lane of its current epoch k until
    either the winner is final and processed, or every slot is decided not e-valid and the current era has been
    probed (processing a winner moves the copy on, or ends it, §6.6 step 3, and the catch-up goes on in its new
@@ -4193,9 +4197,10 @@ history is exhausted. This runs once per copy and session; later calls are no-op
   `(E, n−32..n−1)` and the earlier eras) then starts from the heads found.
 
 Rows found by scrollback are processed like any other (a WELCOME that lies before the processed position was already
-processed and is not applied twice; a LEAVE is applied as §6.9 says: it records a leave the local state lacks, and
-replaces the kept source only when its key is smaller; a REACTION applies to its target as §11.12 says, and one
-whose target is not loaded yet waits for it; in an epoch that a claim removed self from, a row
+processed and is not applied twice: its J is ignored when a held copy holds its bundle, §6.7 step 3, and any other such
+J, whose copy the self lane does not hold, goes through §6.7 again without raising its warnings a second time; a LEAVE
+is applied as §6.9 says: it records a leave the local state lacks, and replaces the kept source only when its key is
+smaller; a REACTION applies to its target as §11.12 says, and one whose target is not loaded yet waits for it; in an epoch that a claim removed self from, a row
 stored after that claim is dropped, §6.8, as the live final sweep dropped it). Older rows are never
 counted as unread.
 
