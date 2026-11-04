@@ -108,6 +108,14 @@ function alignToSecond(world: FakeWorld): void {
   world.advance(1000 - (world.now() % 1000) + 20, { keepSockets: true });
 }
 
+/**
+ * Moves the world clock to ~20 ms after a whole UTC hour. The checkpoint's blobreg value changes with the hour
+ * (fake/ckpt.ts), so a test that expects unchanged heads over a few minutes must not cross one.
+ */
+function alignToHour(world: FakeWorld): void {
+  world.advance(3_600_000 - (world.now() % 3_600_000) + 20, { keepSockets: true });
+}
+
 /** Opens a FakeWebSocket as `who` and decodes everything it receives. */
 function openRt(who: string | null) {
   const WS = server().WebSocketAs(who);
@@ -1795,6 +1803,7 @@ describe("directory", () => {
 describe("checkpoints", () => {
   it("tick() signs C_q over the fake heads; the range recomputes to latest.C; forkAt rewrites the chain", async () => {
     const world = server();
+    alignToHour(world); // the steps below take ~2 min of world clock and expect no new blobreg value
     const E = world.era;
     const srvKey = P.fromB64u((await getJson("/api/v2/params")).j.srvKey);
     expect((await fetch("/api/v2/ckpt/latest")).status).toBe(404);
