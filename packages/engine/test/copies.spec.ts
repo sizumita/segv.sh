@@ -749,6 +749,48 @@ describe("a sibling's ENDED record (§11.7)", () => {
     expect(systemLines(B2, id)).toContain("@alice removed you");
   });
 
+  it("a failed get in the sweep after the record is retried at the next catch-up", async () => {
+    const {
+      users: [alice, bob],
+      engines: [A, B, C],
+      id,
+    } = await group(["alice", "bob", "carol"]);
+    const B2 = newEngine("bob2");
+    await I(B2).unlock(bob.AK, bob.uid, bob.handle);
+    await waitFor(() => !B2.getState().syncing, "bob2's restore");
+    await settle(A, B, B2, C);
+    let offline = true;
+    let failGet = false;
+    server().hooks.fail = (_m, p, who) => {
+      if (who !== "bob2") return null;
+      if (offline) return "before";
+      // the first get once bob2 holds B1's ENDED record: the sweep of epoch 0's lanes
+      if (failGet && p === "/api/v2/get" && I(B2).self!.fold.ended.size > 0) {
+        failGet = false;
+        return "before";
+      }
+      return null;
+    };
+    await C.sendText(id, "before the removal");
+    await settle(A, B, C);
+    await A.removeMember(id, bob.uidB);
+    await settle(A, B, C);
+    expect(chat(B, id)).toContain("carol: before the removal");
+    expect(
+      selfRowsOf(bob)
+        .flat()
+        .some((x) => x.rtype === P.RT.ENDED),
+    ).toBe(true);
+    offline = false;
+    failGet = true;
+    await settle(A, B, B2, C);
+    expect(failGet).toBe(false);
+    expect(mustView(B2, id).blocked).toBe("removed");
+    expect(epoch(B2, id).lanes.every((l) => l.swept)).toBe(true);
+    expect(chat(B2, id)).toContain("carol: before the removal");
+    expect(systemLines(B2, id)).toContain("@alice removed you");
+  });
+
   it("⚠: a copy whose ENDED record the fold holds counts as ended there, also on a lagging device", async () => {
     const {
       users: [alice, bob, carol],

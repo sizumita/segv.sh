@@ -75,6 +75,7 @@ import {
   claimRead,
   deriveLines,
   endByRecord,
+  endSwept,
   historyClaim,
   onLeave,
   processWinner,
@@ -214,8 +215,10 @@ export class Messaging {
   live = false;
   /** the J delivery queue (§6.11, §6.12) */
   private readonly deliveries: Deliveries;
-  /** EPOCH_PENDING records this session wrote (resumed at once, §6.11) */
+  /** EPOCH_PENDING records this session wrote (resumed without waiting for RESUME_AFTER, §6.11) */
   private readonly ownPending = new Set<string>();
+  /** those whose creation or commit is still running: it delivers J itself, so no resume starts a job for them */
+  private readonly ownRunning = new Set<string>();
   /** decrypted images by `id.k` (never by id alone, §8.1) */
   readonly images = new ImageCache();
   /** decrypted files by `id.k` (never by id alone, §8.3): an object URL and the file's length */
@@ -434,13 +437,14 @@ export class Messaging {
 
   /**
    * A copy that holds the epoch its ENDED record names (its own or a sibling's) has ended there, latched, without
-   * processing that claim (§6.6 step 3, §7.3); a record for an epoch it does not hold is not applied yet.
+   * processing that claim (§6.6 step 3, §7.3); a record for an epoch it does not hold is not applied yet. A copy
+   * whose sweep there did not finish (a transient failure) ends by the record again (§11.2 "Sweeping").
    */
   private async endByRecordIf(c: Copy, quiet: boolean): Promise<void> {
-    if (c.removed || c.probe) return;
+    if (c.probe) return;
     const rec = this.h.self.fold.ended.get(copyKeyOf(c));
     const ep = c.epochs.get(c.current);
-    if (!rec || !ep || rec.e !== ep.e) return;
+    if (!rec || !ep || rec.e !== ep.e || (c.removed && endSwept(c, ep))) return;
     await endByRecord(this.membershipHost(quiet), c, ep, rec.claim);
     // A device that holds rows of that epoch reads the claim now: rows stored after it are dropped (§6.8, §11.7).
     if (ep.loaded > 0) await this.readEndClaim(c, quiet);
@@ -2423,7 +2427,9 @@ export class Messaging {
       ]),
     );
     this.h.check();
-    this.ownPending.add(jobKey(copyKeyOf({ conv: cr.conv, root: cr.D.hash }), 0, cr.bundleId));
+    const pendingKey = jobKey(copyKeyOf({ conv: cr.conv, root: cr.D.hash }), 0, cr.bundleId);
+    this.ownPending.add(pendingKey);
+    this.ownRunning.add(pendingKey);
     for (const u of others) this.learnUser(u, true);
     const k = copyKeyOf({ conv: cr.conv, root: cr.D.hash });
     const key = this.h.self.fold.viewKeys.get(k)!;
@@ -2445,7 +2451,8 @@ export class Messaging {
     }));
     void this.h
       .track(this.finishCreation(c, ep, putAt, tReg, recipients, release, hello))
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => this.ownDone([pendingKey]));
     return key;
   }
 
@@ -2662,9 +2669,11 @@ export class Messaging {
       const covered = f.delivered.get(key) ?? new Set<string>();
       const uids = rec.uids.map((u) => P.b64u(u)).filter((u) => !covered.has(u));
       if (uids.length === 0) continue;
-      // This session's own creations deliver through their own attempts (§6.1 steps 8–9, then the job's loop);
-      // another device's (or an earlier session's) once RESUME_AFTER has passed.
-      if (this.ownPending.has(key) || nowSec - t < this.h.delays.resumeAfter / 1000) continue;
+      // A creation or commit of this session that is still running delivers through its own attempts (§6.1 steps
+      // 8–9, §6.3 step 10, then the job's loop); one that ended, at once; another device's (or an earlier
+      // session's) once RESUME_AFTER has passed.
+      if (this.ownRunning.has(key)) continue;
+      if (!this.ownPending.has(key) && nowSec - t < this.h.delays.resumeAfter / 1000) continue;
       const J: P.Join = {
         conv: rec.conv,
         e: rec.e,
@@ -2760,9 +2769,29 @@ export class Messaging {
     return next;
   }
 
+  /**
+   * A creation or commit of this session ended (done, given up, or failed): its EPOCH_PENDING records are resumed
+   * like any other from now on, and one that is already established is resumed at once (§6.3, §6.11). A job its
+   * first attempt left running takes in the resume instead of a second one (`Deliveries.enqueue`).
+   */
+  private ownDone(keys: readonly string[]): void {
+    for (const k of keys) this.ownRunning.delete(k);
+    this.resumeDeliveries();
+  }
+
   // ───────────────────────── membership changes (§6.3, §6.9, §11.11) ─────────────────────────
 
-  private commitHost(): CommitHost {
+  /** Runs one commit (§6.3); the EPOCH_PENDING records it writes are its own to deliver while it runs. */
+  private async commit(c: Copy, plan: Plan): Promise<void> {
+    const written: string[] = [];
+    try {
+      await commit(this.commitHost(written), c, plan);
+    } finally {
+      this.ownDone(written);
+    }
+  }
+
+  private commitHost(written: string[]): CommitHost {
     return {
       api: this.h.api,
       clock: this.h.clock,
@@ -2774,7 +2803,10 @@ export class Messaging {
       sync: (c) => this.h.enqueue(() => this.syncCopies([c], false)),
       settle: (c) => this.h.enqueue(() => this.settleCopy(c)),
       writePending: async (rec) => {
-        this.ownPending.add(jobKey(copyKeyOf(rec), rec.e, rec.bundleId));
+        const key = jobKey(copyKeyOf(rec), rec.e, rec.bundleId);
+        this.ownPending.add(key);
+        this.ownRunning.add(key);
+        written.push(key);
         await this.h.enqueue(() => this.h.self.write([rec]));
       },
       pksOf: (c, ep) => this.epochPks(c, ep),
@@ -2814,7 +2846,7 @@ export class Messaging {
   /** §11.3 step 3: a commit that drops the members who left; a frozen copy refuses, and step 2 decides. */
   private async rotate(c: Copy): Promise<void> {
     try {
-      await commit(this.commitHost(), c, (cc, ep) => {
+      await this.commit(c, (cc, ep) => {
         const keep = this.stay(cc, ep);
         return keep.length === ep.D.members.length ? null : { keep, add: [] };
       });
@@ -2838,9 +2870,8 @@ export class Messaging {
         for (const u of wanted) this.learnUser(u, true);
         const listedLeaver = (cc: Copy, ep: Epoch) =>
           wanted.some((u) => P.memberIndex(ep.D, u.uidBytes) >= 0 && leftIn(cc, ep, u.uid));
-        const host = this.commitHost();
         if (listedLeaver(c, currentEpoch(c)))
-          await commit(host, c, (cc, ep) =>
+          await this.commit(c, (cc, ep) =>
             listedLeaver(cc, ep) ? { keep: this.stay(cc, ep), add: [] } : null,
           );
         const plan: Plan = (cc, ep, round) => {
@@ -2851,7 +2882,7 @@ export class Messaging {
           }
           return { keep: this.stay(cc, ep), add };
         };
-        await commit(host, c, plan);
+        await this.commit(c, plan);
       } finally {
         this.h.progress("");
       }
@@ -2865,7 +2896,7 @@ export class Messaging {
       return Promise.reject(new UserError("use “leave” to leave a conversation"));
     return this.chain(convId, async () => {
       try {
-        await commit(this.commitHost(), c, (cc, ep, round) => {
+        await this.commit(c, (cc, ep, round) => {
           const j = ep.D.members.findIndex((m) => P.b64u(m.uid) === uidB);
           if (j < 0) {
             if (round === 0) throw new UserError("not a member");

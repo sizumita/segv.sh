@@ -3595,10 +3595,11 @@ late, and its sender checks it again (§11.3 step 8).
 **Sweeping.** Before any lane of an older epoch leaves the expected-label map (when the copy switches epochs, or a
 followed lane is dropped), and before the lanes of the epoch that a claim removed self from leave it (§6.6 step 3), the
 client processes each from its processed position to its dense-prefix head, probed at that moment, after the winner that
-ended the epoch is final. So a WELCOME or LEAVE posted in an older epoch before it leaves the map is never skipped. Two
-gaps remain, and scrollback finds their rows (§11.10, §13.2 item 15): a row that a member writes into an older epoch
-after it already wrote in a newer one, which only two of its own devices racing a claim can do; and an honest row raced
-by a malicious member who registers the next bundle in advance and commits two claims back to back.
+ended the epoch is final. A lane leaves the map only once its sweep has completed: a sweep that a failed read interrupts
+runs again at the next catch-up. So a WELCOME or LEAVE posted in an older epoch before it leaves the map is never
+skipped. Two gaps remain, and scrollback finds their rows (§11.10, §13.2 item 15): a row that a member writes into an
+older epoch after it already wrote in a newer one, which only two of its own devices racing a claim can do; and an
+honest row raced by a malicious member who registers the next bundle in advance and commits two claims back to back.
 
 The client also keeps:
 
