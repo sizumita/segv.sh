@@ -186,8 +186,11 @@ export interface DirWrapWrite {
 }
 export type DirWrite = DirUserWrite | DirWrapWrite;
 
-/** The write landed with these dirlog seqs (the user's first, then its wraps), or it was refused (400 / 409). */
-export type DirWriteResult = { ok: true; seqs: number[] } | { ok: false; status: 400 | 409; error: string };
+/**
+ * The write landed with these dirlog seqs (the user's first, then its wraps), or it was refused (400 / 409), or a
+ * database it needs is unavailable or misconfigured (503).
+ */
+export type DirWriteResult = { ok: true; seqs: number[] } | { ok: false; status: 400 | 409 | 503; error: string };
 
 // ───────────── CheckpointDO (§9.5) ─────────────
 

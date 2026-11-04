@@ -1,7 +1,7 @@
 # Deployment
 
-segv.sh runs on Cloudflare: one Worker with static assets, five Durable Object classes with SQLite storage, a D1
-database, an R2 bucket and the Workers rate-limiting binding. The web app's `apps/web/wrangler.jsonc` configures the
+segv.sh runs on Cloudflare: one Worker with static assets, its Durable Object classes with SQLite storage, D1
+databases (one to start), an R2 bucket and the Workers rate-limiting binding. The web app's `apps/web/wrangler.jsonc` configures the
 deployment at <https://segv.sh>; to run your own instance, change the values that the steps below name.
 
 ## Decide these first
@@ -32,7 +32,9 @@ Some settings cannot change once people use a deployment.
 
 Run the commands of these steps in `apps/web`, the directory of `wrangler.jsonc`.
 
-1. Create the D1 database, and put its id into `d1_databases[0].database_id` in `wrangler.jsonc`:
+1. Create the D1 database, and put its id into both entries of `d1_databases` in `wrangler.jsonc`: `DB` (user
+   database 0) and `DIRLOG` (the log database) are the same database until the directory is split
+   ([PROTOCOL.md §9.6](PROTOCOL.md)):
 
    ```bash
    pnpm exec wrangler d1 create segv
@@ -46,7 +48,8 @@ Run the commands of these steps in `apps/web`, the directory of `wrangler.jsonc`
    pnpm exec wrangler r2 bucket create segv-blobs
    ```
 
-3. Apply the D1 migrations (`packages/server/migrations`):
+3. Apply the D1 migrations (`packages/server/migrations`); every database of the directory gets the same schema, so
+   repeat this for each further database you add later (`DB1`, …):
 
    ```bash
    pnpm exec wrangler d1 migrations apply DB --remote
@@ -308,6 +311,13 @@ Custom Domain step after the new version is live. Apply both by hand (the next s
   release working. Changes to Durable Object classes are declared in `migrations` in `wrangler.jsonc`, which both
   deployments share.
 
+- The directory became a log database (`DIRLOG`) and `DIR_SHARDS` user databases (`DB`, `DB1`, …). Bind `DIRLOG`
+  to the existing database (the same database as `DB`, until you move the log out), leave `DIR_SHARDS` unset (one
+  user database) and deploy: nothing moves. Before that database nears its size limit (10 GB; about 1.5 million
+  accounts), create `K − 1` further databases, apply the migrations to each, bind them as `DB1` … `DB{K−1}`, set
+  `DIR_SHARDS` to `K` (a power of two) and deploy; the `DirSeqDO` then moves each account's rows to its database in
+  the background, a page at a time, and lookups keep working meanwhile. Never lower `DIR_SHARDS` (the `DirSeqDO`
+  refuses writes until it is restored), and raise it only in a deploy after the one that introduced the `DirSeqDO`.
 - The blob registry became `BLOBREG_SHARDS` objects, and the directory got its single writer (the `DirSeqDO`,
   migration `v4`). Nothing is done by hand: each registry object copies its share of the first release's registry the
   first time it runs, and the old object stays, read-only. Set `BLOBREG_SHARDS` before the first deploy of this version

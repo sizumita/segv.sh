@@ -3,7 +3,17 @@ import { describe, expect, it } from "vitest";
 import * as P from "@segv/protocol/proto";
 import { clientKey, clientTag } from "../src/abuse";
 import { inboxCacheControl } from "../src/api";
-import { parseShardMap, shardBitsOf, shardsOf } from "../src/env";
+import {
+  dirBitsOf,
+  dirShardOf,
+  parseShardMap,
+  shardBitsOf,
+  shardsOf,
+  userDbs,
+  v2ParamsValid,
+} from "../src/env";
+import { mergeByUid } from "../src/directory";
+import { envWith } from "./helpers";
 import { dec64, enc64 } from "../src/b64";
 import { logErr } from "../src/http";
 import { appHosts } from "../src/hosts";
@@ -49,6 +59,43 @@ describe("SHARD_MAP (§9.1)", () => {
       42,
     ])
       expect(parseShardMap(bad), String(bad)).toBeNull();
+  });
+});
+
+describe("the directory's databases (§9.6)", () => {
+  it("places a uid by the top bits of its upre, and needs every database DIR_SHARDS names", () => {
+    expect(dirShardOf(0xffffffff, 0)).toBe(0);
+    expect(dirShardOf(0x7fffffff, 1)).toBe(0);
+    expect(dirShardOf(0x80000000, 1)).toBe(1);
+    expect(dirShardOf(0xc0000001, 2)).toBe(3);
+    expect(dirShardOf(0xffffffff, 8)).toBe(255);
+    expect(() => dirShardOf(0, 9)).toThrow();
+    expect([1, 2, 4, 256].map(dirBitsOf)).toEqual([0, 1, 2, 8]);
+    expect(() => dirBitsOf(3)).toThrow();
+    expect(() => dirBitsOf(512)).toThrow();
+    expect(userDbs(envWith({}))).toHaveLength(2); // the test deployment: DB and DB1
+    expect(userDbs(envWith({ DIR_SHARDS: "1" }))).toHaveLength(1);
+    expect(v2ParamsValid(envWith({}))).toBe(true);
+    expect(v2ParamsValid(envWith({ DIR_SHARDS: "1" }))).toBe(true);
+    expect(v2ParamsValid(envWith({ DIR_SHARDS: "4" }))).toBe(false); // DB2 and DB3 are not bound
+    expect(v2ParamsValid(envWith({ DIR_SHARDS: "3" }))).toBe(false);
+    expect(v2ParamsValid(envWith({ DIRLOG: undefined }))).toBe(false);
+    expect(v2ParamsValid(envWith({ DB1: undefined }))).toBe(false);
+  });
+
+  it("merges the databases' pages by uid, a uid listed twice once", () => {
+    const r = (uid: string, d: number) => ({ uid, d });
+    expect(mergeByUid([[r("B", 0), r("D", 0)], [r("A", 1), r("B", 1), r("C", 1)], []])).toEqual([
+      r("A", 1),
+      r("B", 0),
+      r("C", 1),
+      r("D", 0),
+    ]);
+    expect(mergeByUid([])).toEqual([]);
+    // b64u text order is byte order: '-' and '_' sort as SQLite's BINARY collation puts them.
+    expect(
+      mergeByUid([[r("a", 0)], [r("-", 1), r("Z", 1), r("_", 1), r("0", 1)]]).map((x) => x.uid),
+    ).toEqual(["-", "0", "Z", "_", "a"]);
   });
 });
 

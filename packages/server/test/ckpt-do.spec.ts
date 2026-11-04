@@ -262,7 +262,7 @@ describe("CheckpointDO", () => {
       });
       // The shard still fails while the dirlog moves: the new checkpoint carries the old shard head.
       await withEnv(
-        { SHARD: deadNs, DB: fakeDb(async () => ({ seq: 9, h: P.b64u(X) })) },
+        { SHARD: deadNs, DIRLOG: fakeDb(async () => ({ seq: 9, h: P.b64u(X) })) },
         async () => {
           const r = await tick();
           expect(r.q).toBe(r1.q + 1);
@@ -272,7 +272,11 @@ describe("CheckpointDO", () => {
       );
       // D1 fails: the dirlog keeps X.
       await withEnv(
-        { DB: fakeDb(async () => Promise.reject(new Error("D1_ERROR: network connection lost"))) },
+        {
+          DIRLOG: fakeDb(async () =>
+            Promise.reject(new Error("D1_ERROR: network connection lost")),
+          ),
+        },
         async () => {
           const r = await tick();
           expect(headOf(r, P.DIRLOG_CID)).toEqual(X);
@@ -283,10 +287,10 @@ describe("CheckpointDO", () => {
       const noTable = fakeDb(async () =>
         Promise.reject(new Error("D1_ERROR: no such table: dirlog: SQLITE_ERROR")),
       );
-      await withEnv({ DB: noTable }, async () => {
+      await withEnv({ DIRLOG: noTable }, async () => {
         expect(headOf(await tick(), P.DIRLOG_CID)).toEqual(P.ZERO32);
       });
-      await withEnv({ DB: fakeDb(async () => null) }, async () => {
+      await withEnv({ DIRLOG: fakeDb(async () => null) }, async () => {
         expect(headOf(await tick(), P.DIRLOG_CID)).toEqual(P.ZERO32);
       });
       expect(errors.mock.calls.some((c) => String(c[0]).includes("did not answer"))).toBe(true);

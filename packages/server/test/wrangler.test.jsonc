@@ -5,11 +5,25 @@
   "main": "./entry.ts",
   "compatibility_date": "2026-10-20",
   "compatibility_flags": ["nodejs_compat"],
+  // The directory (§9.6): the log database and two user databases, so that the tests cover the placement of rows,
+  // merged lookups and the write-ahead log.
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "segv-test",
       "database_id": "00000000-0000-0000-0000-000000000001",
+      "migrations_dir": "../migrations",
+    },
+    {
+      "binding": "DB1",
+      "database_name": "segv-test-1",
+      "database_id": "00000000-0000-0000-0000-000000000002",
+      "migrations_dir": "../migrations",
+    },
+    {
+      "binding": "DIRLOG",
+      "database_name": "segv-test-log",
+      "database_id": "00000000-0000-0000-0000-000000000003",
       "migrations_dir": "../migrations",
     },
   ],
@@ -85,6 +99,8 @@
     "PUSH_SHARDS": "2",
     // Two blob registry shards, so that the tests cover the routing of blob ids (§9.2).
     "BLOBREG_SHARDS": "2",
+    // Two user databases in the directory (§9.6).
+    "DIR_SHARDS": "2",
     // Four inbox buckets in every era, so that the tests cover the bucket map, keys and routing (§9.3).
     "INBOX_MAP": "0:4",
     // Fixed test secrets (never used outside tests).

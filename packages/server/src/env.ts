@@ -3,10 +3,12 @@
  *
  * Vars (wrangler.jsonc "vars", strings): DELTA_S (Δ), SKEW_S (SKEW), INBOX_SLOT_S (Δin), E_FIRST, RT_CONNS (C),
  * RT_FEEDS (F, a power of two; §9.4), BLOBREG_SHARDS (B, a power of two, a constant of the deployment; §9.2),
- * SHARD_MAP (the shard count per era, "E:S" entries; §9.1) and INBOX_MAP (the inbox bucket count per era, the same
- * form; §9.3). A var that is present but invalid (not decimal, out of
- * range, a Δ that does not divide 604 800, a malformed shard map) makes the Worker answer 503 "server misconfigured"
- * on /api/v2/* (v2ParamsValid() is false); v2Params() falls back to the default.
+ * DIR_SHARDS (K, the directory's user databases, a power of two that is only ever raised; §9.6), SHARD_MAP (the shard
+ * count per era, "E:S" entries; §9.1) and INBOX_MAP (the inbox bucket count per era, the same form; §9.3). A var that
+ * is present but invalid (not decimal, out of range, a Δ that does not divide 604 800, a malformed shard map, a
+ * DIR_SHARDS without its databases) makes the Worker answer 503 "server misconfigured" on /api/v2/* (v2ParamsValid()
+ * is false); v2Params() falls back to the default.
+ * D1: DIRLOG is the directory's log database and DB, DB1 … DB{K−1} its user databases (§9.6).
  * Secrets: ROUTE_KEY (32 bytes, b64u) and SRV_KEY (32-byte Ed25519 seed, b64u). When either is missing or
  * malformed the Worker answers 503 "server misconfigured" on /api/v2/* (serverKeys() returns null).
  * Shared by the Worker and every v2 Durable Object (they must agree on Δ and SKEW).
@@ -30,6 +32,8 @@ export interface V2Params {
   rtFeeds: number;
   /** B: the number of BlobRegDO shards, a power of two, fixed for the deployment (§9.2). Default 1. */
   blobShards: number;
+  /** K: the number of user databases of the directory, a power of two, only ever raised (§9.6). Default 1. */
+  dirShards: number;
   /** The shard map (§9.1): entries ascending by `from`; s_E is the `bits` of the last entry at or below E, 0 without one. */
   shardMap: ShardMapEntry[];
   /** The inbox bucket map (§9.3 "Buckets"), the same form: β_E is the `bits` of the last entry at or below E. */
@@ -44,6 +48,8 @@ export interface ShardMapEntry {
 
 /** The largest shard count (2^16; shardOf() takes at most 16 bits). */
 const SHARDS_MAX = 65536;
+/** The largest DIR_SHARDS (and so the number of DB{d} bindings a deployment may need; §9.6). */
+export const DIR_SHARDS_MAX = 256;
 
 /**
  * Parses SHARD_MAP ("E:S,E:S,…", §9.1 "Shard map"): [] when the var is absent or empty, null when it is malformed
@@ -114,6 +120,7 @@ const VARS: Readonly<Record<Exclude<keyof V2Params, "shardMap" | "inboxMap">, Va
   rtConns: { name: "RT_CONNS", dflt: 1, min: 1, max: 4096 },
   rtFeeds: { name: "RT_FEEDS", dflt: 1, min: 1, max: 4096, ok: (n) => (n & (n - 1)) === 0 },
   blobShards: { name: "BLOBREG_SHARDS", dflt: 1, min: 1, max: 4096, ok: (n) => (n & (n - 1)) === 0 },
+  dirShards: { name: "DIR_SHARDS", dflt: 1, min: 1, max: DIR_SHARDS_MAX, ok: (n) => (n & (n - 1)) === 0 },
 };
 
 /** The var's value; undefined when it is absent, null when it is present but invalid. */
@@ -137,6 +144,7 @@ export function v2Params(env: Env): V2Params {
     rtConns: get(VARS.rtConns),
     rtFeeds: get(VARS.rtFeeds),
     blobShards: get(VARS.blobShards),
+    dirShards: get(VARS.dirShards),
     shardMap: parseShardMap((env as unknown as Record<string, unknown>).SHARD_MAP) ?? [],
     inboxMap: parseShardMap((env as unknown as Record<string, unknown>).INBOX_MAP) ?? [],
   };
@@ -144,16 +152,67 @@ export function v2Params(env: Env): V2Params {
 
 /**
  * False when a deployment var is present but invalid (not decimal, out of range, a DELTA_S that does not divide
- * 604 800, an RT_FEEDS or BLOBREG_SHARDS that is not a power of two, or a malformed SHARD_MAP or INBOX_MAP): the Worker
- * then answers 503 "server
- * misconfigured" on /api/v2/* instead of running on a fallback.
+ * 604 800, an RT_FEEDS, BLOBREG_SHARDS or DIR_SHARDS that is not a power of two, a malformed SHARD_MAP or INBOX_MAP,
+ * or a directory database that DIR_SHARDS needs but the deployment does not bind): the Worker then answers 503
+ * "server misconfigured" on /api/v2/* instead of running on a fallback.
  */
 export function v2ParamsValid(env: Env): boolean {
   return (
     Object.values(VARS).every((v) => intVar(env, v) !== null) &&
     parseShardMap((env as unknown as Record<string, unknown>).SHARD_MAP) !== null &&
-    parseShardMap((env as unknown as Record<string, unknown>).INBOX_MAP) !== null
+    parseShardMap((env as unknown as Record<string, unknown>).INBOX_MAP) !== null &&
+    dirDbsBound(env)
   );
+}
+
+// ───────────── the directory's databases (§9.6) ─────────────
+
+/** The binding of user database d: DB for 0, DB{d} above. */
+export const dirDbBinding = (d: number): string => (d === 0 ? "DB" : `DB${d}`);
+
+const isD1 = (x: unknown): x is D1Database =>
+  typeof x === "object" && x !== null && typeof (x as D1Database).prepare === "function";
+
+/** The log database (dirlog, dirmeta; §9.6). */
+export function logDb(env: Env): D1Database {
+  const db = (env as unknown as Record<string, unknown>).DIRLOG;
+  if (!isD1(db)) throw new Error("directory: the log database is not bound");
+  return db;
+}
+
+/** User database d (§9.6); throws when the deployment does not bind it. */
+export function userDb(env: Env, d: number): D1Database {
+  const db = (env as unknown as Record<string, unknown>)[dirDbBinding(d)];
+  if (!isD1(db)) throw new Error(`directory: user database ${d} is not bound`);
+  return db;
+}
+
+/** Every user database of the deployment, 0 .. K − 1 (K = DIR_SHARDS). */
+export const userDbs = (env: Env): D1Database[] =>
+  Array.from({ length: v2Params(env).dirShards }, (_, d) => userDb(env, d));
+
+/** Whether the log database and the K user databases are bound. */
+function dirDbsBound(env: Env): boolean {
+  try {
+    logDb(env);
+    userDbs(env);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** dirShard(uid) = the top `bits` bits of upre (§9.6): the user database of a uid under K = 2^bits. */
+export function dirShardOf(upre: number, bits: number): number {
+  if (!Number.isInteger(bits) || bits < 0 || bits > 8) throw new Error("bad directory shard bits");
+  return Math.floor(upre / 2 ** (32 - bits));
+}
+
+/** log2 of a power of two in 1..DIR_SHARDS_MAX. */
+export function dirBitsOf(K: number): number {
+  const bits = Math.log2(K);
+  if (!Number.isInteger(bits) || bits < 0 || K > DIR_SHARDS_MAX) throw new Error("DIR_SHARDS is not a power of two");
+  return bits;
 }
 
 /**

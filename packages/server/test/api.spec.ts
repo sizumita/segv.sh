@@ -277,7 +277,7 @@ describe("GET /api/v2/params", () => {
       bind: () => stmt,
       first: () => Promise.reject(new Error("D1_ERROR: Network connection lost.")),
     };
-    const DB = new Proxy(env.DB, {
+    const DIRLOG = new Proxy(env.DIRLOG, {
       get: (t, k) => (k === "prepare" ? () => (reads++, stmt) : Reflect.get(t, k)),
     });
     const CKPT = { getByName: () => ({ ensure: async () => {} }) };
@@ -286,7 +286,7 @@ describe("GET /api/v2/params", () => {
     console.error = (...a: unknown[]) => void logs.push(a);
     try {
       for (let i = 0; i < 5; i++) {
-        const res = await direct("/api/v2/params", {}, { DB, CKPT });
+        const res = await direct("/api/v2/params", {}, { DIRLOG, CKPT });
         expect(res.status).toBe(200);
         expect(((await res.json()) as { p: number }).p).toBe(0);
       }
@@ -2427,6 +2427,9 @@ describe("hosts, HSTS and server secrets", () => {
       { INBOX_SLOT_S: "0" },
       { E_FIRST: "65535" },
       { E_FIRST: "-1" },
+      { DIR_SHARDS: "3" }, // not a power of two
+      { DIR_SHARDS: "4" }, // the deployment binds DB and DB1 only (§9.6)
+      { DIRLOG: undefined }, // the log database must be bound
     ];
     for (const over of bad) {
       for (const [path, init] of [

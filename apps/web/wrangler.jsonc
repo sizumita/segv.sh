@@ -19,11 +19,20 @@
     // API + websocket paths always hit the Worker (never the asset server).
     "run_worker_first": ["/api/*"],
   },
-  // The directory (accounts, key wraps, the dirlog hash chain; docs/PROTOCOL.md §9.6). Its schema belongs to the API
-  // (packages/server/migrations).
+  // The directory (docs/PROTOCOL.md §9.6): DIRLOG is its log database (the dirlog hash chain and the user count) and
+  // DB, DB1 … DB{K−1} its K = DIR_SHARDS user databases (accounts, key wraps). A deployment starts with one database
+  // for both, so DIRLOG and DB name the same database here. To raise DIR_SHARDS: create the new databases, apply the
+  // migrations to each, bind them as DB1 …, set DIR_SHARDS and deploy (docs/DEPLOYMENT.md); the DirSeqDO then moves
+  // the rows. The schema belongs to the API (packages/server/migrations).
   "d1_databases": [
     {
       "binding": "DB",
+      "database_name": "segv",
+      "database_id": "6a771a84-e88a-4daa-a66d-1a3c0bed025d",
+      "migrations_dir": "../../packages/server/migrations",
+    },
+    {
+      "binding": "DIRLOG",
       "database_name": "segv",
       "database_id": "6a771a84-e88a-4daa-a66d-1a3c0bed025d",
       "migrations_dir": "../../packages/server/migrations",
@@ -116,6 +125,8 @@
     // of blob registry objects, a power of two: a constant of the deployment, never changed once a blob is
     // registered (ids would route to another object). INBOX_MAP (optional, §9.3) = the inbox bucket count per era,
     // "E:B" entries like SHARD_MAP (B a power of two; unset = one bucket): raise it for an era that has not started
+    // (see below). DIR_SHARDS (§9.6) = the directory's user databases DB, DB1 …, a power of two; unset = one. Only
+    // ever raise it, and only in a deploy after the one that introduced the DirSeqDO: it then moves the rows.
     // once the user count passes 2 · 16 384 · B, never for one that accepts posts.
     // Secrets (wrangler secret put; .dev.vars for vp dev): ROUTE_KEY (32 B b64u), SRV_KEY (Ed25519 seed b64u).
     // Web Push is off unless the secrets VAPID_SK (P-256 scalar, 32 B b64u) and PUSH_KEY (32 B b64u) are set, with
@@ -165,6 +176,12 @@
       "d1_databases": [
         {
           "binding": "DB",
+          "database_name": "segv-canary",
+          "database_id": "f4e5945a-1acc-4c90-bfda-790e16a861b1",
+          "migrations_dir": "../../packages/server/migrations",
+        },
+        {
+          "binding": "DIRLOG",
           "database_name": "segv-canary",
           "database_id": "f4e5945a-1acc-4c90-bfda-790e16a861b1",
           "migrations_dir": "../../packages/server/migrations",

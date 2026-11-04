@@ -61,7 +61,8 @@ texts.
   - `C` **ConnDOs**, which hold the WebSocket connections, and `F` **FeedDOs**, which keep which ConnDOs' sockets
     subscribed to each topic and forward published rows to them (`C` and `F` are deployment parameters, §9.4);
   - one **CheckpointDO**, which signs the heads of the public data every 60 s;
-  - the **directory** in D1 (accounts and key wraps);
+  - the **directory** in D1 (accounts and key wraps): one log database and `K` user databases (`DIR_SHARDS`,
+    §9.6);
   - R2 for blobs, and for the rows of sealed eras (§9.1 "Paging");
   - optionally, for push, the push store (a KV namespace), `PUSH_SHARDS` **BellDOs** and **QuietDOs**, which hold nothing
     durable, a queue and a daily Cron Trigger (§9.8); the Worker sends the contentless pushes.
@@ -2520,8 +2521,8 @@ Worker calls the DO's `ensure()` at most once per isolate (a module-level flag),
     else blobreg is left out). The hour is mixed in so that the value changes every hour whether or not anything was
     registered: P learns nothing about registrations from the checkpoints. The per-shard heads are kept for a later
     stage's mirror feed (§14), not published;
-  - `dirlog`, read from D1 (`SELECT seq, h FROM dirlog ORDER BY seq DESC LIMIT 1`), or ZERO32 while the dirlog is
-    empty (a table that does not exist yet counts as empty); any other D1 error is a failure.
+  - `dirlog`, read from the log database (`SELECT seq, h FROM dirlog ORDER BY seq DESC LIMIT 1`, §9.6), or ZERO32
+    while the dirlog is empty (a table that does not exist yet counts as empty); any other D1 error is a failure.
 - Each component call has 10 s to answer, and at most 32 calls are in flight at a time. A component that fails (an
   error or no answer in time) keeps its head from the previous checkpoint's list; one that has no head there (it has
   never answered) is left out of the list, never listed as ZERO32. A failing component never delays or blocks the
@@ -2560,6 +2561,8 @@ The same key signs receipts (§10.3).
 
 ### 9.6 Directory (D1)
 
+Every database of the directory (below) is created with this schema; the tables a database does not use stay empty.
+
 ```sql
 CREATE TABLE user (
   uid TEXT PRIMARY KEY,            -- b64u(16 B)
@@ -2593,30 +2596,74 @@ h_seq    = H(enc("segv.sh/v2/dirlog", h_{seq−1}, u64 seq, u8 kind, ref))      
 
 Each `ref` and `h` is stored as b64u text, and `dirseq` = the dirlog `seq` of the row.
 
-**Writes: the DirSeqDO (`dirseq/v2`, one instance, no storage).** The Worker validates a registration or a wrap
-record (§10.6) and hands it to the DirSeqDO, the only writer of the directory:
+**Databases.** The directory is one **log database** (`dirlog`, `dirmeta`) and `K = 2^κ` **user databases**
+`0 .. K − 1` (`user`, `wrap`), `K` the deployment variable `DIR_SHARDS` (a power of two, 1 .. 256; 1 when unset).
+The log database MAY be the same database as user database 0: a deployment starts that way, with one database, which
+is the layout of the first release. A user's rows live in user database `dirShard(uid) = ⌊upre / 2^(32 − κ)⌋`, the
+top κ bits of `upre` (§2.5): the user row and all its wrap rows together. `K` is only ever raised (the DirSeqDO then
+moves the rows, below), never lowered: a lookup reads the `K` databases of the deployment, so a lower `K` would hide
+rows, and the DirSeqDO refuses writes while the deployment's `K` is below the one it pinned.
 
-1. It keeps the dirlog head in memory, read from D1 when it starts and again after any failed write.
-2. For every write that arrived since the previous batch started (a burst is a few batches, with no fixed wait), it
-   first counts, for each wrap write, the uid's wrap records (a D1 read: there is no other writer, so the count holds
-   until the batch commits) and refuses the writes that would exceed 64 (400); then it assigns the next contiguous
-   seqs, computes `h`, and runs one atomic D1 `batch()`: `INSERT user`, `INSERT wrap…`, `INSERT dirlog…` with explicit
-   seqs, and, for a registration, `UPDATE dirmeta SET v = v + 1 WHERE k = 'users'`, for all of them.
-3. Failures:
-   - a `UNIQUE` failure on `user.handle`, `user.uid` or `wrap (uid, id)` with several writes in the batch means that
-     nothing was written: each write is retried alone, so the conflicting one answers 409 and the others land;
-   - a `UNIQUE` failure on `dirlog.seq` (another writer: only a Worker of the previous release, during a deploy) makes
-     it re-read the head and retry the batch once, then answer 503 for the batch;
-   - any other failure answers 503 for the batch's writes, and the head is re-read before the next one.
+**Reads.** A lookup asks every user database and merges the answers, so its result never depends on where a row is
+(rows are in their database except while a raise of `K` moves them, when a row may be in its old and its new
+database at once, never in neither): a uid lookup takes the row from whichever database has it; a prefix page reads up
+to 257 rows (`uid > after`, ordered by `uid`) from each database, merges them in `uid` order, drops a uid listed
+twice, answers the first 256 and sets `more` iff a 257th remains; a wraps lookup merges by `dirseq`. The dirlog, its
+head and `dirmeta` are read from the log database.
 
-D1 is authoritative: there is no outbox and no log fallback, and reads go to D1 from the Worker. If D1 is
-unavailable, directory writes and directory reads (register, wraps, prefix, uid and wraps lookups, dirlog) answer 503
-`{error: "directory unavailable"}`. The one exception is `p` in `/api/v2/params` (§10.9), which MUST NOT fail or wait
-because of D1. `users` (and so `P`) is read from `dirmeta` and cached per isolate for at most 60 s while D1 answers.
-While the `dirmeta` read fails, params reports the `P` of that isolate's last successful read, or 0 when there is none;
-the failure is logged, and after a failed read the isolate MUST NOT query `dirmeta` again for 5 s. A prefix lookup
-uses the same cached value and answers 503 while the isolate has none; it never treats the count as 0. `dirmeta.users`
-never decreases, so a cached or stale `P` is never above the current one.
+**Writes: the DirSeqDO (`dirseq/v2`, one instance, SQLite).** The Worker validates a registration or a wrap record
+(§10.6) and hands it to the DirSeqDO, the only writer of the directory. Its storage holds the write-ahead log of the
+rounds in flight and the pinned κ; D1 stays authoritative.
+
+1. It keeps the dirlog head in memory, read from the log database when it starts and again after any failed write.
+2. A **round** is every write that arrived since the previous round started, at most 32 (a burst is a few rounds,
+   with no fixed wait). The round first replays the write-ahead log (below); then it reads, from every user database,
+   the handles and uids of its registrations and the wrap rows of the uids of its wrap writes, and counts the earlier
+   writes of the round and the rows still in the write-ahead log as well. It refuses, without logging them, a handle
+   or uid that is registered (409), a wrap whose `(uid, id)` exists (409) and a wrap that would take its uid above
+   64 (400). While a user database does not answer these reads, or holds rows of the write-ahead log that do not
+   land, the round answers 503.
+3. It assigns the next contiguous seqs to the writes that remain and computes `h`; writes each of them, with its seqs
+   and its user database, to the write-ahead log; then runs one atomic `batch()` on the log database: `INSERT
+   dirlog…` with explicit seqs, and `UPDATE dirmeta SET v = v + 1 WHERE k = 'users'` for each registration.
+4. Then, per user database, one atomic `batch()` of the round's rows for it: `INSERT user`, `INSERT wrap…`. A write
+   whose rows landed answers with its seqs and leaves the write-ahead log.
+5. Failures:
+   - a `UNIQUE` failure on `dirlog.seq` in step 3 (another writer: only a Worker of the previous release, during a
+     deploy) drops the round from the write-ahead log, re-reads the head and retries the round once from step 2,
+     then answers 503 for the round;
+   - any other failure of step 3 may still have committed: the head is re-read, and the round is in the log iff the
+     entry at its last seq carries its `h`. If it is, step 4 follows; if not, the round leaves the write-ahead log
+     and answers 503;
+   - a failure of step 4 is retried once at once; then the write answers 503 while its rows stay in the write-ahead
+     log, and they land at the next replay: the next round, or an alarm one second later (and then every 5 s while
+     any row waits). The dirlog is thus never ahead of the user databases for longer than a replay, and a row never
+     lands without its dirlog entries;
+   - a `UNIQUE` failure of step 4 on a row that is not the round's own (another writer took the key between step 2
+     and the batch: only during the deploy that introduced the DirSeqDO) answers 409, and the write leaves the
+     write-ahead log: its dirlog entries stand and refer to a bundle or record the directory does not serve. A
+     `UNIQUE` failure on the round's own row (the replay of a batch that had landed) counts as landed.
+
+   A replay runs the rows of the write-ahead log as step 4, per user database, oldest first.
+
+**Raising `K`.** The DirSeqDO pins κ in its storage the first time it runs (from `DIR_SHARDS`; 0 for a deployment
+with one database). When the deployment's κ is above the pinned one, new rows are placed by the new κ from then on,
+and the object moves the rows that are no longer in their database, a page at a time from an alarm: for each old
+database in turn, up to 32 users in `uid` order with their wrap rows, `INSERT OR IGNORE` into their new databases,
+then `DELETE` from the old one, with the last uid of the page kept as the cursor; when every old database has been
+walked, the new κ is pinned. A lookup during the move sees a moving row in its old database, in both, or in its new
+one, and merges them (above). A deployment κ below the pinned one is an operator error: the object refuses writes
+(503) and logs it until the deployment's value is restored.
+
+D1 is authoritative: there is no outbox and no log fallback beyond the write-ahead log of a round in flight, and
+reads go to D1 from the Worker. If a database is unavailable, the directory writes and the directory reads that need
+it (register, wraps, prefix, uid and wraps lookups, dirlog) answer 503 `{error: "directory unavailable"}`. The one
+exception is `p` in `/api/v2/params` (§10.9), which MUST NOT fail or wait because of D1. `users` (and so `P`) is read
+from `dirmeta` in the log database and cached per isolate for at most 60 s while it answers. While the `dirmeta` read
+fails, params reports the `P` of that isolate's last successful read, or 0 when there is none; the failure is logged,
+and after a failed read the isolate MUST NOT query `dirmeta` again for 5 s. A prefix lookup uses the same cached value
+and answers 503 while the isolate has none; it never treats the count as 0. `dirmeta.users` never decreases, so a
+cached or stale `P` is never above the current one.
 
 **Prefix reads.** A lookup of the top `p` bits equal to `x` returns exactly the rows with `lo ≤ hpre ≤ hi` (or `upre`),
 and with `uid > after` when `after` is given, ordered by `uid` (the stored b64u text, §10.6), at most 256 per page. The
@@ -2626,8 +2673,9 @@ MUST accept every `p` with `0 ≤ p ≤ min(32, P + 1)`; stage 1 has no lower bo
 the query plan. The server SHOULD bound the rows one page reads: it reads the range through the `hpre`/`upre` index
 when `users / 2^p ≤ 257 · 2^p`, and otherwise walks the `uid` primary key in order and filters by the prefix (for
 SQLite: `+hpre BETWEEN …`, which keeps the planner off the prefix index). No page then reads more than about
-`√(257 · users)` rows, and a `p = 0` page reads about 257. The user count `P` is derived from `dirmeta.users`, never
-from `count(*)`.
+`√(257 · users)` rows, and a `p = 0` page reads about 257. Each user database is read with this query, with
+`users / K` as its size for the choice of plan, and the pages are merged ("Reads" above). The user count `P` is derived
+from `dirmeta.users`, never from `count(*)`.
 
 ### 9.7 Hardening (all endpoints)
 
@@ -3290,7 +3338,8 @@ Cache rules:
 - Every failed check is 400: shape, size, canonical form, handle, `bundleSig`, `checkUserKeys`, a record `uid` that
   differs from the bundle's, a repeated id, a bad `recordSig`, and 0 or more than 4 wraps. 409 is only for a handle or
   uid that is already registered.
-- It writes the user, the wraps and the dirlog entries atomically (§9.6).
+- It appends the dirlog entries atomically, then writes the user and the wraps (§9.6: the request answers 200 only
+  once its rows landed, and rows that a failure leaves behind land from the DirSeqDO's write-ahead log).
 - On success: 200 `{"dirseq": n}`, where n is the dirlog seq of the user entry (kind 1), i.e. the user's `dirseq` in
   lookups; its wrap entries take the following seqs n+1 … n+w in request order.
 
@@ -3298,8 +3347,8 @@ Cache rules:
 
 - Body `{"record": text, "sig": b64u}`.
 - The server checks, in this order: body and record shape, size and canonical form (400); unknown uid (404);
-  `recordSig` under the uid's registered bundle key (400); the cap of 64 records per uid, counted in the same D1
-  snapshot as the dirlog head (400 when the uid already has 64); then the insert, where a duplicate `(uid, id)` is 409.
+  `recordSig` under the uid's registered bundle key (400); the cap of 64 records per uid, counted by the DirSeqDO
+  before the write (§9.6; 400 when the uid already has 64); then the insert, where a duplicate `(uid, id)` is 409.
   A request that is both over the cap and a duplicate therefore answers 400.
 - On success: 200 `{"dirseq": n}`, the seq of the wrap's dirlog entry.
 - A client MUST NOT take a 400 or a 409 as proof that its record is stored. After a network error, a timeout or a
@@ -5296,7 +5345,9 @@ A native app (§11.14) changes whom a user trusts for the client's code, and add
 **Storage and routing:**
 
 - emergency splitting of a shard within an era (`MOVED`, frozen ranges);
-- R2 Range reads of bundle entries.
+- R2 Range reads of bundle entries;
+- read replicas for the directory (the D1 Sessions API): the lookup of an account's own entry right after its
+  registration needs the primary, so replicas need a bookmark per client first.
 
 **Abuse control and transport:**
 

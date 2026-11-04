@@ -8,7 +8,8 @@
  *  - tick() collects (cid, head) from shard/{E_now}/{i} for every i < S_{E_now} (the shard map, §9.1) and
  *    inbox/{E_now}/{g} for every g < 2^β_{E_now} (§9.3); from those of E_now−1 until they are sealed and their final head
  *    appeared once ('final:<cid>'); from the B blob registry shards once per UTC hour, as one value that mixes the
- *    hour in ('blobreg:hour', 'blobreg:head', each shard's last head 'blobreg:head:<j>'); and from the D1 dirlog
+ *    hour in ('blobreg:hour', 'blobreg:head', each shard's last head 'blobreg:head:<j>'); and from the dirlog of
+ *    the log database
  *    (ZERO32 when the table is missing or empty). At most 32 component calls
  *    are in flight at a time. A component that fails keeps its previous head. The list is sorted by cid,
  *    hd = H(heads), C_q = H(enc("segv.sh/v2/ckpt", C_{q−1}, u32 q, u32 sec, hd)), sig = Sign(SRV_SK, enc(…, q, C_q)).
@@ -42,7 +43,7 @@ import {
 } from "@segv/protocol/proto";
 import { errMsg, logErr } from "./http";
 import { Meta, ab } from "./batch";
-import { inboxBucketsOf, serverKeys, shardsOf, srvSign, v2Params } from "./env";
+import { inboxBucketsOf, logDb, serverKeys, shardsOf, srvSign, v2Params } from "./env";
 import { blobRegStub, inboxStub, shardStub, type CkptRange, type CkptRecord } from "./types";
 
 const PERIOD_MS = 60_000;
@@ -305,7 +306,9 @@ export class CheckpointDO extends DurableObject<Env> {
     const dirlog = async (): Promise<void> => {
       try {
         const r = await this.timed(
-          this.env.DB.prepare("SELECT seq, h FROM dirlog ORDER BY seq DESC LIMIT 1").first<{ seq: number; h: string }>(),
+          logDb(this.env)
+            .prepare("SELECT seq, h FROM dirlog ORDER BY seq DESC LIMIT 1")
+            .first<{ seq: number; h: string }>(),
         );
         const h = r ? fromB64u(r.h) : ZERO32;
         if (h.length !== 32) throw new Error("dirlog: bad head");
