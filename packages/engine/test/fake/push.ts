@@ -1,8 +1,9 @@
 /**
  * Web Push in the engine tests (docs/PROTOCOL.md §9.8, §10.10, §11.13).
  *
- * - FakePush is the server side, reduced to what the engine can observe: `push/sub` replaces an endpoint's bells and
- *   quiet tag, a `ring` of a fresh row "pushes" to every endpoint registered under one of its bells, and `seen` marks
+ * - FakePush is the server side, reduced to what the engine can observe: `push/sub` replaces an endpoint's bells (the
+ *   hashes of the secrets it sends, §4.1) and quiet tag, a `ring` of a fresh row "pushes" to every endpoint registered
+ *   under one of its bells, and `seen` marks
  *   rows for the endpoints of the account whose quiet tag hashes from its secret (the windows, jitter, dedup and
  *   storage of the real PushDO are tested in packages/server/test/push.spec.ts). With `holdMs` set, a push to an
  *   endpoint with a quiet tag waits that long (real time) and a mark of its row cancels it, as PUSH_HOLD does;
@@ -17,7 +18,7 @@ import type {
   PushStore,
   PushSubscriptionLike,
 } from "../../src/push";
-import { b64u, fromB64u, quietTag, random } from "@segv/protocol/proto";
+import { b64u, bellOf, fromB64u, quietTag, random } from "@segv/protocol/proto";
 
 type Bytes = Uint8Array;
 
@@ -25,12 +26,13 @@ type Bytes = Uint8Array;
 export const FAKE_VAPID: Bytes = Uint8Array.of(4, ...random(64));
 
 export type PushCall =
+  /** `tokens` are the bell secrets as sent (b64u) */
   | { kind: "sub"; endpoint: string; tokens: string[]; quiet: string | null }
   | { kind: "ring"; E: number; label: string; tokens: string[] }
   | { kind: "seen"; quiet: string; rows: { E: number; label: string }[] };
 
 export class FakePush {
-  /** registered endpoints and their bells (b64u) */
+  /** registered endpoints and their bells (b64u of bell(s) for each secret s sent) */
   readonly subs = new Map<string, Set<string>>();
   readonly calls: PushCall[] = [];
   /** the pushes sent: the endpoint, and the row whose ring caused it */
@@ -55,7 +57,7 @@ export class FakePush {
     this.quiet.delete(endpoint);
     if (tokens.length === 0) this.subs.delete(endpoint);
     else {
-      this.subs.set(endpoint, new Set(tokens));
+      this.subs.set(endpoint, new Set(tokens.map((t) => b64u(bellOf(fromB64u(t))))));
       if (quiet) this.quiet.set(endpoint, quiet);
     }
   }

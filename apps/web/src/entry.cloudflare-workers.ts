@@ -14,7 +14,7 @@ import { handleApi, pinHost, pushCleanup, pushQueue, stampResponse, wellKnown } 
 import render from "./entry.ssr";
 
 // Durable Object classes must be exported from the Worker's main module (docs/PROTOCOL.md §9): per-era
-// shards and inboxes, the blob registry, realtime WebSockets, checkpoints and the push objects.
+// shards and inboxes, the blob registry, realtime WebSockets, checkpoints and the push object.
 export {
   ShardDO,
   BlobRegDO,
@@ -24,7 +24,6 @@ export {
   ConnDO,
   FeedDO,
   CheckpointDO,
-  BellDO,
   QuietDO,
 } from "@segv/server";
 

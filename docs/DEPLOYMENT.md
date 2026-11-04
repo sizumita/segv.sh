@@ -157,7 +157,7 @@ fetch the two files from the canonical host, which answers them without a redire
 | `E_FIRST`        | 42                           | The era of the first deployment                                                                                                                                                                                                                  |
 | `SHARD_MAP`      | unset (one shard per era)    | The shard count per era: `E:S` entries, comma-separated, `S` a power of two in 1–65536 in effect from era `E` on (§9.1 of the protocol). Add an entry only for an era that has not started; never change the count of an era that accepts writes |
 | `INBOX_MAP`      | unset (one bucket per era)   | The inbox bucket count per era, in the same form (§9.3 of the protocol): raise it for an era that has not started once the user count passes 2 · 16 384 · B; never change the count of an era that accepts posts                                 |
-| `PUSH_SHARDS`    | 4                            | The number of objects that index the push bells and of those that own the push registrations, 1–4096. May change at any deploy                                                                                                                   |
+| `PUSH_SHARDS`    | 4                            | The number of objects that own the push registrations, one per range of accounts, 1–4096. May change at any deploy                                                                                                                               |
 | `RT_CONNS`       | 4                            | C, 1–4096: the number of objects that hold the realtime WebSockets; a client's sockets all go to one of them. May change at any deploy                                                                                                           |
 | `RT_FEEDS`       | 4                            | F, a power of two in 1–4096: the number of objects that fan new rows out to them by topic. May change at any deploy                                                                                                                              |
 | `BLOBREG_SHARDS` | 64                           | B, a power of two in 1–4096: the number of blob registry objects (§9.2 of the protocol). A constant of the deployment: never change it once a blob is registered, since ids would route to another object                                        |
@@ -298,6 +298,11 @@ Custom Domain step after the new version is live. Apply both by hand (the next s
 
   Without the workflow, deploy new code with `pnpm run deploy` (segv.sh) or `pnpm run build` followed by
   `pnpm exec wrangler deploy --env canary` (canary.segv.sh).
+
+- The version that lets each account choose its bells ([PROTOCOL.md §4.1](PROTOCOL.md)) carries the Durable Object
+  migration `v6`, which deletes the `BellDO` class (it stored nothing). Registrations made before it stay in the store
+  under bells that no longer ring; each device registers its new bells at its next start, and the daily expiry drops the
+  rest after 30 days. Nothing needs to be done by hand.
 
 - When a change adds a D1 migration, apply it to each deployment before deploying the code that needs it: to
   canary.segv.sh before merging the pull request, and to segv.sh before pushing the release tag. In `apps/web`:

@@ -334,7 +334,7 @@ export interface PushConfig {
   hosts: readonly string[];
   /** POW_PUSH */
   powBase: number;
-  /** PUSH_SHARDS: the number of BellDOs and of QuietDOs (§9.8) */
+  /** PUSH_SHARDS: the number of QuietDOs (§9.8) */
   shards: number;
   /** The first APP_HOSTS host: the payload's `navigate` is https://<appHost>/ */
   appHost: string;

@@ -185,7 +185,7 @@ export class SegvEngine implements Engine {
         return p ? pushParams(p) : null;
       },
       deltaMs: () => (this.api.cachedParams?.delta ?? 10) * 1000,
-      bells: () => this.msg?.pushBells() ?? [],
+      secrets: () => this.msg?.pushSecrets() ?? [],
       quiet: () => this.quietKeys()?.Q ?? null,
       onOff: () => {
         void this.dropCache();
@@ -751,6 +751,7 @@ export class SegvEngine implements Engine {
         regEra: acc.regEra!,
         inbox: acc.inbox,
         refKey: refKeyOf(acc.AK),
+        bellKey: P.bellKey(acc.AK),
       },
       self: this.self!,
       check: () => this.assertSession(acc, gen),

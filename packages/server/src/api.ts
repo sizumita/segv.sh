@@ -27,6 +27,7 @@ import {
   concat,
   eraEnd,
   eraStart,
+  bellOf,
   era,
   hex,
   hpre,
@@ -129,7 +130,7 @@ import {
   sealPage,
   type SealManifest,
 } from "./seal";
-import { PUSH_TOKENS, PUSH_WINDOW, epOf, ownerOf, pushRing, qkOf, quietShard } from "./push";
+import { PUSH_TOKENS, PUSH_WINDOW, epOf, ownerByRecord, pushRing, qkOf, quietShard } from "./push";
 export { _setRingSleepForTests } from "./push";
 import {
   blobRegStub,
@@ -1187,7 +1188,7 @@ async function pushSub(c: Ctx, cfg: PushConfig): Promise<Response> {
   const bytes = await readBody(c.request, MAX_PUSH_SUB_BODY);
   checkPow(c.request, c.env, "push", await sha256(bytes), bytes.length, c.now);
   const raw = parseJsonObject(bytes);
-  // `quiet` may be absent: a tab still open on an earlier release registers without one (§10.10).
+  // `quiet` may be absent only for a deletion (a tab still open on an earlier release sends none, §10.10).
   const keys = ["endpoint", "p256dh", "auth", "tokens"];
   if (Object.prototype.hasOwnProperty.call(raw, "quiet")) keys.push("quiet");
   const o = exactKeys(raw, keys, "push subscription");
@@ -1203,11 +1204,16 @@ async function pushSub(c: Ctx, cfg: PushConfig): Promise<Response> {
   }
   if (seen.size > PUSH_TOKENS) throw new HttpError(400, `at most ${PUSH_TOKENS} tokens`);
   const quiet = o.quiet === undefined ? null : b64uField(o.quiet, 16, "quiet");
-  // The endpoint's QuietDO is its owner's: its account's quiet tag, or the endpoint itself (§9.8).
+  if (quiet === null && seen.size > 0) throw new HttpError(400, "quiet tag required");
+  // The tokens are bell secrets (§4.1): the endpoint is registered under their bells, which only the Worker computes.
+  const bells = [...seen.values()].map((s) => bellOf(s));
+  // The endpoint's QuietDO is its owner's: its account's quiet tag, or, for a deletion without one, the owner its record
+  // names (§9.8, §10.10).
   const ep = epOf(cfg.pushKey, endpoint);
-  const k = quietShard(ownerOf(ep, quiet ? qkOf(cfg.pushKey, quiet) : null), cfg.shards);
+  const owner = quiet ? qkOf(cfg.pushKey, quiet) : await ownerByRecord(c.env, ep);
+  const k = quietShard(owner, cfg.shards);
   try {
-    await quietStub(c.env, k).sub(endpoint, p256dh, auth, [...seen.values()], quiet);
+    await quietStub(c.env, k).sub(endpoint, p256dh, auth, bells, quiet);
   } catch (e) {
     console.error(JSON.stringify({ msg: "push sub failed", error: logErr(e) }));
     throw new HttpError(503, "storage unavailable", { "retry-after": "5" });

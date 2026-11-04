@@ -1,12 +1,15 @@
 /**
  * QuietDO — one of PUSH_SHARDS objects that own the push registrations of their endpoints (docs/PROTOCOL.md §9.8).
  * Name "quiet/v2/{k}"; an endpoint's object is quietShard(owner), the owner being its account's quiet tag (keyed hash)
- * or, for an endpoint that registered none, its own hash: all endpoints of one account are here. It has no storage of
- * its own.
+ * or, for a record of the first release, which registered none, its own hash: all endpoints of one account are here.
+ * It has no storage of its own.
  *
- *  - The records (`e/<ep>` of the push store): read into a bounded cache, written by this object alone, one change of
- *    an endpoint at a time. sub() applies a registration: it tells the BellDOs which bells the endpoint leaves and
- *    takes, and writes the record when anything in it changed (the day included). drop() deletes one.
+ *  - The records (`e/<ep>` of the push store) and the bells (`b/<tk>`): each read into a bounded cache the first time
+ *    the object touches it, and written by this object alone (a bell's secret is the account's, so every endpoint
+ *    under a bell is one of its account's), one change of an endpoint at a time, and one write of a key at a time, at
+ *    least a second apart (the store's limit). sub() applies a registration: it takes the endpoint out of the bells
+ *    it leaves and puts it under those it takes (a bell whose 8 places the account's other endpoints hold is left
+ *    out), and writes the record when anything in it changed (the day included). drop() deletes one.
  *  - Everything a ring causes, never written: per endpoint `last`, `due`, `tries`, `rang`, `rows`, the rows that rang
  *    it recently (so that a sender's repeat changes nothing) and the push in flight; and the rows each account marked
  *    seen. ring() makes pushes due (the hold, the window, the jitter), due() hands the Worker those due now, sent()
@@ -14,7 +17,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 import { hex, type Bytes } from "@segv/protocol/proto";
-import { pushConfig, pushShardsOf, v2Params } from "./env";
+import { pushConfig, v2Params } from "./env";
 import { logErr } from "./http";
 import {
   INFLIGHT_MS,
@@ -23,13 +26,16 @@ import {
   PUSH_SEEN,
   PUSH_WINDOW,
   RETRY_MS,
+  PUSH_PER_BELL,
   RING_DEDUP,
   SEEN_TTL,
-  bellShard,
   dayOf,
+  decodeEntries,
   decodeRecord,
+  encodeEntries,
   encodeRecord,
   epOf,
+  keyBell,
   keyEp,
   khOf,
   ownerOf,
@@ -39,16 +45,19 @@ import {
   sealBox,
   sortedDistinct,
   tkOf,
+  type BellEntry,
   type DuePush,
   type EpRecord,
   type RingTarget,
   type SentReport,
 } from "./push";
 import { PUSH_BELLS } from "./webpush";
-import { bellStub, parseIndexName } from "./types";
+import { parseIndexName } from "./types";
 
 /** Records kept in memory; the least recently used go first (the store keeps them). */
 const CACHE_RECORDS = 32_768;
+/** Bells kept in memory; the least recently used go first (their keys stay in the store). */
+const CACHE_BELLS = 16_384;
 /** Rows remembered per endpoint as having rung it (RING_DEDUP). */
 const RECENT_ROWS = 64;
 /** Accounts whose marks are held at once; beyond it the account marked longest ago goes (marks expire anyway). */
@@ -131,6 +140,14 @@ export class QuietDO extends DurableObject<Env> {
   private readonly chains = new Map<string, Promise<void>>();
   /** ep (hex) → when its record was last written */
   private readonly lastWrite = new Map<string, number>();
+  /** tk (hex) → the entries under the bell (empty: none); insertion order is the recency order */
+  private readonly bells = new Map<string, BellEntry[]>();
+  /** tk (hex) → the write of its key under way or waiting for its turn */
+  private readonly bellWrites = new Map<string, Promise<void>>();
+  /** tk (hex) → when its key was last written */
+  private readonly bellLastWrite = new Map<string, number>();
+  /** tk (hex) → a change was made while its write was under way: another write follows */
+  private readonly bellDirty = new Set<string>();
   private readonly pushes = new Map<string, PushState>();
   /** qh (hex) → the rows its account marked seen, each with when it expires, in that order */
   private readonly marks = new Map<string, Map<string, number>>();
@@ -144,25 +161,27 @@ export class QuietDO extends DurableObject<Env> {
 
   /**
    * Replaces an endpoint's registration as a whole (§9.8 `sub`). The Worker has checked every field (§10.10):
-   * `tokens` are bells, `quiet` the account's quiet tag (or null). Empty `tokens` delete the registration.
+   * `bells` are the bells of the request's secrets, `quiet` the account's quiet tag (null only for a deletion, which
+   * a tab on the first release sends without one). Empty `bells` delete the registration.
    */
-  async sub(endpoint: string, p256dh: Bytes, auth: Bytes, tokens: Bytes[], quiet: Bytes | null = null): Promise<void> {
+  async sub(endpoint: string, p256dh: Bytes, auth: Bytes, bells: Bytes[], quiet: Bytes | null = null): Promise<void> {
     const cfg = pushConfig(this.env);
     if (!cfg) throw new Error("push is off");
     if (typeof endpoint !== "string" || !isBytes(p256dh, 65) || !isBytes(auth, 16)) throw new TypeError("sub: bad endpoint");
-    if (!Array.isArray(tokens) || tokens.length > 256 || !tokens.every((t) => isBytes(t, 16))) throw new TypeError("sub: bad tokens");
+    if (!Array.isArray(bells) || bells.length > 256 || !bells.every((t) => isBytes(t, 16))) throw new TypeError("sub: bad bells");
     if (quiet !== null && !isBytes(quiet, 16)) throw new TypeError("sub: bad quiet tag");
+    if (quiet === null && bells.length > 0) throw new TypeError("sub: quiet tag required");
     const ep = epOf(cfg.pushKey, endpoint);
     await this.serial(ep, async () => {
       const old = await this.loadRecord(ep);
-      if (tokens.length === 0) {
+      if (bells.length === 0) {
         await this.remove(ep, old);
         return;
       }
       const qh = quiet ? qkOf(cfg.pushKey, quiet) : null;
       const kh = khOf(cfg.pushKey, p256dh, auth);
       const box = sealBox(cfg.pushKey, ep, { endpoint, p256dh: p256dh.slice(), auth: auth.slice() });
-      const want = sortedDistinct(tokens.map((b) => tkOf(cfg.pushKey, b)));
+      const want = sortedDistinct(bells.map((b) => tkOf(cfg.pushKey, b)));
       const had = old?.tks ?? [];
       // New keys or another quiet tag: every kept bell is placed again, so that its entry carries them.
       const changed = !old || !sameBytes(old.kh, kh) || !same(old.qh, qh);
@@ -171,21 +190,14 @@ export class QuietDO extends DurableObject<Env> {
       const removed = had.filter((t) => !wantSet.has(hex(t)));
       const added = want.filter((t) => changed || !hadSet.has(hex(t)));
       const held: Bytes[] = changed ? [] : want.filter((t) => hadSet.has(hex(t)));
-      const shards = cfg.shards;
-      const per = new Map<number, { add: Bytes[]; remove: Bytes[] }>();
-      const group = (j: number): { add: Bytes[]; remove: Bytes[] } => {
-        let g = per.get(j);
-        if (!g) per.set(j, (g = { add: [], remove: [] }));
-        return g;
-      };
-      for (const t of removed) group(bellShard(t, shards)).remove.push(t);
-      for (const t of added) group(bellShard(t, shards)).add.push(t);
-      await Promise.all(
-        [...per].map(async ([j, g]) => {
-          const r = await bellStub(this.env, j).apply(ep, qh, kh, box, g.add, g.remove);
-          held.push(...r.held);
-        }),
-      );
+      const touched = new Set<string>();
+      for (const t of removed) if (await this.leaveBell(t, ep)) touched.add(hex(t));
+      for (const t of added) {
+        const r = await this.placeBell(t, { ep, qh, kh, box });
+        if (r.held) held.push(t);
+        if (r.changed) touched.add(hex(t));
+      }
+      await Promise.all([...touched].map((k) => this.writeBell(k)));
       const rec: EpRecord = { day: dayOf(this.clock()), notes: false, qh, kh, tks: sortedDistinct(held) };
       if (!old || !sameRecord(old, rec)) await this.writeRecord(ep, rec);
       // A push in flight to it goes to the newest keys.
@@ -206,6 +218,12 @@ export class QuietDO extends DurableObject<Env> {
   async recordOf(ep: Bytes): Promise<EpRecord | null> {
     if (!isBytes(ep, 16)) throw new TypeError("recordOf: bad endpoint");
     return this.loadRecord(ep);
+  }
+
+  /** The entries under a bell as this object holds them (tests). */
+  async entriesOf(tk: Bytes): Promise<BellEntry[]> {
+    if (!isBytes(tk, 16)) throw new TypeError("entriesOf: bad bell");
+    return [...(await this.loadBell(tk))];
   }
 
   // ───────────── rings and pushes ─────────────
@@ -380,16 +398,103 @@ export class QuietDO extends DurableObject<Env> {
   private async remove(ep: Bytes, old: EpRecord | null): Promise<void> {
     this.pushes.delete(hex(ep));
     if (!old) return;
-    const shards = pushShardsOf(this.env) ?? 1;
-    const per = new Map<number, Bytes[]>();
-    for (const t of old.tks) {
-      const j = bellShard(t, shards);
-      const list = per.get(j);
-      if (list) list.push(t);
-      else per.set(j, [t]);
-    }
-    await Promise.all([...per].map(([j, tks]) => bellStub(this.env, j).leave(ep, tks)));
+    const touched = new Set<string>();
+    for (const t of old.tks) if (await this.leaveBell(t, ep)) touched.add(hex(t));
+    await Promise.all([...touched].map((k) => this.writeBell(k)));
     await this.deleteRecord(ep);
+  }
+
+  // ───────────── the bells (§9.8 `sub` step 2) ─────────────
+
+  /**
+   * Puts the endpoint under the bell, replacing its own earlier entry; when 8 other endpoints hold the bell it is left
+   * out ("full") and takes no other endpoint's place. Answers whether the endpoint holds the bell, and whether the
+   * bell's entries changed.
+   */
+  private async placeBell(tk: Bytes, entry: BellEntry): Promise<{ held: boolean; changed: boolean }> {
+    const entries = await this.loadBell(tk);
+    const i = entries.findIndex((e) => sameBytes(e.ep, entry.ep));
+    if (i >= 0) {
+      const e = entries[i];
+      const changed = !sameBytes(e.kh, entry.kh) || !sameBytes(e.box, entry.box) || !same(e.qh, entry.qh);
+      if (changed) entries[i] = entry;
+      return { held: true, changed };
+    }
+    if (entries.length >= PUSH_PER_BELL) return { held: false, changed: false };
+    entries.push(entry);
+    return { held: true, changed: true };
+  }
+
+  /** Takes the endpoint out of the bell; answers whether the bell's entries changed. */
+  private async leaveBell(tk: Bytes, ep: Bytes): Promise<boolean> {
+    const entries = await this.loadBell(tk);
+    const i = entries.findIndex((e) => sameBytes(e.ep, ep));
+    if (i < 0) return false;
+    entries.splice(i, 1);
+    return true;
+  }
+
+  /** The entries under `tk`, from the cache or the store; the list is the cache's own (changed in place). */
+  private async loadBell(tk: Bytes): Promise<BellEntry[]> {
+    const k = hex(tk);
+    const hit = this.bells.get(k);
+    if (hit) {
+      // Most recently used last.
+      this.bells.delete(k);
+      this.bells.set(k, hit);
+      return hit;
+    }
+    let entries: BellEntry[] = [];
+    try {
+      const raw = await this.env.PUSH_KV.get(keyBell(tk), "arrayBuffer");
+      if (raw) entries = decodeEntries(new Uint8Array(raw)) ?? [];
+    } catch (e) {
+      console.error(JSON.stringify({ msg: "push store read failed", error: logErr(e) }));
+      throw e;
+    }
+    // Another load of the same bell may have finished first: keep the first list, which later calls change.
+    const again = this.bells.get(k);
+    if (again) return again;
+    this.bells.set(k, entries);
+    while (this.bells.size > CACHE_BELLS) {
+      const oldest = this.bells.keys().next().value as string;
+      if (this.bellWrites.has(oldest) || this.bellDirty.has(oldest)) break; // never drop a bell whose write is pending
+      this.bells.delete(oldest);
+    }
+    return entries;
+  }
+
+  /**
+   * Writes the bell's current entries to the store (or deletes its key when none is left): one write per key at a
+   * time, at least WRITE_SPACING_MS after the previous one; a change made while a write is under way gets a write of
+   * its own afterwards. Resolves once the entries as they were at the call are in the store.
+   */
+  private writeBell(k: string): Promise<void> {
+    const pending = this.bellWrites.get(k);
+    if (pending) {
+      this.bellDirty.add(k);
+      return pending.then(() => this.bellWrites.get(k) ?? Promise.resolve());
+    }
+    const run = (async (): Promise<void> => {
+      const wait = (this.bellLastWrite.get(k) ?? 0) + WRITE_SPACING_MS - this.clock();
+      if (wait > 0) await this.sleep(wait);
+      this.bellDirty.delete(k);
+      const entries = this.bells.get(k) ?? [];
+      const key = `b/${k}`;
+      try {
+        if (entries.length === 0) await this.env.PUSH_KV.delete(key);
+        else await this.env.PUSH_KV.put(key, encodeEntries(entries));
+      } catch (e) {
+        console.error(JSON.stringify({ msg: "push store write failed", error: logErr(e) }));
+        this.bellDirty.add(k); // tried again by the next change of the bell
+      }
+      this.bellLastWrite.set(k, this.clock());
+    })().finally(() => {
+      this.bellWrites.delete(k);
+      if (this.bellDirty.has(k)) void this.writeBell(k);
+    });
+    this.bellWrites.set(k, run);
+    return run;
   }
 
   private async loadRecord(ep: Bytes): Promise<EpRecord | null> {

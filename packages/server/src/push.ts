@@ -1,21 +1,24 @@
 /**
  * Push, the Worker's part (docs/PROTOCOL.md §9.8, §10.10): the ids and boxes, the push store's key layout (shared with
- * BellDO and QuietDO), the ring (lookups at the BellDOs, `ring` at the QuietDOs, the hold, `due`, sending, `sent`), the
- * queue consumer for pushes due later than a Worker can wait, and the daily expiry.
+ * QuietDO), the ring (the bells' entries read from the store, `ring` at the QuietDOs, the hold, `due`, sending,
+ * `sent`), the queue consumer for pushes due later than a Worker can wait, and the daily expiry.
  *
- * Nothing here writes: the Worker reads the store only in the daily expiry (key names and metadata), and sends the
- * pushes that a QuietDO hands it. The store is written by the objects alone, one writer per key.
+ * Nothing here writes: the Worker reads the store at a ring (the `b/` key of each bell), for a deletion without a
+ * quiet tag (the endpoint's owner, from its record's metadata) and in the daily expiry (key names and metadata), and
+ * sends the pushes that a QuietDO hands it. The store is written by the QuietDOs alone, one writer per key.
  */
 import { H, HMAC, aeadOpen, aeadSeal, concat, dec, enc, hex, t16, u16, u32, type Bytes } from "@segv/protocol/proto";
 import { pushConfig, pushHostAllowed, pushShardsOf, type PushConfig } from "./env";
 import { logErr } from "./http";
-import { bellStub, quietStub } from "./types";
+import { quietStub } from "./types";
 import { VapidSigner, encryptPayload, pushPayload } from "./webpush";
 
-/** Bells per endpoint (params `push.maxTokens`). */
+/** Bell secrets per endpoint (params `push.maxTokens`). */
 export const PUSH_TOKENS = 256;
-/** Endpoints per bell: the first ones keep their places; a ninth is left out, never evicting. */
+/** Endpoints per bell (all of its account's, since registering needs the secret): the first ones keep their places. */
 export const PUSH_PER_BELL = 8;
+/** A ring's reads of `b/` keys may be served from the edge's cache for this long (the KV minimum). */
+export const KV_CACHE_TTL_S = 60;
 /** At most one push per endpoint per this many seconds (params `push.window`). */
 export const PUSH_WINDOW = 60;
 /** Seconds a push waits at least after the ring that made it due, for a mark of its row (§9.8 `ring`). */
@@ -77,11 +80,12 @@ export const keyEp = (ep: Bytes): string => `e/${hex(ep)}`;
 export const keyBell = (tk: Bytes): string => `b/${hex(tk)}`;
 export const EP_PREFIX = "e/";
 
-/** The owner of an endpoint: its quiet tag's keyed hash, or the endpoint's own hash when it registered none (§9.8). */
+/**
+ * The owner of an endpoint (§9.8): its quiet tag's keyed hash, or, for a record of the first release, which registered
+ * none, the endpoint's own hash.
+ */
 export const ownerOf = (ep: Bytes, qh: Bytes | null): Bytes => qh ?? ep;
 const u32be = (b: Bytes): number => ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0;
-/** `j = u32(tk[0..4]) mod PUSH_SHARDS`: the BellDO of a bell. */
-export const bellShard = (tk: Bytes, shards: number): number => u32be(tk) % shards;
 /** `k = u32(owner[0..4]) mod PUSH_SHARDS`: the QuietDO of an endpoint. */
 export const quietShard = (owner: Bytes, shards: number): number => u32be(owner) % shards;
 
@@ -126,7 +130,7 @@ export function decodeRecord(b: Bytes): EpRecord | null {
   return { day, notes, qh: isZero(qh) ? null : qh, kh, tks };
 }
 
-/** An entry of a bell's key, `b/<tk>`: `ep[16] ‖ qh[16] ‖ kh[16] ‖ u16 len ‖ box`. */
+/** An entry of a bell's key, `b/<tk>`: `ep[16] ‖ qh[16] ‖ kh[16] ‖ u16 len ‖ box` (an endpoint of the bell's account). */
 export interface BellEntry {
   ep: Bytes;
   qh: Bytes | null;
@@ -154,7 +158,7 @@ export function decodeEntries(b: Bytes): BellEntry[] | null {
 
 // ───────────── what crosses the RPC boundary ─────────────
 
-/** An endpoint a ring reaches, as the lookups found it, with the ring's bells it was found under (in the ring's order). */
+/** An endpoint a ring reaches, as the store lists it, with the ring's bells it was found under (in the ring's order). */
 export interface RingTarget {
   ep: Bytes;
   qh: Bytes | null;
@@ -205,33 +209,35 @@ export function _setPushFetchForTests(f: Fetcher | null): void {
   pushFetch = f ?? realFetch;
 }
 
+/** The endpoints registered under a bell, read from the store (a cached read, §9.8 "The Worker's part"). */
+async function entriesOf(env: Env, tk: Bytes): Promise<BellEntry[]> {
+  try {
+    const raw = await env.PUSH_KV.get(keyBell(tk), { type: "arrayBuffer", cacheTtl: KV_CACHE_TTL_S });
+    return raw ? (decodeEntries(new Uint8Array(raw)) ?? []) : [];
+  } catch (e) {
+    console.error(JSON.stringify({ msg: "push store read failed", error: logErr(e) }));
+    return [];
+  }
+}
+
 /**
- * Looks the ring's bells up at their BellDOs, calls `ring` on the QuietDO of each endpoint found, and for each time
- * answered waits in place (≤ RING_WAIT) and sends, or queues a message for later (§9.8 "The Worker's part").
+ * Reads the ring's bells' entries from the store, calls `ring` on the QuietDO of each endpoint found, and for each
+ * time answered waits in place (≤ RING_WAIT) and sends, or queues a message for later (§9.8 "The Worker's part").
  */
-export async function pushRing(env: Env, cfg: PushConfig, E: number, label: Bytes, tokens: Bytes[]): Promise<void> {
+export async function pushRing(env: Env, cfg: PushConfig, E: number, label: Bytes, ringBells: Bytes[]): Promise<void> {
   const shards = cfg.shards;
   const bells = new Map<string, Bytes>();
-  for (const b of tokens) bells.set(hex(b), b);
-  const byShard = new Map<number, { b: Bytes; tk: Bytes }[]>();
-  for (const b of bells.values()) {
-    const tk = tkOf(cfg.pushKey, b);
-    const j = bellShard(tk, shards);
-    const list = byShard.get(j);
-    if (list) list.push({ b, tk });
-    else byShard.set(j, [{ b, tk }]);
-  }
+  for (const b of ringBells) bells.set(hex(b), b);
   const found = new Map<string, BellEntry[]>();
   await Promise.all(
-    [...byShard].map(async ([j, list]) => {
-      const res = await bellStub(env, j).lookup(list.map((x) => x.tk));
-      for (const r of res) found.set(hex(r.tk), r.entries);
+    [...bells].map(async ([k, b]) => {
+      found.set(k, await entriesOf(env, tkOf(cfg.pushKey, b)));
     }),
   );
   // Each endpoint with the ring's bells it was found under, in the ring's order; grouped by its QuietDO.
   const targets = new Map<string, RingTarget>();
-  for (const b of bells.values()) {
-    for (const e of found.get(hex(tkOf(cfg.pushKey, b))) ?? []) {
+  for (const [k, b] of bells) {
+    for (const e of found.get(k) ?? []) {
       const k = hex(e.ep);
       const t = targets.get(k) ?? { ep: e.ep, qh: e.qh, kh: e.kh, box: e.box, bells: [] };
       t.bells.push(b);
@@ -341,7 +347,22 @@ export async function pushCleanup(env: Env, now = Date.now()): Promise<{ scanned
   return { scanned, expired };
 }
 
-const fromHex = (h: string): Bytes => Uint8Array.from(h.match(/../g)!.map((x) => parseInt(x, 16)));
+export const fromHex = (h: string): Bytes => Uint8Array.from(h.match(/../g)!.map((x) => parseInt(x, 16)));
+
+/**
+ * The owner of an endpoint by its record's metadata (`o`), for a deletion that carries no quiet tag (§10.10): the
+ * endpoint itself when the store has no record, or the read fails (the QuietDO then finds nothing to delete, or 503s).
+ */
+export async function ownerByRecord(env: Env, ep: Bytes): Promise<Bytes> {
+  try {
+    const r = await env.PUSH_KV.getWithMetadata<{ o?: unknown }>(keyEp(ep));
+    const o = r.metadata?.o;
+    return typeof o === "string" && /^[0-9a-f]{32}$/.test(o) ? fromHex(o) : ep;
+  } catch (e) {
+    console.error(JSON.stringify({ msg: "push store read failed", error: logErr(e) }));
+    return ep;
+  }
+}
 
 // ───────────── sending (§9.8 "Sending a push") ─────────────
 

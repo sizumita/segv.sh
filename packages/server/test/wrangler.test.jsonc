@@ -51,7 +51,6 @@
       { "name": "CONN", "class_name": "ConnDO" },
       { "name": "FEED", "class_name": "FeedDO" },
       { "name": "CKPT", "class_name": "CheckpointDO" },
-      { "name": "BELL", "class_name": "BellDO" },
       { "name": "QUIET", "class_name": "QuietDO" },
     ],
   },
@@ -68,6 +67,7 @@
     },
     { "tag": "v4", "new_sqlite_classes": ["DirSeqDO"] },
     { "tag": "v5", "new_sqlite_classes": ["KeyDO"] },
+    { "tag": "v6", "deleted_classes": ["BellDO"] },
   ],
   "ratelimits": [
     { "name": "RL_WRITE", "namespace_id": "1001", "simple": { "limit": 60, "period": 60 } },
@@ -95,7 +95,7 @@
     // Two ConnDOs and two FeedDOs, so that the tests cover the routing of clients and topics (§9.4).
     "RT_CONNS": "2",
     "RT_FEEDS": "2",
-    // Two of each push object, so that the tests cover the routing of bells and of accounts (§9.8).
+    // Two QuietDOs, so that the tests cover the routing of accounts (§9.8).
     "PUSH_SHARDS": "2",
     // Two blob registry shards, so that the tests cover the routing of blob ids (§9.2).
     "BLOBREG_SHARDS": "2",

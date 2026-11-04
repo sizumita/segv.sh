@@ -1519,23 +1519,30 @@ describe("conversation epochs (§4.2)", () => {
     expect(toHex(P.topicConv(nk))).toBe(toHex(tr16(hmacN(nk, "segv.sh/v2/topic/conv"))));
   });
 
-  it("B_e(ℓ) follows the spec, differs per lane and epoch, and never equals T_e", () => {
+  it("bells are the account's, not the epoch's (§4.1): bS, s(conv, g) and bell(s) follow the spec", () => {
+    const AK = seqBytes(32, 0x40);
+    const bS = P.bellKey(AK);
+    expect(toHex(bS)).toBe(toHex(hkdfN(AK, "", "segv.sh/v2/self/bell")));
+    expect(toHex(bS)).not.toBe(toHex(P.quietSecret(AK)));
     const seen = new Set<string>();
-    for (const e of [0, 1]) {
-      const { nk } = P.epochKeys(EK, CONV, e);
-      seen.add(toHex(P.topicConv(nk)));
-      for (const l of [0, 1, 31, 0xffff]) {
-        const b = P.bell(nk, l);
+    for (const conv of [CONV, seqBytes(16, 0x70)]) {
+      for (const g of [0, 1, 7, 0xffffffff]) {
+        const sec = P.bellSecret(bS, conv, g);
+        expect(sec.length).toBe(16);
+        expect(toHex(sec)).toBe(toHex(tr16(hmacN(bS, refEnc("segv.sh/v2/bell/secret", conv, be32(g))))));
+        const b = P.bellOf(sec);
         expect(b.length).toBe(16);
-        expect(toHex(b)).toBe(toHex(tr16(hmacN(nk, refEnc("segv.sh/v2/bell", be16(l))))));
+        expect(toHex(b)).toBe(toHex(tr16(sha(refEnc("segv.sh/v2/bell", sec)))));
+        seen.add(toHex(sec));
         seen.add(toHex(b));
       }
     }
-    expect(seen.size).toBe(10);
-    // A fixed vector, so a change of the derivation is caught even if the reference helpers change with it.
-    const nk = new Uint8Array(32).fill(7);
-    expect(toHex(P.bell(nk, 2))).toBe(toHex(tr16(hmacN(nk, refEnc("segv.sh/v2/bell", be16(2))))));
-    expect(() => P.bell(nk, 0x10000)).toThrow();
+    expect(seen.size).toBe(16); // every secret and bell differs, per conversation and generation
+    // Nothing a member holds derives a bell: it is not a function of the epoch keys.
+    const { nk } = P.epochKeys(EK, CONV, 0);
+    expect(toHex(P.bellOf(P.bellSecret(bS, CONV, 0)))).not.toBe(toHex(P.topicConv(nk)));
+    expect(() => P.bellSecret(bS, CONV, 2 ** 32)).toThrow();
+    expect(() => P.bellSecret(bS, CONV, -1)).toThrow();
   });
 
   it("labels are distinct across lane, era, slot, epoch and label kind", () => {

@@ -59,8 +59,8 @@
   // §9.2), DIRSEQ "dirseq/v2" (the only writer of the directory, §9.6), KEYS "keys/v2" (the per-era inbox bucket
   // keys, §9.3), CONN "conn/v2/{c}" (the realtime WebSockets,
   // RT_CONNS of them) and FEED "feed/v2/{j}" (topic fan-out to the ConnDOs, RT_FEEDS of them; §9.4), CKPT "ckpt/v2"
-  // (signed checkpoints every 60 s), BELL "bell/v2/{j}" and QUIET "quiet/v2/{k}" (push: the bell index and each
-  // account's window, hold and seen marks, memory only, PUSH_SHARDS of each; addressed only while push is on, §9.8).
+  // (signed checkpoints every 60 s) and QUIET "quiet/v2/{k}" (push: each account's registrations, window, hold and
+  // seen marks, memory only, PUSH_SHARDS of them; addressed only while push is on, §9.8).
   "durable_objects": {
     "bindings": [
       { "name": "SHARD", "class_name": "ShardDO" },
@@ -71,7 +71,6 @@
       { "name": "CONN", "class_name": "ConnDO" },
       { "name": "FEED", "class_name": "FeedDO" },
       { "name": "CKPT", "class_name": "CheckpointDO" },
-      { "name": "BELL", "class_name": "BellDO" },
       { "name": "QUIET", "class_name": "QuietDO" },
     ],
   },
@@ -94,6 +93,9 @@
     { "tag": "v4", "new_sqlite_classes": ["DirSeqDO"] },
     // The per-era inbox bucket keys (§9.3 "Buckets").
     { "tag": "v5", "new_sqlite_classes": ["KeyDO"] },
+    // Bells chosen by their owners (§4.1, §11.13): the QuietDO of an account writes its bells' keys itself, so the
+    // bell index (BellDO, which stored nothing) is gone.
+    { "tag": "v6", "deleted_classes": ["BellDO"] },
   ],
   // Per-IP (IPv6 /64) abuse limits. Keys are never persisted. Period must be 10 or 60 seconds.
   "ratelimits": [
@@ -141,7 +143,7 @@
     "RT_CONNS": "4",
     "RT_FEEDS": "4",
     "BLOBREG_SHARDS": "64",
-    // Push: the number of BellDOs and of QuietDOs (§9.8). May change at any deploy; the store is the truth.
+    // Push: the number of QuietDOs (§9.8). May change at any deploy; the store is the truth.
     "PUSH_SHARDS": "4",
     // Hostnames this Worker answers on (comma-separated; the first is canonical). Any other host gets a
     // 308 to https://<first><path> (pages) or 421 (/api/*). "" disables the check. localhost = local dev
@@ -213,7 +215,6 @@
           { "name": "CONN", "class_name": "ConnDO" },
           { "name": "FEED", "class_name": "FeedDO" },
           { "name": "CKPT", "class_name": "CheckpointDO" },
-          { "name": "BELL", "class_name": "BellDO" },
           { "name": "QUIET", "class_name": "QuietDO" },
         ],
       },

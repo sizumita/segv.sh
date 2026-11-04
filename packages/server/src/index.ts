@@ -14,6 +14,5 @@ export { InboxDO } from "./inbox-do";
 export { ConnDO } from "./conn-do";
 export { FeedDO } from "./feed-do";
 export { CheckpointDO } from "./ckpt-do";
-export { BellDO } from "./bell-do";
 export { QuietDO } from "./quiet-do";
 export { pushCleanup, pushQueue } from "./push";

@@ -850,8 +850,16 @@ export const Lmsg = (rk: Bytes, lane: number, E: number, n: number): Bytes =>
 export const Lctl = (rk: Bytes, E: number, k: number): Bytes => t16(HMAC(rk, enc("segv.sh/v2/lab/ctl", u16(E), u32(k))));
 /** T_e: realtime topic of epoch e. */
 export const topicConv = (nk: Bytes): Bytes => t16(HMAC(nk, utf8("segv.sh/v2/topic/conv")));
-/** B_e(ℓ): the Web Push bell of lane ℓ in epoch e (§4.2, §11.13). Every member can compute it; outsiders cannot. */
-export const bell = (nk: Bytes, lane: number): Bytes => t16(HMAC(nk, enc("segv.sh/v2/bell", u16(lane))));
+/** bS: the account's bell secret key (§2.1), the root of its bell secrets (§4.1). Only the account's devices know it. */
+export const bellKey = (AK: Bytes): Bytes => HKDF(AK, "", "segv.sh/v2/self/bell", 32);
+/**
+ * s(conv, g): the account's bell secret in conversation `conv`, generation `g` (§4.1). It is what a device registers
+ * (§10.10); the server computes the bell from it, and so can whoever learns it, but no member of the conversation does.
+ */
+export const bellSecret = (bS: Bytes, conv: Bytes, g: number): Bytes =>
+  t16(HMAC(bS, enc("segv.sh/v2/bell/secret", conv, u32(g))));
+/** bell(s): the bell of a secret (§4.1): what the account's BELL rows tell the members, and what rings carry. */
+export const bellOf = (s: Bytes): Bytes => t16(H(enc("segv.sh/v2/bell", s)));
 
 // ───────────────────────── links (§4.3) ─────────────────────────
 
@@ -2050,7 +2058,7 @@ export function acceptOldRow(row: WalkRow, epochs: readonly WalkEpoch[], selfRem
 export const M_VER = 2;
 export const M_HEADER_LEN = 62;
 /** The types of M (§3.3): every other value is invalid. */
-export const MT = { TEXT: 1, IMAGE: 2, REACTION: 3, FILE: 4, WELCOME: 8, CLAIM: 16, LEAVE: 17 } as const;
+export const MT = { TEXT: 1, IMAGE: 2, REACTION: 3, FILE: 4, BELL: 5, WELCOME: 8, CLAIM: 16, LEAVE: 17 } as const;
 export type MsgType = (typeof MT)[keyof typeof MT];
 const MSG_TYPES: readonly number[] = Object.values(MT);
 /** lane of a CLAIM. */
@@ -2244,12 +2252,34 @@ export interface MHeader {
   ck16: Bytes;
 }
 
+/** BELL content (§3.3): `u32 g | bell[16]`, the sender's bell in the conversation and its generation (§4.1, §11.13). */
+export interface BellRef {
+  g: number;
+  bell: Bytes;
+}
+export const BELL_LEN = 20;
+
+export function parseBell(b: Bytes): BellRef {
+  const r = new Rd(b, "bell");
+  const g = r.u32();
+  const bell = r.bytes(16);
+  r.end();
+  return { g, bell };
+}
+
+export function encodeBell(x: BellRef): Bytes {
+  const out = concat(u32(x.g), fixed(x.bell, 16, "bell"));
+  parseBell(out);
+  return out;
+}
+
 /** The type and typed content of M. */
 export type MBody =
   | { type: typeof MT.TEXT; text: string }
   | { type: typeof MT.IMAGE; image: ImageRef }
   | { type: typeof MT.REACTION; reaction: Reaction }
   | { type: typeof MT.FILE; file: FileRef }
+  | { type: typeof MT.BELL; bell: BellRef }
   | { type: typeof MT.WELCOME; join: Join }
   | { type: typeof MT.CLAIM; claim: Claim }
   | { type: typeof MT.LEAVE };
@@ -2268,6 +2298,8 @@ function encodeContent(m: MBody): Bytes {
       return encodeReaction(m.reaction);
     case MT.FILE:
       return encodeFile(m.file);
+    case MT.BELL:
+      return encodeBell(m.bell);
     case MT.WELCOME:
       return encodeJ(m.join);
     case MT.CLAIM:
@@ -2290,6 +2322,8 @@ function parseContent(type: number, c: Bytes): MBody {
       return { type: MT.REACTION, reaction: parseReaction(c) };
     case MT.FILE:
       return { type: MT.FILE, file: parseFile(c) };
+    case MT.BELL:
+      return { type: MT.BELL, bell: parseBell(c) };
     case MT.WELCOME:
       return { type: MT.WELCOME, join: parseJ(c) };
     case MT.CLAIM:
@@ -2587,6 +2621,7 @@ export const RT = {
   LEFT: 0x0e,
   TREG: 0x0f,
   ENDED: 0x12,
+  BELLS: 0x15,
   SNAP: 0x20,
 } as const;
 export type RType = (typeof RT)[keyof typeof RT];
@@ -2729,6 +2764,21 @@ export interface LeftRec extends CopyRef {
   row: Pos;
 }
 /**
+ * The bells of epoch e of a copy as the writing device knows them (§7.2, §11.13): `g`, the generation of the account's
+ * own bell as its registration set holds it (BELLS_NO_GEN while it has posted none in the current generation), and
+ * the other members' bells of the current generation, by lane of D_e. Written beside every HEADS entry of the copy, in
+ * the same row or snapshot (§7.3); the latest per copy wins.
+ */
+export interface BellsRec extends CopyRef {
+  rtype: typeof RT.BELLS;
+  e: number;
+  g: number;
+  /** by lane, ascending; self's lane never appears */
+  entries: { lane: number; bell: Bytes }[];
+}
+/** BELLS `g` while the account has posted no BELL row in the current generation. */
+export const BELLS_NO_GEN = 0xffffffff;
+/**
  * The registration time `t_reg` of a bundle (§7.2): written in the same row as the CONV_JOIN of an accepted join (and
  * kept by snapshots), so a restore reads E_start = era(t_reg) without `blob/meta`. Folded by bundleId; the first wins.
  */
@@ -2773,9 +2823,18 @@ export type SelfRecord =
   | LeftRec
   | TregRec
   | EndedRec
+  | BellsRec
   | SnapRec;
 
 const wrCopy = (x: CopyRef): Bytes => concat(fixed(x.conv, 16, "record conv"), fixed(x.root, 32, "record root"));
+/** BELLS entries: at most 32, by lane ascending and distinct, each below 32 (§7.2). */
+function checkBellsEntries(entries: readonly { lane: number; bell: Bytes }[], what: string): void {
+  if (entries.length > MAX_MEMBERS) bad(`${what}: too many entries`);
+  entries.forEach((b, i) => {
+    if (!Number.isInteger(b.lane) || b.lane < 0 || b.lane >= MAX_MEMBERS) bad(`${what}: bad lane`);
+    if (i > 0 && b.lane <= entries[i - 1].lane) bad(`${what}: lanes not ascending`);
+  });
+}
 const wrMaterial = (x: EpochMaterial): Bytes =>
   concat(u32(x.e), fixed(x.EK, 32, "record EK"), fixed(x.bundleId, 32, "record bundleId"), u32(x.bundleSize));
 const wrUids = (uids: readonly Bytes[]): Bytes =>
@@ -2846,6 +2905,15 @@ function recordContent(x: SelfRecord): Bytes {
     case RT.ENDED:
       if (isNone(x.claim)) bad("ENDED: the claim position is NONE");
       return concat(wrCopy(x), u32(x.e), wrPos(x.claim, "ENDED"));
+    case RT.BELLS:
+      checkBellsEntries(x.entries, "BELLS");
+      return concat(
+        wrCopy(x),
+        u32(x.e),
+        u32(x.g),
+        u8(x.entries.length),
+        ...x.entries.map((b) => concat(u8(b.lane), fixed(b.bell, 16, "BELLS bell"))),
+      );
     case RT.SNAP:
       return concat(
         fixed(x.blobId, 32, "SNAP blobId"),
@@ -2984,6 +3052,18 @@ export function parseRecord(rtype: number, c: Bytes): SelfRecord | null {
       x = { rtype, ...rdCopy(r), e: r.u32(), claim: rdPos(r, what) };
       if (isNone(x.claim)) bad(`${what}: the claim position is NONE`);
       break;
+    case RT.BELLS: {
+      const copy = rdCopy(r);
+      const e = r.u32();
+      const g = r.u32();
+      const k = r.u8();
+      if (k > MAX_MEMBERS) bad(`${what}: too many entries`);
+      const entries: { lane: number; bell: Bytes }[] = [];
+      for (let i = 0; i < k; i++) entries.push({ lane: r.u8(), bell: r.bytes(16) });
+      checkBellsEntries(entries, what);
+      x = { rtype, ...copy, e, g, entries };
+      break;
+    }
     case RT.SNAP:
       x = { rtype, blobId: r.bytes(32), key: r.bytes(32), size: r.u32(), pos: rdPos(r, what) };
       break;

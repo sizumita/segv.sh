@@ -417,6 +417,7 @@ export const TEST_DELAYS: Partial<EngineDelays> = {
   resumeAfter: 0,
   headsInterval: 0,
   headsJitter: 0,
+  bellDelay: 0,
   catchUpInterval: 1000,
 };
 

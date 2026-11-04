@@ -1,6 +1,7 @@
 // Notifications on this device (docs/PROTOCOL.md §11.13): the per-device setting, the browser's push subscription,
-// its registration with the server, and the ring a sender makes after a text or an image. The engine passes in what it
-// owns (the registration set, the API, the clock), so this module keeps no protocol state of its own.
+// its registration with the server (the bell secrets of the registration set), and the ring a sender makes after a
+// text, an image or a file. The engine passes in what it owns (the registration set, the API, the clock), so this
+// module keeps no protocol state of its own.
 import * as P from "@segv/protocol/proto";
 import type { EngineClock, EngineTimer } from "./options";
 
@@ -15,8 +16,9 @@ export interface PushSubBody {
   endpoint: string;
   p256dh: string;
   auth: string;
+  /** the bell secrets of the registration set (§4.1, §10.10); empty to delete the registration */
   tokens: string[];
-  /** the account's quiet tag Qself (§4.1), so that its marks reach this endpoint; absent when deleting */
+  /** the account's quiet tag Qself (§4.1): the owner of the endpoint; may be absent only when deleting */
   quiet?: string;
 }
 
@@ -123,8 +125,8 @@ export interface PushClientOptions {
   params: () => PushParams | null;
   /** Δ in ms: re-sends are batched over it, and a ring's retry falls within it */
   deltaMs: () => number;
-  /** the registration set (§11.13), newest `lastTs` first */
-  bells: () => Uint8Array[];
+  /** the registration set (§11.13): the bell secrets, newest `lastTs` first */
+  secrets: () => Uint8Array[];
   /** the account's quiet tag Qself (§4.1), registered with the set; null without a session */
   quiet?: () => Uint8Array | null;
   /** told when the setting turns off by itself (push gone from the server, or a subscription that needs a click) */
@@ -287,6 +289,8 @@ export class PushClient {
     let body: PushSubBody | null = null;
     try {
       body = bodyOf(s, []);
+      const q = this.o.quiet?.() ?? null;
+      if (q) body.quiet = P.b64u(q); // the owner of the endpoint, while the session still gives it (§10.10)
     } catch {
       body = null;
     }
@@ -366,7 +370,7 @@ export class PushClient {
         await this.o.transport.pushSub({ ...bodyOf(s, []), endpoint: st.endpoint });
       const seen = new Set<string>();
       const tokens: string[] = [];
-      for (const b of this.o.bells()) {
+      for (const b of this.o.secrets()) {
         const t = P.b64u(b);
         if (seen.has(t)) continue;
         seen.add(t);

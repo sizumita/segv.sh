@@ -46,6 +46,12 @@ export interface RowRef extends Slot {
  * recorded in HEADS.
  */
 export interface Lane {
+  /**
+   * The lane's latest BELL row (§11.13): its member's bell and generation (`g` is meaningful for self's lane; for
+   * another member's lane seeded from a BELLS record it is 0), at its position. `seeded`: from a BELLS record at a
+   * HEADS position, which a row at or after that position replaces; a row replaces a row only from a later position.
+   */
+  bell: LaneBell | null;
   next: Slot;
   tail: Slot | null;
   /** the member's last valid row on this lane in this epoch (prev / prevh of the next own row) */
@@ -65,6 +71,13 @@ export interface Lane {
   prevhs: Map<string, Bytes>;
   /** the prevh a held row expects of the row at "E:n", which this session has not loaded yet (§12.2) */
   expect: Map<string, Bytes>;
+}
+
+export interface LaneBell {
+  g: number;
+  bell: Bytes;
+  at: Slot;
+  seeded: boolean;
 }
 
 /** A stored row: its slot, label, stored time (seconds since T0) and body. */
@@ -291,6 +304,7 @@ export function newLane(start: Slot): Lane {
     tail: null,
     last: null,
     seen: false,
+    bell: null,
     oldest: null,
     head: null,
     swept: false,

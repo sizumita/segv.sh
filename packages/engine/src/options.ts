@@ -49,6 +49,8 @@ export interface EngineDelays {
   headsInterval: number;
   /** and after a random delay of up to this much */
   headsJitter: number;
+  /** a BELL row is posted after a random delay of up to this much (BELL_DELAY, §11.13) */
+  bellDelay: number;
   /** catch-up interval while the realtime socket is down (the inbox is read at each catch-up, and on notices, §11.5) */
   catchUpInterval: number;
 }
@@ -61,6 +63,7 @@ export const DEFAULT_DELAYS: EngineDelays = {
   resumeAfter: 10 * 60_000,
   headsInterval: 30 * 60_000,
   headsJitter: 5 * 60_000,
+  bellDelay: 60_000,
   catchUpInterval: 10_000,
 };
 

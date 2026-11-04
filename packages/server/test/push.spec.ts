@@ -1,7 +1,8 @@
 /**
  * Push (docs/PROTOCOL.md §9.8, §10.10): the configuration, the three endpoints, the registrations in the push store
- * through the QuietDOs and BellDOs, rings, the hold, the window, the pushes the Worker sends, marks of rows seen, the
- * queue for pushes due later, and the daily expiry.
+ * through the QuietDOs (bell secrets in, bells and their entries out), rings (the Worker reads the bells from the
+ * store), the hold, the window, the pushes the Worker sends, marks of rows seen, the queue for pushes due later, and
+ * the daily expiry.
  *
  * The objects hold nothing durable: each test starts from an empty store and evicted objects (reset()), replaces the
  * objects' clocks, randomness and sleeps, the Worker's wait and its push fetch. The objects' clock runs days ahead of
@@ -15,7 +16,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as P from "@segv/protocol/proto";
 import * as W from "@segv/protocol/wire";
 import { MAX_RING_BODY, MAX_SEEN_BODY, RING_FRESH, ringEraOk, ringRowFresh } from "../src/api";
-import type { BellDO } from "../src/bell-do";
 import { _resetPushConfigForTests } from "../src/env";
 import {
   PUSH_EXPIRY,
@@ -27,7 +27,6 @@ import {
   SEEN_TTL,
   _setPushFetchForTests,
   _setRingSleepForTests,
-  bellShard,
   dayOf,
   decodeEntries,
   decodeRecord,
@@ -46,7 +45,7 @@ import {
   type RingTarget,
 } from "../src/push";
 import type { PushState, QuietDO } from "../src/quiet-do";
-import { bellStub, quietStub } from "../src/types";
+import { quietStub } from "../src/types";
 import { vapidPublicKey } from "../src/webpush";
 import {
   DELTA,
@@ -80,18 +79,21 @@ const scalarB64 = (x: bigint): string =>
     ),
   );
 
-const tk = (bell: Bytes): Bytes => tkOf(PUSH_KEY, bell);
+/** The keyed hash of the bell of a secret: what the store files an endpoint under (§9.8). */
+const tk = (secret: Bytes): Bytes => tkOf(PUSH_KEY, P.bellOf(secret));
 const qk = (Q: Bytes): Bytes => qkOf(PUSH_KEY, Q);
+/** Bell secrets (§4.1): what a device registers; a ring carries their bells, `P.bellOf(s)`. */
 const bells = (n: number): Bytes[] => Array.from({ length: n }, () => P.random(16));
 
-/** A browser's push subscription: its endpoint and its keys, and the quiet tag it last registered with. */
+/** A browser's push subscription: its endpoint and its keys, and the quiet tag of its account (§10.10). */
 interface Dev {
   endpoint: string;
   ep: Bytes;
   sk: Bytes;
   p256dh: Bytes;
   auth: Bytes;
-  quiet: Bytes | null;
+  /** the account's quiet tag; `sub` registers it unless a test gives another */
+  quiet: Bytes;
 }
 let devSeq = 0;
 function dev(host = "fcm.push.test"): Dev {
@@ -103,13 +105,12 @@ function dev(host = "fcm.push.test"): Dev {
     sk,
     p256dh: p256.getPublicKey(sk, false),
     auth: P.random(16),
-    quiet: null,
+    quiet: P.random(16),
   };
 }
-/** The QuietDO of a device: its owner is its account's quiet tag, or itself (§9.8). */
-const kOf = (d: Dev): number => quietShard(ownerOf(d.ep, d.quiet ? qk(d.quiet) : null), SHARDS);
+/** The QuietDO of a device: its owner is its account's quiet tag (§9.8). */
+const kOf = (d: Dev): number => quietShard(ownerOf(d.ep, qk(d.quiet)), SHARDS);
 const quiet = (k: number) => quietStub(env, k);
-const bell = (j: number) => bellStub(env, j);
 
 /** RFC 8291's receiving side (one record). */
 function decrypt(body: Bytes, d: Dev): Bytes {
@@ -163,10 +164,6 @@ const hook = async (): Promise<void> => {
       quiet(i),
       (inst: QuietDO) => void Object.assign(inst as unknown as Hooks, h),
     );
-    await runInDurableObject(
-      bell(i),
-      (inst: BellDO) => void Object.assign(inst as unknown as Hooks, h),
-    );
   }
 };
 
@@ -195,10 +192,7 @@ async function reset(now: number | null = BASE): Promise<void> {
     for (const k of page.keys) await env.PUSH_KV.delete(k.name);
     cursor = page.list_complete ? undefined : page.cursor;
   } while (cursor);
-  for (let i = 0; i < SHARDS; i++) {
-    await evict(quiet(i));
-    await evict(bell(i));
-  }
+  for (let i = 0; i < SHARDS; i++) await evict(quiet(i));
   Object.assign(fake, {
     now,
     rand: 0,
@@ -225,29 +219,31 @@ async function reset(now: number | null = BASE): Promise<void> {
 
 /** A restart of the objects (an eviction): memory is lost, the store stays. */
 async function restart(): Promise<void> {
-  for (let i = 0; i < SHARDS; i++) {
-    await evict(quiet(i));
-    await evict(bell(i));
-  }
+  for (let i = 0; i < SHARDS; i++) await evict(quiet(i));
   await hook();
 }
 
 // ───────────── driving the endpoints ─────────────
 
+/**
+ * `POST /api/v2/push/sub` with the device's keys, the secrets `bs` and the quiet tag `q` (the device's own by
+ * default; `withQuiet` false sends none, which only a deletion may).
+ */
 async function subApi(
   d: Dev,
   bs: Bytes[],
   q: Bytes | null = null,
   over: Record<string, unknown> = {},
+  withQuiet = true,
 ): Promise<Response> {
-  d.quiet = bs.length === 0 ? d.quiet : q;
+  if (q && bs.length > 0) d.quiet = q;
   const body: Record<string, unknown> = {
     endpoint: d.endpoint,
     p256dh: P.b64u(d.p256dh),
     auth: P.b64u(d.auth),
     tokens: bs.map(P.b64u),
   };
-  if (q) body.quiet = P.b64u(q);
+  if (withQuiet) body.quiet = P.b64u(q ?? d.quiet);
   const bytes = P.utf8(JSON.stringify(body));
   return direct(
     "/api/v2/push/sub",
@@ -273,9 +269,11 @@ async function freshRow(): Promise<RowRef> {
   await putOk([row]);
   return { E: row.E, label: row.label };
 }
-const ringBody = (r: RowRef, tokens: Bytes[], ver = 1): Bytes =>
-  P.concat(Uint8Array.of(ver), P.u16(r.E), r.label, Uint8Array.of(tokens.length), ...tokens);
-/** `POST /api/v2/ring`: the Worker looks the bells up, calls `ring`, waits and sends (or queues). */
+/** A ring request naming these bells (a ring carries bells, never secrets: `bellsOf`). */
+const ringBody = (r: RowRef, ringBells: Bytes[], ver = 1): Bytes =>
+  P.concat(Uint8Array.of(ver), P.u16(r.E), r.label, Uint8Array.of(ringBells.length), ...ringBells);
+const bellsOf = (secrets: readonly Bytes[]): Bytes[] => secrets.map((s) => P.bellOf(s));
+/** `POST /api/v2/ring` for the bells of the secrets `bs`: the Worker reads the store, calls `ring`, waits and sends. */
 async function ringApi(
   bs: Bytes[],
   row?: RowRef,
@@ -284,7 +282,7 @@ async function ringApi(
   const r = row ?? (await freshRow());
   const res = await direct(
     "/api/v2/ring",
-    { method: "POST", body: ringBody(r, bs) },
+    { method: "POST", body: ringBody(r, bellsOf(bs)) },
     { ...OVER, ...over },
   );
   expect(res.status).toBe(204);
@@ -293,19 +291,12 @@ async function ringApi(
 /** `ring` alone, as the Worker calls it, without the wait and the send: what it makes due. */
 async function ringState(bs: Bytes[], row?: RowRef): Promise<RowRef> {
   const r = row ?? { E: 1, label: P.random(16) };
-  const byJ = new Map<number, Bytes[]>();
-  for (const b of bs) {
-    const j = bellShard(tk(b), SHARDS);
-    byJ.set(j, [...(byJ.get(j) ?? []), tk(b)]);
-  }
-  const found = new Map<string, BellEntry[]>();
-  for (const [j, tks] of byJ)
-    for (const x of await bell(j).lookup(tks)) found.set(P.hex(x.tk), x.entries);
   const targets = new Map<string, RingTarget>();
   for (const b of bs) {
-    for (const e of found.get(P.hex(tk(b))) ?? []) {
+    const raw = await env.PUSH_KV.get(keyBell(tk(b)), "arrayBuffer");
+    for (const e of raw ? (decodeEntries(new Uint8Array(raw)) ?? []) : []) {
       const t = targets.get(P.hex(e.ep)) ?? { ep: e.ep, qh: e.qh, kh: e.kh, box: e.box, bells: [] };
-      t.bells.push(b);
+      t.bells.push(P.bellOf(b));
       targets.set(P.hex(e.ep), t);
     }
   }
@@ -474,6 +465,7 @@ describe("POST /api/v2/push/sub (§10.10)", () => {
       p256dh: P.b64u(d.p256dh),
       auth: P.b64u(d.auth),
       tokens: [P.b64u(P.random(16))],
+      quiet: P.b64u(d.quiet),
       ...over,
     };
   };
@@ -499,6 +491,7 @@ describe("POST /api/v2/push/sub (§10.10)", () => {
       expect(r.headers.get("cache-control")).toBe("no-store");
     }
     expect((await post(body({ tokens: [] }))).status).toBe(204);
+    expect((await post(body({ tokens: [], quiet: undefined }))).status).toBe(204); // a deletion needs no tag
   });
 
   const BAD: [string, Record<string, unknown>][] = [
@@ -524,13 +517,14 @@ describe("POST /api/v2/push/sub (§10.10)", () => {
     ["an extra key", { extra: 1 }],
     ["a 15-byte quiet tag", { quiet: P.b64u(P.random(15)) }],
     ["a quiet tag that is not a string", { quiet: 1 }],
+    ["no quiet tag with a non-empty set", { quiet: undefined }],
   ];
   it.each(BAD)("400 for %s", async (_name, over) => {
     expect(`https://fcm.googleapis.com/${"a".repeat(1025 - 27)}`.length).toBe(1025);
     expect((await post(body(over))).status).toBe(400);
   });
 
-  it("takes the account's quiet tag, or none; a repeated token counts once; 256 distinct ones are accepted", async () => {
+  it("takes the account's quiet tag; a repeated secret counts once; 256 distinct ones are accepted", async () => {
     expect((await post(body({ quiet: P.b64u(P.random(16)) }))).status).toBe(204);
     expect((await post(body())).status).toBe(204);
     const t = P.b64u(P.random(16));
@@ -595,15 +589,16 @@ describe("registrations in the store (§9.8 `sub`)", () => {
     const r1 = await record(d);
     expect(r1).not.toBeNull();
     expect(r1!.day).toBe(dayOf(BASE));
-    expect(r1!.qh).toBeNull();
+    expect(r1!.qh).toEqual(qk(d.quiet));
+    // Filed under the keyed hashes of the secrets' bells: the secret reaches the store in no form (§9.8).
     expect(r1!.tks.map(P.hex).sort()).toEqual([tk(b1), tk(b2)].map(P.hex).sort());
     expect(await holders(b1)).toEqual([P.hex(d.ep)]);
     expect(await reaches(d, [b1])).toBe(true);
     expect(await reaches(d, [b2])).toBe(true);
-    // The metadata the expiry reads: the day and the owner (the endpoint itself, without a quiet tag).
+    // The metadata the expiry reads: the day and the owner (the account's quiet tag, keyed).
     const meta = (await env.PUSH_KV.getWithMetadata<{ d: number; o: string }>(keyEp(d.ep)))
       .metadata;
-    expect(meta).toEqual({ d: dayOf(BASE), o: P.hex(d.ep) });
+    expect(meta).toEqual({ d: dayOf(BASE), o: P.hex(qk(d.quiet)) });
 
     await sub(d, [b3]);
     expect((await record(d))!.tks.map(P.hex)).toEqual([P.hex(tk(b3))]);
@@ -636,9 +631,7 @@ describe("registrations in the store (§9.8 `sub`)", () => {
       P.hex(qk(q)),
     );
     const entry = async (): Promise<BellEntry> =>
-      (await bell(bellShard(tk(b), SHARDS)).entriesOf(tk(b))).find(
-        (e) => P.hex(e.ep) === P.hex(phone.ep),
-      )!;
+      (await quiet(kOf(phone)).entriesOf(tk(b))).find((e) => P.hex(e.ep) === P.hex(phone.ep))!;
     const before = await entry();
     // New keys under the same endpoint: the bell's entry carries the new box and kh.
     const sk = p256.utils.randomSecretKey();
@@ -650,13 +643,14 @@ describe("registrations in the store (§9.8 `sub`)", () => {
     expect(await holders(b)).toHaveLength(2);
   });
 
-  it("a bell's 8 places go to the first endpoints; a ninth is left out without evicting, and takes a freed place", async () => {
+  it("a bell's 8 places go to the account's first endpoints; a ninth is left out without evicting, and takes a freed place", async () => {
     const b = P.random(16);
+    const q = P.random(16); // one account: only its devices hold the secret (§10.10)
     const eight = Array.from({ length: 8 }, () => dev());
-    for (const d of eight) await sub(d, [b]);
+    for (const d of eight) await sub(d, [b], q);
     const ninth = dev();
     const own = P.random(16);
-    await sub(ninth, [b, own]);
+    await sub(ninth, [b, own], q);
     expect((await record(ninth))!.tks.map(P.hex)).toEqual([P.hex(tk(own))]); // b was left out
     await ringState([b]);
     for (const d of eight) expect(await dueOf(d)).not.toBeNull();
@@ -664,8 +658,35 @@ describe("registrations in the store (§9.8 `sub`)", () => {
     expect(await reaches(ninth, [own])).toBe(true); // its other bells work
     expect(await holders(b)).toHaveLength(8);
     await sub(eight[0], []);
-    await sub(ninth, [b, own]);
+    await sub(ninth, [b, own], q);
     expect(await reaches(ninth, [b])).toBe(true);
+  });
+
+  it("a deletion without a quiet tag (a tab of an earlier release) reaches the owner the record names", async () => {
+    const d = dev();
+    const b = P.random(16);
+    await sub(d, [b]);
+    expect((await subApi(d, [], null, {}, false)).status).toBe(204);
+    expect(await record(d)).toBeNull();
+    expect(await holders(b)).toEqual([]);
+    // Nothing to delete: still 204, and nothing is written.
+    expect((await subApi(dev(), [], null, {}, false)).status).toBe(204);
+    expect((await env.PUSH_KV.list({ prefix: "e/" })).keys).toEqual([]);
+  });
+
+  it("the Worker reads a bell's entries from the store: a registration reaches rings at once here, within a minute at an edge", async () => {
+    const d = dev();
+    const b = P.random(16);
+    await sub(d, [b]);
+    await ringApi([b]);
+    expect((await stateOf(d))!.recent).toHaveLength(1);
+    // The ring carries the bell, never the secret: a ring of the secret's bytes reaches nobody.
+    const before = (await stateOf(d))!.recent.length;
+    const r = await freshRow();
+    expect(
+      (await direct("/api/v2/ring", { method: "POST", body: ringBody(r, [b]) }, OVER)).status,
+    ).toBe(204);
+    expect((await stateOf(d))!.recent).toHaveLength(before);
   });
 
   it("a restart keeps every registration: the objects read the store back", async () => {
@@ -696,11 +717,11 @@ describe("POST /api/v2/ring (§10.10)", () => {
     await sub(d, [b]);
     const row = await freshRow();
     const cases = [
-      ringBody(row, [b]), // registered, fresh
-      ringBody(row, [b]), // a repeat
+      ringBody(row, bellsOf([b])), // registered, fresh
+      ringBody(row, bellsOf([b])), // a repeat
       ringBody(row, [P.random(16)]), // unregistered
-      ringBody({ E: row.E, label: P.random(16) }, [b]), // a missing row
-      ringBody({ E: row.E + 5, label: row.label }, [b]), // outside the era bound
+      ringBody({ E: row.E, label: P.random(16) }, bellsOf([b])), // a missing row
+      ringBody({ E: row.E + 5, label: row.label }, bellsOf([b])), // outside the era bound
     ];
     const answers: string[] = [];
     for (const c of cases) {
@@ -888,7 +909,7 @@ describe("the push request (§9.8)", () => {
       true,
     );
     expect(new TextDecoder().decode(decrypt(c.body, d))).toBe(
-      `{"web_push":8030,"mutable":true,"notification":{"title":"segv.sh","body":"new messages","navigate":"https://segv.test/","tag":"segv","data":{"bells":"${P.b64u(P.concat(b, new Uint8Array(48)))}"}}}`,
+      `{"web_push":8030,"mutable":true,"notification":{"title":"segv.sh","body":"new messages","navigate":"https://segv.test/","tag":"segv","data":{"bells":"${P.b64u(P.concat(P.bellOf(b), new Uint8Array(48)))}"}}}`,
     );
   });
 });
@@ -923,7 +944,7 @@ describe("the bells a push names (§9.8 `rang`)", () => {
     fake.now = BASE + HOLD + DELTA * 1000;
     await drainQueue([kOf(d)]);
     expect(callsTo(d)).toHaveLength(1);
-    expect(named(callsTo(d)[0], d)).toEqual([bs[1], bs[4], bs[3], bs[2]].map(P.hex));
+    expect(named(callsTo(d)[0], d)).toEqual(bellsOf([bs[1], bs[4], bs[3], bs[2]]).map(P.hex));
     expect((await stateOf(d))!.rang).toEqual([]);
   });
 
@@ -1127,13 +1148,13 @@ describe("expiry and what is stored (§9.8)", () => {
         expect(() => P.aeadOpen(P.random(32), e.box, P.enc("segv.sh/v2/push/sub", d.ep))).toThrow();
       }
       const all = keys.join("|") + P.hex(P.concat(...values));
-      for (const x of [...bs, q]) {
+      for (const x of [...bs, ...bellsOf(bs), q]) {
         expect(all).not.toContain(P.hex(x));
         expect(all).not.toContain(P.b64u(x));
       }
       // The objects store nothing: no table, no key, no alarm.
       for (let i = 0; i < SHARDS; i++) {
-        for (const stub of [quiet(i), bell(i)]) {
+        for (const stub of [quiet(i)]) {
           const stored = await runInDurableObject(
             stub as DurableObjectStub<QuietDO>,
             async (_inst, state) => ({
@@ -1158,6 +1179,7 @@ describe("expiry and what is stored (§9.8)", () => {
         P.b64u(d.auth),
         ...bs.map(P.b64u),
         ...bs.map(P.hex),
+        ...bellsOf(bs).map(P.hex),
         P.hex(d.ep),
         P.hex(q),
       ])
@@ -1248,26 +1270,24 @@ describe("the QuietDO holds pushes for marks of rows seen (§9.8 `seen`)", () =>
 
   it("a mark before the ring keeps every endpoint of the account from the push, and nobody else's", async () => {
     await reset(BASE);
-    const [phone, laptop, member, plain] = [dev(), dev(), dev(), dev()];
-    const b = P.random(16); // bob's bell, which every member of the conversation computes
+    const [phone, laptop, member] = [dev(), dev(), dev()];
+    const b = P.random(16); // bob's bell secret, which only bob's devices hold
+    const bMember = P.random(16); // another member's, rung by the same row
     const [qBob, qMember] = [P.random(16), P.random(16)];
     await sub(phone, [b], qBob);
     await sub(laptop, [b], qBob);
-    await sub(member, [b], qMember); // a member who registered its own endpoint under bob's bell
-    await sub(plain, [b]); // a tab of an earlier release: no quiet tag
+    await sub(member, [bMember], qMember);
     const row = { E: 1, label: P.random(16) };
     await seen(qBob, [row]);
-    await ringState([b], row);
+    await ringState([b, bMember], row);
     expect(await dueOf(phone)).toBeNull();
     expect(await dueOf(laptop)).toBeNull();
     expect(await dueOf(member)).not.toBeNull();
-    expect(await dueOf(plain)).not.toBeNull();
     fake.now = BASE + HOLD + DELTA * 1000;
-    await drainQueue([kOf(member), kOf(plain)]);
+    await drainQueue([kOf(member)]);
     expect(callsTo(phone)).toHaveLength(0);
     expect(callsTo(laptop)).toHaveLength(0);
     expect(callsTo(member)).toHaveLength(1);
-    expect(callsTo(plain)).toHaveLength(1);
   });
 
   it("a mark after the ring cancels the waiting push once every row that rang it is marked; `last` stays", async () => {

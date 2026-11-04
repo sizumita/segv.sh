@@ -875,6 +875,8 @@ export class FakeWorld implements WorldCtx, RtHost {
         return err(400, "bad push subscription");
       if (o.quiet !== undefined && (typeof o.quiet !== "string" || fromB64u(o.quiet).length !== 16))
         return err(400, "bad quiet tag");
+      // The quiet tag is required unless the registration is deleted (§10.10).
+      if (o.quiet === undefined && o.tokens.length > 0) return err(400, "quiet tag required");
       this.push.sub(o.endpoint, o.tokens as string[], (o.quiet as string | undefined) ?? null);
       return { status: 204 };
     });

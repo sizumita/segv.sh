@@ -457,6 +457,11 @@ describe("envelope M: layout", () => {
     ],
     ["LEAVE", { ...hdr(), type: P.MT.LEAVE }, { type: 17, content: new Uint8Array(0) }],
     [
+      "BELL",
+      { ...hdr(), type: P.MT.BELL, bell: { g: 7, bell: fill(16, 0x55) } },
+      { type: 5, content: cat(be32(7), fill(16, 0x55)) },
+    ],
+    [
       "TEXT with prev and checkpoint",
       {
         ...hdr({ prev: { E: 3, n: 7 }, prevh: fill(16, 0x77), ckq: 9, ck16: fill(16, 0x99) }),
@@ -568,9 +573,14 @@ describe("envelope M: strict parsing", () => {
       { ...hdr(), type: 19 as typeof P.MT.LEAVE },
       { ...hdr({ prev: { E: 3, n: 1 } }), type: P.MT.CLAIM, lane: P.CTL_LANE, claim: claim3 },
       { ...hdr({ lane: P.CTL_LANE }), type: P.MT.CLAIM, claim: { ...claim3, cuts: [] } },
-      { ...hdr(), type: 5 as typeof P.MT.LEAVE },
+      { ...hdr(), type: 6 as typeof P.MT.LEAVE },
+      { ...hdr(), type: P.MT.BELL, bell: { g: 7, bell: fill(15, 0x55) } },
+      { ...hdr(), type: P.MT.BELL, bell: { g: 2 ** 32, bell: fill(16, 0x55) } },
     ];
     for (const m of bads) expect(throwsError(() => P.encodeM(m))).toBe(true);
+    // A BELL's content is exactly 20 bytes (§3.3).
+    const bell = P.encodeM({ ...hdr(), type: P.MT.BELL, bell: { g: 7, bell: fill(16, 0x55) } });
+    for (const c of [cat(bell, be8(0)), bell.slice(0, -1)]) expect(throwsError(() => P.parseM(c))).toBe(true);
   });
 });
 
@@ -882,7 +892,7 @@ describe("conversation rows: seal, sign, open (§3.3)", () => {
       const body = P.sealRow(keys0.mk, E, label, M, P.signRow(bob.id.sigSk, conv, 0, E, label, M)).body;
       expect(P.acceptRow(rowCtx0, E, label, body)).toEqual({ ok: false, why: "malformed" });
     }
-    expect(Object.values(P.MT)).toEqual([1, 2, 3, 4, 8, 16, 17]);
+    expect(Object.values(P.MT)).toEqual([1, 2, 3, 4, 5, 8, 16, 17]);
   });
 
   it("flipping any byte of a body, or changing the label or E, makes the row fail to open", () => {
@@ -2002,6 +2012,22 @@ const records: [string, P.SelfRecord, B, number][] = [
   ["TREG", { rtype: 0x0f, bundleId: fill(32, 0x34), tReg: 25_465_628 }, cat(fill(32, 0x34), be32(25_465_628)), 36],
   ["ENDED", { rtype: 0x12, ...copy, e: 6, claim: { E: 7, n: 3 } }, cat(refCopy, be32(6), be16(7), be32(3)), 58],
   [
+    "BELLS",
+    {
+      rtype: 0x15,
+      ...copy,
+      e: 4,
+      g: 2,
+      entries: [
+        { lane: 0, bell: fill(16, 0x41) },
+        { lane: 2, bell: fill(16, 0x42) },
+      ],
+    },
+    cat(refCopy, be32(4), be32(2), be8(2), be8(0), fill(16, 0x41), be8(2), fill(16, 0x42)),
+    57 + 17 * 2,
+  ],
+  ["BELLS (none known)", { rtype: 0x15, ...copy, e: 4, g: 0xffffffff, entries: [] }, cat(refCopy, be32(4), be32(0xffffffff), be8(0)), 57],
+  [
     "SNAP",
     { rtype: 0x20, blobId: fill(32, 0x73), key: fill(32, 0x74), size: 4096, pos: { E: 7, n: 12 } },
     cat(fill(32, 0x73), fill(32, 0x74), be32(4096), be16(7), be32(12)),
@@ -2058,6 +2084,10 @@ describe("self records (§7.2)", () => {
       ["EPOCH_PENDING a = 33", 3, cat(refCopy, refMat, be32(1), be8(33), ...Array(33).fill(fill(16, 1)))],
       ["LINK flags 4", 6, set(content("LINK"), 20, 4)],
       ["PREFS empty", 7, new Uint8Array(0)],
+      ["BELLS 33 entries", 0x15, cat(refCopy, be32(4), be32(2), be8(33), ...Array(33).fill(cat(be8(0), fill(16, 1))))],
+      ["BELLS lanes not ascending", 0x15, cat(refCopy, be32(4), be32(2), be8(2), be8(2), fill(16, 1), be8(0), fill(16, 1))],
+      ["BELLS lane repeated", 0x15, cat(refCopy, be32(4), be32(2), be8(2), be8(3), fill(16, 1), be8(3), fill(16, 1))],
+      ["BELLS lane 32", 0x15, cat(refCopy, be32(4), be32(2), be8(1), be8(32), fill(16, 1))],
       [
         "HEADS lane count 0",
         8,
@@ -2541,12 +2571,16 @@ function computeKat() {
       ts: TS,
       records: [records[3][1], records[0][1]],
     });
-    // LEFT (0x0E) and TREG (0x0F) came after this vector was pinned: they have vectors of their own (below)
+    // LEFT (0x0E), TREG (0x0F), ENDED (0x12) and BELLS (0x15) came after this vector was pinned: they have vectors
+    // of their own (below)
     const snap = P.encryptSnapshot({
       pos: { E: 7, n: 30 },
       ts: TS,
       records: records
-        .filter(([, r]) => r.rtype !== 0x20 && r.rtype !== 0x0e && r.rtype !== 0x0f && r.rtype !== 0x12)
+        .filter(
+          ([, r]) =>
+            r.rtype !== 0x20 && r.rtype !== 0x0e && r.rtype !== 0x0f && r.rtype !== 0x12 && r.rtype !== 0x15,
+        )
         .map(([, r]) => r),
     });
     return {

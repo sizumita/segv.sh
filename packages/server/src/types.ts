@@ -12,10 +12,8 @@
  *   ConnDO       "conn/v2/{c}"        (c = conn(ck) of the client, §4.4; C of them)
  *   FeedDO       "feed/v2/{j}"        (j = feed(T) of the topic, §4.4; F of them)
  *   CheckpointDO "ckpt/v2"
- *   BellDO       "bell/v2/{j}"        (j = bellShard(tk) of a bell's keyed hash, §9.8; PUSH_SHARDS of them)
  *   QuietDO      "quiet/v2/{k}"       (k = quietShard(owner) of an endpoint, §9.8; PUSH_SHARDS of them)
  */
-import type { BellDO } from "./bell-do";
 import type { BlobRegDO } from "./blobreg-do";
 import type { CheckpointDO } from "./ckpt-do";
 import type { ConnDO } from "./conn-do";
@@ -226,7 +224,6 @@ export const KEYS_NAME = "keys/v2";
 export const connName = (c: number): string => `conn/v2/${c}`;
 export const feedName = (j: number): string => `feed/v2/${j}`;
 export const CKPT_NAME = "ckpt/v2";
-export const bellName = (j: number): string => `bell/v2/${j}`;
 export const quietName = (k: number): string => `quiet/v2/${k}`;
 
 export const shardStub = (env: Env, E: number, i: number): DurableObjectStub<ShardDO> =>
@@ -242,7 +239,6 @@ export const keyStub = (env: Env): DurableObjectStub<KeyDO> => ns<KeyDO>(env, "K
 export const connStub = (env: Env, c: number): DurableObjectStub<ConnDO> => ns<ConnDO>(env, "CONN").getByName(connName(c));
 export const feedStub = (env: Env, j: number): DurableObjectStub<FeedDO> => ns<FeedDO>(env, "FEED").getByName(feedName(j));
 export const ckptStub = (env: Env): DurableObjectStub<CheckpointDO> => ns<CheckpointDO>(env, "CKPT").getByName(CKPT_NAME);
-export const bellStub = (env: Env, j: number): DurableObjectStub<BellDO> => ns<BellDO>(env, "BELL").getByName(bellName(j));
 export const quietStub = (env: Env, k: number): DurableObjectStub<QuietDO> => ns<QuietDO>(env, "QUIET").getByName(quietName(k));
 
 /** Parses "blobreg/v2/{j}" (decimal, no padding, j ≤ 4095) to j, and the legacy "blobreg/v2" to null (§9.2). */
@@ -253,8 +249,8 @@ export function parseBlobRegName(name: string | undefined): number | null {
   return Number(m[1]);
 }
 
-/** Parses "conn/v2/{c}" / "feed/v2/{j}" / "bell/v2/{j}" / "quiet/v2/{k}" (decimal, no padding, below 2^31). */
-export function parseIndexName(name: string | undefined, kind: "conn" | "feed" | "bell" | "quiet"): number {
+/** Parses "conn/v2/{c}" / "feed/v2/{j}" / "quiet/v2/{k}" (decimal, no padding, below 2^31). */
+export function parseIndexName(name: string | undefined, kind: "conn" | "feed" | "quiet"): number {
   const m = name ? new RegExp(`^${kind}/v2/(0|[1-9]\\d{0,9})$`).exec(name) : null;
   if (!m) throw new Error(`${kind} DO: unexpected name`);
   const c = Number(m[1]);

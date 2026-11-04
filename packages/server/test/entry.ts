@@ -15,7 +15,6 @@ export { InboxDO } from "../src/inbox-do";
 export { ConnDO } from "../src/conn-do";
 export { FeedDO } from "../src/feed-do";
 export { CheckpointDO } from "../src/ckpt-do";
-export { BellDO } from "../src/bell-do";
 export { QuietDO } from "../src/quiet-do";
 
 export default {
