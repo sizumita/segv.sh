@@ -4,7 +4,7 @@
 import * as P from "@segv/protocol/proto";
 import { BAD_RECEIPT, RowMemory, type CkptLatest, type CkptRange } from "./integrity";
 import * as W from "@segv/protocol/wire";
-import type { EngineClock } from "./options";
+import type { EngineClock, EngineTimer } from "./options";
 import type { PushParams, PushSubBody } from "./push";
 
 export type Bytes = Uint8Array;
@@ -80,6 +80,14 @@ const POW_SCOPES: readonly P.PowScope[] = ["register", "wrap", "put", "inbox", "
 /** Clients refuse a PoW base above 26 (§10.2). */
 export const MAX_POW_BASE = 26;
 const PARAMS_TTL_MS = 5 * 60_000;
+
+/**
+ * The deadline of a request (§10.1 "Timeouts"), from just before it is sent until its whole answer is read; a blob
+ * download's answer headers, and each chunk of its body, get it too.
+ */
+export const REQUEST_TIMEOUT_MS = 30_000;
+/** A blob upload gets one more second for every this many bytes of its body (§10.1 "Timeouts"). */
+export const UPLOAD_BYTES_PER_S = 16 * 1024;
 
 const isInt = (x: unknown, lo: number, hi: number): x is number =>
   typeof x === "number" && Number.isSafeInteger(x) && x >= lo && x <= hi;
@@ -317,6 +325,53 @@ async function readError(res: Response): Promise<ApiError> {
   return new ApiError(res.status, msg, body, Number.isFinite(ra) && ra >= 0 ? ra : null);
 }
 
+const TIMEOUT = "timeout";
+
+/**
+ * One request's deadline on the engine's clock. When it passes, the request's signal aborts, and every promise raced
+ * against it rejects with `ApiError(0, "timeout")` at once, whether or not the transport honours the signal.
+ */
+class Deadline {
+  private readonly ctl = new AbortController();
+  private timer: EngineTimer | null = null;
+  private fail: (e: ApiError) => void = () => {};
+  private readonly expired = new Promise<never>((_, reject) => (this.fail = reject));
+
+  constructor(private readonly clock: EngineClock) {
+    this.expired.catch(() => {});
+  }
+
+  get signal(): AbortSignal {
+    return this.ctl.signal;
+  }
+
+  /** Expires `ms` from now, unless armed again or ended before. */
+  arm(ms: number): void {
+    this.timer?.cancel();
+    this.timer = this.clock.setTimer(() => {
+      this.fail(new ApiError(0, TIMEOUT));
+      this.ctl.abort();
+    }, ms);
+  }
+
+  end(): void {
+    this.timer?.cancel();
+    this.timer = null;
+  }
+
+  race<T>(p: Promise<T>): Promise<T> {
+    return Promise.race([p, this.expired]);
+  }
+}
+
+/** Statuses whose responses have no body (a Response cannot be built with one). */
+const NULL_BODY = new Set([101, 103, 204, 205, 304]);
+
+const asApiError = (e: unknown): ApiError =>
+  e instanceof ApiError
+    ? e
+    : new ApiError(0, `network error: ${e instanceof Error ? e.message : String(e)}`);
+
 export class Api {
   readonly time: ServerClock;
   /** every row this session fetched, received or wrote (§12.1) */
@@ -356,16 +411,26 @@ export class Api {
   }
 
   /**
-   * One HTTP request. Network failures become `ApiError(0)`. Every `no-store` response with a valid `x-segv-now`
-   * adds a clock sample (§10.1); cacheable responses never do.
+   * One HTTP request under its deadline (§10.1 "Timeouts"). Network failures become `ApiError(0)`, and a missed
+   * deadline `ApiError(0, "timeout")`. The answer comes back with its body already read, except for a `download`,
+   * whose body fails once no bytes arrive for REQUEST_TIMEOUT_MS. `timeout` replaces the deadline of the whole
+   * request (a blob upload's, which grows with its body). Every `no-store` response with a valid `x-segv-now` adds a
+   * clock sample (§10.1); cacheable responses never do.
    */
-  async request(path: string, init: RequestInit = {}): Promise<Response> {
+  async request(
+    path: string,
+    init: RequestInit = {},
+    opts: { timeout?: number; download?: boolean } = {},
+  ): Promise<Response> {
+    const dl = new Deadline(this.clock);
+    dl.arm(opts.timeout ?? REQUEST_TIMEOUT_MS);
     const sent = this.clock.mono();
     let res: Response;
     try {
-      res = await this.fetchFn(this.base + path, init);
+      res = await dl.race(this.fetchFn(this.base + path, { ...init, signal: dl.signal }));
     } catch (e) {
-      throw new ApiError(0, `network error: ${e instanceof Error ? e.message : String(e)}`);
+      dl.end();
+      throw asApiError(e);
     }
     const recv = this.clock.mono();
     const cc = res.headers.get("cache-control") ?? "";
@@ -374,7 +439,41 @@ export class Api {
       const s = Number(now);
       if (Number.isSafeInteger(s)) this.time.add(s, sent, recv);
     }
-    return res;
+    const head = { status: res.status, statusText: res.statusText, headers: res.headers };
+    if (res.body === null || NULL_BODY.has(res.status)) {
+      dl.end();
+      return res;
+    }
+    if (!opts.download) {
+      try {
+        return new Response(await dl.race(res.arrayBuffer()), head);
+      } catch (e) {
+        throw asApiError(e);
+      } finally {
+        dl.end();
+      }
+    }
+    const reader = res.body.getReader();
+    const body = new ReadableStream<Uint8Array>({
+      async pull(c) {
+        dl.arm(REQUEST_TIMEOUT_MS);
+        try {
+          const { done, value } = await dl.race(reader.read());
+          dl.end();
+          if (done) c.close();
+          else c.enqueue(value);
+        } catch (e) {
+          dl.end();
+          void reader.cancel().catch(() => {});
+          c.error(asApiError(e));
+        }
+      },
+      cancel(reason) {
+        dl.end();
+        return reader.cancel(reason);
+      },
+    });
+    return new Response(body, head);
   }
 
   private async json<T>(res: Response): Promise<T> {
@@ -663,11 +762,15 @@ export class Api {
     onProgress?: Progress,
   ): Promise<{ t: number; size: number }> {
     const pow = await this.powHeader("blob", id, blob.length, onProgress);
-    const res = await this.request(`/api/v2/blob/${P.b64u(id)}`, {
-      method: "PUT",
-      headers: { "content-type": "application/octet-stream", "x-segv-pow": pow },
-      body: blob as BodyInit,
-    });
+    const res = await this.request(
+      `/api/v2/blob/${P.b64u(id)}`,
+      {
+        method: "PUT",
+        headers: { "content-type": "application/octet-stream", "x-segv-pow": pow },
+        body: blob as BodyInit,
+      },
+      { timeout: REQUEST_TIMEOUT_MS + Math.ceil((blob.length * 1000) / UPLOAD_BYTES_PER_S) },
+    );
     if (!res.ok) throw await readError(res);
     const j = await this.json<{ t?: unknown; size?: unknown }>(res);
     if (!isInt(j.t, 0, 0xffffffff) || j.size !== blob.length)
@@ -709,7 +812,7 @@ export class Api {
    * body longer than `max`, is a size mismatch (the caller decides; §6.7 step 1).
    */
   async getBlob(id: Bytes, max: number): Promise<{ bytes: Bytes; sizeOk: boolean } | null> {
-    const res = await this.request(`/api/v2/blob/${P.b64u(id)}`);
+    const res = await this.request(`/api/v2/blob/${P.b64u(id)}`, {}, { download: true });
     if (res.status === 404) return null;
     if (!res.ok) throw await readError(res);
     const cl = res.headers.get("content-length");
@@ -740,7 +843,7 @@ export class Api {
 
   /** `GET /api/v2/blob/{id}` of unknown size, at most `cap` bytes: null for 404; a longer body is refused. */
   async getBlobUpTo(id: Bytes, cap: number): Promise<Bytes | null> {
-    const res = await this.request(`/api/v2/blob/${P.b64u(id)}`);
+    const res = await this.request(`/api/v2/blob/${P.b64u(id)}`, {}, { download: true });
     if (res.status === 404) return null;
     if (!res.ok) throw await readError(res);
     const cl = Number(res.headers.get("content-length") ?? "0");
@@ -748,7 +851,12 @@ export class Api {
       await res.body?.cancel().catch(() => {});
       throw new ApiError(0, "blob too large");
     }
-    const b = new Uint8Array(await res.arrayBuffer());
+    let b: Bytes;
+    try {
+      b = new Uint8Array(await res.arrayBuffer());
+    } catch (e) {
+      throw new ApiError(0, `blob read failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
     if (b.length > cap) throw new ApiError(0, "blob too large");
     return b;
   }
