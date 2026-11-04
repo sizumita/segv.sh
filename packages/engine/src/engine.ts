@@ -496,34 +496,34 @@ export class SegvEngine implements Engine {
     return this.action(() => this.messaging().create(handles, name));
   }
 
-  async sendText(convId: string, text: string): Promise<void> {
+  async sendText(convId: string, text: string, replyTo?: string): Promise<void> {
     this.requireAccount();
     try {
-      await this.messaging().sendText(convId, text);
+      await this.messaging().sendText(convId, text, replyTo);
     } catch (e) {
       this.patch({ error: message(e) });
     }
   }
 
-  async sendImage(convId: string, file: File): Promise<void> {
+  async sendImage(convId: string, file: File, replyTo?: string): Promise<void> {
     this.requireAccount();
     try {
-      await this.messaging().sendImage(convId, file);
+      await this.messaging().sendImage(convId, file, replyTo);
     } catch (e) {
       this.patch({ error: message(e) });
     }
   }
 
-  async sendFile(convId: string, file: File): Promise<void> {
+  async sendFile(convId: string, file: File, replyTo?: string): Promise<void> {
     this.requireAccount();
     try {
-      await this.messaging().sendFile(convId, file);
+      await this.messaging().sendFile(convId, file, replyTo);
     } catch (e) {
       this.patch({ error: message(e) });
     }
   }
 
-  /** §11.12: one emoji reaction to a TEXT, IMAGE or FILE message, without an echo; rejects with §11.3's errors. */
+  /** §11.12: one emoji reaction to a TEXT, IMAGE, FILE or REPLY message, without an echo; rejects with §11.3's errors. */
   async react(convId: string, messageKey: string, emoji: string, on: boolean): Promise<void> {
     this.requireAccount();
     await this.action(() => this.messaging().react(convId, messageKey, emoji, on));

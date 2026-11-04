@@ -214,7 +214,8 @@ async function readNewest(
       );
       if (!v.ok || v.msg.from !== l.j) return;
       const who = `@${l.ep.members[l.j]?.handle ?? "?"}`;
-      const msg = v.msg;
+      // A REPLY shows as the message it carries (§11.17).
+      const msg = v.msg.type === P.MT.REPLY ? v.msg.body : v.msg;
       let text: () => string;
       // As plain text: a notification can neither style nor hide, and a spoiler must not reach the lock screen.
       if (msg.type === P.MT.TEXT) text = () => `${who}: ${plainText(msg.text)}`;

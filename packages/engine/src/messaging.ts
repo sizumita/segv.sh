@@ -74,7 +74,7 @@ import type {
 import { Realtime } from "./realtime";
 import { keysChangedWarning, leftKeyCmp, liveAt, type SelfLane } from "./selflane";
 import { SNAP_RECORDS, firstFreePointer, writeSnapshot } from "./snapshot";
-import { reactionSets, refreshReactions } from "./reactions";
+import { reactionSets, refreshRefs } from "./reactions";
 import { lanesEnd, olderInitialHistory, scrollback } from "./history";
 import { prepareImage } from "./image";
 import { ImageCache } from "./image-cache";
@@ -145,6 +145,10 @@ export const FILE_TOO_LARGE = "the file is too large";
 /** A file's bytes are only ever saved, never shown: its object URL has no type a browser renders (§8.3). */
 const FILE_TYPE = "application/octet-stream";
 
+/** A message as it is sent: as it is, or as a REPLY to `to` (§11.17). */
+const asReply = (to: P.ReplyTo | null, body: P.ReplyBody): P.MBody =>
+  to ? { type: P.MT.REPLY, to, body } : body;
+
 /** The account of the session, as the engine holds it. */
 export interface SessionAccount {
   uid: Bytes;
@@ -186,9 +190,9 @@ export interface MessagingHost {
   setConnected(on: boolean): void;
   /** the latest verified checkpoint (EngineState.head, §12.3) */
   setHead(q: number, C: Bytes): void;
-  /** a TEXT, IMAGE or FILE was stored: ask the server to ring these bells (§11.13); never waits */
+  /** a TEXT, IMAGE, FILE or REPLY was stored: ask the server to ring these bells (§11.13); never waits */
   ring(E: number, label: Bytes, bells: Bytes[]): void;
-  /** a TEXT, IMAGE or FILE of another member was shown as it arrived: marked seen while in use (§11.13); never waits */
+  /** a TEXT, IMAGE, FILE or REPLY of another member was shown as it arrived: marked seen while in use (§11.13); never waits */
   shown(E: number, label: Bytes, t: number): void;
   /** the same row, in a copy whose bell the registration set holds: an app without push may notify (§11.13) */
   arrived?(a: Arrival): void;
@@ -927,7 +931,8 @@ export class Messaging {
       heads: null,
       probe: false,
       reactions: new Map(),
-      reactionsDirty: false,
+      replies: new Map(),
+      refsDirty: false,
     };
   }
 
@@ -2539,7 +2544,7 @@ export class Messaging {
   }
 
   /**
-   * Before self's TEXT, IMAGE, FILE or REACTION: in a live copy whose `rootBy` is neither self nor a contact, the post is the
+   * Before self's TEXT, IMAGE, FILE, REPLY or REACTION: in a live copy whose `rootBy` is neither self nor a contact, the post is the
    * user's acceptance (§11.5): it writes the same records as `accept`, before the put.
    */
   private async acceptForPost(c: Copy): Promise<void> {
@@ -3141,10 +3146,15 @@ export class Messaging {
 
   // ───────────────────────── images (§8.1) ─────────────────────────
 
-  /** Re-encodes, encrypts and uploads an image, then sends its IMAGE row (§8.1, §11.3). */
-  sendImage(convId: string, file: File): Promise<void> {
+  /**
+   * Re-encodes, encrypts and uploads an image, then sends its IMAGE row (§8.1, §11.3), or a REPLY carrying it to the
+   * message `replyTo` (§11.17).
+   */
+  sendImage(convId: string, file: File, replyTo?: string): Promise<void> {
     const c = this.copy(convId);
-    const echo = this.addEcho(c, "image", "[image]");
+    const to = this.replyTarget(c, replyTo);
+    if (to instanceof Error) return Promise.reject(to);
+    const echo = this.addEcho(c, "image", "[image]", undefined, replyTo);
     const run = async () => {
       try {
         this.h.progress("preparing image…");
@@ -3162,10 +3172,14 @@ export class Messaging {
         );
         await this.acceptForPost(c);
         const mime = img.mime === "image/webp" ? 1 : 2;
-        await sendRow(this.sendCtx(c, echo.key), c, {
-          type: P.MT.IMAGE,
-          image: { id: P.fromB64u(id), k: key, mime, w: img.w, h: img.h },
-        });
+        await sendRow(
+          this.sendCtx(c, echo.key),
+          c,
+          asReply(to, {
+            type: P.MT.IMAGE,
+            image: { id: P.fromB64u(id), k: key, mime, w: img.w, h: img.h },
+          }),
+        );
         this.endSend(c, echo.key, "sent");
       } catch (e) {
         this.endSend(c, echo.key, "failed");
@@ -3207,11 +3221,16 @@ export class Messaging {
 
   // ───────────────────────── files (§8.3) ─────────────────────────
 
-  /** Encrypts and uploads a file as it is, then sends its FILE row (§8.3, §11.3). */
-  sendFile(convId: string, file: File): Promise<void> {
+  /**
+   * Encrypts and uploads a file as it is, then sends its FILE row (§8.3, §11.3), or a REPLY carrying it to the message
+   * `replyTo` (§11.17).
+   */
+  sendFile(convId: string, file: File, replyTo?: string): Promise<void> {
     const c = this.copy(convId);
+    const to = this.replyTarget(c, replyTo);
+    if (to instanceof Error) return Promise.reject(to);
     const name = P.safeFileName(file.name);
-    const echo = this.addEcho(c, "file", name, { id: "", k: "", name, size: file.size });
+    const echo = this.addEcho(c, "file", name, { id: "", k: "", name, size: file.size }, replyTo);
     const run = async () => {
       try {
         if (file.size > P.FILE_MAX) throw new UserError(FILE_TOO_LARGE);
@@ -3226,10 +3245,14 @@ export class Messaging {
         const url = URL.createObjectURL(new Blob([bytes as BlobPart], { type: FILE_TYPE }));
         this.fileCache.set(`${id}.${k}`, Promise.resolve({ url, size: bytes.length }));
         await this.acceptForPost(c);
-        await sendRow(this.sendCtx(c, echo.key), c, {
-          type: P.MT.FILE,
-          file: { id: P.fromB64u(id), k: key, size: bytes.length, name },
-        });
+        await sendRow(
+          this.sendCtx(c, echo.key),
+          c,
+          asReply(to, {
+            type: P.MT.FILE,
+            file: { id: P.fromB64u(id), k: key, size: bytes.length, name },
+          }),
+        );
         this.endSend(c, echo.key, "sent");
       } catch (e) {
         this.endSend(c, echo.key, "failed");
@@ -3277,11 +3300,25 @@ export class Messaging {
 
   // ───────────────────────── sending (§11.3) ─────────────────────────
 
+  /**
+   * The target fields of a reply to the message `key` (§11.17 "Sending"): a TEXT, IMAGE, FILE or REPLY row that the
+   * copy holds and accepts. Null without a key; an "unknown message" error for any other key.
+   */
+  private replyTarget(c: Copy, key: string | undefined): P.ReplyTo | null | UserError {
+    if (!key) return null;
+    for (const ep of c.epochs.values()) {
+      const row = ep.rows.get(key);
+      if (row?.shown) return { te: ep.e, tl: row.j, tE: row.E, tn: row.n, th: row.th };
+    }
+    return new UserError("unknown message");
+  }
+
   private addEcho(
     c: Copy,
     kind: "text" | "image" | "file",
     text: string,
     file?: MessageView["file"],
+    replyTo?: string,
   ): MessageView {
     const m: MessageView = {
       key: `local:${++this.localCounter}`,
@@ -3295,6 +3332,7 @@ export class Messaging {
       ...(file ? { file } : {}),
       status: "sending",
       reactions: [],
+      ...(replyTo ? { reply: { key: replyTo, state: "shown" as const } } : {}),
     };
     c.messages.push(m);
     trimMessages(c);
@@ -3391,7 +3429,7 @@ export class Messaging {
     return this.latestBell(c, uid, ep.e - 1, this.genOf(c, ep.e - 1));
   }
 
-  /** The bells a TEXT, IMAGE or FILE stored in `ep` rings (§11.13): one per other member that has a bell, no repeats. */
+  /** The bells a TEXT, IMAGE, FILE or REPLY stored in `ep` rings (§11.13): one per other member that has a bell, no repeats. */
   private ringBells(c: Copy, ep: Epoch): Bytes[] {
     const out: Bytes[] = [];
     const seen = new Set<string>();
@@ -3473,7 +3511,7 @@ export class Messaging {
   }
 
   /**
-   * A TEXT, IMAGE or FILE row of another member reached the device live (§11.13 "Apps without push"): what its
+   * A TEXT, IMAGE, FILE or REPLY row of another member reached the device live (§11.13 "Apps without push"): what its
    * notification needs, when the copy is one whose bell the registration set would hold.
    */
   private arrival(c: Copy, m: MessageView): Arrival | null {
@@ -3527,17 +3565,20 @@ export class Messaging {
     return out;
   }
 
-  sendText(convId: string, text: string): Promise<void> {
+  /** Sends a TEXT row (§11.3), or a REPLY carrying it to the message `replyTo` (§11.17). */
+  sendText(convId: string, text: string, replyTo?: string): Promise<void> {
     const c = this.copy(convId);
     const body = text.replace(/\s+$/, "");
     if (!body.trim()) return Promise.resolve();
     if (P.utf8(body).length > MAX_TEXT_BYTES)
       return Promise.reject(new UserError("message is too long"));
-    const echo = this.addEcho(c, "text", body);
+    const to = this.replyTarget(c, replyTo);
+    if (to instanceof Error) return Promise.reject(to);
+    const echo = this.addEcho(c, "text", body, undefined, replyTo);
     const run = async () => {
       try {
         await this.acceptForPost(c);
-        await sendRow(this.sendCtx(c, echo.key), c, { type: P.MT.TEXT, text: body });
+        await sendRow(this.sendCtx(c, echo.key), c, asReply(to, { type: P.MT.TEXT, text: body }));
         this.endSend(c, echo.key, "sent");
       } catch (e) {
         this.endSend(c, echo.key, "failed");
@@ -3734,7 +3775,7 @@ export class Messaging {
   // ───────────────────────── reactions (§11.12) ─────────────────────────
 
   /**
-   * §11.12: one REACTION row for the TEXT, IMAGE or FILE message `messageKey`, sent as a text is (§11.3) but without an echo,
+   * §11.12: one REACTION row for the TEXT, IMAGE, FILE or REPLY message `messageKey`, sent as a text is (§11.3) but without an echo,
    * after the user's acceptance that a post makes (§11.5). A reaction that changes nothing by the state this device
    * holds (an add of an emoji that is on, a remove of one that is off, an add beyond 8) resolves without a row.
    */
@@ -4045,7 +4086,7 @@ export class Messaging {
     const x = this.viewCtx();
     const out: ConversationView[] = [];
     for (const c of this.copies.values()) {
-      if (c.reactionsDirty) refreshReactions(c, this.h.acc.uidB);
+      if (c.refsDirty) refreshRefs(c, this.h.acc.uidB);
       const v = viewOf(c, x);
       if (v) out.push(v);
     }

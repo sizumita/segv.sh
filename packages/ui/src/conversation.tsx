@@ -1,15 +1,28 @@
-import { $, component$, useContext, useSignal, useVisibleTask$ } from "@qwik.dev/core";
+import {
+  $,
+  component$,
+  useContext,
+  useContextProvider,
+  useSignal,
+  useStore,
+  useVisibleTask$,
+} from "@qwik.dev/core";
 import type { ConversationView } from "@segv/engine/types";
 import { Composer } from "./composer";
 import { loadEngine } from "./engine-loader";
 import { Members } from "./members";
 import { Messages } from "./messages";
+import { gist } from "./reply";
+import { ReplyTree } from "./reply-tree";
 import { leaveChat } from "./route";
-import { StateCtx, UiCtx } from "./state";
+import { PaneCtx, StateCtx, UiCtx, type PaneState } from "./state";
 import { errMsg, inviterOf, isGone } from "./util";
 
 export const ConversationPane = component$<{ conv: ConversationView }>((props) => {
   const ui = useContext(UiCtx);
+  // chat.tsx keys this pane by conversation: the reply and the open thread start empty in each one
+  const pane = useStore<PaneState>({ reply: "", thread: "", threadTo: "" });
+  useContextProvider(PaneCtx, pane);
   const conv = props.conv;
   const active = conv.members.filter((m) => !m.left).length;
 
@@ -51,6 +64,15 @@ export const ConversationPane = component$<{ conv: ConversationView }>((props) =
     if (byContact && ui.list === "requests") ui.list = "chats";
   });
 
+  // One side pane at a time: opening the members closes the replies.
+  useVisibleTask$(({ track }) => {
+    if (track(() => ui.members)) pane.thread = "";
+  });
+
+  // A reply is a post (§11.17): not where nothing can be sent, nor in a read-only preview, which it would accept.
+  const canReply = conv.canSend && conv.byContact;
+  const replyTo = pane.reply ? conv.messages.find((m) => m.key === pane.reply) : undefined;
+
   return (
     <>
       <header class="convhead">
@@ -78,10 +100,22 @@ export const ConversationPane = component$<{ conv: ConversationView }>((props) =
           {!conv.byContact && !isGone(conv) ? (
             <RequestBar conv={conv} />
           ) : (
-            <Composer convId={conv.id} blocked={conv.blocked} />
+            <Composer
+              convId={conv.id}
+              blocked={conv.blocked}
+              // a target that left the view (§6.8 dropped it) is not replied to
+              replyTo={replyTo ? replyTo.key : ""}
+              replyWho={replyTo ? replyTo.fromHandle || "unknown" : ""}
+              replyGist={replyTo ? gist(replyTo) : ""}
+              canStop={true}
+              setReply$={$((key: string) => {
+                pane.reply = key;
+              })}
+            />
           )}
         </div>
         {ui.members && <Members conv={conv} />}
+        {!ui.members && pane.thread && <ReplyTree conv={conv} canReply={canReply} />}
       </div>
     </>
   );

@@ -20,6 +20,9 @@ The reference deployment runs at <https://segv.sh>.
 
 - One-to-one and group conversations (up to 32 members) with text, images and files (up to 10 MB). Text is shown with
   the Markdown that Discord supports: bold, italics, spoilers, code, quotes, headings, lists and links.
+- Replies: a reply shows a small line naming the message it answers. Clicking that line opens a pane beside the
+  conversation with the messages the reply answers and every reply below it, and a message box there replies to the
+  last of them.
 - Sign-in with a passkey. A recovery code, shown once at registration, unlocks the account without a passkey, and
   more passkeys can be added later.
 - Restore on any device: a passkey or the recovery code brings back every conversation and its history, including the

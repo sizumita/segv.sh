@@ -241,6 +241,24 @@ describe("the notifications of a push (§11.13)", () => {
     expect(notes.map((n) => n.body)).toEqual(["@bob sent a file (+1)"]);
   });
 
+  it("`message`: a reply shows as the message it carries (§11.17)", async () => {
+    const a = makeConv();
+    const c: NotifyCache = { v: 1, preview: "message", deltaS: 10, copies: [a.copy] };
+    const w = world(c);
+    const to = { te: 3, tl: 2, tE: E, tn: 0, th: P.random(16) };
+    const text = { type: P.MT.TEXT, text: "**ramen?**" } as const;
+    w.put(a.row(1, 0, { type: P.MT.REPLY, to, body: text }, { ts: NOW - 1000 }));
+    expect((await notesFor(proposed([a.bell]), w.deps, later)).map((n) => n.body)).toEqual([
+      "@bob: ramen?",
+    ]);
+    const file = { id: P.random(32), k: P.random(32), size: 10, name: "menu.pdf" };
+    const w2 = world(c);
+    w2.put(a.row(1, 0, { type: P.MT.REPLY, to, body: { type: P.MT.FILE, file } }));
+    expect((await notesFor(proposed([a.bell]), w2.deps, later)).map((n) => n.body)).toEqual([
+      "@bob sent a file",
+    ]);
+  });
+
   it("keeps only rows that verify: a wrong signer, a reaction and junk occupy their slots but show nothing", async () => {
     const a = makeConv();
     const c: NotifyCache = { v: 1, preview: "message", deltaS: 10, copies: [a.copy] };

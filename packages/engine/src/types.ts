@@ -54,6 +54,15 @@ export interface ReactionView {
   mine: boolean;
 }
 
+/**
+ * The target of a reply (a REPLY row, §11.17): `shown` with the target's message key, `waiting` while the target is
+ * not loaded (or not decided) yet, or `none` when the reply names no message this conversation can show (`key` "").
+ */
+export interface ReplyView {
+  key: string;
+  state: "shown" | "waiting" | "none";
+}
+
 export interface MessageView {
   /** stable unique key (era and label hex for a row, `local:<n>` for a local echo) */
   key: string;
@@ -69,8 +78,10 @@ export interface MessageView {
   image?: ImageRef;
   file?: FileRef;
   status: "sent" | "sending" | "failed";
-  /** the reactions to a TEXT, IMAGE or FILE message (§11.12); empty for every other message */
+  /** the reactions to a TEXT, IMAGE, FILE or REPLY message (§11.12); empty for every other message */
   reactions: ReactionView[];
+  /** what a REPLY replies to (§11.17), in its view and its echo; absent for every other message */
+  reply?: ReplyView;
 }
 
 /**
@@ -176,10 +187,14 @@ export interface Engine {
    * invitations finish in the background (at least Δ + SKEW later).
    */
   createConversation(handles: string[], name?: string): Promise<string>;
-  sendText(convId: string, text: string): Promise<void>;
-  sendImage(convId: string, file: File): Promise<void>;
+  /**
+   * The send calls take an optional `replyTo`: the key of a TEXT, IMAGE, FILE or REPLY message of the conversation,
+   * which the message then replies to (a REPLY row, §11.17). An unknown key rejects at once ("unknown message").
+   */
+  sendText(convId: string, text: string, replyTo?: string): Promise<void>;
+  sendImage(convId: string, file: File, replyTo?: string): Promise<void>;
   /** Sends a file as it is (§8.3): no re-encoding, so its metadata goes with it. At most FILE_MAX bytes. */
-  sendFile(convId: string, file: File): Promise<void>;
+  sendFile(convId: string, file: File, replyTo?: string): Promise<void>;
   /** Resolves after the switch to the new epoch and the first delivery attempt (§6.3). */
   addMembers(convId: string, handles: string[]): Promise<void>;
   /** Resolves after the switch to the new epoch and the first delivery attempt (§6.3). */
@@ -187,7 +202,7 @@ export interface Engine {
   leave(convId: string): Promise<void>;
 
   /**
-   * Adds (`on`) or removes one emoji reaction to the TEXT, IMAGE or FILE message `messageKey` (§11.12): one REACTION row,
+   * Adds (`on`) or removes one emoji reaction to the TEXT, IMAGE, FILE or REPLY message `messageKey` (§11.12): one REACTION row,
    * sent as a text is (§11.3) but without an echo. Resolves when the row counts as delivered; a reaction that would
    * change nothing resolves at once without a row.
    */

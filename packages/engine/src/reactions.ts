@@ -1,24 +1,40 @@
-// Reactions (docs/PROTOCOL.md §11.12): which REACTION rows react to which TEXT, IMAGE or FILE row, and the state per target,
-// member and emoji, walked in lane order with the 8-emoji rule. Pure functions of the rows a copy holds and accepts,
-// computed again whenever a row arrives or a §6.8 decision changes, so devices holding the same rows agree.
+// Reactions (docs/PROTOCOL.md §11.12): which REACTION rows react to which TEXT, IMAGE, FILE or REPLY row, and the state
+// per target, member and emoji, walked in lane order with the 8-emoji rule. Replies (§11.17) name their target by the
+// same rule. Pure functions of the rows a copy holds and accepts, computed again whenever a row arrives or a §6.8
+// decision changes, so devices holding the same rows agree.
 import * as P from "@segv/protocol/proto";
 import { acceptedOld, rowKey, type Copy, type ReactionRow } from "./conv";
-import { MAX_REACTIONS, type ReactionView } from "./types";
+import { MAX_REACTIONS, type ReactionView, type ReplyView } from "./types";
+
+/** The target fields of a REACTION or a REPLY (§3.3). */
+type TargetFields = Pick<P.ReplyTo, "te" | "tl" | "tE" | "tn" | "th">;
 
 /**
- * The message key of the row a REACTION row reacts to (§11.12 "Target"): a TEXT, IMAGE or FILE row the copy holds and
- * accepts, in an epoch `te ≤ e` that the copy holds, on a lane `tl < |D_te|`, whose label and stored body `th` names.
- * Null while the target is not loaded or not decided, and for a row that reacts to nothing.
+ * The row that a REACTION or REPLY of epoch `e` names (§11.12 "Target", §11.17): a TEXT, IMAGE, FILE or REPLY row the
+ * copy holds and accepts, in an epoch `te ≤ e` that the copy holds, on a lane `tl < |D_te|`, whose label and stored body
+ * `th` names. `waiting` while no decided row is held at that position; `none` when it names no row the copy can show.
  */
-export function targetOf(c: Copy, r: ReactionRow): string | null {
-  const x = r.reaction;
-  if (x.te > r.e || x.te < c.rootE) return null;
+export function targetState(c: Copy, e: number, x: TargetFields): ReplyView {
+  const none: ReplyView = { key: "", state: "none" };
+  if (x.te > e || x.te < c.rootE) return none;
   const ep = c.epochs.get(x.te);
-  if (!ep || x.tl >= ep.D.members.length) return null;
+  if (!ep) return { key: "", state: "waiting" };
+  if (x.tl >= ep.D.members.length) return none;
   const key = rowKey(x.tE, P.Lmsg(ep.keys.rk, x.tl, x.tE, x.tn));
   const t = ep.rows.get(key);
-  if (!t || !t.shown || !P.equalBytes(t.th, x.th)) return null;
-  return key;
+  // The slot holds a row of another type (a reaction, a leave …): never a message.
+  if (!t) return c.order.has(key) ? none : { key: "", state: "waiting" };
+  if (!t.shown || !P.equalBytes(t.th, x.th)) return none;
+  return { key, state: "shown" };
+}
+
+/**
+ * The message key of the row a REACTION row reacts to (§11.12 "Target"). Null while the target is not loaded or not
+ * decided, and for a row that reacts to nothing.
+ */
+export function targetOf(c: Copy, r: ReactionRow): string | null {
+  const t = targetState(c, r.e, r.reaction);
+  return t.state === "shown" ? t.key : null;
 }
 
 /**
@@ -56,15 +72,18 @@ export function reactionViews(byUid: Map<string, Set<string>>, selfUidB: string)
     .map(([emoji, n]) => ({ emoji, count: n, mine: mine.has(emoji) }));
 }
 
-/** Writes the reactions of every TEXT, IMAGE and FILE message of the copy into its views; true when one changed. */
-export function refreshReactions(c: Copy, selfUidB: string): boolean {
-  c.reactionsDirty = false;
-  const sets = reactionSets(c);
+/**
+ * Writes the reactions of every TEXT, IMAGE, FILE and REPLY message of the copy, and the target of every REPLY
+ * (§11.17), into its views; true when one changed. A local echo keeps the target it was sent with.
+ */
+export function refreshRefs(c: Copy, selfUidB: string): boolean {
+  c.refsDirty = false;
+  const sets = c.reactions.size ? reactionSets(c) : null;
   let changed = false;
   for (let i = 0; i < c.messages.length; i++) {
     const m = c.messages[i];
     if (m.kind !== "text" && m.kind !== "image" && m.kind !== "file") continue;
-    const byUid = sets.get(m.key);
+    const byUid = sets?.get(m.key);
     const next = byUid ? reactionViews(byUid, selfUidB) : [];
     const same =
       next.length === m.reactions.length &&
@@ -74,8 +93,11 @@ export function refreshReactions(c: Copy, selfUidB: string): boolean {
           x.count === m.reactions[k].count &&
           x.mine === m.reactions[k].mine,
       );
-    if (same) continue;
-    c.messages[i] = { ...m, reactions: next };
+    const r = c.replies.get(m.key);
+    const reply = r ? targetState(c, r.e, r.to) : m.reply;
+    const sameReply = reply?.key === m.reply?.key && reply?.state === m.reply?.state;
+    if (same && sameReply) continue;
+    c.messages[i] = { ...m, reactions: same ? m.reactions : next, ...(reply ? { reply } : {}) };
     changed = true;
   }
   return changed;

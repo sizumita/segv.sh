@@ -148,7 +148,7 @@ export interface AppliedRow {
   unread: boolean;
   /** the row is in the view (false: §6.8 dropped it) */
   shown: boolean;
-  /** reactTh(rk_e, label, body): what a REACTION to this row names (§3.3, §11.12) */
+  /** reactTh(rk_e, label, body): what a REACTION or REPLY to this row names (§3.3, §11.12, §11.17) */
   th: Bytes;
 }
 
@@ -199,7 +199,7 @@ export interface Epoch {
   lanesOn: boolean;
   /** the valid rows applied in this epoch, of any type (the initial history's "fewer than 30 rows", §11.4 step 6) */
   loaded: number;
-  /** applied TEXT, IMAGE and FILE rows by message key (§6.8 retraction) */
+  /** applied TEXT, IMAGE, FILE and REPLY rows by message key (§6.8 retraction) */
   rows: Map<string, AppliedRow>;
 }
 
@@ -250,8 +250,13 @@ export interface Copy {
   probe: boolean;
   /** the REACTION rows applied, by row key (§11.12) */
   reactions: Map<string, ReactionRow>;
-  /** the reactions shown on the messages are to be computed again (a row, a target or a §6.8 decision changed) */
-  reactionsDirty: boolean;
+  /** the REPLY rows applied as messages, by message key: their epoch and what they reply to (§11.17) */
+  replies: Map<string, { e: number; to: P.ReplyTo }>;
+  /**
+   * The reactions and the reply targets shown on the messages are to be computed again (a row, a target or a §6.8
+   * decision changed).
+   */
+  refsDirty: boolean;
 }
 
 /** The epoch the copy was joined at: its root epoch (every epoch above it is held, §6.6 step 3). */
