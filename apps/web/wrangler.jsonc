@@ -187,9 +187,7 @@
         },
       ],
       "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "segv-blobs-canary" }],
-      "kv_namespaces": [
-        { "binding": "PUSH_KV", "id": "REPLACE_WITH_THE_SEGV_PUSH_CANARY_NAMESPACE_ID" },
-      ],
+      "kv_namespaces": [{ "binding": "PUSH_KV", "id": "c2c4e7524e394831b1b4caef058180b5" }],
       "queues": {
         "producers": [{ "binding": "PUSH_QUEUE", "queue": "segv-push-canary" }],
         "consumers": [
