@@ -1480,8 +1480,11 @@ function errorExtra(e: HttpError): Record<string, unknown> | null {
   return typeof x === "object" && x !== null && !Array.isArray(x) ? (x as Record<string, unknown>) : null;
 }
 
+/** The request clock: `Date.now`, or what a test set (`_setClockForTests`). */
+let requestClock: () => number = () => Date.now();
+
 export async function handleApi(request: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
-  const now = Date.now();
+  const now = requestClock();
   let res: Response;
   try {
     const keys = serverKeys(env);
@@ -1506,6 +1509,15 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
     }
   }
   return stampResponse(res, request, env, url, now);
+}
+
+/**
+ * Test hook: the time every request is handled at (`c.now`), without touching `Date.now`. The objects run in the same
+ * isolate as the tests, so a mocked `Date.now` reaches their clocks too: a current-era shard whose batch alarm fires
+ * while the mock holds a far-future time seals and pages itself, and every later put is `wrong_era`.
+ */
+export function _setClockForTests(f: (() => number) | null): void {
+  requestClock = f ?? (() => Date.now());
 }
 
 /** Test hook: forget the per-isolate caches (ckpt ensure flag, the directory's cached P). */

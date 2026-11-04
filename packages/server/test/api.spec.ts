@@ -13,6 +13,7 @@ import {
   MAX_REGISTER_BODY,
   MAX_WRAP_BODY,
   _resetApiForTests,
+  _setClockForTests,
   feedTokens,
   routeLabel,
 } from "../src/api";
@@ -3277,7 +3278,9 @@ describe('paged shards (§9.1 "Paging", §10.4, §10.9)', () => {
     for (const r of await s.put(E, 0, toShard(rows.slice(3)))) expect(r.s).toBe("ok");
     const sealedAt = P.eraEnd(E) + 5000;
     await clock(sealedAt);
-    const now = vi.spyOn(Date, "now").mockReturnValue(sealedAt);
+    // The Worker's clock alone, never `Date.now`: the current era's shard shares the isolate, and its batch alarm,
+    // firing while a far-future time holds, would seal it.
+    _setClockForTests(() => sealedAt);
     try {
       const keys: W.GetKey[] = [
         ...rows.map((r) => ({ E, label: r.label, mode: 0 as const })),
@@ -3368,7 +3371,7 @@ describe('paged shards (§9.1 "Paging", §10.4, §10.9)', () => {
         await errorOf(await direct(`/api/v2/seal/${E + 1}/0`, { origin: "https://b.segv.test" })),
       ).toBe("not paged");
     } finally {
-      now.mockRestore();
+      _setClockForTests(null);
     }
   }, 60_000);
 });

@@ -21,7 +21,14 @@ import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as P from "@segv/protocol/proto";
 import * as W from "@segv/protocol/wire";
-import { MAX_RING_BODY, MAX_SEEN_BODY, RING_FRESH, ringEraOk, ringRowFresh } from "../src/api";
+import {
+  MAX_RING_BODY,
+  MAX_SEEN_BODY,
+  RING_FRESH,
+  _setClockForTests,
+  ringEraOk,
+  ringRowFresh,
+} from "../src/api";
 import { _resetPushConfigForTests, shardBitsOf, v2Params } from "../src/env";
 import {
   PUSH_EXPIRY,
@@ -928,12 +935,14 @@ describe("POST /api/v2/ring (§10.10)", () => {
       expect(k, "paging alarms").toBeLessThan(40);
       expect(await runDurableObjectAlarm(s)).toBe(true);
     }
+    // The Worker's clock alone: a mocked `Date.now` would reach the current era's shard too, and its batch alarm,
+    // firing meanwhile, would seal it.
     fake.now = at;
-    const now = vi.spyOn(Date, "now").mockReturnValue(at);
+    _setClockForTests(() => at);
     try {
       await ringApi([b], { E, label: row.label });
     } finally {
-      now.mockRestore();
+      _setClockForTests(null);
     }
     expect(callsTo(d)).toHaveLength(1);
   }, 60_000);
