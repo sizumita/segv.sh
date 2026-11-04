@@ -643,11 +643,11 @@ textarea:focus {
   font: inherit;
   font-size: 13px;
   line-height: 1.4;
-  padding: 0 8px;
+  padding: 3px 8px;
   color: var(--fg);
   background: var(--surface);
   border: 1px solid var(--edge);
-  border-radius: var(--pill);
+  border-radius: var(--r-s);
   cursor: pointer;
 }
 .react.mine {
