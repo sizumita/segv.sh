@@ -37,7 +37,8 @@ describe("a request that never answers (§10.1)", () => {
       return new Promise<void>((r) => (release = r));
     };
     try {
-      for (let i = 0; i < 60 && held === 0; i++) {
+      // A deadline in real time, not a count of rounds: a busy CI runner may need more than 60 × 10 ms to send it.
+      for (const end = Date.now() + 20_000; held === 0 && Date.now() < end;) {
         server().tick(1000);
         await sleep(10);
       }

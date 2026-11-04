@@ -31,6 +31,8 @@ export interface UiState {
   viewer: NoSerialize<{ src: string; w: number; h: number; mime: string; img: ImageRef }>;
   /** the URL of a [label](url) link the user clicked, to confirm before it opens ('' = none) */
   leaving: string;
+  /** security warnings the user dismissed, by their text without the repeat count (warnings.tsx) */
+  hiddenWarnings: string[];
 }
 
 export const initialEngineState = (): EngineState => ({
@@ -62,6 +64,7 @@ export const initialUiState = (): UiState => ({
   now: 0,
   viewer: undefined,
   leaving: "",
+  hiddenWarnings: [],
 });
 
 /**
