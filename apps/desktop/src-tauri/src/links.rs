@@ -47,16 +47,32 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
+    use windows::Win32::System::Com::{
+        COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
+    };
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
     use windows::core::{HSTRING, w};
 
+    /// On a thread of its own, not the window's. WebView2 hands the page's requests to the app's commands
+    /// (`https://ipc.localhost`) to the window's thread, and does not hand it one that comes while that thread is inside
+    /// ShellExecute (about 100 ms as the browser starts): such a request goes to the network, where nothing answers it,
+    /// and the page's IPC then falls back to postMessage for good. The click on the link often comes with one: the page
+    /// closes the conversation's notifications.
     pub fn open(url: &str) {
-        // ShellExecute answers a value above 32 when it succeeds.
-        let r = unsafe { ShellExecuteW(None, w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL) };
-        if r.0 as usize <= 32 {
-            eprintln!("segv: could not open a link ({})", r.0 as usize);
-        }
+        let url = url.to_owned();
+        std::thread::spawn(move || {
+            // ShellExecute may hand the URL to a shell extension through COM, which the thread must initialize.
+            let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+            // ShellExecute answers a value above 32 when it succeeds.
+            let r = unsafe { ShellExecuteW(None, w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL) };
+            if r.0 as usize <= 32 {
+                eprintln!("segv: could not open a link ({})", r.0 as usize);
+            }
+            if com.is_ok() {
+                unsafe { CoUninitialize() };
+            }
+        });
     }
 }
 
