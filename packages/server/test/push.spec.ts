@@ -136,6 +136,7 @@ interface PushState {
   rang?: Bytes[];
   rows?: Set<string> | null;
   sending?: boolean;
+  later?: { rang: Bytes[]; rows: Set<string> | null } | null;
 }
 interface Hooks {
   clock: () => number;
@@ -231,6 +232,30 @@ const ring = (bs: Bytes[], label: Bytes = P.random(16), E = 1) => DO().ring(E, l
 async function run(at?: number): Promise<void> {
   if (at !== undefined) fake.now = at;
   await DO().run();
+}
+/**
+ * A run at `at` whose requests the push services answer with `status` only once `answer()` is called: `out()` resolves
+ * when `n` requests in all are waiting, so a test can act while they are being sent.
+ */
+function runHeld(
+  at: number,
+  status = 201,
+): { out: (n?: number) => Promise<void>; answer: () => Promise<void> } {
+  let open!: () => void;
+  const gate = new Promise<void>((r) => (open = r));
+  fake.respond = async () => {
+    await gate;
+    return new Response(null, { status });
+  };
+  const done = run(at);
+  return {
+    out: (n = 1) => vi.waitFor(() => expect(fake.calls.length).toBeGreaterThanOrEqual(n)),
+    answer: async () => {
+      open();
+      await done;
+      fake.respond = () => new Response(null, { status: 201 });
+    },
+  };
 }
 /**
  * `sub` as a device sends it: while the journal's next row is full (BUSY), the next minute's run, which writes that
@@ -887,6 +912,55 @@ describe("the bells a push names (§9.8 `rang`)", () => {
     expect(callsTo(d)).toHaveLength(4);
     expect(named(callsTo(d)[3], d)).toEqual([P.hex(b3)]);
     expect((await stateOf(d)).rang).toEqual([]);
+  });
+
+  it("a ring while a push is being sent is pushed at the end of the next window, not emptied with it", async () => {
+    await reset(BASE);
+    const d = dev();
+    const [b1, b2] = bells(2);
+    await sub(d, [b1, b2]);
+    await ring([b1]);
+    const held = runHeld(BASE + HOLD + DELTA * 1000);
+    await held.out();
+    await ring([b2]);
+    expect(await stateOf(d)).toMatchObject({ sending: true });
+    await held.answer();
+    const at = callsTo(d)[0].at;
+    expect(named(callsTo(d)[0], d)).toEqual([P.hex(b1)]);
+    const st = await stateOf(d);
+    expect(st).toMatchObject({ last: at, due: at + PUSH_WINDOW * 1000, tries: 0 });
+    expect(st.rang?.map(P.hex)).toEqual([P.hex(b2)]);
+    await run(at + PUSH_WINDOW * 1000 - 1);
+    expect(callsTo(d)).toHaveLength(1);
+    await run(at + PUSH_WINDOW * 1000);
+    expect(callsTo(d)).toHaveLength(2);
+    expect(named(callsTo(d)[1], d)).toEqual([P.hex(b2)]);
+    expect(await stateOf(d)).toMatchObject({ due: null, rang: [] });
+  });
+
+  it("a ring during a failed attempt rides its retry; one during the last attempt comes after the dropped push", async () => {
+    await reset(BASE);
+    const d = dev();
+    const [b1, b2, b3] = bells(3);
+    await sub(d, [b1, b2, b3]);
+    await ring([b1]);
+    let held = runHeld(BASE + HOLD + DELTA * 1000, 500);
+    await held.out();
+    await ring([b2]);
+    await held.answer();
+    const first = callsTo(d)[0].at;
+    expect(await stateOf(d)).toMatchObject({ tries: 1, due: first + 10_000 });
+    held = runHeld(first + 10_000, 500);
+    await held.out(2);
+    expect(named(callsTo(d)[1], d)).toEqual([b2, b1].map(P.hex));
+    await ring([b3]);
+    await held.answer();
+    const st = await stateOf(d);
+    expect(st).toMatchObject({ last: first, due: first + PUSH_WINDOW * 1000, tries: 0 });
+    expect(st.rang?.map(P.hex)).toEqual([P.hex(b3)]);
+    await run(first + PUSH_WINDOW * 1000);
+    expect(callsTo(d)).toHaveLength(3);
+    expect(named(callsTo(d)[2], d)).toEqual([P.hex(b3)]);
   });
 
   it("a push with no bell is as long as one with four", async () => {
@@ -1812,6 +1886,36 @@ describe("PushDO holds pushes for marks of rows seen (§9.8 `seen`)", () => {
     expect(callsTo(d)).toHaveLength(2);
     await seen(q, [rowAt(l2)]); // after the push: changes nothing
     expect(await stateOf(d)).toMatchObject({ due: null, last: callsTo(d)[1].at });
+  });
+
+  it("a ring while a push is being sent stays cancellable: marked before the answer, nothing more is due", async () => {
+    await reset(BASE);
+    const d = dev();
+    const b = P.random(16);
+    const q = P.random(16);
+    await sub(d, [b], q);
+    await ring([b]);
+    let held = runHeld(BASE + HOLD + DELTA * 1000);
+    await held.out();
+    const l2 = P.random(16);
+    await ring([b], l2);
+    await seen(q, [rowAt(l2)]);
+    await held.answer();
+    expect(callsTo(d)).toHaveLength(1);
+    expect(await stateOf(d)).toMatchObject({ due: null, last: callsTo(d)[0].at, rang: [] });
+
+    // Unmarked, it is due after the answer, and a mark then cancels it as any waiting push.
+    fake.now = callsTo(d)[0].at + PUSH_WINDOW * 1000;
+    await ring([b]);
+    held = runHeld(fake.now + HOLD + DELTA * 1000);
+    await held.out(2);
+    const l4 = P.random(16);
+    await ring([b], l4);
+    await held.answer();
+    const at = callsTo(d)[1].at;
+    expect(await dueOf(d)).toBe(at + PUSH_WINDOW * 1000);
+    await seen(q, [rowAt(l4)]);
+    expect(await stateOf(d)).toMatchObject({ due: null, last: at });
   });
 
   it("past PUSH_PENDING rows a push can no longer be cancelled", async () => {

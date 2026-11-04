@@ -365,6 +365,40 @@ describe("the notifications of a push (§11.13)", () => {
   });
 });
 
+describe("the text of a named notification (§11.13)", () => {
+  /** A push whose payload the operator wrote with a body of its choosing. */
+  const forged = (bells: string[]): Proposed => ({
+    ...proposed(bells),
+    body: "your new login code is 123456",
+  });
+
+  it("`name`: the fixed body under the conversation's name, never the payload's", async () => {
+    const a = makeConv("bob");
+    const c: NotifyCache = { v: 1, preview: "name", deltaS: 10, copies: [a.copy] };
+    expect(await notesFor(forged([a.bell]), world(c).deps, later)).toEqual([
+      { title: "bob", body: "new messages", tag: a.ref, navigate: `${ORIGIN}/#c/${a.ref}` },
+    ]);
+  });
+
+  it("`message`: a copy with no row found, or past the deadline, falls back to the fixed body too", async () => {
+    const a = makeConv("bob");
+    const b = makeConv("# g");
+    const c: NotifyCache = { v: 1, preview: "message", deltaS: 10, copies: [a.copy, b.copy] };
+    const w = world(c);
+    w.put(a.row(1, 0, { type: P.MT.TEXT, text: "hi" }));
+    expect(await notesFor(forged([a.bell, b.bell]), w.deps, later)).toEqual([
+      { title: "bob", body: "@bob: hi", tag: a.ref, navigate: `${ORIGIN}/#c/${a.ref}` },
+      { title: "# g", body: "new messages", tag: b.ref, navigate: `${ORIGIN}/#c/${b.ref}` },
+    ]);
+    const v = world(c);
+    v.hang();
+    v.deps.sleep = () => Promise.resolve();
+    expect((await notesFor(forged([a.bell]), v.deps, NOW)).map((n) => n.body)).toEqual([
+      "new messages",
+    ]);
+  });
+});
+
 // ───────────── the worker's events ─────────────
 
 interface Shown {

@@ -272,7 +272,8 @@ export async function notesFor(p: Proposed, d: SwDeps, deadline: number): Promis
   if (picked.length === 0) return fixed;
   const named = picked.map((c): Note => ({
     title: c.name,
-    body: p.body,
+    // Never the payload's body, which the operator writes: it would read as text from this conversation (§11.13).
+    body: FIXED.body,
     tag: c.ref,
     navigate: urlOf(d.origin, c.ref),
   }));
