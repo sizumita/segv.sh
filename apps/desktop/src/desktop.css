@@ -28,7 +28,7 @@ html[data-shell="desktop"] body {
 }
 /* Text that people read or write stays selectable. */
 [data-shell="desktop"]
-  :is(.msgs, .composer, input, textarea, .recovery .code, .fp, .settings, .errors, .warnings) {
+  :is(.msgs, .composer, input, textarea, .recovery .code, .fp, .settings, .errors, .warn-list) {
   -webkit-user-select: text;
   user-select: text;
 }
@@ -60,7 +60,11 @@ html[data-shell="desktop"] body {
 [data-shell="desktop"] .bar button:not(.link) {
   background: var(--glass);
 }
-[data-shell="desktop"] :is(.warnings, .chat > .errors) {
+[data-shell="desktop"] .bar .warn-chip,
+[data-shell="desktop"] .bar .warn-chip:hover {
+  background: var(--fg);
+}
+[data-shell="desktop"] .chat > .errors {
   margin: 0 8px 8px;
   background: var(--bg);
   color: var(--fg);

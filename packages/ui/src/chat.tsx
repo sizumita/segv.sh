@@ -4,8 +4,9 @@ import { ConversationPane } from "./conversation";
 import { Errors } from "./errors";
 import { Settings } from "./settings";
 import { StateCtx, UiCtx } from "./state";
+import { Warnings } from "./warnings";
 
-/** Signed-in screen: status bar, alerts, then list | conversation. */
+/** Signed-in screen: status bar (with the security warnings), errors, then list | conversation. */
 export const Chat = component$(() => {
   const state = useContext(StateCtx);
   const ui = useContext(UiCtx);
@@ -32,17 +33,9 @@ export const Chat = component$(() => {
         >
           checkpoint #{state.head.seq}
         </span>
+        <Warnings />
       </header>
 
-      {state.warnings.length > 0 && (
-        <div class="warnings" role="alert">
-          {state.warnings.map((w, i) => (
-            <p key={`${i}:${w}`}>
-              <b>security warning:</b> {w}
-            </p>
-          ))}
-        </div>
-      )}
       <Errors />
 
       <div class="panes" data-pane={active ? "conv" : "list"}>

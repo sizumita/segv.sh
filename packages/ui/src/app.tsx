@@ -124,6 +124,7 @@ export const App = component$(() => {
             ui.viewer = undefined;
             ui.settings = false;
             ui.leaving = "";
+            ui.hiddenWarnings = [];
           }
           lastPhase = snap.phase;
         }
