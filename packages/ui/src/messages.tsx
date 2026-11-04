@@ -56,6 +56,41 @@ const ReactIcon = () => (
   </svg>
 );
 
+/** Two overlapping sheets: copy the message's text. */
+const CopyIcon = () => (
+  <svg
+    class="icon"
+    viewBox="0 0 20 20"
+    aria-hidden="true"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.5"
+    stroke-linejoin="round"
+  >
+    <rect x="7" y="7" width="10" height="10" rx="2" />
+    <path d="M13 4.5V4a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h.5" />
+  </svg>
+);
+
+/** A check mark: the text was copied. */
+const CopiedIcon = () => (
+  <svg
+    class="icon"
+    viewBox="0 0 20 20"
+    aria-hidden="true"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.75"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  >
+    <path d="M4.5 10.5l3.5 3.5 7.5-8" />
+  </svg>
+);
+
+/** How long the copy button shows its check mark. */
+const COPIED_MS = 1500;
+
 export const Messages = component$<{ conv: ConversationView }>((props) => {
   const ui = useContext(UiCtx);
   const pane = useContext(PaneCtx);
@@ -75,6 +110,8 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
   });
   /** On a touch screen, which has no hover, the message whose actions a tap shows ('' = none). */
   const active = useSignal("");
+  /** The message whose text was just copied ('' = none): its copy button shows a check mark for a moment. */
+  const copied = useSignal("");
 
   // Auto-scroll: to the bottom when the conversation opens, and on new messages while stuck.
   useVisibleTask$(({ track }) => {
@@ -106,9 +143,9 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
   });
 
   // One click handler for the list: "reply" makes the composer reply to its message, a reply's quote line opens its
-  // thread beside the list, an "add a reaction" button opens (or closes) the picker beside it, and on a touch screen a
-  // tap on a message shows its actions, or hides them.
-  const onClick = $((ev: MouseEvent) => {
+  // thread beside the list, a "copy text" button copies its message's text, an "add a reaction" button opens (or
+  // closes) the picker beside it, and on a touch screen a tap on a message shows its actions, or hides them.
+  const onClick = $(async (ev: MouseEvent) => {
     const t = ev.target as Element;
     const reply = t.closest<HTMLElement>("[data-reply]");
     if (reply) {
@@ -124,6 +161,23 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
     if (thread) {
       pane.thread = thread.dataset.thread ?? "";
       ui.members = false; // one side pane at a time
+      return;
+    }
+    const copy = t.closest<HTMLElement>("[data-copy]");
+    if (copy) {
+      const key = copy.dataset.copy ?? "";
+      const text = props.conv.messages.find((m) => m.key === key)?.text ?? "";
+      ui.localError = "";
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch {
+        ui.localError = "copy failed — select the text and copy it by hand.";
+        return;
+      }
+      copied.value = key;
+      setTimeout(() => {
+        if (copied.value === key) copied.value = "";
+      }, COPIED_MS);
       return;
     }
     const open = t.closest<HTMLElement>("[data-react-open]");
@@ -190,7 +244,11 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
             prev.from !== m.from ||
             m.ts - prev.ts > GROUP_MS ||
             !!m.reply;
-          const tools = canReact && m.status === "sent";
+          // A reply is a post as a reaction is: both need a sent message where self can post.
+          const reactable = canReact && m.status === "sent";
+          // Any text can be copied, even one that is still sending or failed (to send it again).
+          const copyable = m.kind === "text" && !!m.text;
+          const done = copied.value === m.key;
           return (
             <div key={m.key} class="mrow">
               {newDay && (
@@ -217,22 +275,36 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
                   title={fullTime(m.ts)}
                   data-key={m.key}
                 >
-                  {tools && (
+                  {(reactable || copyable) && (
                     <div class="mtools-at">
                       <div class="mtools" role="toolbar" aria-label="message actions">
-                        <button type="button" data-reply={m.key} aria-label="reply" title="reply">
-                          <ReplyIcon />
-                        </button>
-                        <button
-                          type="button"
-                          data-react-open={m.key}
-                          aria-label="add a reaction"
-                          title="add a reaction"
-                          aria-haspopup="dialog"
-                          aria-expanded={pk === m.key}
-                        >
-                          <ReactIcon />
-                        </button>
+                        {reactable && (
+                          <button type="button" data-reply={m.key} aria-label="reply" title="reply">
+                            <ReplyIcon />
+                          </button>
+                        )}
+                        {copyable && (
+                          <button
+                            type="button"
+                            data-copy={m.key}
+                            aria-label={done ? "copied" : "copy text"}
+                            title={done ? "copied" : "copy text"}
+                          >
+                            {done ? <CopiedIcon /> : <CopyIcon />}
+                          </button>
+                        )}
+                        {reactable && (
+                          <button
+                            type="button"
+                            data-react-open={m.key}
+                            aria-label="add a reaction"
+                            title="add a reaction"
+                            aria-haspopup="dialog"
+                            aria-expanded={pk === m.key}
+                          >
+                            <ReactIcon />
+                          </button>
+                        )}
                       </div>
                     </div>
                   )}
