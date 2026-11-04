@@ -193,8 +193,10 @@ export class Messaging {
   private readonly unregistered = new Set<string>();
   /** CONTACT and MEMBER records for the next HEADS row (§7.3) */
   private pendingRecords: P.SelfRecord[] = [];
-  /** the local echo of each row being sent, by row key */
-  private readonly echoes = new Map<string, { c: Copy; echoKey: string }>();
+  /** the local echo of each row being sent, with the row's body, by row key */
+  private readonly echoes = new Map<string, { c: Copy; echoKey: string; body: Bytes }>();
+  /** the row key of the view that replaced an echo still being sent, by echo key */
+  private readonly echoRows = new Map<string, string>();
   private readonly sendChains = new Map<string, Promise<unknown>>();
   /** T_e of every held epoch, by b64u topic */
   private readonly topics = new Map<string, { c: Copy; ep: Epoch }>();
@@ -1499,10 +1501,12 @@ export class Messaging {
         this.welcome({ c, ep, j, at, J, old });
       },
       onValidRow: (c, ep, j) => this.corroborate(c, ep, j),
-      takeEcho: (key) => {
+      takeEcho: (key, body) => {
         const x = this.echoes.get(key);
+        if (!x || !P.equalBytes(x.body, body)) return undefined;
         this.echoes.delete(key);
-        return x ? { c: x.c, echoKey: x.echoKey } : undefined;
+        this.echoRows.set(x.echoKey, key);
+        return { c: x.c, echoKey: x.echoKey };
       },
       onLeave: (c, ep, j, src) => onLeave(this.membershipHost(quiet), c, ep, j, src),
       checkRow: (c, ep, j, row, msg, q) => {
@@ -2963,10 +2967,9 @@ export class Messaging {
           type: P.MT.IMAGE,
           image: { id: P.fromB64u(id), k: key, mime, w: img.w, h: img.h },
         });
-        if (c.messages.some((m) => m.key === echo.key)) this.markEcho(c, echo.key, "sent");
+        this.endSend(c, echo.key, "sent");
       } catch (e) {
-        for (const [kk, x] of this.echoes) if (x.echoKey === echo.key) this.echoes.delete(kk);
-        this.markEcho(c, echo.key, "failed");
+        this.endSend(c, echo.key, "failed");
         if (!(e instanceof SessionEnded)) this.h.error(message(e));
       } finally {
         this.h.progress("");
@@ -3028,10 +3031,9 @@ export class Messaging {
           type: P.MT.FILE,
           file: { id: P.fromB64u(id), k: key, size: bytes.length, name },
         });
-        if (c.messages.some((m) => m.key === echo.key)) this.markEcho(c, echo.key, "sent");
+        this.endSend(c, echo.key, "sent");
       } catch (e) {
-        for (const [kk, x] of this.echoes) if (x.echoKey === echo.key) this.echoes.delete(kk);
-        this.markEcho(c, echo.key, "failed");
+        this.endSend(c, echo.key, "failed");
         if (!(e instanceof SessionEnded)) this.h.error(message(e));
       } finally {
         this.h.progress("");
@@ -3107,6 +3109,19 @@ export class Messaging {
     this.h.changed();
   }
 
+  /**
+   * The send of an echo has decided (§11.3 steps 6–8): marks the bubble the user sees, the echo or the stored row's
+   * view that replaced it. `sent` never overrides a `failed` that §6.8 set meanwhile (step 7).
+   */
+  private endSend(c: Copy, echoKey: string, status: "sent" | "failed"): void {
+    for (const [k, x] of this.echoes) if (x.echoKey === echoKey) this.echoes.delete(k);
+    const rowKey = this.echoRows.get(echoKey);
+    this.echoRows.delete(echoKey);
+    const key = c.messages.some((m) => m.key === echoKey) ? echoKey : rowKey;
+    const m = key === undefined ? undefined : c.messages.find((x) => x.key === key);
+    if (m && (status === "failed" || m.status === "sending")) this.markEcho(c, m.key, status);
+  }
+
   private sendCtx(c: Copy, echoKey: string | null): SendCtx {
     return {
       api: this.h.api,
@@ -3122,8 +3137,8 @@ export class Messaging {
       ck: () => this.ckpt.ck(),
       wait: (ms) => this.h.wait(ms),
       applyOwn: (cc, ep, row) => this.applyOwn(cc, ep, row),
-      expectEcho: (key) => {
-        if (echoKey) this.echoes.set(key, { c, echoKey });
+      expectEcho: (key, body) => {
+        if (echoKey) this.echoes.set(key, { c, echoKey, body });
       },
       beforePutAttempt: this.h.opts.beforePutAttempt,
       progress: (t) => this.h.progress(t),
@@ -3241,10 +3256,9 @@ export class Messaging {
       try {
         await this.acceptForPost(c);
         await sendRow(this.sendCtx(c, echo.key), c, { type: P.MT.TEXT, text: body });
-        if (c.messages.some((m) => m.key === echo.key)) this.markEcho(c, echo.key, "sent");
+        this.endSend(c, echo.key, "sent");
       } catch (e) {
-        for (const [k, x] of this.echoes) if (x.echoKey === echo.key) this.echoes.delete(k);
-        this.markEcho(c, echo.key, "failed");
+        this.endSend(c, echo.key, "failed");
         if (!(e instanceof SessionEnded)) this.h.error(message(e));
       } finally {
         this.h.progress("");

@@ -47,8 +47,11 @@ export interface SyncCtx {
   onWelcome(c: Copy, ep: Epoch, j: number, at: Slot, J: P.Join): void;
   /** a valid row of member j (corroboration and request acceptance, §6.7 step 6, §11.5) */
   onValidRow(c: Copy, ep: Epoch, j: number): void;
-  /** the local echo waiting for this row (rowKey), if any */
-  takeEcho(key: string): { c: Copy; echoKey: string } | undefined;
+  /**
+   * The local echo waiting for this row (rowKey) with exactly this stored body, if any: a sibling device's row in the
+   * same slot is not this device's message.
+   */
+  takeEcho(key: string, body: Bytes): { c: Copy; echoKey: string } | undefined;
   /**
    * §12.2 and §12.4 for a valid row of lane j: its `ck` against the verified checkpoints, and its `prev` against the
    * row this session holds there (checked later when it holds none).
@@ -388,9 +391,12 @@ export function applyLaneRow(
   if (!accepted) {
     c.order.set(key, order);
     ep.rows.set(key, { j, E: r.E, n: r.n, t: r.t, unread: false, shown: false, th });
-    ctx.takeEcho(key); // the echo stays as it is; the send reports the failure (§11.3 step 7)
+    // The echo stays: its send finds the row not shown and marks the echo failed (§11.3 step 7).
+    ctx.takeEcho(key, r.body);
     return;
   }
+  // A row that replaces its echo stays `sending` until its send has decided (§11.3 steps 6–8).
+  const echo = ctx.takeEcho(key, r.body);
   const view: MessageView = {
     key,
     seq: ctx.seq(),
@@ -398,11 +404,10 @@ export function applyLaneRow(
     fromHandle: ctx.handleOf(c, ep, j),
     mine,
     ts,
-    status: "sent",
+    status: echo ? "sending" : "sent",
     reactions: [],
     ...messageBody(m),
   };
-  const echo = ctx.takeEcho(key);
   if (echo) removeMessage(echo.c, echo.echoKey);
   if (!insertMessage(c, view, order)) return;
   const unread = !mine && !quiet && ctx.live();
