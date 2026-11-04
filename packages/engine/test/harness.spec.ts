@@ -109,11 +109,14 @@ function alignToSecond(world: FakeWorld): void {
 }
 
 /**
- * Moves the world clock to ~20 ms after a whole UTC hour. The checkpoint's blobreg value changes with the hour
- * (fake/ckpt.ts), so a test that expects unchanged heads over a few minutes must not cross one.
+ * Moves the world clock out of the last 10 minutes of a UTC hour (to the middle of the next one), so a test that runs a
+ * few minutes of clock does not see the checkpoint's hourly blobreg value change under it. Eras start on whole hours,
+ * so the middle of an hour is never an era boundary.
  */
-function alignToHour(world: FakeWorld): void {
-  world.advance(3_600_000 - (world.now() % 3_600_000) + 20, { keepSockets: true });
+function awayFromHourEnd(world: FakeWorld): void {
+  const HOUR = 3_600_000;
+  const into = world.now() % HOUR;
+  if (into > HOUR - 600_000) world.advance(HOUR - into + HOUR / 2, { keepSockets: true });
 }
 
 /** Opens a FakeWebSocket as `who` and decodes everything it receives. */
@@ -1803,7 +1806,7 @@ describe("directory", () => {
 describe("checkpoints", () => {
   it("tick() signs C_q over the fake heads; the range recomputes to latest.C; forkAt rewrites the chain", async () => {
     const world = server();
-    alignToHour(world); // the steps below take ~2 min of world clock and expect no new blobreg value
+    awayFromHourEnd(world); // the test runs ~2 min of clock; an hour boundary would add a q
     const E = world.era;
     const srvKey = P.fromB64u((await getJson("/api/v2/params")).j.srvKey);
     expect((await fetch("/api/v2/ckpt/latest")).status).toBe(404);
