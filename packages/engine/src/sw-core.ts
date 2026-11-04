@@ -145,7 +145,8 @@ function slotsOf(next: P.Pos, k: number, Enow: number): Slot[] {
 
 interface Found {
   ts: number;
-  text: string;
+  /** its body text, made only for the row that is shown (Markdown is parsed for that one alone) */
+  text: () => string;
 }
 
 /** The newest verified TEXT, IMAGE or FILE of each copy, and how far each lane's dense prefix reaches. */
@@ -213,11 +214,12 @@ async function readNewest(
       );
       if (!v.ok || v.msg.from !== l.j) return;
       const who = `@${l.ep.members[l.j]?.handle ?? "?"}`;
-      let text: string;
+      const msg = v.msg;
+      let text: () => string;
       // As plain text: a notification can neither style nor hide, and a spoiler must not reach the lock screen.
-      if (v.msg.type === P.MT.TEXT) text = `${who}: ${plainText(v.msg.text)}`;
-      else if (v.msg.type === P.MT.IMAGE) text = `${who} sent an image`;
-      else if (v.msg.type === P.MT.FILE) text = `${who} sent a file`;
+      if (msg.type === P.MT.TEXT) text = () => `${who}: ${plainText(msg.text)}`;
+      else if (msg.type === P.MT.IMAGE) text = () => `${who} sent an image`;
+      else if (msg.type === P.MT.FILE) text = () => `${who} sent a file`;
       else return;
       const lo = P.T0_MS + r.t * 1000 - TS_SLACK_MS;
       const hi = P.T0_MS + (r.t + deltaS) * 1000 + TS_SLACK_MS;
@@ -242,9 +244,9 @@ async function readNewest(
 
 /** A message body: the newest row, cut to 200 characters, and how many more were found. */
 export function bodyOf(found: readonly Found[]): string {
-  const newest = found.reduce((a, b) => (b.ts > a.ts ? b : a));
-  const chars = Array.from(newest.text);
-  const text = chars.length > MAX_BODY ? `${chars.slice(0, MAX_BODY - 1).join("")}…` : newest.text;
+  const newest = found.reduce((a, b) => (b.ts > a.ts ? b : a)).text();
+  const chars = Array.from(newest);
+  const text = chars.length > MAX_BODY ? `${chars.slice(0, MAX_BODY - 1).join("")}…` : newest;
   return found.length > 1 ? `${text} (+${found.length - 1})` : text;
 }
 
@@ -270,7 +272,8 @@ export async function notesFor(p: Proposed, d: SwDeps, deadline: number): Promis
   if (picked.length === 0) return fixed;
   const named = picked.map((c): Note => ({
     title: c.name,
-    body: p.body,
+    // Never the payload's body, which the operator writes: it would read as text from this conversation (§11.13).
+    body: FIXED.body,
     tag: c.ref,
     navigate: urlOf(d.origin, c.ref),
   }));

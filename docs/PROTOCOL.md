@@ -1217,9 +1217,13 @@ is settled.
    unknown member (§11.2). If any check fails, give a noise warning and stop. Whether D's key for `D.by` is the
    directory's is checked in step 6, only where it matters (a first contact, a re-add included, or a separate copy).
 3. **Duplicate.** Ignore the join if any copy, ended or not, already holds `(conv, e)` with the same `H(D)`. Step 4
-   can move a copy to e (it processes the claim that ended e − 1), so this step is applied again after step 4. One D
-   can be registered in several bundles (`descCt` is sealed with a random nonce, §5.4), so no rule here compares
-   `bundleId`.
+   can move a copy to e (it processes the claim that ended e − 1), so this step is applied again after step 4. A copy
+   holds every epoch from its root epoch to its current or last one, also one that a restore did not load (§11.4 step
+   5): the root epoch's `H(D)` is the copy's root, and another epoch's D comes from its DESC record or from the bundle
+   that its EPOCH record names. One D can be registered in several bundles (`descCt` is sealed with a random nonce,
+   §5.4), so another `bundleId` does not make a join new; but a bundle holds one D, so a J whose `bundleId` is the
+   bundle of `(conv, e)` in a held copy (the one its CONV_JOIN, REQUEST or EPOCH record names, or that of the claim it
+   processed to reach e) is ignored before step 1 fetches anything.
 4. **Settle the held copies.** For each held copy of `conv`, catch up the control lane of its current epoch k until
    either the winner is final and processed, or every slot is decided not e-valid and the current era has been
    probed (processing a winner moves the copy on, or ends it, §6.6 step 3, and the catch-up goes on in its new
@@ -3239,6 +3243,17 @@ the pushes a second. Nothing runs while nothing happens: no alarm, no pass.
   the system may set; only the elapsed-time checks of §11.3 steps 6 and 8 read it. Every API call a client makes
   regularly (`get`, `put`, params, `blob/meta`, directory, `ckpt/latest`) is `no-store`, so the estimate of §3.1 never
   goes stale.
+- **Timeouts.** A client MUST give every request a deadline on its monotonic clock. A request that misses it is
+  aborted and counts as a timeout: a transient failure, like a network error (for a put, "outcome unknown", §10.3).
+  The deadline is 30 s from just before the request is sent until its whole answer has been read. Two kinds of request
+  can be large, and get more time:
+  - A blob upload gets 30 s plus one second per 16 KiB of its body, about 13 minutes for 12 MiB. A page sees no
+    progress of an upload, so the deadline is that of the slowest link the client still serves.
+  - A blob download gets 30 s for its answer headers, then 30 s again for every chunk of its body, so it goes on as
+    long as bytes keep arriving.
+
+  The platforms set no deadline of their own, or only a long one. Without this one, a request that never answers, on a
+  connection that went half-open during sleep or at a network change, would hold up every request queued behind it.
 - **Hardening.** §9.7 applies to every response (the `101` upgrade only through its exemption), including the era
   bounds and the cache-before-limits rule.
 - **Cross-origin requests.** Only the pages of the deployment's own origin and of its app origins (`APP_ORIGINS`,
@@ -3706,8 +3721,11 @@ that a withdrawal took is never a row's. A GAP only costs a catch-up (§11.6), n
 - Ping every 30 s. When no frame (the `pong` or any other) arrives within 10 s of a ping, give the socket up and
   reconnect at once: a socket can die without a close event, and the server answers every ping while the socket lives.
   Give up a connection attempt that has not opened within 15 s, and retry it with the backoff.
-- In a browser, when the page is shown again or the network comes back, ping an open socket at once (as above), or
-  connect at once without waiting for the backoff (but not during the 60 s wait after a 1008 or 1013).
+- In a browser, when the page is shown again or the network comes back, and in a desktop app also when the system
+  wakes or the network changes (§11.14), ping an open socket at once (as above), or connect at once without waiting for
+  the backoff (but not during the 60 s wait after a 1008 or 1013). An open socket that has received no frame for more
+  than 60 s by the wall clock, two ping intervals, as after the system slept, is given up and replaced at once instead
+  of pinged: its own pings would have been answered.
 - On any frame the client cannot parse, close and reconnect.
 
 ### 10.9 Params, eras, checkpoints, feed
@@ -4011,10 +4029,11 @@ late, and its sender checks it again (§11.3 step 8).
 **Sweeping.** Before any lane of an older epoch leaves the expected-label map (when the copy switches epochs, or a
 followed lane is dropped), and before the lanes of the epoch that a claim removed self from leave it (§6.6 step 3), the
 client processes each from its processed position to its dense-prefix head, probed at that moment, after the winner that
-ended the epoch is final. So a WELCOME or LEAVE posted in an older epoch before it leaves the map is never skipped. Two
-gaps remain, and scrollback finds their rows (§11.10, §13.2 item 15): a row that a member writes into an older epoch
-after it already wrote in a newer one, which only two of its own devices racing a claim can do; and an honest row raced
-by a malicious member who registers the next bundle in advance and commits two claims back to back.
+ended the epoch is final. A lane leaves the map only once its sweep has completed: a sweep that a failed read interrupts
+runs again at the next catch-up. So a WELCOME or LEAVE posted in an older epoch before it leaves the map is never
+skipped. Two gaps remain, and scrollback finds their rows (§11.10, §13.2 item 15): a row that a member writes into an
+older epoch after it already wrote in a newer one, which only two of its own devices racing a claim can do; and an
+honest row raced by a malicious member who registers the next bundle in advance and commits two claims back to back.
 
 The client also keeps:
 
@@ -4094,9 +4113,11 @@ same error instead, nothing keeps its body, and it is not retried (the user reac
      of work). A slow proof of work, a frozen tab or a WRONG_ERA wait thus costs one more `get`, never a row in an
      epoch the others have left (§11.2).
    - **OK**: verify the receipt, apply the row locally (the echo becomes `sent`, unless the row is late, step 8), and
-     update the lane head. For a TEXT, IMAGE or FILE row, this success and the two others below (a CONFLICT with its
-     own body, a probe that finds its own body) are each followed by the row's ring (§11.13), whether or not this
-     device has notifications on.
+     update the lane head. If the row arrives first (§11.6, or a catch-up), its view takes the echo's place, with status
+     `sending`, until the send decides; only a row with exactly the body sent does, never a sibling's row in that slot.
+     For a TEXT, IMAGE or FILE row, this success and the two others below (a CONFLICT with its own body, a probe that
+     finds its own body) are each followed by the row's ring (§11.13), whether or not this device has notifications
+     on.
    - **CONFLICT(o)**:
      - if `o.body` is exactly what was sent: success (a lost response was retried);
      - else if `o` opens under `mk_e` and is a valid row of this lane signed by self (a sibling device): apply it as a
@@ -4112,8 +4133,9 @@ same error instead, nothing keeps its body, and it is not retried (the user reac
        the request failed); try again". The client keeps the sealed body and its slot.
      - If every probe fails: the echo becomes `failed` with the same error, and the client keeps the body.
    - Any other 4xx: the echo becomes `failed`, with the server's error.
-7. After success, if the cut rule (§6.8) later drops this row because a final winning claim removed the sender, mark the
-   echo `failed`, with the same "not delivered" error (a dropped REACTION counts for nothing, §11.12).
+7. After success, if the cut rule (§6.8) drops this row because a final winning claim removed the sender, when it is
+   applied or later, mark the echo `failed`, with the same "not delivered" error (a dropped REACTION counts for
+   nothing, §11.12).
 8. **Late rows.** A row is *late* when the answer to its put (or to the probe that found its body) arrived `Δ + SKEW`
    seconds or more after its latest step-1 probe was sent, by the monotonic clock, the wall clock or the estimated
    server time (as in step 6), or
@@ -4366,8 +4388,11 @@ read per notice instead of one per slot per client, most of them served by the e
    Without a cursor (the self lane holds no HEADS record), start at the registration cursor with `t_r = start(regEra)`
    (below).
 2. Trial-decrypt each row (§5.3, with the bucket it was read from), in chunks in a Web Worker, so the page stays
-   responsive. A decapsulation that throws
-   means "not for me". Process each J (§6.7). Joins found in one poll are processed one after the other, each after
+   responsive. A decapsulation that throws means "not for me". A worker that fails (an `error` or `messageerror`
+   event, as when its script does not load) or leaves a chunk unanswered for 30 s is terminated. Its waiting chunks,
+   and every later chunk of the session, are then decrypted on the page's thread, yielding to the event loop between
+   chunks, so a failed worker never stops a poll. Process each J (§6.7). Joins found in one poll are processed one
+   after the other, each after
    the held copies of its conversation are caught up and settled (§6.7 step 4). A J of a conversation of which an
    earlier J of the same poll created a copy is parked, with the cursor before it, until the next poll, when that copy
    is held and settled (§6.7 step 4): so an honest sequence of re-adds, each after a removal
@@ -4632,9 +4657,10 @@ history is exhausted. This runs once per copy and session; later calls are no-op
   `(E, n−32..n−1)` and the earlier eras) then starts from the heads found.
 
 Rows found by scrollback are processed like any other (a WELCOME that lies before the processed position was already
-processed and is not applied twice; a LEAVE is applied as §6.9 says: it records a leave the local state lacks, and
-replaces the kept source only when its key is smaller; a REACTION applies to its target as §11.12 says, and one
-whose target is not loaded yet waits for it; in an epoch that a claim removed self from, a row
+processed and is not applied twice: its J is ignored when a held copy holds its bundle, §6.7 step 3, and any other such
+J, whose copy the self lane does not hold, goes through §6.7 again without raising its warnings a second time; a LEAVE
+is applied as §6.9 says: it records a leave the local state lacks, and replaces the kept source only when its key is
+smaller; a REACTION applies to its target as §11.12 says, and one whose target is not loaded yet waits for it; in an epoch that a claim removed self from, a row
 stored after that claim is dropped, §6.8, as the live final sweep dropped it). Older rows are never
 counted as unread.
 
@@ -4700,6 +4726,10 @@ lane's `prev` chain (§12.2). It writes no self record of its own.
   agree on the state and differ only in what they show. A client SHOULD send one emoji only, and SHOULD NOT send a
   REACTION that changes nothing by the state it holds (an add of an emoji that is on, a remove of one that is off, or
   an add beyond the 8).
+- **Form.** The state tells emoji apart by their bytes, so one emoji sent in two forms counts as two. A client SHOULD
+  send an emoji in its fully-qualified form (Unicode's `emoji-test.txt`), and an emoji whose fully-qualified form is
+  longer than 32 bytes without its U+FE0F, which makes it fit: only kisses with skin tones are that long, by at most
+  3 bytes, and only through their U+FE0F.
 - **Not a message.** A REACTION creates no `MessageView` and is not a message for `VIEW_MESSAGES` (§11.10); it never
   counts toward `unread`, never raises `lastTs` (§11.8), shows no system line (§11.9) and does not ring (§11.13). It
   is a valid row of its member wherever a rule asks for one: the followed lanes and sweeps (§11.2), the qualifying
@@ -4863,8 +4893,8 @@ decrypts itself.
      notification with the payload's `title`, `body` and `tag` that opens `navigate`, or with the same fixed values
      when the payload is not that JSON. It does nothing else.
   2. Otherwise one notification per distinct copy that the bells name and that is not muted in the cache, in their
-     order. With `name` its title is the copy's name and its body the payload's `body`; its `tag` is the copy's `ref`,
-     and it opens the copy's URL (below).
+     order. With `name` its title is the copy's name and its body the fixed `body` of §9.8 (`new messages`), whatever
+     the payload's `body` is; its `tag` is the copy's `ref`, and it opens the copy's URL (below).
   3. With `message` it first makes one `POST /api/v2/get` (§10.4) for those copies: for each lane of each copy's cached
      epoch other than self's, the slot before the lane's next slot when it is in the same era, and the slots from the
      next slot on, at most `W` of those per lane and at most 256 keys in all, with slot 0 of `E_now` in place of the
@@ -4875,16 +4905,17 @@ decrypts itself.
      comes), only when it was stored in the last 5 minutes. A copy's notification is then that of step 2 with, as its
      body, the copy's newest such row by clamped `ts` (§11.8): `@handle: ` and its text, cut to 200 characters, or
      `@handle sent an image` or `@handle sent a file`, followed by ` (+k)` when it found k more. A copy whose answer has
-     not come 8 s after the push event gets the notification of step 2 as it is, and so does a copy without such a row,
-     unless every row found lies before its read positions: that copy gets none. Then it moves each lane's next slot
-     past the dense prefix it found from that slot on, keeping the later of the stored one and its own.
+     not come 8 s after the push event gets the notification of step 2, with its fixed body, and so does a copy without
+     such a row, unless every row found lies before its read positions: that copy gets none. Then it moves each lane's
+     next slot past the dense prefix it found from that slot on, keeping the later of the stored one and its own.
   4. When steps 2 and 3 leave no notification (every copy muted, or read according to the notes), the notification of
      step 1, or none from a handler whose endpoint takes notes.
 
-  It takes the text of these notifications from the cache and from rows that verify only, never from the payload,
-  which O composes. It reads no key but the cache's device key (and a native app's push keys), makes no request but that
-  `get`, and stores nothing but the next slots and what notes change in the cache. It checks no checkpoint, receipt or
-  `prev` chain (§12) and reads no control lane, so a preview may miss rows, or show a row that the app later drops
+  It takes the text of the notifications of steps 2 and 3 from the cache, from rows that verify and from the fixed text
+  of §9.8 only, never from the payload, which O composes: O can choose the text of step 1's notification alone, which
+  names no conversation. It reads no key but the cache's device key (and a native app's push keys), makes no request but
+  that `get`, and stores nothing but the next slots and what notes change in the cache. It checks no checkpoint, receipt
+  or `prev` chain (§12) and reads no control lane, so a preview may miss rows, or show a row that the app later drops
   (§6.8). A tap on a notification opens its URL: the Service Worker's `notificationclick` handler focuses an open window
   of the app and moves it to that URL, or opens it; a native app opens itself at that URL.
 - **Closing and the badge.** A device closes a copy's notifications once its read positions cover them: when it shows
@@ -5011,9 +5042,14 @@ browser client does, with these differences:
   hides its content in the system's app switcher. It is a gate in the app's interface, not a key: the files and keys
   above stay readable to the notification handler, whose notifications follow the device's preview (§11.13).
 - **Desktop.** The desktop app keeps running when its window is closed, with an icon in the menu bar or the system tray,
-  and MAY start hidden when the user signs in to the system. While it runs it keeps its realtime socket, reconnects when
-  the system wakes, notifies as §11.13 says ("Apps without push"), and shows the badge where the system has one (the
-  Dock on macOS, the taskbar button's overlay on Windows).
+  and MAY start hidden when the user signs in to the system. While it runs it keeps its realtime socket, notifies as
+  §11.13 says ("Apps without push"), and shows the badge where the system has one (the Dock on macOS, the taskbar
+  button's overlay on Windows). Its timers (the pings and reconnects of §10.8, the catch-up of §11.6, the notifications
+  of §11.13) keep their schedule while the window is closed, which a hidden web view does not promise for the page's
+  own timers: while the page is hidden, the app's native code also wakes it when its earliest timer is due. The native
+  code also tells the page when the system wakes from sleep and when the network changes (an interface or an address
+  comes or goes), which the page cannot see for itself, and the page then wakes its sockets (§10.8) and catches up
+  (§11.6).
 - **Updates.** A desktop app distributed outside a store MAY update itself. It reads a feed at a fixed `https` URL
   built into it, which the deployment's server does not serve, and sends with that request and the download no
   cookie, credential or other value that names the user, the account or the device. The feed names the newest version
@@ -5037,6 +5073,8 @@ browser client does, with these differences:
   (for segv.sh `segv:`, whose `segv://open#c/<ref>` names a conversation), and a page of the web app MAY offer to open
   a conversation URL in it, with the fragment carried over. A conversation
   URL that the app opens shows that copy as in a browser, and a notification of the app opens its copy's URL in the app.
+  A link of a message to any other `http` or `https` URL opens in the system's browser, never in the app's window, which
+  shows the app's own pages only ("Origin" above).
 
 The server answers a native app as it answers a browser. Its requests differ only in their `Origin` header, which,
 like the User-Agent that every client already sends, tells O which kind of app sent them (§13.5).

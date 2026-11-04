@@ -86,8 +86,16 @@ export async function web({ base, browser, shots, P, Wire }) {
       await seen(A, t2);
       const mine = B.page.locator(".thread .m", { hasText: t1 }).first();
       await mine.hover();
-      await mine.getByRole("button", { name: "add a reaction" }).click({ timeout: T });
-      await mine.getByRole("button", { name: "👍", exact: true }).click({ timeout: T });
+      await mine
+        .getByRole("toolbar")
+        .getByRole("button", { name: "add a reaction" })
+        .click({ timeout: T });
+      const picker = B.page.getByRole("dialog", { name: "add a reaction" });
+      await picker.getByRole("textbox", { name: "search emoji" }).fill("thumbs up");
+      const thumbs = picker.getByRole("button", { name: "thumbs up", exact: true });
+      await thumbs.waitFor({ timeout: T });
+      await screen(B, "reaction picker");
+      await thumbs.click({ timeout: T });
       await mine.locator(".react.mine", { hasText: "👍 1" }).waitFor({ timeout: T });
       const theirs = A.page.locator(".thread .m", { hasText: t1 }).first();
       await theirs.locator(".react", { hasText: "👍 1" }).waitFor({ timeout: T });

@@ -169,6 +169,11 @@ export class PushClient {
   private syncing: Promise<void> | null = null;
   private again = false;
   private stopped = false;
+  /**
+   * Counts `stop()`s. A sync or an enable that awaited across one (turned off, logged out) has lost its turn: it must
+   * not save the setting on, and undoes what it did meanwhile (see `abandon`).
+   */
+  private gen = 0;
   /** the endpoint and set last registered, and when (monotonic): an unchanged set is sent again only daily */
   private lastKey: string | null = null;
   private lastAt = -Infinity;
@@ -191,6 +196,7 @@ export class PushClient {
     const pl = this.o.platform;
     const params = this.o.params();
     if (!pl || !params) throw new Error("notifications are not available in this browser");
+    const gen = this.gen;
     // Both start inside the click: the permission prompt needs the user's gesture, and registering the Service Worker
     // meanwhile keeps the subscription below from waiting for it after the gesture has passed.
     const asked =
@@ -205,10 +211,12 @@ export class PushClient {
       s = null;
     }
     if (!s)
-      await mgr.subscribe({
+      s = await mgr.subscribe({
         userVisibleOnly: true,
         applicationServerKey: params.vapid as BufferSource,
       });
+    // Turned off or logged out while this waited: the later click wins.
+    if (gen !== this.gen) return this.abandon(s, false);
     this.o.store.save({ ...this.o.store.load(), on: true });
     this.stopped = false;
     this.force = true;
@@ -261,6 +269,7 @@ export class PushClient {
 
   stop(): void {
     this.stopped = true;
+    this.gen++;
     this.timer?.cancel();
     this.timer = null;
     this.dueAt = Infinity;
@@ -304,6 +313,25 @@ export class PushClient {
     this.o.onOff?.();
   }
 
+  /**
+   * A sync or an enable that lost its turn to a `stop()` while it waited, holding subscription `s`. When the setting is
+   * on again (a later enable), that enable's own sync takes over and nothing is undone. When it is off, `s` is ended
+   * (it may be one that `off` never saw) and, if this one had registered its set, that registration is deleted again,
+   * in the background, as `off` does.
+   */
+  private async abandon(s: PushSubscriptionLike, registered: boolean): Promise<void> {
+    if (this.o.store.load().on) return;
+    let body: PushSubBody | null = null;
+    try {
+      body = bodyOf(s, []);
+    } catch {
+      body = null;
+    }
+    await s.unsubscribe().catch(() => false);
+    if (registered && body && this.o.params() !== null)
+      void this.o.transport.pushSub(body).catch(() => {});
+  }
+
   private schedule(ms: number): void {
     if (this.stopped || !this.on || !this.available) return;
     const now = this.o.clock.mono();
@@ -341,15 +369,22 @@ export class PushClient {
     if (!st.on || !pl || !params || this.stopped) return;
     const force = this.force || this.o.clock.mono() >= this.lastAt + DAY_MS;
     this.force = false;
+    // Every await below may span a turn-off or a logout (`off` stops this client and saves the setting off): after
+    // each one a sync that lost its turn stops, and never saves the setting on again.
+    const gen = this.gen;
+    const gone = () => gen !== this.gen;
     try {
       const mgr = await pl.manager();
+      if (gone()) return;
       let s = await mgr.getSubscription();
+      if (gone()) return;
       let deleted: string | null = null;
       if (s && !sameKey(s, params.vapid)) {
         // The server's VAPID key changed: end this subscription, delete its registration, subscribe again.
         const old = bodyOf(s, []);
         await s.unsubscribe().catch(() => false);
         await this.o.transport.pushSub(old).catch(() => {});
+        if (gone()) return;
         deleted = old.endpoint;
         s = null;
       }
@@ -361,13 +396,17 @@ export class PushClient {
           });
         } catch {
           // Subscribing again needs a click here: show the setting off.
-          this.turnOff();
+          if (!gone()) this.turnOff();
           return;
         }
+        // `off` may have looked for a subscription before this one existed: end it.
+        if (gone()) return this.abandon(s, false);
       }
       // A new endpoint: delete the old one's registration first (its keys are gone; any valid keys serve).
-      if (st.endpoint !== null && st.endpoint !== s.endpoint && st.endpoint !== deleted)
+      if (st.endpoint !== null && st.endpoint !== s.endpoint && st.endpoint !== deleted) {
         await this.o.transport.pushSub({ ...bodyOf(s, []), endpoint: st.endpoint });
+        if (gone()) return this.abandon(s, false);
+      }
       const seen = new Set<string>();
       const tokens: string[] = [];
       for (const b of this.o.secrets()) {
@@ -383,6 +422,8 @@ export class PushClient {
       const key = `${s.endpoint} ${quiet ?? ""} ${tokens.join(",")}`;
       if (force || key !== this.lastKey || st.endpoint !== s.endpoint) {
         await this.o.transport.pushSub({ ...bodyOf(s, tokens), ...(quiet ? { quiet } : {}) });
+        // This registration may have reached the server after the empty set that `off` sent: delete it again.
+        if (gone()) return this.abandon(s, true);
         this.o.store.save({ on: true, endpoint: s.endpoint });
         this.lastKey = key;
         this.lastAt = this.o.clock.mono();
@@ -392,6 +433,8 @@ export class PushClient {
       // At least once a day while running (§11.13).
       this.schedule(Math.max(0, this.lastAt + DAY_MS - this.o.clock.mono()));
     } catch (e) {
+      // Turned off, or off and on again, meanwhile: the setting is no longer this sync's to change.
+      if (gone()) return;
       this.force ||= force;
       if (statusOf(e) === 404) {
         // The server no longer offers push.

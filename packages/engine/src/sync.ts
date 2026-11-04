@@ -9,6 +9,7 @@ import {
   W_SLOTS,
   acceptedOld,
   clampTs,
+  ctlTail,
   insertMessage,
   removeMessage,
   rowKey,
@@ -48,8 +49,11 @@ export interface SyncCtx {
   onValidRow(c: Copy, ep: Epoch, j: number): void;
   /** lane j's latest BELL row changed: its member's bell (§11.13) */
   onBell?(c: Copy, ep: Epoch, j: number): void;
-  /** the local echo waiting for this row (rowKey), if any */
-  takeEcho(key: string): { c: Copy; echoKey: string } | undefined;
+  /**
+   * The local echo waiting for this row (rowKey) with exactly this stored body, if any: a sibling device's row in the
+   * same slot is not this device's message.
+   */
+  takeEcho(key: string, body: Bytes): { c: Copy; echoKey: string } | undefined;
   /**
    * §12.2 and §12.4 for a valid row of lane j: its `ck` against the verified checkpoints, and its `prev` against the
    * row this session holds there (checked later when it holds none).
@@ -140,7 +144,10 @@ class LaneWalk {
       if (s.s === "hit" && s.body) {
         rows.push({ E: this.tail.E, n: this.tail.n, label: keys[o].label, t: s.t, body: s.body });
         this.tail = { E: this.tail.E, n: this.tail.n + 1 };
-      } else if (s.s === "miss" && s.sealed) this.tail = null;
+      } else if (s.s === "miss" && s.sealed) {
+        this.sealedAt.set(this.tail.E, this.tail.n);
+        this.tail = null;
+      }
       o++;
     }
     let ended = false;
@@ -232,8 +239,9 @@ export async function syncLanes(
   const Enow = P.era(ctx.api.serverNow());
   const walks = targets.map((x) => {
     if (x.lane === "ctl") {
+      // The tail: the prefix end of an earlier era not yet observed sealed, which a late claim can still fill (§6.5).
       const ctl = x.ep.ctl;
-      return new LaneWalk(ctl.next, null, Enow, (E, n) => P.Lctl(x.ep.keys.rk, E, n));
+      return new LaneWalk(ctl.next, ctlTail(x.ep), Enow, (E, n) => P.Lctl(x.ep.keys.rk, E, n));
     }
     const lane = x.ep.lanes[x.lane];
     const j = x.lane;
@@ -256,7 +264,12 @@ export async function syncLanes(
         const ctl = x.ep.ctl;
         for (const r of rows) {
           ctl.counts.set(r.E, Math.max(ctl.counts.get(r.E) ?? 0, r.n + 1));
-          if (P.posCmp(r, ctl.next) >= 0 && !ctl.queue.some((q) => q.E === r.E && q.n === r.n))
+          // A row at an earlier era's tail lies before `next`: it was never decided, and is decided first.
+          const late = r.E < ctl.next.E && !ctl.sealed.has(r.E);
+          if (
+            (late || P.posCmp(r, ctl.next) >= 0) &&
+            !ctl.queue.some((q) => q.E === r.E && q.n === r.n)
+          )
             ctl.queue.push(r);
         }
         ctl.queue.sort((a, b) => P.posCmp(a, b));
@@ -393,9 +406,12 @@ export function applyLaneRow(
   if (!accepted) {
     c.order.set(key, order);
     ep.rows.set(key, { j, E: r.E, n: r.n, t: r.t, unread: false, shown: false, th });
-    ctx.takeEcho(key); // the echo stays as it is; the send reports the failure (§11.3 step 7)
+    // The echo stays: its send finds the row not shown and marks the echo failed (§11.3 step 7).
+    ctx.takeEcho(key, r.body);
     return;
   }
+  // A row that replaces its echo stays `sending` until its send has decided (§11.3 steps 6–8).
+  const echo = ctx.takeEcho(key, r.body);
   const view: MessageView = {
     key,
     seq: ctx.seq(),
@@ -403,11 +419,10 @@ export function applyLaneRow(
     fromHandle: ctx.handleOf(c, ep, j),
     mine,
     ts,
-    status: "sent",
+    status: echo ? "sending" : "sent",
     reactions: [],
     ...messageBody(m),
   };
-  const echo = ctx.takeEcho(key);
   if (echo) removeMessage(echo.c, echo.echoKey);
   if (!insertMessage(c, view, order)) return;
   const unread = !mine && !quiet && ctx.live();

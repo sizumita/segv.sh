@@ -7,10 +7,11 @@ import { render } from "@qwik.dev/core";
 import { configureEngine } from "@segv/engine";
 import { App } from "@segv/ui";
 import { markWindow, moveByTitleBar } from "./chrome";
-import { followOpens, followSettings, platform } from "./platform";
+import { followAlarms, followOpens, followSettings, platform } from "./platform";
 
 markWindow();
 configureEngine(platform());
+followAlarms().catch((e: unknown) => console.error("segv: could not follow the alarm", e));
 followOpens().catch((e: unknown) => console.error("segv: could not follow links", e));
 followSettings().catch((e: unknown) =>
   console.error("segv: could not follow the settings menu", e),

@@ -1153,6 +1153,49 @@ describe("the bells a push names (§9.8 `rang`)", () => {
     expect(await stateOf(d)).toMatchObject({ due: null, rang: [] });
   });
 
+  it("a ring during a failed attempt rides its retry; one during the last attempt comes after the dropped push", async () => {
+    await reset(BASE);
+    const d = dev();
+    const [b1, b2, b3] = bells(3);
+    await sub(d, [b1, b2, b3]);
+    // The first attempt fails while b2 rings: the retry, 10 s later, carries b2 as well.
+    fake.respond = async () => {
+      await ringState([b2]);
+      return new Response(null, { status: 500 });
+    };
+    await ringApi([b1]);
+    expect(callsTo(d)).toHaveLength(1);
+    expect(named(callsTo(d)[0], d)).toEqual([P.hex(P.bellOf(b1))]);
+    const first = callsTo(d)[0].at;
+    expect(await stateOf(d)).toMatchObject({ tries: 1, due: first + 10_000, later: null });
+    expect(fake.queued).toEqual([{ k: kOf(d), delaySeconds: 10 }]);
+    // The retry fails too, while b3 rings: the push is dropped, its first attempt counting as the last push, and
+    // b3's ring is due at the window's end.
+    fake.respond = async () => {
+      await ringState([b3]);
+      return new Response(null, { status: 500 });
+    };
+    fake.now = first + 10_000;
+    await drainQueue();
+    expect(callsTo(d)).toHaveLength(2);
+    expect(named(callsTo(d)[1], d)).toEqual(bellsOf([b2, b1]).map(P.hex));
+    const st = (await stateOf(d))!;
+    expect(st).toMatchObject({
+      last: first,
+      due: first + PUSH_WINDOW * 1000,
+      tries: 0,
+      later: null,
+    });
+    expect(st.rang.map(P.hex)).toEqual([P.hex(P.bellOf(b3))]);
+    expect(fake.queued).toEqual([{ k: kOf(d), delaySeconds: PUSH_WINDOW - 10 }]);
+    fake.respond = () => new Response(null, { status: 201 });
+    fake.now = st.due!;
+    await drainQueue();
+    expect(callsTo(d)).toHaveLength(3);
+    expect(named(callsTo(d)[2], d)).toEqual([P.hex(P.bellOf(b3))]);
+    expect(await stateOf(d)).toMatchObject({ due: null, rang: [], last: st.due });
+  });
+
   it("a push with no bell is as long as one with four", async () => {
     await reset(BASE);
     const d = dev();
@@ -1658,6 +1701,45 @@ describe("the QuietDO holds pushes for marks of rows seen (§9.8 `seen`)", () =>
     ]);
     expect(wait).toBeNull(); // cancelled instead of retried
     expect(await stateOf(d)).toMatchObject({ due: null, tries: 0 });
+  });
+
+  it("a ring while a push is being sent stays cancellable: marked before the answer, nothing more is due", async () => {
+    await reset(BASE);
+    const d = dev();
+    const b = P.random(16);
+    const q = P.random(16);
+    await sub(d, [b], q);
+    // Another row rings the endpoint while its push is out, and a device shows that row before the answer comes.
+    const l2 = { E: 1, label: P.random(16) };
+    fake.respond = async () => {
+      await ringState([b], l2);
+      await seen(q, [l2]);
+      return new Response(null, { status: 201 });
+    };
+    await ringApi([b]);
+    expect(callsTo(d)).toHaveLength(1);
+    expect(await stateOf(d)).toMatchObject({
+      due: null,
+      last: callsTo(d)[0].at,
+      rang: [],
+      later: null,
+    });
+    expect(fake.queued).toEqual([]);
+
+    // Unmarked, it is due after the answer, and a mark then cancels it as any waiting push.
+    const l4 = { E: 1, label: P.random(16) };
+    fake.respond = async () => {
+      await ringState([b], l4);
+      return new Response(null, { status: 201 });
+    };
+    fake.now = callsTo(d)[0].at + PUSH_WINDOW * 1000;
+    await ringApi([b]);
+    expect(callsTo(d)).toHaveLength(2);
+    const at = callsTo(d)[1].at;
+    expect(await dueOf(d)).toBe(at + PUSH_WINDOW * 1000);
+    expect(fake.queued).toEqual([{ k: kOf(d), delaySeconds: PUSH_WINDOW }]);
+    await seen(q, [l4]);
+    expect(await stateOf(d)).toMatchObject({ due: null, last: at, rang: [] });
   });
 
   it("past PUSH_PENDING rows a push can no longer be cancelled", async () => {

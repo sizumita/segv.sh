@@ -45,6 +45,34 @@ describe("HEADS rows", () => {
     for (const r of puts) expect(r.putResults?.every((x) => x.s === "ok")).toBe(true);
     expect(A.getState().error).toBe("");
   });
+
+  it("a record queued while a HEADS row is being written stays pending and goes into the next one", async () => {
+    const alice = makeUser("alice");
+    const A = await engineFor(alice);
+    const msg = (A as unknown as { msg: MessagingI }).msg;
+    const first: P.ContactRec = { rtype: P.RT.CONTACT, uid: P.random(16), pin: P.random(32) };
+    const late: P.ContactRec = { rtype: P.RT.CONTACT, uid: P.random(16), pin: P.random(32) };
+    msg.pendingRecords.push(first);
+    let queued = false;
+    // While the first row's put is held, a record is queued (as learnUser does outside the engine queue).
+    server().hooks.beforePut = (_rows, who) => {
+      if (who !== "alice" || queued) return;
+      queued = true;
+      msg.pendingRecords.push(late);
+    };
+    try {
+      await msg.flushHeads();
+    } finally {
+      server().hooks.beforePut = undefined;
+    }
+    expect(queued).toBe(true);
+    expect(msg.pendingRecords).toEqual([late]);
+    await msg.flushHeads();
+    expect(msg.pendingRecords).toEqual([]);
+    const fold = I(A).self!.fold;
+    expect(fold.contacts.has(P.b64u(first.uid))).toBe(true);
+    expect(fold.contacts.has(P.b64u(late.uid))).toBe(true);
+  });
 });
 
 describe("HEADS entries over several rows (M6 test 11)", () => {

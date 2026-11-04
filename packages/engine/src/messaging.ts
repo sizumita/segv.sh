@@ -22,6 +22,7 @@ import {
   cleanName,
   contest,
   copyKeyOf,
+  ctlRecorded,
   currentEpoch,
   leftIn,
   memberHandle,
@@ -55,6 +56,7 @@ import { Checkpoints, different, hiding } from "./integrity";
 import { HelloProber, LINK_ERAS, liveLinks, putHello, type LiveLink } from "./links";
 import {
   acceptJoin,
+  heldBundle,
   secondCopyWarning,
   type JoinCtx,
   type JoinOutcome,
@@ -72,7 +74,7 @@ import type {
 import { Realtime } from "./realtime";
 import { keysChangedWarning, leftKeyCmp, liveAt, type SelfLane } from "./selflane";
 import { SNAP_RECORDS, firstFreePointer, writeSnapshot } from "./snapshot";
-import { MAX_REACTIONS, reactionSets, refreshReactions } from "./reactions";
+import { reactionSets, refreshReactions } from "./reactions";
 import { lanesEnd, olderInitialHistory, scrollback } from "./history";
 import { prepareImage } from "./image";
 import { ImageCache } from "./image-cache";
@@ -82,6 +84,7 @@ import {
   claimRead,
   deriveLines,
   endByRecord,
+  endSwept,
   historyClaim,
   onLeave,
   processWinner,
@@ -98,7 +101,7 @@ import {
   type FoundRow,
   type SyncCtx,
 } from "./sync";
-import type { ConversationView, MessageView } from "./types";
+import { MAX_REACTIONS, type ConversationView, type MessageView } from "./types";
 
 type Bytes = Uint8Array;
 
@@ -111,13 +114,15 @@ const CONNECTED_CATCH_UP_MS = 300_000;
 /** A self row holds at most this many bytes of records (cls 3 minus the S header and a margin, §7.1, §7.3). */
 const ROW_BUDGET = 16_384 - 32 - 64;
 
-/** A WELCOME's J that parked: its carrier copy, epoch, lane and row. */
+/** A WELCOME's J not yet recorded (CAS OK) or parked: its carrier copy, epoch, lane and row. */
 interface ParkedWelcome {
   c: Copy;
   ep: Epoch;
   j: number;
   at: Slot;
   J: P.Join;
+  /** its row lies before its lane's processed position: it was processed before, so its warnings are not raised again */
+  old: boolean;
 }
 
 /** A join of one poll on its way to the self lane: its outcome, where it came from, and whether it was taken out. */
@@ -201,8 +206,10 @@ export class Messaging {
   private readonly unregistered = new Set<string>();
   /** CONTACT and MEMBER records for the next HEADS row (§7.3) */
   private pendingRecords: P.SelfRecord[] = [];
-  /** the local echo of each row being sent, by row key */
-  private readonly echoes = new Map<string, { c: Copy; echoKey: string }>();
+  /** the local echo of each row being sent, with the row's body, by row key */
+  private readonly echoes = new Map<string, { c: Copy; echoKey: string; body: Bytes }>();
+  /** the row key of the view that replaced an echo still being sent, by echo key */
+  private readonly echoRows = new Map<string, string>();
   private readonly sendChains = new Map<string, Promise<unknown>>();
   /** T_e of every held epoch, by b64u topic */
   private readonly topics = new Map<string, { c: Copy; ep: Epoch }>();
@@ -230,8 +237,10 @@ export class Messaging {
   live = false;
   /** the J delivery queue (§6.11, §6.12) */
   private readonly deliveries: Deliveries;
-  /** EPOCH_PENDING records this session wrote (resumed at once, §6.11) */
+  /** EPOCH_PENDING records this session wrote (resumed without waiting for RESUME_AFTER, §6.11) */
   private readonly ownPending = new Set<string>();
+  /** those whose creation or commit is still running: it delivers J itself, so no resume starts a job for them */
+  private readonly ownRunning = new Set<string>();
   /** decrypted images by `id.k` (never by id alone, §8.1) */
   readonly images = new ImageCache();
   /** decrypted files by `id.k` (never by id alone, §8.3): an object URL and the file's length */
@@ -261,8 +270,10 @@ export class Messaging {
   private readonly corroborations = new Set<Copy>();
   /** rows walked in an epoch whose ending claim is not read yet (an ENDED record, §11.4 step 5), applied after it is */
   private heldRows: { c: Copy; ep: Epoch; j: number; r: FoundRow }[] = [];
-  /** WELCOME Js that parked, with their carrier lane and row (§6.7 step 4) */
+  /** WELCOME Js not yet recorded or parked, with their carrier lane and row (§6.7 step 4, §7.3) */
   private parkedWelcomes: ParkedWelcome[] = [];
+  /** H(D) of held epochs that a restore did not load, by `${copy key}:${e}` (null: the record does not check) */
+  private unloadedHashes = new Map<string, Bytes | null>();
 
   constructor(private readonly h: MessagingHost) {
     for (const b of h.acc.inbox) this.ownBuckets.set(b.E, b.g);
@@ -372,22 +383,36 @@ export class Messaging {
     for (const t of this.timers) t.cancel();
     this.inboxRetry?.cancel();
     this.inboxRetry = null;
-    void this.worker?.then((w) => w?.terminate());
+    void this.inbox?.then((x) => x.worker?.terminate());
   }
 
-  private worker: Promise<Worker | null> | null = null;
+  private inbox: Promise<{ worker: Worker | null; decrypt: Decrypt }> | null = null;
 
   /**
    * Trial decryption in the inbox Web Worker when one can be made (§11.5 step 2; EngineOptions.inboxWorker: absent
-   * is the default factory, null is none), else on this thread.
+   * is the default factory, null is none), else on this thread. A worker that fails is dropped, and the session goes
+   * on with this thread, as when none can be made.
    */
   private async decrypter(): Promise<Decrypt> {
     const opt = this.h.opts.inboxWorker;
     if (opt === null) return sameThread;
     const make = opt ?? (() => import("./inbox-worker-url").then((m) => m.createInboxWorker()));
-    this.worker ??= make().catch(() => null);
-    const w = await this.worker;
-    return w ? workerDecrypt(w) : sameThread;
+    const none = { worker: null, decrypt: sameThread };
+    this.inbox ??= make()
+      .catch(() => null)
+      .then((worker) =>
+        worker
+          ? {
+              worker,
+              decrypt: workerDecrypt(
+                worker,
+                this.h.clock,
+                () => (this.inbox = Promise.resolve(none)),
+              ),
+            }
+          : none,
+      );
+    return (await this.inbox).decrypt;
   }
 
   private every(ms: () => number, fn: () => Promise<unknown>): void {
@@ -460,13 +485,14 @@ export class Messaging {
 
   /**
    * A copy that holds the epoch its ENDED record names (its own or a sibling's) has ended there, latched, without
-   * processing that claim (§6.6 step 3, §7.3); a record for an epoch it does not hold is not applied yet.
+   * processing that claim (§6.6 step 3, §7.3); a record for an epoch it does not hold is not applied yet. A copy
+   * whose sweep there did not finish (a transient failure) ends by the record again (§11.2 "Sweeping").
    */
   private async endByRecordIf(c: Copy, quiet: boolean): Promise<void> {
-    if (c.removed || c.probe) return;
+    if (c.probe) return;
     const rec = this.h.self.fold.ended.get(copyKeyOf(c));
     const ep = c.epochs.get(c.current);
-    if (!rec || !ep || rec.e !== ep.e) return;
+    if (!rec || !ep || rec.e !== ep.e || (c.removed && endSwept(c, ep))) return;
     await endByRecord(this.membershipHost(quiet), c, ep, rec.claim);
     // A device that holds rows of that epoch reads the claim now: rows stored after it are dropped (§6.8, §11.7).
     if (ep.loaded > 0) await this.readEndClaim(c, quiet);
@@ -1532,8 +1558,13 @@ export class Messaging {
       onWelcome: (c, ep, j, at, J) => {
         // Own WELCOMEs (this device's or a sibling's) carry J of copies the account already holds; a probe copy's
         // rows carry nothing until it is held.
-        if (!c.probe && !P.equalBytes(ep.D.members[j].uid, this.h.acc.uid))
-          void this.welcome(c, ep, j, at, J);
+        if (c.probe || P.equalBytes(ep.D.members[j].uid, this.h.acc.uid)) return;
+        // A J whose bundle a held copy names is a duplicate (§6.7 step 3): so a WELCOME before the processed position,
+        // already processed, is not applied twice (§11.10). One that no copy holds goes through §6.7 again, quietly.
+        if (heldBundle(this.joinCtx([]), J)) return;
+        const l = ep.lanes[j];
+        const old = (!ep.lanesOn && l.swept) || P.posCmp(at, l.tail ?? l.next) < 0;
+        this.welcome({ c, ep, j, at, J, old });
       },
       onValidRow: (c, ep, j) => this.corroborate(c, ep, j),
       onBell: (c, ep, j) => {
@@ -1541,10 +1572,12 @@ export class Messaging {
         this.markHeads(); // HEADS rows carry the bells (§7.3)
         if (j === ep.myIndex) this.h.changed(); // the registration set may have changed (§11.13)
       },
-      takeEcho: (key) => {
+      takeEcho: (key, body) => {
         const x = this.echoes.get(key);
+        if (!x || !P.equalBytes(x.body, body)) return undefined;
         this.echoes.delete(key);
-        return x ? { c: x.c, echoKey: x.echoKey } : undefined;
+        this.echoRows.set(x.echoKey, key);
+        return { c: x.c, echoKey: x.echoKey };
       },
       onLeave: (c, ep, j, src) => onLeave(this.membershipHost(quiet), c, ep, j, src),
       checkRow: (c, ep, j, row, msg, q) => {
@@ -1803,34 +1836,50 @@ export class Messaging {
   }
 
   /**
-   * A WELCOME's J: accepted whenever its row is processed (§5.2). A J that parks is kept with its carrier lane and
-   * evaluated again after each catch-up; meanwhile the carrier copy's HEADS entries hold that lane's position before
-   * the row (§6.7 step 4, §7.3 "Durability order").
+   * A WELCOME's J: accepted whenever its row is processed (§5.2). It is held at once, before its row's lane moves on,
+   * and stays held until the J is recorded (CAS OK) or decided otherwise: a J that parks, or whose records fail to be
+   * written, is evaluated again after each catch-up. Meanwhile the carrier copy's HEADS entries hold that lane's
+   * position before the row (§6.7 step 4, §7.3 "Durability order").
    */
-  private async welcome(c: Copy, ep: Epoch, j: number, at: Slot, J: P.Join): Promise<void> {
-    await this.h.track(
-      this.h.enqueue(async () => {
-        const [kind] = await this.processJoins([{ J, at: null }]);
-        const same = (x: ParkedWelcome) =>
-          x.c === c && x.ep === ep && x.j === j && P.posCmp(x.at, at) === 0;
-        if (kind === "parked") {
-          if (!this.parkedWelcomes.some(same)) this.parkedWelcomes.push({ c, ep, j, at, J });
-          this.markHeads();
-        } else this.parkedWelcomes = this.parkedWelcomes.filter((x) => !same(x));
-      }),
-    );
+  private welcome(x: ParkedWelcome): void {
+    const same = (y: ParkedWelcome) =>
+      y.c === x.c && y.ep === x.ep && y.j === x.j && P.posCmp(y.at, x.at) === 0;
+    if (this.parkedWelcomes.some(same)) return;
+    this.parkedWelcomes.push(x);
+    void this.h
+      .track(
+        this.h.enqueue(async () => {
+          if (this.parkedWelcomes.includes(x)) await this.retryWelcome(x);
+        }),
+      )
+      .catch(() => {});
   }
 
-  /** The parked WELCOME Js, evaluated again after a catch-up (§6.7 step 4). In the queue. */
+  /**
+   * Evaluates one held WELCOME J (in the queue): it is let go once accepted and recorded, a duplicate, or dropped; it
+   * stays held when it parks, and when its records fail to be written (the throw goes on).
+   */
+  private async retryWelcome(x: ParkedWelcome): Promise<void> {
+    const [kind] = await this.processJoins([{ J: x.J, at: null }], undefined, x.old);
+    if (kind === "parked") return;
+    this.parkedWelcomes = this.parkedWelcomes.filter((y) => y !== x);
+    this.markHeads();
+  }
+
+  /**
+   * The held WELCOME Js, evaluated again after a catch-up (§6.7 step 4), in order. A failure stops the round and keeps
+   * that J and those after it. In the queue.
+   */
   private async retryWelcomes(): Promise<void> {
-    const parked = this.parkedWelcomes;
-    if (parked.length === 0) return;
-    this.parkedWelcomes = [];
-    for (const x of parked) {
-      const [kind] = await this.processJoins([{ J: x.J, at: null }]);
-      if (kind === "parked") this.parkedWelcomes.push(x);
+    for (const x of this.parkedWelcomes.slice()) {
+      if (!this.parkedWelcomes.includes(x)) continue;
+      try {
+        await this.retryWelcome(x);
+      } catch {
+        this.h.check();
+        return;
+      }
     }
-    if (this.parkedWelcomes.length !== parked.length) this.markHeads();
   }
 
   /** Applies a row that this device's own send stored (or a sibling's found by the send). */
@@ -2121,7 +2170,7 @@ export class Messaging {
     return scan.closed;
   }
 
-  private joinCtx(pending: NewCopy[]): JoinCtx {
+  private joinCtx(pending: NewCopy[], quiet = false): JoinCtx {
     return {
       api: this.h.api,
       self: { uid: this.h.acc.uid, sigPk: this.h.acc.id.sigPk, kh: P.kemHash(this.h.acc.id.kemPk) },
@@ -2133,7 +2182,10 @@ export class Messaging {
       ],
       member: (uidB) => this.h.self.fold.members.get(uidB) ?? null,
       contact: (uidB) => this.h.self.fold.contacts.get(uidB) ?? null,
-      warn: (t, c) => this.h.warn(t, c),
+      warn: (t, c) => {
+        if (!quiet) this.h.warn(t, c);
+      },
+      unloaded: (c, e) => this.unloadedEpoch(c, e),
       settle: async (c) => {
         await this.syncCopies([c], !this.live);
         const ep = c.epochs.get(c.current);
@@ -2143,6 +2195,32 @@ export class Messaging {
         return !!ep && (c.removed || (controlSettled(ep) && !this.endAhead(c)));
       },
       settleOwn: (x) => this.settleOwn(x),
+    };
+  }
+
+  /**
+   * An epoch that a copy holds below the start of its restore (§11.4 step 5), which it has not loaded: the root epoch
+   * from the copy's CONV_JOIN or REQUEST (H(D) is its root), any other from its EPOCH record (D from a DESC record or
+   * the bundle, kept for the session).
+   */
+  private unloadedEpoch(c: Copy, e: number): ReturnType<JoinCtx["unloaded"]> {
+    if (c.epochs.has(e) || e < c.rootE || e > c.current) return null;
+    const f = this.h.self.fold;
+    const k = copyKeyOf(c);
+    if (e === c.rootE) {
+      const rec = f.joins.get(k) ?? f.requestOf(k)?.rec;
+      return rec && rec.e === e ? { bundleId: rec.bundleId, hD: async () => c.root } : null;
+    }
+    const rec = f.epochs.get(`${k}:${e}`);
+    if (!rec) return null;
+    const at = `${k}:${e}`;
+    return {
+      bundleId: rec.bundleId,
+      hD: async () => {
+        if (!this.unloadedHashes.has(at))
+          this.unloadedHashes.set(at, (await this.epochFromRecord(c, rec))?.D.hash ?? null);
+        return this.unloadedHashes.get(at)!;
+      },
     };
   }
 
@@ -2196,6 +2274,7 @@ export class Messaging {
   private async processJoins(
     found: { J: P.Join; at: { E: number; rel: number } | null; hello?: boolean }[],
     next?: InboxCursor,
+    quiet = false,
   ): Promise<string[]> {
     const kinds: string[] = [];
     const created: JoinWrite[] = [];
@@ -2206,7 +2285,14 @@ export class Messaging {
         : x.hello
           ? { via: P.VIA.HELLO }
           : { via: P.VIA.WELCOME };
-      const out = await acceptJoin(this.joinCtx(created.map((y) => y.x)), x.J, src);
+      const out = await acceptJoin(
+        this.joinCtx(
+          created.map((y) => y.x),
+          quiet,
+        ),
+        x.J,
+        src,
+      );
       kinds.push(out.kind);
       this.h.check();
       if (out.kind === "parked" && x.at && cursor) cursor = minCursor(cursor, before(x.at));
@@ -2558,7 +2644,9 @@ export class Messaging {
       ]),
     );
     this.h.check();
-    this.ownPending.add(jobKey(copyKeyOf({ conv: cr.conv, root: cr.D.hash }), 0, cr.bundleId));
+    const pendingKey = jobKey(copyKeyOf({ conv: cr.conv, root: cr.D.hash }), 0, cr.bundleId);
+    this.ownPending.add(pendingKey);
+    this.ownRunning.add(pendingKey);
     for (const u of others) this.learnUser(u, true);
     const k = copyKeyOf({ conv: cr.conv, root: cr.D.hash });
     const key = this.h.self.fold.viewKeys.get(k)!;
@@ -2580,7 +2668,8 @@ export class Messaging {
     }));
     void this.h
       .track(this.finishCreation(c, ep, putAt, tReg, recipients, release, hello))
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => this.ownDone([pendingKey]));
     return key;
   }
 
@@ -2797,9 +2886,11 @@ export class Messaging {
       const covered = f.delivered.get(key) ?? new Set<string>();
       const uids = rec.uids.map((u) => P.b64u(u)).filter((u) => !covered.has(u));
       if (uids.length === 0) continue;
-      // This session's own creations deliver through their own attempts (§6.1 steps 8–9, then the job's loop);
-      // another device's (or an earlier session's) once RESUME_AFTER has passed.
-      if (this.ownPending.has(key) || nowSec - t < this.h.delays.resumeAfter / 1000) continue;
+      // A creation or commit of this session that is still running delivers through its own attempts (§6.1 steps
+      // 8–9, §6.3 step 10, then the job's loop); one that ended, at once; another device's (or an earlier
+      // session's) once RESUME_AFTER has passed.
+      if (this.ownRunning.has(key)) continue;
+      if (!this.ownPending.has(key) && nowSec - t < this.h.delays.resumeAfter / 1000) continue;
       const J: P.Join = {
         conv: rec.conv,
         e: rec.e,
@@ -2895,9 +2986,29 @@ export class Messaging {
     return next;
   }
 
+  /**
+   * A creation or commit of this session ended (done, given up, or failed): its EPOCH_PENDING records are resumed
+   * like any other from now on, and one that is already established is resumed at once (§6.3, §6.11). A job its
+   * first attempt left running takes in the resume instead of a second one (`Deliveries.enqueue`).
+   */
+  private ownDone(keys: readonly string[]): void {
+    for (const k of keys) this.ownRunning.delete(k);
+    this.resumeDeliveries();
+  }
+
   // ───────────────────────── membership changes (§6.3, §6.9, §11.11) ─────────────────────────
 
-  private commitHost(): CommitHost {
+  /** Runs one commit (§6.3); the EPOCH_PENDING records it writes are its own to deliver while it runs. */
+  private async commit(c: Copy, plan: Plan): Promise<void> {
+    const written: string[] = [];
+    try {
+      await commit(this.commitHost(written), c, plan);
+    } finally {
+      this.ownDone(written);
+    }
+  }
+
+  private commitHost(written: string[]): CommitHost {
     return {
       api: this.h.api,
       clock: this.h.clock,
@@ -2909,7 +3020,10 @@ export class Messaging {
       sync: (c) => this.h.enqueue(() => this.syncCopies([c], false)),
       settle: (c) => this.h.enqueue(() => this.settleCopy(c)),
       writePending: async (rec) => {
-        this.ownPending.add(jobKey(copyKeyOf(rec), rec.e, rec.bundleId));
+        const key = jobKey(copyKeyOf(rec), rec.e, rec.bundleId);
+        this.ownPending.add(key);
+        this.ownRunning.add(key);
+        written.push(key);
         await this.h.enqueue(() => this.h.self.write([rec]));
       },
       pksOf: (c, ep) => this.epochPks(c, ep),
@@ -2949,7 +3063,7 @@ export class Messaging {
   /** §11.3 step 3: a commit that drops the members who left; a frozen copy refuses, and step 2 decides. */
   private async rotate(c: Copy): Promise<void> {
     try {
-      await commit(this.commitHost(), c, (cc, ep) => {
+      await this.commit(c, (cc, ep) => {
         const keep = this.stay(cc, ep);
         return keep.length === ep.D.members.length ? null : { keep, add: [] };
       });
@@ -2973,9 +3087,8 @@ export class Messaging {
         for (const u of wanted) this.learnUser(u, true);
         const listedLeaver = (cc: Copy, ep: Epoch) =>
           wanted.some((u) => P.memberIndex(ep.D, u.uidBytes) >= 0 && leftIn(cc, ep, u.uid));
-        const host = this.commitHost();
         if (listedLeaver(c, currentEpoch(c)))
-          await commit(host, c, (cc, ep) =>
+          await this.commit(c, (cc, ep) =>
             listedLeaver(cc, ep) ? { keep: this.stay(cc, ep), add: [] } : null,
           );
         const plan: Plan = (cc, ep, round) => {
@@ -2986,7 +3099,7 @@ export class Messaging {
           }
           return { keep: this.stay(cc, ep), add };
         };
-        await commit(host, c, plan);
+        await this.commit(c, plan);
       } finally {
         this.h.progress("");
       }
@@ -3000,7 +3113,7 @@ export class Messaging {
       return Promise.reject(new UserError("use “leave” to leave a conversation"));
     return this.chain(convId, async () => {
       try {
-        await commit(this.commitHost(), c, (cc, ep, round) => {
+        await this.commit(c, (cc, ep, round) => {
           const j = ep.D.members.findIndex((m) => P.b64u(m.uid) === uidB);
           if (j < 0) {
             if (round === 0) throw new UserError("not a member");
@@ -3053,10 +3166,9 @@ export class Messaging {
           type: P.MT.IMAGE,
           image: { id: P.fromB64u(id), k: key, mime, w: img.w, h: img.h },
         });
-        if (c.messages.some((m) => m.key === echo.key)) this.markEcho(c, echo.key, "sent");
+        this.endSend(c, echo.key, "sent");
       } catch (e) {
-        for (const [kk, x] of this.echoes) if (x.echoKey === echo.key) this.echoes.delete(kk);
-        this.markEcho(c, echo.key, "failed");
+        this.endSend(c, echo.key, "failed");
         if (!(e instanceof SessionEnded)) this.h.error(message(e));
       } finally {
         this.h.progress("");
@@ -3118,10 +3230,9 @@ export class Messaging {
           type: P.MT.FILE,
           file: { id: P.fromB64u(id), k: key, size: bytes.length, name },
         });
-        if (c.messages.some((m) => m.key === echo.key)) this.markEcho(c, echo.key, "sent");
+        this.endSend(c, echo.key, "sent");
       } catch (e) {
-        for (const [kk, x] of this.echoes) if (x.echoKey === echo.key) this.echoes.delete(kk);
-        this.markEcho(c, echo.key, "failed");
+        this.endSend(c, echo.key, "failed");
         if (!(e instanceof SessionEnded)) this.h.error(message(e));
       } finally {
         this.h.progress("");
@@ -3197,6 +3308,19 @@ export class Messaging {
     this.h.changed();
   }
 
+  /**
+   * The send of an echo has decided (§11.3 steps 6–8): marks the bubble the user sees, the echo or the stored row's
+   * view that replaced it. `sent` never overrides a `failed` that §6.8 set meanwhile (step 7).
+   */
+  private endSend(c: Copy, echoKey: string, status: "sent" | "failed"): void {
+    for (const [k, x] of this.echoes) if (x.echoKey === echoKey) this.echoes.delete(k);
+    const rowKey = this.echoRows.get(echoKey);
+    this.echoRows.delete(echoKey);
+    const key = c.messages.some((m) => m.key === echoKey) ? echoKey : rowKey;
+    const m = key === undefined ? undefined : c.messages.find((x) => x.key === key);
+    if (m && (status === "failed" || m.status === "sending")) this.markEcho(c, m.key, status);
+  }
+
   private sendCtx(c: Copy, echoKey: string | null): SendCtx {
     return {
       api: this.h.api,
@@ -3212,8 +3336,8 @@ export class Messaging {
       ck: () => this.ckpt.ck(),
       wait: (ms) => this.h.wait(ms),
       applyOwn: (cc, ep, row) => this.applyOwn(cc, ep, row),
-      expectEcho: (key) => {
-        if (echoKey) this.echoes.set(key, { c, echoKey });
+      expectEcho: (key, body) => {
+        if (echoKey) this.echoes.set(key, { c, echoKey, body });
       },
       beforePutAttempt: this.h.opts.beforePutAttempt,
       progress: (t) => this.h.progress(t),
@@ -3414,10 +3538,9 @@ export class Messaging {
       try {
         await this.acceptForPost(c);
         await sendRow(this.sendCtx(c, echo.key), c, { type: P.MT.TEXT, text: body });
-        if (c.messages.some((m) => m.key === echo.key)) this.markEcho(c, echo.key, "sent");
+        this.endSend(c, echo.key, "sent");
       } catch (e) {
-        for (const [k, x] of this.echoes) if (x.echoKey === echo.key) this.echoes.delete(k);
-        this.markEcho(c, echo.key, "failed");
+        this.endSend(c, echo.key, "failed");
         if (!(e instanceof SessionEnded)) this.h.error(message(e));
       } finally {
         this.h.progress("");
@@ -3526,7 +3649,7 @@ export class Messaging {
         root: c.root,
         e: ep.e,
         lastTs: Math.max(0, Math.floor(c.lastTs)),
-        ctl: { E: ep.ctl.next.E, cnt: ep.ctl.next.n },
+        ctl: (({ E, n }) => ({ E, cnt: n }))(ctlRecorded(ep)),
         lanes: ep.lanes.map((l, j) => pos(ep.e, j, l)),
         followed,
       },
@@ -3561,7 +3684,9 @@ export class Messaging {
           bells.entries.map((b) => [b.lane, P.b64u(b.bell)]),
         ]),
       ]);
-      const recs = this.pendingRecords;
+      // A copy: records queued while the rows below are being written (learnUser outside the queue, recordEnd) are not
+      // in them, and must stay pending for the next flush.
+      const recs = [...this.pendingRecords];
       if (sig === this.lastHeads && recs.length === 0) return;
       // Split everything over as many self rows as needed (§7.3 "HEADS splitting"): every row stays within the cls-3
       // budget and the record cap, ends with a HEADS record (the cursor, and the entries placed in it), and holds

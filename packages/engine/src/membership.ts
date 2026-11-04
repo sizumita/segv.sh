@@ -264,6 +264,11 @@ function unsweptBelow(c: Copy, ep: Epoch): LaneTarget[] {
   return prev.lanes.flatMap((l, j) => (l.swept ? [] : [{ c, ep: prev, lane: j }]));
 }
 
+/** The sweep of an ended copy's last epoch has finished: its lanes, and those of e−1 still followed, are swept. */
+export function endSwept(c: Copy, ep: Epoch): boolean {
+  return ep.lanes.every((l) => l.swept) && unsweptBelow(c, ep).length === 0;
+}
+
 /**
  * Processes the final winning claim `w` of epoch `ep` (§6.6): self removed (rm bit 1: the copy has ended, for good),
  * frozen (the own entry does not open, or a D′ check fails), or the switch to e+1. In every case the claim is kept as
@@ -338,10 +343,11 @@ export async function processWinner(
  * The copy holds the epoch that its ENDED record names (§6.6 step 3, §7.3): it has ended there, latched, without
  * processing the claim. The lanes of the epoch, and those of e−1 still followed, are swept once more as for a processed
  * removal; a row that needs the claim waits for it (`SyncCtx.holdRow`), and the claim is read at the record's position
- * only when such a row, or the copy's history, needs it (§11.4 steps 5–6).
+ * only when such a row, or the copy's history, needs it (§11.4 steps 5–6). A sweep that fails leaves its lanes
+ * unswept, and the copy ends by the record again at the next catch-up (`endSwept`, §11.2 "Sweeping").
  */
 export async function endByRecord(h: MembershipHost, c: Copy, ep: Epoch, at: P.Pos): Promise<void> {
-  ep.endedAt = { ...at };
+  if (!ep.ended) ep.endedAt = { ...at }; // a retry keeps a claim already read
   c.removed = true;
   if (ep.lanesOn)
     await h.sweep([...ep.lanes.map((_, j) => ({ c, ep, lane: j })), ...unsweptBelow(c, ep)]);

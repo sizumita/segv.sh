@@ -6,7 +6,9 @@
 // can die without a close event: a laptop that slept, a network that changed, a NAT that forgot it); an attempt that
 // has not opened within 15 s is given up and retried with the back-off.
 // In a browser, a page shown again or a network that comes back skips the back-off, or pings an open socket at once:
-// phones stop a hidden page's socket, and the app should be online as soon as it is opened.
+// phones stop a hidden page's socket, and the app should be online as soon as it is opened. An open socket that has
+// received nothing for longer than STALE_MS is replaced at once instead (a system that slept, timers that stopped): its
+// own pings would have been answered by then.
 import * as P from "@segv/protocol/proto";
 import * as W from "@segv/protocol/wire";
 import type { EngineClock, EngineTimer, WebSocketCtor } from "./options";
@@ -35,6 +37,8 @@ const POLICY_WAIT = 60_000;
 const PROBE_MS = 10_000;
 /** A socket still connecting after this long is given up (and retried with the back-off). */
 const CONNECT_MS = 15_000;
+/** An open socket that has received nothing for longer than this (two ping intervals) is replaced at a wake. */
+const STALE_MS = 2 * PING_MS;
 
 export class Realtime {
   private ws: WebSocket | null = null;
@@ -57,6 +61,11 @@ export class Realtime {
   private probe: EngineTimer | null = null;
   /** monotonic time of the last frame received on the open socket */
   private lastRx = -Infinity;
+  /**
+   * wall-clock time of the last frame received on the open socket, or of its opening: a wake measures staleness on
+   * the wall clock, since a monotonic clock may stop while the system sleeps
+   */
+  private heardWall = -Infinity;
   /** no reconnect before this monotonic time (the wait after a 1008 or 1013) */
   private notBefore = 0;
   /** removes the page listeners */
@@ -108,15 +117,17 @@ export class Realtime {
   }
 
   /**
-   * The page is shown again, or the network came back: connect now instead of after the back-off (never during the
-   * wait after a 1008 or 1013), or check that an open socket still answers, since it may have died while hidden.
+   * The page is shown again, the network came back or changed, or the system woke: connect now instead of after the
+   * back-off (never during the wait after a 1008 or 1013), or check that an open socket still answers, since it may
+   * have died while hidden; one that has heard nothing for longer than STALE_MS is replaced at once.
    */
   wake(): void {
     if (this.stopped) return;
     const ws = this.ws;
     if (ws?.readyState === 0) return; // still connecting
-    if (ws?.readyState === 1) return this.probeNow(ws);
-    if (ws) this.abandon(ws); // closing, but no close event yet
+    if (ws?.readyState === 1 && this.clock.wall() - this.heardWall <= STALE_MS)
+      return this.probeNow(ws);
+    if (ws) this.abandon(ws); // stale, or closing but no close event yet
     const wait = this.notBefore - this.clock.mono();
     if (wait > 0) {
       this.timer ??= this.clock.setTimer(() => {
@@ -219,6 +230,7 @@ export class Realtime {
       this.dial?.cancel();
       this.dial = null;
       this.backoff = BACKOFF_MIN;
+      this.heardWall = this.clock.wall();
       const topics = [...this.want.values()];
       if (this.boot) {
         ws.send(W.encodeClientFrame({ f: "resume", boot: this.boot, since: this.seq, topics }));
@@ -230,6 +242,7 @@ export class Realtime {
     };
     ws.onmessage = (ev) => {
       this.lastRx = this.clock.mono();
+      this.heardWall = this.clock.wall();
       this.message(ev.data);
     };
     ws.onclose = (ev) => {

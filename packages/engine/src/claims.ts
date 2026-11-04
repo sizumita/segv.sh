@@ -4,7 +4,15 @@
 // the switch to e+1) is the caller's (messaging.ts), which needs the sweep, the lines and the topics.
 import * as P from "@segv/protocol/proto";
 import { ApiError, type Api } from "./api";
-import { eraOfSec, type Copy, type Epoch, type StoredRow, type Winner } from "./conv";
+import {
+  eraOfSec,
+  type ControlLane,
+  type Copy,
+  type Epoch,
+  type Slot,
+  type StoredRow,
+  type Winner,
+} from "./conv";
 import { UNDECRYPTABLE } from "./sync";
 
 type Bytes = Uint8Array;
@@ -75,6 +83,16 @@ export async function evaluate(api: Api, ep: Epoch, row: StoredRow): Promise<Ver
 const backoff = (attempt: number, hint: number): number =>
   Math.max(hint, Math.min(60_000, 1000 * 2 ** attempt));
 
+/**
+ * Sets the control position. Leaving an era for a later one keeps how far that era was decided in `counts`: if it was
+ * not observed sealed, its tail starts there (`ctlTail`), and never probes again the slots already decided.
+ */
+function moveNext(ctl: ControlLane, to: Slot): void {
+  if (to.E > ctl.next.E)
+    ctl.counts.set(ctl.next.E, Math.max(ctl.counts.get(ctl.next.E) ?? 0, ctl.next.n));
+  ctl.next = { E: to.E, n: to.n };
+}
+
 export interface ControlHost {
   api: Api;
   mono(): number;
@@ -120,7 +138,9 @@ export async function settleControl(h: ControlHost, c: Copy): Promise<boolean> {
       ctl.queue.shift();
       if (v.kind === "invalid") {
         h.warn(v.warning);
-        ctl.next = { E: row.E, n: row.n + 1 };
+        // A row found late at an earlier era's tail lies before `next`, which stays where it is.
+        const after = { E: row.E, n: row.n + 1 };
+        if (P.posCmp(after, ctl.next) > 0) moveNext(ctl, after);
         continue;
       }
       ctl.winner = {
@@ -134,7 +154,7 @@ export async function settleControl(h: ControlHost, c: Copy): Promise<boolean> {
         processed: false,
       };
       ctl.queue.length = 0;
-      ctl.next = { E: row.E, n: row.n };
+      moveNext(ctl, row);
       ctl.pendingSince ??= h.mono();
     }
     const w = ctl.winner;

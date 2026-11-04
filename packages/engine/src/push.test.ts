@@ -89,6 +89,8 @@ function world(
   let bells: Uint8Array[] = [P.random(16), P.random(16)];
   let subscribeThrows = opts.subscribeThrows ?? false;
   let offs = 0;
+  /** holds the next push/sub request until released (it reaches the "server", and the log, only then) */
+  let held: Promise<void> | null = null;
   const manager: PushManagerLike = {
     getSubscription: async () => (current && !current.ended ? current : null),
     subscribe: async (o) => {
@@ -105,6 +107,11 @@ function world(
   const client = new PushClient({
     transport: {
       pushSub: async (b) => {
+        if (held) {
+          const h = held;
+          held = null;
+          await h;
+        }
         log.push(`sub ${b.endpoint} ${b.tokens.length}`);
         const f = failures.shift();
         if (f) throw Object.assign(new Error("failed"), f);
@@ -164,6 +171,12 @@ function world(
     },
     fail: (status: number, retryAfter: number | null = null) =>
       failures.push({ status, retryAfter }),
+    /** Holds the next push/sub request; the returned function lets it through. */
+    holdNextSub: (): (() => void) => {
+      let release = () => {};
+      held = new Promise<void>((r) => (release = r));
+      return release;
+    },
     failRing: (status: number) => ringFailures.push(status),
   };
 }
@@ -304,6 +317,51 @@ describe("PushClient", () => {
       await w.clock.advance(86_400_000);
       expect(w.log.at(-1)).toBe(`sub ${ep} 0`); // nothing more
     }
+  });
+
+  it("a sync still registering when notifications are turned off (or the user logs out) leaves them off", async () => {
+    for (const how of ["disable", "logout"] as const) {
+      const w = world();
+      await w.client.enable();
+      const ep = w.current!.endpoint;
+      // A restore's sync is registering the set (its request waits for a proof of work) when the user turns off.
+      const release = w.holdNextSub();
+      w.client.restored();
+      await w.clock.advance(0);
+      await w.client[how]();
+      expect(w.setting.on).toBe(false);
+      release();
+      await settle();
+      expect(w.setting).toEqual({ on: false, endpoint: null });
+      expect(w.current!.ended).toBe(true);
+      // Its registration may have reached the server after the empty set of the turn-off: it is deleted again.
+      const subs = w.log.filter((l) => l.startsWith(`sub ${ep}`));
+      expect(subs.at(-1)).toBe(`sub ${ep} 0`);
+      // The next start does not subscribe again.
+      w.client.restored();
+      await w.clock.advance(86_400_000);
+      expect(w.log.filter((l) => l.startsWith("subscribe"))).toHaveLength(1);
+    }
+  });
+
+  it("a sync that lost its turn leaves the setting to a later enable", async () => {
+    const w = world();
+    await w.client.enable();
+    const release = w.holdNextSub();
+    w.client.restored();
+    await w.clock.advance(0);
+    await w.client.disable();
+    // Turned on again while the old sync still waits (enable joins that sync, which then schedules a new one).
+    const on = w.client.enable();
+    await settle();
+    release();
+    await on;
+    await w.clock.advance(0);
+    expect(w.setting.on).toBe(true);
+    expect(w.current!.ended).toBe(false);
+    expect(w.setting.endpoint).toBe(w.current!.endpoint);
+    expect(w.subs.at(-1)!.endpoint).toBe(w.current!.endpoint);
+    expect(w.subs.at(-1)!.tokens).toHaveLength(2);
   });
 
   it("rings once after a put, retries once within Δ after a network error or a 5xx, never after a 4xx", async () => {

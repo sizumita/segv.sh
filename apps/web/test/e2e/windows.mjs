@@ -8,10 +8,13 @@
 // The app's passkeys are the system's (webauthn.dll), which a test cannot answer: the accounts are made on the web,
 // and the app unlocks with a recovery code, as on a new device. macOS has no such port in WKWebView, so the macOS app
 // is not driven here.
+//
+// What the system does is read through Windows PowerShell (5.1, which reaches WinRT): the browser that a link of a
+// message starts, and the notifications that the app shows with its window closed (its toast history).
 import { spawn, spawnSync } from "node:child_process";
 import { chromium } from "playwright";
 import { kill } from "./lib/server.mjs";
-import { check, problems, step, unwatch, watch } from "./lib/harness.mjs";
+import { T, check, note, problems, step, unwatch, watch } from "./lib/harness.mjs";
 import {
   accept,
   closeImage,
@@ -33,6 +36,117 @@ import {
 } from "./lib/ui.mjs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** The app's AppUserModelID, under which its toasts are kept (the installer's shortcut, src-tauri/src/lib.rs). */
+const AUMID = "sh.segv.desktop";
+/**
+ * How long the window stays closed before a message comes: longer than the 5 minutes after which Chromium throttles a
+ * hidden page's timers hardest, which the app must not depend on (docs/PROTOCOL.md §11.14 "Desktop").
+ */
+const HIDDEN_MS = Number(process.env.E2E_HIDDEN_MS ?? 6 * 60_000);
+
+/** Runs a Windows PowerShell script and returns what it printed (the script goes encoded: no quoting to get wrong). */
+function powershell(script) {
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  const r = spawnSync(
+    "powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+    {
+      encoding: "utf8",
+    },
+  );
+  if (r.status !== 0) throw new Error(`PowerShell failed: ${(r.stderr || r.stdout).trim()}`);
+  return r.stdout.trim();
+}
+
+/** Windows PowerShell's JSON of a list, which it prints as a lone object for one item. */
+const list = (json) => (json ? [JSON.parse(json)].flat() : []);
+
+const TOASTS =
+  "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; " +
+  "$h = [Windows.UI.Notifications.ToastNotificationManager]::History;";
+
+/** The app's toasts in the notification center: their tags and XML. */
+const toasts = () =>
+  list(
+    powershell(
+      `${TOASTS} ConvertTo-Json -Compress -InputObject @($h.GetHistory('${AUMID}') | ForEach-Object { @{ tag = $_.Tag; xml = $_.Content.GetXml() } })`,
+    ),
+  );
+
+const clearToasts = () => powershell(`${TOASTS} $h.Clear('${AUMID}')`);
+
+/** Lists a process's top-level windows, and closes one as its close button does (WM_CLOSE). */
+const WINDOWS = `Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class SegvWindows {
+  delegate bool EnumProc(IntPtr hwnd, IntPtr lparam);
+  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc proc, IntPtr lparam);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr hwnd, StringBuilder text, int max);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, StringBuilder text, int max);
+  [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr w, IntPtr l);
+  public static string[] Of(uint pid) {
+    var found = new List<string>();
+    EnumWindows(delegate (IntPtr h, IntPtr l) {
+      uint p;
+      GetWindowThreadProcessId(h, out p);
+      if (p == pid) {
+        var title = new StringBuilder(256);
+        GetWindowText(h, title, 256);
+        var cls = new StringBuilder(256);
+        GetClassName(h, cls, 256);
+        found.Add(h.ToInt64() + "|" + (IsWindowVisible(h) ? "visible" : "hidden") + "|" + cls + "|" + title);
+      }
+      return true;
+    }, IntPtr.Zero);
+    return found.ToArray();
+  }
+  public static bool Close(long hwnd) {
+    return PostMessage(new IntPtr(hwnd), 0x0010, IntPtr.Zero, IntPtr.Zero);
+  }
+}
+"@
+`;
+
+/** A process's top-level windows: handle, whether visible, class and title. */
+const windowsOf = (pid) =>
+  list(
+    powershell(`${WINDOWS} ConvertTo-Json -Compress -InputObject @([SegvWindows]::Of(${pid}))`),
+  ).map((line) => {
+    const [hwnd, state, cls, ...title] = String(line).split("|");
+    return { hwnd, visible: state === "visible", cls, title: title.join("|") };
+  });
+
+const describe = (ws) =>
+  ws.map((w) => `${w.hwnd} ${w.visible ? "visible" : "hidden"} ${w.cls} "${w.title}"`).join(", ") ||
+  "none";
+
+/** The processes, other than this script's, whose command line holds `text`: a browser started for a URL. */
+const processesWith = (text) =>
+  list(
+    powershell(
+      `ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*${text}*' } | ForEach-Object { @{ id = $_.ProcessId; name = $_.Name } })`,
+    ),
+  );
+
+/** Polls `fn` every 500 ms until it returns a truthy value, for at most `ms`; returns that value, or null. */
+async function until(fn, ms) {
+  const end = Date.now() + ms;
+  for (;;) {
+    const v = await fn();
+    if (v) return v;
+    if (Date.now() > end) return null;
+    await sleep(500);
+  }
+}
+
+/** The page's visibility, read without waiting for a frame (a hidden page draws none). */
+const visibility = (d) => d.page.evaluate(() => document.visibilityState);
 
 /** Starts the app with its web view's DevTools on `port`, and resolves with its page once the page has loaded. */
 async function launch(exe, port) {
@@ -71,7 +185,9 @@ async function launch(exe, port) {
       }
       await until("DevTools port");
     }
-    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
+    // No default overrides: Playwright's focus emulation would keep the page visible and focused (Chromium counts an
+    // emulated focus as a viewer) with the window closed, and the app does not notify of what is on a page in use.
+    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`, { noDefaults: true });
     for (;;) {
       const page = browser
         .contexts()
@@ -79,7 +195,7 @@ async function launch(exe, port) {
         .find((p) => p.url().startsWith("https://tauri.localhost/"));
       if (page) {
         await page.waitForLoadState("load");
-        return { page, stop: () => kill(proc) };
+        return { page, pid: proc.pid, alive: () => proc.exitCode === null, stop: () => kill(proc) };
       }
       await until("page");
     }
@@ -95,6 +211,8 @@ export async function windows({ base, browser, shots, exe, cdpPort }) {
   const t1 = `from the web secret-1 ${sfx}`;
   const t2 = `from the app secret-2 ${sfx}`;
   const t3 = `while the app runs secret-3 ${sfx}`;
+  const t4 = `while the window is closed secret-4 ${sfx}`;
+  const url = `https://example.com/segv-e2e-${sfx}`;
   const screen = (d, title) => shots.screen(d.page, title);
   let code = "";
   let B;
@@ -150,6 +268,110 @@ export async function windows({ base, browser, shots, exe, cdpPort }) {
       await settings(W);
       await screen(W, "settings");
       await closeSettings(W);
+    });
+
+    await step("a link of a message opens in the browser, not in the app", async () => {
+      await send(B, `see ${url}`);
+      await seen(W, url);
+      await W.page.locator(`.thread a[href="${url}"]`).first().click();
+      // An empty list is no browser: keep waiting for one.
+      const started = await until(() => {
+        const found = processesWith(url);
+        return found.length > 0 ? found : null;
+      }, 30_000);
+      check(started?.length > 0, `no browser started for the link`);
+      note(`started ${started.map((p) => p.name).join(", ")}`);
+      check(
+        W.page.url().startsWith("https://tauri.localhost/"),
+        `the app's window left its page: ${W.page.url()}`,
+      );
+      for (const p of started) spawnSync("taskkill", ["/pid", String(p.id), "/t", "/f"]);
+    });
+
+    await step("notifications turn on in the app, with the message shown", async () => {
+      const dialog = await settings(W);
+      await dialog.getByRole("button", { name: "turn on", exact: true }).click();
+      await dialog
+        .getByRole("button", { name: "turn off", exact: true })
+        .waitFor({ timeout: T })
+        .catch(() => {
+          throw new Error("notifications did not turn on: the system refused them");
+        });
+      await dialog.getByRole("radio", { name: /the name and the newest message/ }).check();
+      await screen(W, "settings, notifications on");
+      await closeSettings(W);
+    });
+
+    let toast;
+    await step(
+      `with its window closed for ${Math.round(HIDDEN_MS / 60_000)} min, the app gets a message and notifies of it`,
+      async () => {
+        clearToasts();
+        // What went wrong, all of it: one run tells whether the window closed, whether the page saw it, and whether
+        // the notification came anyway.
+        const failures = [];
+        // The app's window, by its title: the process has other top-level windows (the tray's, the web view's), and
+        // the one that .NET takes for its main window may be another.
+        const before = windowsOf(app.pid);
+        note(`the app's windows: ${describe(before)}`);
+        const main = before.find((w) => w.visible && w.title === "segv.sh");
+        let closed = false;
+        if (!main) failures.push(`no visible window titled "segv.sh"`);
+        else if (powershell(`${WINDOWS} [SegvWindows]::Close(${main.hwnd})`) !== "True")
+          failures.push(`could not send WM_CLOSE to ${main.hwnd}`);
+        else {
+          closed = Boolean(
+            await until(
+              () => !windowsOf(app.pid).find((w) => w.hwnd === main.hwnd)?.visible,
+              10_000,
+            ),
+          );
+          if (!closed) failures.push(`the window ${main.hwnd} did not close`);
+        }
+        const hidden = await until(async () => (await visibility(W)) === "hidden", 10_000);
+        const page = () =>
+          W.page.evaluate(
+            () => `${document.visibilityState}, ${document.hasFocus() ? "focused" : "not focused"}`,
+          );
+        if (!hidden) failures.push(`the page did not go hidden (${await page()})`);
+        note(
+          `window ${main?.hwnd ?? "-"} ${closed ? "closed" : "still shown"}; page ${await page()}; ` +
+            `the app's windows: ${describe(windowsOf(app.pid))}`,
+        );
+        await sleep(HIDDEN_MS);
+        if (hidden && (await visibility(W)) !== "hidden")
+          failures.push("the page did not stay hidden");
+        check(app.alive(), "the app quit when its window closed");
+        await send(B, t4);
+        const sent = Date.now();
+        toast = await until(() => toasts().find((n) => n.xml.includes(t4)), 30_000);
+        // The page draws nothing while hidden, but keeps its title, which counts the unread messages.
+        const title = await W.page.title();
+        if (toast) note(`notified ${Date.now() - sent} ms after the send (title "${title}")`);
+        else
+          failures.push(
+            `no notification of the message (title "${title}"); the app's notifications: ${JSON.stringify(toasts())}`,
+          );
+        check(failures.length === 0, failures.join("; "));
+      },
+    );
+
+    await step("the notification's link opens the app at the conversation", async () => {
+      const launch = /launch="([^"]+)"/.exec(toast.xml)?.[1]?.replaceAll("&amp;", "&") ?? "";
+      check(
+        /^segv:\/\/open#c\/[A-Za-z0-9_-]{12}$/.test(launch),
+        `the notification opens ${launch}`,
+      );
+      // As a click on the toast does: the system opens its link, and the app's second instance hands it over.
+      powershell(`Start-Process '${launch}'`);
+      check(
+        await until(async () => (await visibility(W)) === "visible", T),
+        "the window did not open",
+      );
+      await seen(W, t4);
+      const hash = await W.page.evaluate(() => location.hash);
+      check(launch.endsWith(hash), `the app shows ${hash}, not the conversation of ${launch}`);
+      await screen(W, "opened from a notification");
     });
 
     await step("no page errors or CSP violations", async () => {

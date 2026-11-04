@@ -1,5 +1,6 @@
 // The inbox (docs/PROTOCOL.md §10.5, §11.5): the cursor rules, the poll and the trial decryption.
 import * as P from "@segv/protocol/proto";
+import type { EngineClock, EngineTimer } from "./options";
 
 /** An inbox cursor (Ein, relIn): every row of era E with rel ≤ relIn has been processed (§7.2 HEADS, §11.5). */
 export interface InboxCursor {
@@ -73,39 +74,79 @@ export const sameThread: Decrypt = async (kemSk, E, g, rows) => {
   return out;
 };
 
-/** Trial decryption in the inbox Web Worker (packages/engine/src/inbox-worker.ts). */
-export function workerDecrypt(worker: Worker): Decrypt {
-  let seq = 0;
-  const waiting = new Map<number, (out: (Uint8Array | 0 | null)[]) => void>();
-  worker.onmessage = (ev: MessageEvent<{ id: number; out: (Uint8Array | 0 | null)[] }>) => {
-    waiting.get(ev.data.id)?.(ev.data.out);
-    waiting.delete(ev.data.id);
+/** How long the inbox worker may take to answer one page before it is given up (§11.5 step 2). */
+export const WORKER_TIMEOUT_MS = 30_000;
+
+/**
+ * Trial decryption in the inbox Web Worker (packages/engine/src/inbox-worker.ts), whose handlers are set here, once.
+ * When the worker fails (an `error` event: a script that did not load or that threw; a `messageerror`; a message it
+ * cannot be sent) or leaves a page unanswered for WORKER_TIMEOUT_MS, it is terminated, `onFail` runs, and every page
+ * still waiting, and every later one, is decrypted on the page's thread instead.
+ */
+export function workerDecrypt(worker: Worker, clock: EngineClock, onFail: () => void): Decrypt {
+  type Waiting = {
+    done(out: (Uint8Array | 0 | null)[]): void;
+    fallback(): void;
+    timer: EngineTimer;
   };
-  return (kemSk, E, g, rows) =>
-    new Promise((resolve, reject) => {
+  let seq = 0;
+  let dead = false;
+  const waiting = new Map<number, Waiting>();
+  const fail = () => {
+    if (dead) return;
+    dead = true;
+    worker.onmessage = worker.onerror = worker.onmessageerror = null;
+    worker.terminate();
+    onFail();
+    const left = [...waiting.values()];
+    waiting.clear();
+    for (const w of left) {
+      w.timer.cancel();
+      w.fallback();
+    }
+  };
+  worker.onmessage = (ev: MessageEvent<{ id: number; out: (Uint8Array | 0 | null)[] }>) => {
+    const w = waiting.get(ev.data.id);
+    if (!w) return;
+    waiting.delete(ev.data.id);
+    w.timer.cancel();
+    w.done(ev.data.out);
+  };
+  worker.onerror = fail;
+  worker.onmessageerror = fail;
+  return (kemSk, E, g, rows) => {
+    if (dead) return sameThread(kemSk, E, g, rows);
+    return new Promise((resolve, reject) => {
       const id = ++seq;
-      waiting.set(id, (out) =>
-        resolve(
-          out.map((x) => {
-            if (x === null) return null;
-            if (x === 0) return { kind: "malformed" as const };
-            try {
-              return { kind: "join" as const, join: P.parseJ(x) };
-            } catch {
-              return { kind: "malformed" as const };
-            }
-          }),
-        ),
-      );
-      worker.onerror = (e) => reject(new Error(`inbox worker failed: ${e.message}`));
-      worker.postMessage({
-        id,
-        kemSk,
-        E,
-        g,
-        rows: rows.map((r) => ({ eid: r.eid, body: r.body })),
+      waiting.set(id, {
+        done: (out) =>
+          resolve(
+            out.map((x) => {
+              if (x === null) return null;
+              if (x === 0) return { kind: "malformed" as const };
+              try {
+                return { kind: "join" as const, join: P.parseJ(x) };
+              } catch {
+                return { kind: "malformed" as const };
+              }
+            }),
+          ),
+        fallback: () => void sameThread(kemSk, E, g, rows).then(resolve, reject),
+        timer: clock.setTimer(fail, WORKER_TIMEOUT_MS),
       });
+      try {
+        worker.postMessage({
+          id,
+          kemSk,
+          E,
+          g,
+          rows: rows.map((r) => ({ eid: r.eid, body: r.body })),
+        });
+      } catch {
+        fail();
+      }
     });
+  };
 }
 
 /**

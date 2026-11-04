@@ -42,9 +42,11 @@ class FakeSocket {
 
 class FakeClock implements EngineClock {
   t = 0;
+  /** wall-clock time that passed while the system slept: no timer ran, and the monotonic clock stood still */
+  slept = 0;
   private timers: { at: number; fn: () => void; live: boolean }[] = [];
   mono = (): number => this.t;
-  wall = (): number => this.t;
+  wall = (): number => this.t + this.slept;
   setTimer(fn: () => void, ms: number): EngineTimer {
     const timer = { at: this.t + Math.max(0, ms), fn, live: true };
     this.timers.push(timer);
@@ -209,6 +211,31 @@ describe("realtime: liveness and reconnect", () => {
     clock.advance(1);
     expect(s.closed).toBe(true);
     expect(FakeSocket.all).toHaveLength(2);
+  });
+
+  it("replaces an open socket at once on a wake after the system slept", () => {
+    const first = last();
+    first.open();
+    clock.advance(45_000); // the ping at 30 s was answered
+    clock.slept += 10 * 60_000;
+    first.sent = [];
+    win.dispatchEvent(new Event("online"));
+    expect(first.sent).toEqual([]); // no probe of a socket that cannot have answered its own pings
+    expect(first.closed).toBe(true);
+    expect(FakeSocket.all).toHaveLength(2);
+    expect(states).toEqual([true, false]);
+  });
+
+  it("probes, rather than replaces, an open socket that heard from the server within two ping intervals", () => {
+    const first = last();
+    first.open();
+    clock.advance(45_000); // the pong of the ping at 30 s
+    clock.slept += 44_000; // 59 s since that pong
+    first.sent = [];
+    win.dispatchEvent(new Event("online"));
+    expect(first.sent).toEqual(["ping"]);
+    expect(FakeSocket.all).toHaveLength(1);
+    expect(first.closed).toBe(false);
   });
 
   it("gives up an attempt that has not opened within 15 s and retries it with the back-off", () => {

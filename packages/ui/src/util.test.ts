@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 import * as proto from "@segv/protocol/proto";
 import {
   HANDLE_RE,
+  MAX_EMOJI_BYTES,
   MAX_FILE_BYTES,
   MAX_MEMBERS,
   MAX_NAME,
@@ -23,6 +24,7 @@ describe("ui constants mirror proto.ts", () => {
     expect(MAX_MEMBERS).toBe(proto.MAX_MEMBERS);
     expect(MAX_NAME).toBe(proto.MAX_NAME);
     expect(MAX_FILE_BYTES).toBe(proto.FILE_MAX);
+    expect(MAX_EMOJI_BYTES).toBe(proto.MAX_EMOJI_BYTES);
   });
 });
 
