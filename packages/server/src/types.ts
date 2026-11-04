@@ -8,6 +8,7 @@
  *   BlobRegDO    "blobreg/v2/{j}"     (j = blobShard(id) of the blob id, §4.4; B of them; "blobreg/v2" is the first
  *                                     release's single registry, read-only, which the shards import from, §9.2)
  *   DirSeqDO     "dirseq/v2"          (the only writer of the directory, §9.6)
+ *   KeyDO        "keys/v2"            (the per-era inbox bucket keys kbucket_E, §9.3)
  *   ConnDO       "conn/v2/{c}"        (c = conn(ck) of the client, §4.4; C of them)
  *   FeedDO       "feed/v2/{j}"        (j = feed(T) of the topic, §4.4; F of them)
  *   CheckpointDO "ckpt/v2"
@@ -21,6 +22,7 @@ import type { ConnDO } from "./conn-do";
 import type { DirSeqDO } from "./dirseq-do";
 import type { FeedDO } from "./feed-do";
 import type { InboxDO } from "./inbox-do";
+import type { KeyDO } from "./key-do";
 import type { QuietDO } from "./quiet-do";
 import type { ShardDO } from "./shard-do";
 
@@ -217,6 +219,7 @@ export const blobRegName = (j: number): string => `blobreg/v2/${j}`;
 /** The first release's single registry: read-only, the source of each shard's import (§9.2). */
 export const BLOBREG_LEGACY_NAME = "blobreg/v2";
 export const DIRSEQ_NAME = "dirseq/v2";
+export const KEYS_NAME = "keys/v2";
 export const connName = (c: number): string => `conn/v2/${c}`;
 export const feedName = (j: number): string => `feed/v2/${j}`;
 export const CKPT_NAME = "ckpt/v2";
@@ -232,6 +235,7 @@ export const blobRegStub = (env: Env, j: number): DurableObjectStub<BlobRegDO> =
 export const blobRegLegacyStub = (env: Env): DurableObjectStub<BlobRegDO> =>
   ns<BlobRegDO>(env, "BLOBREG").getByName(BLOBREG_LEGACY_NAME);
 export const dirSeqStub = (env: Env): DurableObjectStub<DirSeqDO> => ns<DirSeqDO>(env, "DIRSEQ").getByName(DIRSEQ_NAME);
+export const keyStub = (env: Env): DurableObjectStub<KeyDO> => ns<KeyDO>(env, "KEYS").getByName(KEYS_NAME);
 export const connStub = (env: Env, c: number): DurableObjectStub<ConnDO> => ns<ConnDO>(env, "CONN").getByName(connName(c));
 export const feedStub = (env: Env, j: number): DurableObjectStub<FeedDO> => ns<FeedDO>(env, "FEED").getByName(feedName(j));
 export const ckptStub = (env: Env): DurableObjectStub<CheckpointDO> => ns<CheckpointDO>(env, "CKPT").getByName(CKPT_NAME);

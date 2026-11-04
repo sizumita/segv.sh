@@ -48,12 +48,13 @@ texts.
   row: no sender, recipient, conversation, epoch, counter, arrival order or address.
 - Clients find the rows meant for them by **computing the labels they expect and looking them up by key**. They also
   receive new rows over a WebSocket topic that they subscribe to (topics are never stored). No client downloads or
-  scans data that is not addressed to it, with one exception: first-contact invites in the global inbox (β = 0,
-  §5.3).
+  scans data that is not addressed to it, with one exception: first-contact invites in its bucket of the global
+  inbox (§5.3, §9.3).
 - Server components:
   - `S_E` **ShardDOs** per era, a power of two the deployment sets per era (`SHARD_MAP`, §9.1; 1 until it is
     raised);
-  - one **InboxDO** per era;
+  - `2^{β_E}` **InboxDOs** per era, one per inbox bucket (`INBOX_MAP`; one until it is raised, §9.3);
+  - one **KeyDO**, which holds the per-era inbox bucket keys (§9.3);
   - `B` **BlobRegDOs** (`BLOBREG_SHARDS`, a power of two fixed for the deployment, §9.2), which register R2 blobs
     and their registration time, each for the blob ids routed to it;
   - one **DirSeqDO**, the only writer of the directory (§9.6);
@@ -661,6 +662,9 @@ h(T) = HMAC(kfeed, T)[0..8]                                               the fe
 feed(T) = u64(h(T)) >> (64 − f)                                           the topic's FeedDO "feed/v2/{j}", F = 2^f (f = 0 ⇒ j = 0)
 kblob = HMAC(ROUTE_KEY, utf8("segv.sh/v2/blob"))
 blobShard(id) = u32(HMAC(kblob, id)[0..4]) >> (32 − b)                   the blob id's BlobRegDO "blobreg/v2/{j}", B = 2^b (b = 0 ⇒ j = 0)
+kbucket_E                                                                 32 random bytes per era, made and kept by the KeyDO (§9.3); never derived
+x(handle) = topBits(hpre(handle), min(32, β_E + 5))                       the inbox prefix of a handle (about K/32 users each)
+bucket(E, handle) = u32(HMAC(kbucket_E, enc("segv.sh/v2/inbox/bucket", u16 β_E, u32 x))[0..4]) mod 2^β_E     (β_E = 0 ⇒ 0)
 ```
 
 ## 5. Descriptors, joins and key bundles
@@ -743,18 +747,19 @@ J reaches its recipient by one of:
 
 J itself is not signed. Authenticity comes from `dsig` over the descriptor stored in the bundle (§6.7).
 
-### 5.3 Inbox invite (stage 1: β = 0, one bucket `0`)
+### 5.3 Inbox invite
 
 ```
-eid = random(16); bucket = 0
+eid = random(16); bucket = bucket(E, recipient's handle)      (§4.4; the sender takes it from the directory, §10.6)
 (kct, ss) = KEM.encap(kemPk_recipient)
 k    = HKDF(ss, H(kct), enc("segv.sh/v2/inv", u16 E, u32 bucket, eid), 32)
 body = kct ‖ aeadSeal(k, pad(J, [256]), aad = enc("segv.sh/v2/inv", u16 E, u32 bucket, eid))       (1416 B)
 ```
 
-`E` is the era of the InboxDO that accepts the row (the current era).
+`E` is the era of the InboxDO that accepts the row (the current era), and `bucket` the recipient's bucket of that
+era, which the invite is posted into (§10.5).
 
-**Scanning.** For every inbox row the client fetches (§11.5):
+**Scanning.** For every row the client fetches from its own bucket (§11.5), with that bucket in the context:
 
 1. `ss' = KEM.decap(kct, kemSk)`. A throw (§1.1) means "not for me".
 2. Derive `k`, then `aeadOpen`. A failure means "not for me" and is **silent**: it is the normal case, and a junk
@@ -2231,7 +2236,7 @@ shard's cid `blobreg/{j}`.
 
 **`head()`** works as for the shard. There is no enumeration RPC.
 
-### 9.3 InboxDO (`inbox/v2/{E}/{g}`, SQLite; stage 1: β = 0, g = 0, bucket 0)
+### 9.3 InboxDO (`inbox/v2/{E}/{g}`, SQLite; 2^{β_E} buckets per era, 0 ≤ g < 2^{β_E})
 
 ```sql
 CREATE TABLE meta (k TEXT PRIMARY KEY, v BLOB NOT NULL) WITHOUT ROWID;     -- 'head', 'closed_hw', 'ended',
@@ -2245,6 +2250,23 @@ CREATE INDEX inv_rel ON inv (bucket, rel, eid);
 CREATE TABLE cnt  (bucket INTEGER NOT NULL, day INTEGER NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (bucket, day)) WITHOUT ROWID;
 CREATE TABLE slot (rel INTEGER PRIMARY KEY, n INTEGER NOT NULL, root BLOB NOT NULL, head BLOB NOT NULL);
 ```
+
+**Buckets.** An era has `2^{β_E}` buckets, `0 ≤ β_E ≤ 16`, one InboxDO each, and an invite for a user goes into the
+user's bucket of the era, `bucket(E, handle)` (§4.4): a keyed hash of the top `β_E + 5` bits of the handle's `hpre`,
+under `kbucket_E`, a 32-byte secret that the KeyDO (`keys/v2`, one instance) draws at random the first time the
+Worker asks for an era in `E_now − 3 .. era(now + SKEW·1000) + 1` and keeps until the era leaves the inbox retention
+(it deletes the keys of eras below `E_now − 3` at every call; no key is made for an era with one bucket). The key is
+never derived from another secret and never leaves the server: the Worker caches it per isolate. A reader therefore
+reads one bucket of about `N_E / 2^{β_E}` users instead of every invite, while a passive P, who never holds
+`kbucket_E`, still sees every invite as one of all users; only an active P that registers accounts of its own learns
+the buckets of their prefixes (§13.1). `β_E` comes from the deployment variable `INBOX_MAP`, with the form and the
+rules of `SHARD_MAP` (§9.1): `E:B` entries, `B = 2^{β}` a power of two in 1..65536, the last entry at or below E, and
+0 without one; an entry MAY be added or changed only for eras that accept no posts yet, since readers and senders
+would otherwise compute different buckets than those the era's invites were posted into. The rule for raising it:
+`β_E = max(0, ⌊log2(N_E / K)⌋)` with `K = 2^14` and `N_E` the user count expected at `start(E)`: every bucket then
+holds about K users, the anonymity set of a passive P that learned a bucket's users some other way. Clients never
+compute buckets: the directory lists each user's bucket of `E_now − 3 .. E_now + 1` (§10.6), the sender posts into the
+recipient's, and the reader reads and watches its own.
 
 The slot clock uses milliseconds since T0 and `Δin` = `INBOX_SLOT` seconds (a deployment parameter; production 10,
 tests 1). Let `D = Δin·1000` and `ms = now − T0`. D is computed from the pinned `'slot'` once it exists; a deployment
@@ -2268,7 +2290,7 @@ rel     = max(⌊(ms + j) / D⌋ + 1, closed_hw + 1)        j uniform in [0, D),
 - **Monotonic.** `closed` MUST never decrease: every `read` and `head` reports a `closed` that is ≥ every `closed`
   reported before, before and after `ended`.
 
-**`post(E, bucket, rows: {eid, body}[])`** (1..32 rows) returns one result per row:
+**`post(E, bucket, rows: {eid, body}[])`** (1..32 rows; `bucket` is the object's own `g`) returns one result per row:
 
 - If posts are not accepted (above), the whole call returns `WRONG_ERA(era(now))`.
 - If `(bucket, eid)` exists with the same body, the row's result is its `rel` (an idempotent retry). With another body:
@@ -2278,7 +2300,7 @@ rel     = max(⌊(ms + j) / D⌋ + 1, closed_hw + 1)        j uniform in [0, D),
   against that day.
 - Otherwise insert, increment `cnt`, and return `OK(rel)`.
 
-**`read(bucket, after, limit)`** returns `{closed, rows}`:
+**`read(bucket, after, limit)`** (`bucket` the object's own `g`) returns `{closed, rows}`:
 
 - `closed` as above.
 - `rows` are those with `after < rel ≤ closed`, ordered by `(rel, eid)`.
@@ -2287,8 +2309,8 @@ rel     = max(⌊(ms + j) / D⌋ + 1, closed_hw + 1)        j uniform in [0, D),
 
 **Slot commitments.** Before `read` and `head` answer, in the transaction that persists `closed_hw`, close every slot
 with `rel ≤ closed` that has rows and no `slot` row yet. Each leaf is
-`leaf(enc("segv.sh/v2/leaf/inbox", u16 E, u32 bucket, u32 rel, eid, H(body)))`, ordered by `(eid, bucket)` (bucket
-breaks ties only in stage 2), and the chain uses `t = rel`.
+`leaf(enc("segv.sh/v2/leaf/inbox", u16 E, u32 bucket, u32 rel, eid, H(body)))`, ordered by `eid` (one bucket per
+object), and the chain uses `t = rel`.
 
 **`head(E, g)`** settles as `read` does (persisting `closed_hw` and committing slots) and returns
 `{head, t_last, ended}`: `t_last` is the `rel` of the newest slot row (0 when there is none), and `ended` says whether
@@ -2321,9 +2343,10 @@ or posts a slot holds, and nothing about a sender or a recipient (§13.1).
 **Retention.** Clients never read inbox eras older than `E_now − 3`, and the Worker answers 410 for them. The rows are
 still stored (and committed).
 
-**Size under attack.** The day cap bounds an era to 14 000 rows: 7 days of 2 000, the SKEW early window included
-(about 19.8 MB of bodies). The 4 retained eras hold at most 56 000 rows (about 79.3 MB, 56 000 X-Wing
-decapsulations). Only a device with no inbox cursor reads that much (§11.5).
+**Size under attack.** The day cap bounds a bucket's era to 14 000 rows: 7 days of 2 000, the SKEW early window
+included (about 19.8 MB of bodies). A reader's 4 retained eras hold at most 56 000 rows of its bucket (about
+79.3 MB, 56 000 X-Wing decapsulations), whatever the other buckets hold. Only a device with no inbox cursor reads that
+much (§11.5).
 
 ### 9.4 ConnDO (`conn/v2/{c}`, hibernatable WebSockets, C instances) and FeedDO (`feed/v2/{j}`, F instances)
 
@@ -2476,8 +2499,8 @@ Worker calls the DO's `ensure()` at most once per isolate (a module-level flag),
 **Collecting heads.**
 
 - Collect `(cid, head)` from:
-  - `shard/{E_now}/{i}` for every `i < S_{E_now}` (§9.1) and `inbox/{E_now}/0`;
-  - `shard/{E_now−1}/{i}` for every `i < S_{E_now−1}` and `inbox/{E_now−1}/0`, when `E_now − 1 ≥ max(E_FIRST, 0)`,
+  - `shard/{E_now}/{i}` for every `i < S_{E_now}` (§9.1) and `inbox/{E_now}/{g}` for every `g < 2^{β_{E_now}}` (§9.3);
+  - those of era `E_now − 1`, when `E_now − 1 ≥ max(E_FIRST, 0)`,
     until the component reports
     `sealed` (shard) or `ended` (inbox) and that final head has appeared once; then `final:<cid>` is persisted in the
     same transaction as that checkpoint (alone when `hd` is unchanged) and the cid is no longer collected. Eras before
@@ -3201,18 +3224,20 @@ it never ends a dense prefix) and MUST ask for the key again in a later request.
 ### 10.5 Inbox
 
 `POST /api/v2/inbox` (binary; PoW `inbox`, priced by the body length; `RL_INBOX`, one token per request; body =
-exactly `7 + 1432·count` B, at most 45 831 B):
+exactly `3 + 1436·count` B, at most 45 955 B):
 
 ```
-request  = u16 E | u32 bucket | u8 count (1..32) | (eid[16] | body[1416]) × count
+request  = u16 E | u8 count (1..32) | (u32 bucket | eid[16] | body[1416]) × count
 response = 200, JSON {"results": [{"rel": <u32>} | {"error": "conflict"} | {"error": "full"}, …]}     same order
 ```
 
-One request carries the invites of one delivery burst (§6.12), so a 32-member creation needs one request, not 31.
-Errors:
+Each row names its recipient's bucket of E (§5.3, §10.6). One request carries the invites of one delivery burst
+(§6.12), whatever their buckets, so a 32-member creation needs one request, not 31: the Worker hands each bucket's
+rows to its InboxDO together, and answers in request order. Errors:
 
-- 400: `bucket ≠ 0` in stage 1, a bad count, or a bad length.
-- 409: `{error: "wrong era", era}` when E is not accepted (§9.3, §9.7).
+- 400: a `bucket` at or above `2^{β_E}` (§9.3), a bad count, or a bad length.
+- 409: `{error: "wrong era", era}` when E is not accepted (§9.3, §9.7) by any of the objects called (the rows the
+  others accepted are returned again by a retry: posts are eid-idempotent).
 - Per row: `conflict` (the eid is taken with another body) and `full` (the day cap).
 
 `GET /api/v2/inbox/{E}/{bucket}?after=<rel>&limit=<1..1024, default 1024>` (binary; `RL_READ`):
@@ -3231,7 +3256,7 @@ that holds no row with `rel > after` is a failed read.
 Errors, checked in this order before any cache lookup, rate limit or DO call (`E_now = era(Worker now)`):
 
 1. 400 for a path whose E is above 0xFFFE or whose bucket is not a u32;
-2. 400 for `bucket ≠ 0`;
+2. 400 for a `bucket` at or above `2^{β_E}` (§9.3);
 3. 400 for `E > era(now + SKEW)`;
 4. 410 for `E < E_now − 3`, also when E is below `E_FIRST`;
 5. 404 for `E_now − 3 ≤ E < E_FIRST`;
@@ -3315,7 +3340,12 @@ Cache rules:
   time (then a MEMBER record is written, §7.3). Commits and J deliveries take every other `kemPk` from the bundles
   (§5.4, §6.12).
   Restores and catch-ups use MEMBER records and make no lookup for known members (§11.4).
-- Response: `{"p": p, "users": [{"uid", "handle", "bundle", "sig", "regEra", "dirseq"}], "more": bool}`.
+- Response: `{"p": p, "users": [{"uid", "handle", "bundle", "sig", "regEra", "dirseq", "inbox"}], "more": bool}`, where
+  `inbox` is `[{"E": E, "g": g}, …]` for `E = E_now − 3 .. E_now + 1` within `E_FIRST..0xFFFE`, `g =
+  bucket(E, handle)` (§9.3): the user's inbox bucket of each era a reader reads (§11.5) or a sender posts into. A sender
+  takes a recipient's bucket from here (§6.12 step 2: from its entry, looked up by uid prefix when the session holds
+  none, and again, fresh, when the entry does not cover the era), and a reader takes its own from
+  `GET /api/v2/dir/uid/{uid}`.
 - Clients MUST verify every bundle they use (`verifyBundle`, `checkUserKeys`, `uid` and `handle` match), filter
   locally, and compare with their CONTACT and MEMBER pins (§7.3).
 - **Transient failures.** Only a complete answer (every page fetched, the last with `more = false`) that lacks the
@@ -3332,8 +3362,8 @@ Cache rules:
   complete is retried, or fails the operation with that error; it never makes a handle unknown (§6.1 step 1, §6.3) or a
   member unknown (§11.2), and a join that needs the lookup is parked (§6.7).
 
-**`GET /api/v2/dir/uid/{uid}`** is the exact lookup of one user. Clients use it only for their own account.
-Response: `{"user": {…} }`, or 404.
+**`GET /api/v2/dir/uid/{uid}`** is the exact lookup of one user, in the same shape (`inbox` included). Clients use it
+only for their own account: at unlock, and for their own inbox buckets (§11.5). Response: `{"user": {…} }`, or 404.
 
 **`GET /api/v2/dir/wraps/{id}[?uid=<b64u>]`** returns `{"wraps": [{"uid", "record", "sig", "dirseq"}]}`:
 
@@ -3447,11 +3477,12 @@ costs a catch-up (§11.6), never a lost row.
 - On reconnect, send RESUME, and SUB any further topics.
 - Send NOTES on every socket: right after its RESUME, or as its first frame when it sends none. On a NOTE frame for
   `Tself`, apply the note (§11.16); ignore a NOTE frame for any other topic.
-- Subscribe, on the first socket and right after `Tself` in priority, to the notice topics `Tinbox(E, 0)` (§9.3) of
-  the eras `E_now − 1`, `E_now` and `E_now + 1` that lie in `max(E_FIRST, E_now − 3)..0xFFFE`, and recompute that set
-  at least every 300 s (the era changes once a week). On an INBOX frame for one of them, poll the inbox (§11.5); when
-  the poll's read of that era reports `closed < rel`, poll once more after Δin. Ignore an INBOX frame for any other
-  bucket.
+- Subscribe, on the first socket and right after `Tself` in priority, to the notice topics `Tinbox(E, g_E)` (§9.3) of
+  the eras `E_now − 1`, `E_now` and `E_now + 1` that lie in `max(E_FIRST, E_now − 3)..0xFFFE`, with `g_E` the
+  account's own bucket of E (from its directory entry, §10.6, §11.5; an era whose bucket is not known yet is left out
+  until it is), and recompute that set at least every 300 s (the era changes once a week). On an INBOX frame for one
+  of them, poll the inbox (§11.5); when the poll's read of that era reports `closed < rel`, poll once more after Δin.
+  Ignore an INBOX frame for any other bucket.
 - After GAP, run catch-up (§11.6). After a SUB of a topic that was not subscribed before, run a one-shot probe of that
   topic's expected slots, since rows published before the SUB are not replayed.
 - Reconnect with backoff of 1 s, doubling to 30 s, with jitter. After a close with 1008 or 1013, wait at least 60 s and
@@ -3469,15 +3500,16 @@ costs a catch-up (§11.6), never a lost row.
 
 ```json
 {"v":2, "now":<ms>, "T0":1767639600000, "eraMs":604800000, "era":<E_now>, "delta":Δ, "skew":SKEW,
- "inboxSlot":Δin, "inboxRetention":4, "inboxDayCap":2000, "inboxBatch":32, "shards":S_E_now, "p":P, "efirst":E_FIRST,
+ "inboxSlot":Δin, "inboxRetention":4, "inboxDayCap":2000, "inboxBatch":32, "shards":S_E_now, "inboxBuckets":2^β_E_now,
+ "p":P, "efirst":E_FIRST,
  "kcommit":"<b64u kcommit_E_now>", "srvKey":"<b64u Ed25519 pk>",
  "pow":{"register":20,"wrap":18,"put":16,"inbox":18,"blob":18},
  "limits":{"putRows":16,"putBytes":263345,"getKeys":256,"topics":256,"blobMax":12582912,"textMax":12000}}
 ```
 
 `p` is `P` as §9.6 says; during a D1 outage it may be a stale value or 0, and params never fails because of D1.
-Clients bound it from below by the dirlog size (`P*`, §10.6). `shards` is `S_{E_now}` (§9.1): a client needs it for
-nothing and accepts any value in 1..65536.
+Clients bound it from below by the dirlog size (`P*`, §10.6). `shards` is `S_{E_now}` (§9.1) and `inboxBuckets` is `2^{β_{E_now}}`
+(§9.3): a client needs them for nothing and accepts any value in 1..65536.
 
 A deployment whose push is on (§9.8) also reports `"push":{"window":60,"maxTokens":256}` and `pow.push`, and in `push`
 the transports that are on: `"vapid":"<b64u 65-byte P-256 public key>"` while Web Push is on, `"apns":["<topic>", …]`
@@ -3489,7 +3521,7 @@ integer, or that comes without `pow.push`, as no push; a native app does the sam
 does not list its bundle ID, or an `fcm` that is not its project.
 
 **`GET /api/v2/era/{E}`** (JSON; `RL_READ`) returns `{"era": E, "start": start(E), "end": end(E), "delta": Δ,
-"shards": S_E, "kcommit": b64u(kcommit_E), "sealed": bool}`. `start` and `end` (§3.1) are Unix milliseconds, the unit of
+"shards": S_E, "inboxBuckets": 2^{β_E}, "kcommit": b64u(kcommit_E), "sealed": bool}`. `start` and `end` (§3.1) are Unix milliseconds, the unit of
 params `T0` and `now`; `delta` is in seconds. The Worker answers it alone and MUST NOT address any Durable Object for
 it. `E > era(now + SKEW·1000)` or `E < E_FIRST` → 404 (§9.7); a malformed E → 400. `sealed = (now ≥ end(E) +
 SKEW·1000)` by the Worker's clock: by the SKEW bound no component of era E accepts a write from then on, so every field
@@ -4093,10 +4125,16 @@ down), and after unlock (§11.4 step 7). Nothing polls at the slot cadence: a no
 one read per notice instead of one per slot per client.
 
 1. Let `(Ec, rc)` be the cursor. For each era E from `max(Ec, E_now − 3)` to `era(server now)` (from params or
-   `x-segv-now`): `GET …/inbox/{E}/0?after=a` until `more = 0`, with `a = rc` for `E = Ec` and `a = 0` for every later
-   era. A 410 moves the cursor to `(max(E_FIRST, E_now − 3), 0)`. Without a cursor (the self lane holds no HEADS
-   record), start at the registration cursor with `t_r = start(regEra)` (below).
-2. Trial-decrypt each row (§5.3), in chunks in a Web Worker, so the page stays responsive. A decapsulation that throws
+   `x-segv-now`): `GET …/inbox/{E}/{g_E}?after=a` until `more = 0`, with `g_E` the account's own bucket of E and
+   `a = rc` for `E = Ec` and `a = 0` for every later era. The account's buckets come from its own entry
+   (`GET /api/v2/dir/uid/{uid}`, §10.6: the lookup of §11.1 step 2 already gives them; it is made again when an
+   era's bucket is not known, once the era moved on); while a bucket stays unknown the poll
+   fails like a transient error (and the era's notice topic is not subscribed, §10.8). A bucket is a function of the
+   era and the handle, so the cursor needs no bucket. A 410 moves the cursor to `(max(E_FIRST, E_now − 3), 0)`.
+   Without a cursor (the self lane holds no HEADS record), start at the registration cursor with `t_r = start(regEra)`
+   (below).
+2. Trial-decrypt each row (§5.3, with the bucket it was read from), in chunks in a Web Worker, so the page stays
+   responsive. A decapsulation that throws
    means "not for me". Process each J (§6.7). Joins found in one poll are processed one after the other, each after
    the held copies of its conversation are caught up and settled (§6.7 step 4). A J of a conversation of which an
    earlier J of the same poll created a copy is parked, with the cursor before it, until the next poll, when that copy
@@ -4916,7 +4954,7 @@ are kept. Critical warnings are kept until sign-out.
 | linkage | P / P\* (public archive, public API) | O (operator, direct TLS) | M (member) | N (push service) |
 | ------- | ------------------------------------ | ------------------------ | ---------- | ---------------- |
 | message ↔ sender | None: no sender column, the signature is inside the AEAD, writes are anonymous. Only Δ-rounded `t` and the class. | The writer's IP for every put, which with an IP-to-account match (unlock, own-bundle lookup) gives the account. | Verifiable, not deniable. | — |
-| message ↔ recipients | None for rows. Inbox invite: one of all users (β = 0), even against a quantum P. | Exactly, through the socket's topic set and the labels each client fetches. | The member list. | — |
+| message ↔ recipients | None for rows. Inbox invite: one of all users while an era has one bucket, even against a quantum P. With buckets (§9.3), the invite's bucket is public, and its users are about `N_E / 2^{β_E} ≥ K` of them, but which users needs `kbucket_E`, which P never holds: a passive P still sees one of all users; an active P that registers accounts learns the buckets of their prefixes, and narrows the invites of those buckets to the users it knows there. | Exactly, through the socket's topic set and the labels each client fetches; an invite's bucket, which O can compute from any handle anyway. | The member list. | — |
 | message ↔ message (same conversation) | No identifiers. Rows in the same Δ batch and rare classes are visible. With few shards and low traffic, timing correlation is strong. | Exactly: same topic, same IP. | Everything. | — |
 | user ↔ conversation | None. The directory reveals that the account exists and when it registered (the client's `ts`, and the minute through the dirlog head in checkpoints). | The topic set and fetch pattern per socket / IP, linked to the uid at unlock. | Co-members of shared conversations. | — |
 | user ↔ user | None. Global inbox counts per slot are public. | The whole social graph, including a p-bit prefix of every handle and co-member lookup (§13.2 item 10). | Co-members only. | — |
@@ -5018,7 +5056,7 @@ Each item is a deliberate trade-off that stage 2 or 3 addresses. None is silent.
     anonymity set is about 64–128 accounts at honest `P` (all accounts while there are fewer than 64). The client
     bounds `p` by the public dirlog size (§10.6), so O can shrink the set only by inflating the audited dirlog.
 11. **A third party can delay first contact and inbox deliveries.** v1 had no global quota. Stage 1's inbox has one
-    global day cap (2 000, β = 0). Anyone who fills it with PoW-priced invites makes first contacts, and adds of
+    day cap per bucket (2 000; one bucket until `INBOX_MAP` raises it, §9.3). Anyone who fills it with PoW-priced invites makes first contacts, and adds of
     members without a 1:1, wait until the next day, and an attacker who refills the cap right after every day rollover
     (about 2.6·10^8 SHA-256 of PoW per day, spread over a few IPs) delays them for as long as it keeps doing so: honest
     retries back off up to 10 minutes and rarely land in the first seconds of a day. Committers retry (§6.12), and
@@ -5268,7 +5306,7 @@ A native app (§11.14) changes whom a user trusts for the client's code, and add
   can no longer register under others' bells, and the bell index (the BellDOs, §9.8) goes away;
 - a separate `segv-rt` Worker for the realtime path, and Bloom-filtered fan-out from the FeedDOs.
 
-**Inbox:** β > 0 buckets aligned to handle prefixes, dynamic inbox pricing, and the link-only flag (`flags.bit0`).
+**Inbox:** dynamic inbox pricing, and the link-only flag (`flags.bit0`).
 
 **Groups:**
 

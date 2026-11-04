@@ -2,8 +2,9 @@
  * Deployment parameters and server secrets for the v2 API (docs/PROTOCOL.md §3.1, §4.4, §9.5, §9.7).
  *
  * Vars (wrangler.jsonc "vars", strings): DELTA_S (Δ), SKEW_S (SKEW), INBOX_SLOT_S (Δin), E_FIRST, RT_CONNS (C),
- * RT_FEEDS (F, a power of two; §9.4), BLOBREG_SHARDS (B, a power of two, a constant of the deployment; §9.2) and
- * SHARD_MAP (the shard count per era, "E:S" entries; §9.1). A var that is present but invalid (not decimal, out of
+ * RT_FEEDS (F, a power of two; §9.4), BLOBREG_SHARDS (B, a power of two, a constant of the deployment; §9.2),
+ * SHARD_MAP (the shard count per era, "E:S" entries; §9.1) and INBOX_MAP (the inbox bucket count per era, the same
+ * form; §9.3). A var that is present but invalid (not decimal, out of
  * range, a Δ that does not divide 604 800, a malformed shard map) makes the Worker answer 503 "server misconfigured"
  * on /api/v2/* (v2ParamsValid() is false); v2Params() falls back to the default.
  * Secrets: ROUTE_KEY (32 bytes, b64u) and SRV_KEY (32-byte Ed25519 seed, b64u). When either is missing or
@@ -31,6 +32,8 @@ export interface V2Params {
   blobShards: number;
   /** The shard map (§9.1): entries ascending by `from`; s_E is the `bits` of the last entry at or below E, 0 without one. */
   shardMap: ShardMapEntry[];
+  /** The inbox bucket map (§9.3 "Buckets"), the same form: β_E is the `bits` of the last entry at or below E. */
+  inboxMap: ShardMapEntry[];
 }
 
 /** One SHARD_MAP entry: from era `from` on, 2^bits shards per era. */
@@ -81,6 +84,10 @@ export const shardsOf = (map: readonly ShardMapEntry[], E: number): number => 2 
 /** b of the blob registry: B = 2^b shards (§9.2). */
 export const blobBitsOf = (B: number): number => 31 - Math.clz32(B);
 
+/** β_E: the bits of the last INBOX_MAP entry at or below E (0 when there is none); 2^β_E inbox buckets (§9.3). */
+export const inboxBitsOf = (map: readonly ShardMapEntry[], E: number): number => shardBitsOf(map, E);
+export const inboxBucketsOf = (map: readonly ShardMapEntry[], E: number): number => 2 ** inboxBitsOf(map, E);
+
 /** Inbox constants (§9.3, §10.9). */
 export const INBOX_DAY_CAP = 2000;
 export const INBOX_RETENTION = 4;
@@ -97,7 +104,7 @@ interface VarSpec {
 /** Seconds per era. */
 const ERA_S = ERA_MS / 1000;
 
-const VARS: Readonly<Record<Exclude<keyof V2Params, "shardMap">, VarSpec>> = {
+const VARS: Readonly<Record<Exclude<keyof V2Params, "shardMap" | "inboxMap">, VarSpec>> = {
   // Δ must divide 604 800: the first rows of an era get t = sec(start(E)), and a BlobReg MISS at now ≥ t_row is
   // final (§6.4(g)) only if tpub(now) ≥ t_row, i.e. only if every sec(start(E)) is a multiple of Δ.
   delta: { name: "DELTA_S", dflt: 10, min: 1, max: 3600, ok: (n) => ERA_S % n === 0 },
@@ -131,18 +138,21 @@ export function v2Params(env: Env): V2Params {
     rtFeeds: get(VARS.rtFeeds),
     blobShards: get(VARS.blobShards),
     shardMap: parseShardMap((env as unknown as Record<string, unknown>).SHARD_MAP) ?? [],
+    inboxMap: parseShardMap((env as unknown as Record<string, unknown>).INBOX_MAP) ?? [],
   };
 }
 
 /**
  * False when a deployment var is present but invalid (not decimal, out of range, a DELTA_S that does not divide
- * 604 800, an RT_FEEDS or BLOBREG_SHARDS that is not a power of two, or a malformed SHARD_MAP): the Worker then answers 503 "server
+ * 604 800, an RT_FEEDS or BLOBREG_SHARDS that is not a power of two, or a malformed SHARD_MAP or INBOX_MAP): the Worker
+ * then answers 503 "server
  * misconfigured" on /api/v2/* instead of running on a fallback.
  */
 export function v2ParamsValid(env: Env): boolean {
   return (
     Object.values(VARS).every((v) => intVar(env, v) !== null) &&
-    parseShardMap((env as unknown as Record<string, unknown>).SHARD_MAP) !== null
+    parseShardMap((env as unknown as Record<string, unknown>).SHARD_MAP) !== null &&
+    parseShardMap((env as unknown as Record<string, unknown>).INBOX_MAP) !== null
   );
 }
 

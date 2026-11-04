@@ -6,7 +6,7 @@
  *    constructor arms it (inside blockConcurrencyWhile) when no alarm is set; the Worker calls ensure() once per
  *    isolate just to wake the object, and ensure() writes nothing while an alarm is scheduled.
  *  - tick() collects (cid, head) from shard/{E_now}/{i} for every i < S_{E_now} (the shard map, §9.1) and
- *    inbox/{E_now}/0; from shard/{E_now−1}/{i} and inbox/{E_now−1}/0 until they are sealed and their final head
+ *    inbox/{E_now}/{g} for every g < 2^β_{E_now} (§9.3); from those of E_now−1 until they are sealed and their final head
  *    appeared once ('final:<cid>'); from the B blob registry shards once per UTC hour, as one value that mixes the
  *    hour in ('blobreg:hour', 'blobreg:head', each shard's last head 'blobreg:head:<j>'); and from the D1 dirlog
  *    (ZERO32 when the table is missing or empty). At most 32 component calls
@@ -42,7 +42,7 @@ import {
 } from "@segv/protocol/proto";
 import { errMsg, logErr } from "./http";
 import { Meta, ab } from "./batch";
-import { serverKeys, shardsOf, srvSign, v2Params } from "./env";
+import { inboxBucketsOf, serverKeys, shardsOf, srvSign, v2Params } from "./env";
 import { blobRegStub, inboxStub, shardStub, type CkptRange, type CkptRecord } from "./types";
 
 const PERIOD_MS = 60_000;
@@ -130,6 +130,8 @@ export class CheckpointDO extends DurableObject<Env> {
   protected sweepShards = SWEEP_SHARDS;
   /** B, the registry shard count (§9.2); an instance field so tests can set it without a deployment variable. */
   protected blobShards = (): number => v2Params(this.env).blobShards;
+  /** 2^β_E, the inbox buckets of an era (§9.3); an instance field so tests can set it without a deployment variable. */
+  protected inboxBucketsOf = (E: number): number => inboxBucketsOf(v2Params(this.env).inboxMap, E);
 
   private readonly sql: SqlStorage;
   private readonly kv: Meta;
@@ -260,11 +262,11 @@ export class CheckpointDO extends DurableObject<Env> {
         keep(cid, e);
       }
     };
-    const inbox = async (Ec: number, previous: boolean): Promise<void> => {
-      const cid = inboxCid(Ec, 0);
+    const inbox = async (Ec: number, g: number, previous: boolean): Promise<void> => {
+      const cid = inboxCid(Ec, g);
       if (previous && this.kv.num(`final:${cid}`) !== null) return;
       try {
-        const h = await this.timed(Promise.resolve(inboxStub(this.env, Ec, 0).head(Ec, 0)));
+        const h = await this.timed(Promise.resolve(inboxStub(this.env, Ec, g).head(Ec, g)));
         heads.set(cid, new Uint8Array(h.head));
         if (previous && h.ended) metaWrites.set(`final:${cid}`, 1);
       } catch (e) {
@@ -316,10 +318,11 @@ export class CheckpointDO extends DurableObject<Env> {
 
     const jobs: (() => Promise<void>)[] = [];
     for (let i = 0; i < this.shardsOf(E); i++) jobs.push(() => shard(E, i, false));
-    jobs.push(() => inbox(E, false), blobreg, dirlog);
+    for (let g = 0; g < this.inboxBucketsOf(E); g++) jobs.push(() => inbox(E, g, false));
+    jobs.push(blobreg, dirlog);
     if (E - 1 >= Math.max(eFirst, 0)) {
       for (let i = 0; i < this.shardsOf(E - 1); i++) jobs.push(() => shard(E - 1, i, true));
-      jobs.push(() => inbox(E - 1, true));
+      for (let g = 0; g < this.inboxBucketsOf(E - 1); g++) jobs.push(() => inbox(E - 1, g, true));
     }
     await pool(jobs, COLLECT_CONCURRENCY);
     await this.sweep(now, E, eFirst, metaWrites);

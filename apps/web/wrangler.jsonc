@@ -47,7 +47,8 @@
   "triggers": { "crons": ["17 3 * * *"] },
   // docs/PROTOCOL.md §9: SHARD "shard/v2/{E}/{i}" and INBOX "inbox/v2/{E}/{g}" per era, BLOBREG
   // "blobreg/v2/{j}" (BLOBREG_SHARDS of them; "blobreg/v2" is the first release's registry, which they import from,
-  // §9.2), DIRSEQ "dirseq/v2" (the only writer of the directory, §9.6), CONN "conn/v2/{c}" (the realtime WebSockets,
+  // §9.2), DIRSEQ "dirseq/v2" (the only writer of the directory, §9.6), KEYS "keys/v2" (the per-era inbox bucket
+  // keys, §9.3), CONN "conn/v2/{c}" (the realtime WebSockets,
   // RT_CONNS of them) and FEED "feed/v2/{j}" (topic fan-out to the ConnDOs, RT_FEEDS of them; §9.4), CKPT "ckpt/v2"
   // (signed checkpoints every 60 s), BELL "bell/v2/{j}" and QUIET "quiet/v2/{k}" (push: the bell index and each
   // account's window, hold and seen marks, memory only, PUSH_SHARDS of each; addressed only while push is on, §9.8).
@@ -56,6 +57,7 @@
       { "name": "SHARD", "class_name": "ShardDO" },
       { "name": "BLOBREG", "class_name": "BlobRegDO" },
       { "name": "DIRSEQ", "class_name": "DirSeqDO" },
+      { "name": "KEYS", "class_name": "KeyDO" },
       { "name": "INBOX", "class_name": "InboxDO" },
       { "name": "CONN", "class_name": "ConnDO" },
       { "name": "FEED", "class_name": "FeedDO" },
@@ -81,6 +83,8 @@
     },
     // The directory's single writer (§9.6). The blob registry's shards are more objects of the existing BlobRegDO.
     { "tag": "v4", "new_sqlite_classes": ["DirSeqDO"] },
+    // The per-era inbox bucket keys (§9.3 "Buckets").
+    { "tag": "v5", "new_sqlite_classes": ["KeyDO"] },
   ],
   // Per-IP (IPv6 /64) abuse limits. Keys are never persisted. Period must be 10 or 60 seconds.
   "ratelimits": [
@@ -110,7 +114,9 @@
     // (S a power of two), in effect from era E on; unset = one shard per era. Add an entry only for an era that
     // has not started; never change the count of an era that accepts writes. BLOBREG_SHARDS (§9.2) = the number
     // of blob registry objects, a power of two: a constant of the deployment, never changed once a blob is
-    // registered (ids would route to another object).
+    // registered (ids would route to another object). INBOX_MAP (optional, §9.3) = the inbox bucket count per era,
+    // "E:B" entries like SHARD_MAP (B a power of two; unset = one bucket): raise it for an era that has not started
+    // once the user count passes 2 · 16 384 · B, never for one that accepts posts.
     // Secrets (wrangler secret put; .dev.vars for vp dev): ROUTE_KEY (32 B b64u), SRV_KEY (Ed25519 seed b64u).
     // Web Push is off unless the secrets VAPID_SK (P-256 scalar, 32 B b64u) and PUSH_KEY (32 B b64u) are set, with
     // VAPID_SUB (mailto: or https: contact). Optional: PUSH_HOSTS, POW_PUSH (20), PUSH_SHARDS (1). An invalid push
@@ -185,6 +191,7 @@
           { "name": "SHARD", "class_name": "ShardDO" },
           { "name": "BLOBREG", "class_name": "BlobRegDO" },
           { "name": "DIRSEQ", "class_name": "DirSeqDO" },
+          { "name": "KEYS", "class_name": "KeyDO" },
           { "name": "INBOX", "class_name": "InboxDO" },
           { "name": "CONN", "class_name": "ConnDO" },
           { "name": "FEED", "class_name": "FeedDO" },

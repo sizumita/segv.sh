@@ -1,4 +1,5 @@
 // Deliveries, WELCOMEs, parked joins and stale times (docs/PROTOCOL.md §6.1, §6.7, §6.11, §6.12, §10.1).
+import * as W from "@segv/protocol/wire";
 import { describe, expect, it } from "vite-plus/test";
 import { notNotified } from "../src/deliver";
 import {
@@ -24,7 +25,7 @@ freshWorldPerTest();
 const postSizes = () =>
   server()
     .requests.filter((r) => r.method === "POST" && r.path === "/api/v2/inbox" && r.status === 200)
-    .map((r) => (r.reqBytes - 7) / 1432);
+    .map((r) => (r.reqBytes - 3) / W.INBOX_POST_ROW_LEN);
 
 describe("creation crash and resume", () => {
   it("a second device of the creator delivers J after RESUME_AFTER; the invitee holds the conversation", async () => {

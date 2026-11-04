@@ -52,18 +52,22 @@ export const MALFORMED_INVITE = "ignored a malformed conversation key";
 /** Rows trial-decrypted between two yields to the event loop (§11.5 step 2, same thread). */
 const DECRYPT_CHUNK = 8;
 
-/** Trial decryption of one page's rows (§5.3): the J, "malformed", or null (not for this key), in row order. */
+/**
+ * Trial decryption of one page's rows (§5.3), read from bucket g of era E: the J, "malformed", or null (not for this
+ * key), in row order.
+ */
 export type Decrypt = (
   kemSk: Uint8Array,
   E: number,
+  g: number,
   rows: readonly { eid: Uint8Array; body: Uint8Array }[],
 ) => Promise<(P.JoinOpen | null)[]>;
 
 /** Trial decryption on the page's thread, yielding to the event loop every few rows (the engine tests' path). */
-export const sameThread: Decrypt = async (kemSk, E, rows) => {
+export const sameThread: Decrypt = async (kemSk, E, g, rows) => {
   const out: (P.JoinOpen | null)[] = [];
   for (let i = 0; i < rows.length; i++) {
-    out.push(P.tryOpenInvite(kemSk, E, 0, rows[i].eid, rows[i].body));
+    out.push(P.tryOpenInvite(kemSk, E, g, rows[i].eid, rows[i].body));
     if ((i + 1) % DECRYPT_CHUNK === 0) await new Promise((res) => setTimeout(res, 0));
   }
   return out;
@@ -77,7 +81,7 @@ export function workerDecrypt(worker: Worker): Decrypt {
     waiting.get(ev.data.id)?.(ev.data.out);
     waiting.delete(ev.data.id);
   };
-  return (kemSk, E, rows) =>
+  return (kemSk, E, g, rows) =>
     new Promise((resolve, reject) => {
       const id = ++seq;
       waiting.set(id, (out) =>
@@ -94,20 +98,29 @@ export function workerDecrypt(worker: Worker): Decrypt {
         ),
       );
       worker.onerror = (e) => reject(new Error(`inbox worker failed: ${e.message}`));
-      worker.postMessage({ id, kemSk, E, rows: rows.map((r) => ({ eid: r.eid, body: r.body })) });
+      worker.postMessage({
+        id,
+        kemSk,
+        E,
+        g,
+        rows: rows.map((r) => ({ eid: r.eid, body: r.body })),
+      });
     });
 }
 
 /**
  * Reads the inbox from `cursor` (or, without one, from the registration rule with `t_r = start(regEra)`) up
- * to the current era and trial-decrypts every row (§11.5 steps 1–2, §5.3). Rows with `rel ≤ after` or above the
- * reported `closed` are ignored (§10.5). Errors are thrown (the caller retries later); a 410 skips that era.
+ * to the current era and trial-decrypts every row (§11.5 steps 1–2, §5.3): of each era, the account's own bucket,
+ * `bucketOf(E)` (§9.3 "Buckets"; it throws when the bucket is not known, which fails the poll like any transient
+ * error). Rows with `rel ≤ after` or above the reported `closed` are ignored (§10.5). Errors are thrown (the caller
+ * retries later); a 410 skips that era.
  */
 export async function scanInbox(
   api: {
     serverNow(): number;
     readInbox(
       E: number,
+      g: number,
       after: number,
     ): Promise<{
       closed: number;
@@ -120,6 +133,7 @@ export async function scanInbox(
   p: { skew: number; inboxSlot: number; efirst: number },
   regEra: number,
   warn: (text: string) => void,
+  bucketOf: (E: number) => Promise<number>,
   decrypt: Decrypt = sameThread,
 ): Promise<InboxScan> {
   const Enow = P.era(api.serverNow());
@@ -135,11 +149,12 @@ export async function scanInbox(
     let page: Awaited<ReturnType<typeof api.readInbox>>;
     let closed = after;
     try {
+      const g = await bucketOf(E);
       for (;;) {
-        page = await api.readInbox(E, after);
+        page = await api.readInbox(E, g, after);
         const closedNow = page.closed;
         const rows = page.rows.filter((r) => r.rel > after && r.rel <= closedNow);
-        const opened = await decrypt(kemSk, E, rows);
+        const opened = await decrypt(kemSk, E, g, rows);
         rows.forEach((r, i) => {
           const o = opened[i];
           if (!o) return;

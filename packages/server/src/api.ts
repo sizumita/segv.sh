@@ -29,6 +29,9 @@ import {
   eraStart,
   era,
   hex,
+  hpre,
+  inboxBucketOf,
+  inboxPrefixOf,
   quietTag,
   receiptMsg,
   connOf,
@@ -86,6 +89,7 @@ import {
   dirRegister,
   dirWrapsById,
   dirlogPage,
+  type DirUser,
 } from "./directory";
 import {
   INBOX_BATCH,
@@ -104,6 +108,8 @@ import {
   type ServerKeys,
   type V2Params,
   blobBitsOf,
+  inboxBitsOf,
+  inboxBucketsOf,
   shardBitsOf,
   shardsOf,
 } from "./env";
@@ -129,12 +135,14 @@ import {
   blobRegStub,
   ckptStub,
   inboxStub,
+  keyStub,
   quietStub,
   connStub,
   feedStub,
   shardStub,
   type BlobMeta,
   type CkptRecord,
+  type InboxRowResult,
   type RtPublishRow,
   type ShardFeedBatches,
   type ShardFeedRow,
@@ -304,6 +312,7 @@ async function params(c: Ctx): Promise<Response> {
     inboxDayCap: INBOX_DAY_CAP,
     inboxBatch: INBOX_BATCH,
     shards: shardsOf(c.params.shardMap, E),
+    inboxBuckets: inboxBucketsOf(c.params.inboxMap, E),
     p,
     efirst: c.params.eFirst,
     kcommit: enc64(kcommitFor(c.keys, E)),
@@ -338,6 +347,7 @@ async function eraInfo(c: Ctx, E: number): Promise<Response> {
       end: eraEnd(E),
       delta: c.params.delta,
       shards: shardsOf(c.params.shardMap, E),
+      inboxBuckets: inboxBucketsOf(c.params.inboxMap, E),
       kcommit: enc64(kcommitFor(c.keys, E)),
       sealed,
     },
@@ -558,12 +568,32 @@ async function inboxPost(c: Ctx): Promise<Response> {
     if (e instanceof WireError) throw new HttpError(400, `bad inbox post: ${e.message}`);
     throw e;
   }
-  if (post.bucket !== 0) throw new HttpError(400, "unknown bucket");
+  const buckets = inboxBucketsOf(c.params.inboxMap, post.E);
+  if (post.rows.some((r) => r.bucket >= buckets)) throw new HttpError(400, "unknown bucket");
   const { now: Enow, lo, hi } = eraBounds(c.now, c.params.skew);
   if (post.E < lo || post.E > hi) throw new ApiError(409, "wrong era", { era: Enow });
-  const res = await inboxStub(c.env, post.E, 0).post(post.E, 0, post.bucket, post.rows);
-  if (res.s === "wrong_era") throw new ApiError(409, "wrong era", { era: res.era });
-  return json({ results: res.results });
+  // One InboxDO per bucket (§9.3): the rows of each bucket go to it together; a WRONG_ERA from any is the call's.
+  const groups = new Map<number, number[]>();
+  post.rows.forEach((r, k) => {
+    const g = groups.get(r.bucket);
+    if (g) g.push(k);
+    else groups.set(r.bucket, [k]);
+  });
+  const results = Array.from({ length: post.rows.length }) as InboxRowResult[];
+  let wrongEra: number | null = null;
+  await Promise.all(
+    [...groups].map(async ([g, idx]) => {
+      const rows = idx.map((k) => ({ eid: post.rows[k].eid, body: post.rows[k].body }));
+      const res = await inboxStub(c.env, post.E, g).post(post.E, g, g, rows);
+      if (res.s === "wrong_era") {
+        wrongEra ??= res.era;
+        return;
+      }
+      idx.forEach((k, i) => (results[k] = res.results[i]));
+    }),
+  );
+  if (wrongEra !== null) throw new ApiError(409, "wrong era", { era: wrongEra });
+  return json({ results });
 }
 
 /**
@@ -578,7 +608,7 @@ export function inboxCacheControl(closed: number, nowMs: number, inboxSlot: numb
 }
 
 async function inboxRead(c: Ctx, E: number, bucket: number): Promise<Response> {
-  if (bucket !== 0) throw new HttpError(400, "unknown bucket");
+  if (bucket >= inboxBucketsOf(c.params.inboxMap, E)) throw new HttpError(400, "unknown bucket");
   const { now: Enow, hi } = eraBounds(c.now, c.params.skew);
   if (E > hi) throw new HttpError(400, "era is in the future");
   if (E < Enow - (INBOX_RETENTION - 1)) throw new HttpError(410, "inbox era no longer served");
@@ -591,7 +621,7 @@ async function inboxRead(c: Ctx, E: number, bucket: number): Promise<Response> {
   const hit = await cacheGet(key);
   if (hit) return hit;
   await readLimit(c);
-  const r = await inboxStub(c.env, E, 0).read(E, 0, bucket, after, limit);
+  const r = await inboxStub(c.env, E, bucket).read(E, bucket, bucket, after, limit);
   for (const row of r.rows) if (row.body.length !== INBOX_BODY_LEN) throw new Error("inbox: bad stored body");
   const cc = r.ended && !r.more ? IMMUTABLE : inboxCacheControl(r.closed, c.now, c.params.inboxSlot);
   const res = binary(encodeInboxRead({ closed: r.closed, more: r.more, rows: r.rows }), cc);
@@ -1035,13 +1065,55 @@ async function postWrap(c: Ctx): Promise<Response> {
   return json(await dirAddWrap(c.env, parseJsonObject(bytes)));
 }
 
+/** kbucket_E per isolate (§9.3 "Buckets"): a key never changes once the KeyDO made it. */
+const bucketKeys = new Map<number, Bytes>();
+const BUCKET_KEYS_MAX = 16;
+
+async function bucketKeyFor(c: Ctx, E: number): Promise<Bytes> {
+  const hit = bucketKeys.get(E);
+  if (hit) return hit;
+  let key: Bytes;
+  try {
+    key = new Uint8Array(await keyStub(c.env).bucketKey(E));
+  } catch (e) {
+    console.error(JSON.stringify({ msg: "inbox bucket key failed", error: logErr(e) }));
+    throw unavailable();
+  }
+  if (bucketKeys.size >= BUCKET_KEYS_MAX) bucketKeys.clear();
+  bucketKeys.set(E, key);
+  return key;
+}
+
+/**
+ * §10.6: each user's inbox bucket of E_now − 3 .. E_now + 1 (within E_FIRST..0xFFFE: the eras a reader reads and a
+ * sender posts into), `bucket(E, handle)` of §9.3. An era with one bucket needs no key.
+ */
+async function withInboxBuckets(c: Ctx, users: DirUser[]): Promise<(DirUser & { inbox: { E: number; g: number }[] })[]> {
+  const Enow = era(c.now);
+  const eras = [Enow - 3, Enow - 2, Enow - 1, Enow, Enow + 1].filter((E) => E >= c.params.eFirst && E <= 0xfffe);
+  const keys = await Promise.all(
+    eras.map(async (E) => {
+      const bits = inboxBitsOf(c.params.inboxMap, E);
+      return { E, bits, key: bits === 0 ? null : await bucketKeyFor(c, E) };
+    }),
+  );
+  return users.map((u) => {
+    const h = hpre(u.handle);
+    return {
+      ...u,
+      inbox: keys.map(({ E, bits, key }) => ({ E, g: key ? inboxBucketOf(key, bits, inboxPrefixOf(h, bits)) : 0 })),
+    };
+  });
+}
+
 async function dirPrefix(c: Ctx, kind: "h" | "u", pS: string, xS: string): Promise<Response> {
   await readLimit(c);
   const p = decimal(pS, 32, "prefix bits");
   const x = decimal(xS, 2 ** p - 1, "prefix value");
   const afterS = c.url.searchParams.get("after");
   if (afterS !== null) b64uParam(afterS, 16, 16, "after");
-  return json(await dirByPrefix(c.env, kind, p, x, afterS));
+  const page = await dirByPrefix(c.env, kind, p, x, afterS);
+  return json({ p: page.p, users: await withInboxBuckets(c, page.users), more: page.more });
 }
 
 async function dirUid(c: Ctx, uid: string): Promise<Response> {
@@ -1049,7 +1121,7 @@ async function dirUid(c: Ctx, uid: string): Promise<Response> {
   b64uParam(uid, 16, 16, "uid");
   const user = await dirByUid(c.env, uid);
   if (!user) throw new HttpError(404, "no such user");
-  return json({ user });
+  return json({ user: (await withInboxBuckets(c, [user]))[0] });
 }
 
 async function dirWraps(c: Ctx, id: string): Promise<Response> {
@@ -1421,6 +1493,7 @@ export async function handleApi(request: Request, env: Env, ctx: ExecutionContex
 /** Test hook: forget the per-isolate caches (ckpt ensure flag, the directory's cached P). */
 export function _resetApiForTests(): void {
   ckptEnsured = false;
+  bucketKeys.clear();
   _resetDirectoryCacheForTests();
   _resetSealForTests();
 }

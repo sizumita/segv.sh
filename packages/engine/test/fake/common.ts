@@ -18,6 +18,8 @@ export interface FakeParams {
   efirst: number;
   /** S_E, the shard count of every era of this world: a power of two in 1..65536 (§9.1). Tests: 1. */
   shards: number;
+  /** 2^β, the inbox buckets of every era of this world: a power of two in 1..65536 (§9.3). Tests: 1. */
+  inboxBuckets: number;
 }
 
 /** A row the Worker hands to the ConnDO after a successful put (spec §10.3 step 6). */
@@ -32,6 +34,8 @@ export interface PublishRow {
 
 /** What a component needs from the world: the clocks, the parameters and a few cross-component calls. */
 export interface WorldCtx {
+  /** the `inbox` list of a directory entry (§10.6): the user's bucket of E_now − 3 .. E_now + 1 (§9.3) */
+  inboxOf(handle: string): { E: number; g: number }[];
   /** Server time of the Worker, BlobReg, Realtime and Checkpoint components: Date.now() + offsetMs. */
   now(): number;
   /** The ShardDO clock: now() − shardLagMs. */

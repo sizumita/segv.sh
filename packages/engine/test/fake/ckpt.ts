@@ -56,7 +56,9 @@ export interface CkptSources {
   /** S_E (§9.1) */
   shards(E: number): number;
   shardHead(E: number, i: number): { head: Bytes; sealed: boolean };
-  inboxHead(E: number): { head: Bytes; ended: boolean };
+  /** 2^β_E (§9.3) */
+  inboxBuckets(E: number): number;
+  inboxHead(E: number, g: number): { head: Bytes; ended: boolean };
   blobregHead(): Bytes;
   dirlogHead(): Bytes;
 }
@@ -152,14 +154,17 @@ export class FakeCheckpoints {
     const heads: CkptHead[] = [];
     for (let i = 0; i < this.src.shards(E); i++)
       heads.push({ cid: shardCid(E, i), head: this.src.shardHead(E, i).head });
-    heads.push({ cid: inboxCid(E, 0), head: this.src.inboxHead(E).head });
+    for (let g = 0; g < this.src.inboxBuckets(E); g++)
+      heads.push({ cid: inboxCid(E, g), head: this.src.inboxHead(E, g).head });
     if (E - 1 >= Math.max(this.src.efirst(), 0)) {
       for (let i = 0; i < this.src.shards(E - 1); i++) {
         const sh = this.src.shardHead(E - 1, i);
         this.previous(heads, shardCid(E - 1, i), sh.head, sh.sealed);
       }
-      const ib = this.src.inboxHead(E - 1);
-      this.previous(heads, inboxCid(E - 1, 0), ib.head, ib.ended);
+      for (let g = 0; g < this.src.inboxBuckets(E - 1); g++) {
+        const ib = this.src.inboxHead(E - 1, g);
+        this.previous(heads, inboxCid(E - 1, g), ib.head, ib.ended);
+      }
     }
     const hour = Math.floor(now / 3_600_000);
     if (hour > this.blobHour) {

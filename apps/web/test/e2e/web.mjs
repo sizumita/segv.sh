@@ -226,14 +226,22 @@ export async function web({ base, browser, shots, P, Wire }) {
       }
       return batches;
     };
-    /** Every inbox row of era E (§10.5). */
+    /** Every inbox row of era E, over its buckets (§9.3, §10.5). */
     const inboxOf = async (E) => {
+      const r = await fetch(`${base}/api/v2/era/${E}`);
+      check(r.ok, `era ${E}: ${r.status}`);
+      const buckets = (await r.json()).inboxBuckets;
+      check(Number.isInteger(buckets) && buckets >= 1, `era ${E}: inboxBuckets = ${buckets}`);
       const rows = [];
-      for (let after = 0; ;) {
-        const page = Wire.decodeInboxRead(await getBytes(`/api/v2/inbox/${E}/0?after=${after}`));
-        rows.push(...page.rows);
-        if (!page.more) break;
-        after = page.rows.at(-1).rel;
+      for (let g = 0; g < buckets; g++) {
+        for (let after = 0; ;) {
+          const page = Wire.decodeInboxRead(
+            await getBytes(`/api/v2/inbox/${E}/${g}?after=${after}`),
+          );
+          rows.push(...page.rows);
+          if (!page.more) break;
+          after = page.rows.at(-1).rel;
+        }
       }
       return rows;
     };

@@ -322,40 +322,43 @@ export function decodeGetResponse(b: Bytes, modes: readonly number[]): GetStatus
 // ───────────────────────── inbox (§10.5) ─────────────────────────
 
 export const INBOX_MAX_ROWS = 32;
+/** eid[16] | body[1416]: a stored row, as a read returns it (after its u32 rel) */
 export const INBOX_ROW_LEN = 16 + INBOX_BODY_LEN; // 1432
-/** 7 + 1432 · 32 = 45 831 */
-export const INBOX_MAX_BYTES = 7 + INBOX_MAX_ROWS * INBOX_ROW_LEN;
+/** u32 bucket | eid[16] | body[1416]: a row of a post */
+export const INBOX_POST_ROW_LEN = 4 + INBOX_ROW_LEN; // 1436
+/** 3 + 1436 · 32 = 45 955 */
+export const INBOX_MAX_BYTES = 3 + INBOX_MAX_ROWS * INBOX_POST_ROW_LEN;
 export const INBOX_READ_MAX_LIMIT = 1024;
 
+/** One invite of a post: the recipient's bucket of era E (§9.3 "Buckets"), the eid and the sealed body. */
 export interface InboxPostRow {
+  bucket: number;
   eid: Bytes;
   body: Bytes;
 }
 
 export interface InboxPost {
   E: number;
-  bucket: number;
   rows: InboxPostRow[];
 }
 
 export function encodeInboxPost(p: InboxPost): Bytes {
   if (p.rows.length < 1 || p.rows.length > INBOX_MAX_ROWS) fail("bad invite count");
-  const w = new Writer().u16(p.E).u32(p.bucket).u8(p.rows.length);
-  for (const x of p.rows) w.bytes(x.eid, 16).bytes(x.body, INBOX_BODY_LEN);
+  const w = new Writer().u16(p.E).u8(p.rows.length);
+  for (const x of p.rows) w.u32(x.bucket).bytes(x.eid, 16).bytes(x.body, INBOX_BODY_LEN);
   return w.done();
 }
 
 export function decodeInboxPost(b: Bytes): InboxPost {
   const r = new Reader(b);
   const E = r.u16();
-  const bucket = r.u32();
   const count = r.u8();
   if (count < 1 || count > INBOX_MAX_ROWS) fail("bad invite count");
-  if (b.length !== 7 + INBOX_ROW_LEN * count) fail("bad inbox post length");
+  if (b.length !== 3 + INBOX_POST_ROW_LEN * count) fail("bad inbox post length");
   const rows: InboxPostRow[] = [];
-  for (let i = 0; i < count; i++) rows.push({ eid: r.bytes(16), body: r.bytes(INBOX_BODY_LEN) });
+  for (let i = 0; i < count; i++) rows.push({ bucket: r.u32(), eid: r.bytes(16), body: r.bytes(INBOX_BODY_LEN) });
   r.end();
-  return { E, bucket, rows };
+  return { E, rows };
 }
 
 /** JSON results of a post, in request order. */

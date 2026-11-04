@@ -19,6 +19,7 @@ export {
   ShardDO,
   BlobRegDO,
   DirSeqDO,
+  KeyDO,
   InboxDO,
   ConnDO,
   FeedDO,

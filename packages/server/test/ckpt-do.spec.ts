@@ -310,8 +310,9 @@ describe("CheckpointDO", () => {
       await withEnv({ SHARD: deadNs, INBOX: deadNs }, async () => {
         r1 = await tick();
       });
+      // Two shards (F and F − 1) and the four inbox buckets of each (INBOX_MAP "0:4").
       expect(errors.mock.calls.filter((c) => String(c[0]).includes("did not answer"))).toHaveLength(
-        4,
+        10,
       );
     } finally {
       errors.mockRestore();

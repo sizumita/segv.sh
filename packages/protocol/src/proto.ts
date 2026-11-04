@@ -1164,6 +1164,24 @@ export function prefixRange(p: number, x: number): { lo: number; hi: number } {
 /** Top p bits of a u32 prefix value. */
 export const topBits = (pre: number, p: number): number => Math.floor(pre / 2 ** (32 - p));
 
+// ───────────────────────── inbox buckets (§9.3) ─────────────────────────
+
+/** The inbox prefix has this many bits more than β_E: about K / 32 users per prefix (§9.3 "Buckets"). */
+export const INBOX_PREFIX_EXTRA = 5;
+/** x = the top (β_E + 5) bits of hpre(handle), at most 32. */
+export const inboxPrefixOf = (hpreV: number, bits: number): number => topBits(hpreV, Math.min(32, bits + INBOX_PREFIX_EXTRA));
+/**
+ * bucket(E, handle) = u32(HMAC(kbucket_E, enc("segv.sh/v2/inbox/bucket", u16 β_E, u32 x))[0..4]) mod 2^β_E, with x the
+ * inbox prefix of the handle; β_E = 0 ⇒ 0 (no key needed). Server only: kbucket_E never leaves it.
+ */
+export function inboxBucketOf(kbucket: Bytes, bits: number, x: number): number {
+  if (!Number.isInteger(bits) || bits < 0 || bits > 16) throw new Error("bad inbox bucket bits");
+  if (bits === 0) return 0;
+  if (kbucket.length !== 32) throw new Error("kbucket must be 32 bytes");
+  const h = HMAC(kbucket, enc("segv.sh/v2/inbox/bucket", u16(bits), u32(x)));
+  return new DataView(h.buffer, h.byteOffset, 4).getUint32(0) % 2 ** bits;
+}
+
 /** Largest k ≥ 0 with b·2^k ≤ a, or −1 when a < b. Integer-exact. */
 function floorLog2Div(a: number, b: number): number {
   if (a < b) return -1;

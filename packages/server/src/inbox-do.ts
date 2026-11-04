@@ -1,6 +1,7 @@
 /**
- * InboxDO — one era of the global inbox of sealed invites (docs/PROTOCOL.md §9.3, §10.5).
- * Name "inbox/v2/{E}/{g}" (stage 1: g = 0, bucket 0); (E, g) come from ctx.id.name. SQLite-backed.
+ * InboxDO — one bucket of one era of the global inbox of sealed invites (docs/PROTOCOL.md §9.3, §10.5).
+ * Name "inbox/v2/{E}/{g}", 0 ≤ g < 2^β_E (INBOX_MAP; one bucket until it is raised); (E, g) come from ctx.id.name.
+ * The object is its bucket: a post or read names the same bucket. SQLite-backed.
  *
  *  - Slot clock: D = Δin·1000 and ms = now − T0. Readers see `closed = max(⌊ms/D⌋, closed_hw)`; a new row gets
  *    `rel = max(⌊(ms + j)/D⌋ + 1, closed_hw + 1)` with a per-row jitter j uniform in [0, D) that is never stored.
@@ -345,7 +346,7 @@ export class InboxDO extends DurableObject<Env> {
   /** §9.3 post: 1..32 invites, one result per row (no atomicity across rows). */
   post(E: number, g: number, bucket: number, rows: { eid: Uint8Array; body: Uint8Array }[]): InboxPostOut {
     this.checkId(E, g);
-    if (!isU32(bucket)) throw new TypeError("inbox post: bad bucket");
+    if (bucket !== g) throw new TypeError("inbox post: bucket is not this object's");
     const input = checkRows(rows);
     const now = this.clock();
     this.prepare(now);
@@ -409,7 +410,7 @@ export class InboxDO extends DurableObject<Env> {
    */
   read(E: number, g: number, bucket: number, after: number, limit: number): InboxReadOut {
     this.checkId(E, g);
-    if (!isU32(bucket)) throw new RangeError("inbox read: bad bucket");
+    if (bucket !== g) throw new RangeError("inbox read: bucket is not this object's");
     if (!isU32(after)) throw new RangeError("inbox read: bad after");
     if (!Number.isInteger(limit) || limit < 1 || limit > INBOX_READ_MAX_LIMIT) throw new RangeError("inbox read: bad limit");
     const now = this.clock();

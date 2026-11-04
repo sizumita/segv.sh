@@ -3,7 +3,7 @@
 // routing, HEADS writes and the views. The engine (engine.ts) owns accounts and the session lifecycle and creates one
 // Messaging per unlocked session.
 import * as P from "@segv/protocol/proto";
-import { isTransient, type Api, type DirUser, type Params } from "./api";
+import { ApiError, bucketIn, isTransient, type Api, type DirUser, type Params } from "./api";
 import { controlSettled, settleControl, type ControlHost } from "./claims";
 import { CANNOT_CHANGE, commit, waitCommitTime, type CommitHost, type Plan } from "./commit";
 import {
@@ -138,6 +138,8 @@ export interface SessionAccount {
   id: P.Identity;
   handle: string;
   regEra: number;
+  /** the account's inbox buckets as the account check saw them (§10.6 `inbox`, §9.3) */
+  inbox: readonly { E: number; g: number }[];
   /** the key of copy refs (`refKeyOf(AK)`) */
   refKey: Bytes;
 }
@@ -199,6 +201,9 @@ export class Messaging {
   private lastPeriodic = -Infinity;
   /** the eras whose inbox notice topics are subscribed (§10.8) */
   private inboxEras: number[] = [];
+  /** The account's own inbox bucket per era (§9.3, §10.6), from its directory entry; refreshed when an era is missing. */
+  private readonly ownBuckets = new Map<number, number>();
+  private bucketsPending: Promise<void> | null = null;
   /** the poll Δin after a notice whose slot the read had not reached (§10.8); at most one pending */
   private inboxRetry: EngineTimer | null = null;
   private WS: WebSocketCtor | null = null;
@@ -245,6 +250,7 @@ export class Messaging {
   private parkedWelcomes: ParkedWelcome[] = [];
 
   constructor(private readonly h: MessagingHost) {
+    for (const b of h.acc.inbox) this.ownBuckets.set(b.E, b.g);
     this.ckpt = new Checkpoints({
       api: h.api,
       storage: () => {
@@ -266,6 +272,7 @@ export class Messaging {
       track: (p) => h.track(p),
       warn: (t) => h.warn(t),
       pks: (job) => this.pksOf(job),
+      bucketOf: (uid, E) => this.recipientBucket(uid, E),
       handleOf: (uidB) => this.handleOfUid(uidB),
       welcomeChannel: async (uid) => this.welcomeChannel(uid),
       sendWelcome: (c, uid, J) => this.sendWelcome(c as Copy, uid, J),
@@ -323,6 +330,10 @@ export class Messaging {
       (typeof WebSocket === "undefined" ? null : (WebSocket as unknown as WebSocketCtor));
     this.WS = WS;
     this.subscribe();
+    // The notice topics need the account's buckets (§10.8): subscribe again once they are known.
+    void this.h
+      .track(this.ensureBuckets(this.inboxErasNow()).then((changed) => changed && this.subscribe()))
+      .catch(() => {});
     // The loop ticks at the short interval, so a socket that drops gets the short cadence at once, not after the
     // long wait that was scheduled while it was connected. Each tick also keeps the inbox notice topics on E_now.
     this.every(
@@ -1878,7 +1889,10 @@ export class Messaging {
     if (!this.live || !this.WS) return;
     const topics: Bytes[] = [P.topicSelf(this.h.acc.id.nS)];
     this.inboxEras = this.inboxErasNow();
-    for (const E of this.inboxEras) topics.push(P.topicInbox(E, 0));
+    for (const E of this.inboxEras) {
+      const g = this.ownBuckets.get(E);
+      if (g !== undefined) topics.push(P.topicInbox(E, g));
+    }
     const accepted = [...this.copies.values()]
       .filter((c) => !c.request && !c.removed)
       .sort((a, b) => b.lastTs - a.lastTs);
@@ -1921,9 +1935,60 @@ export class Messaging {
   /** Subscribes again when the era moved on, so that the notice topics follow E_now (§10.8). */
   private refreshInboxTopics(): void {
     const want = this.inboxErasNow();
-    if (want.length === this.inboxEras.length && want.every((E, i) => E === this.inboxEras[i]))
-      return;
-    this.subscribe();
+    const same =
+      want.length === this.inboxEras.length && want.every((E, i) => E === this.inboxEras[i]);
+    const known = want.every((E) => this.ownBuckets.has(E));
+    if (same && known) return;
+    void this.h
+      .track(
+        this.ensureBuckets(want).then((changed) => {
+          if (!same || changed) this.subscribe();
+        }),
+      )
+      .catch(() => {});
+  }
+
+  /**
+   * The account's own inbox bucket of each of `eras` (§9.3 "Buckets"): seeded from the account check (§11.1 step
+   * 2), then one lookup of its own entry (`dir/uid`, §10.6, which lists E_now − 3 .. E_now + 1) when any is missing.
+   * Returns whether a bucket was learnt. A failed lookup leaves the map as it was: the next catch-up tries again, and
+   * a poll of an era without a bucket fails like a transient error.
+   */
+  private async ensureBuckets(eras: readonly number[]): Promise<boolean> {
+    if (eras.every((E) => this.ownBuckets.has(E))) return false;
+    if (!this.bucketsPending) {
+      this.bucketsPending = (async () => {
+        const u = await this.h.api.userByUid(this.h.acc.uid);
+        if (!u) throw new ApiError(0, "own directory entry missing");
+        for (const b of u.inbox) this.ownBuckets.set(b.E, b.g);
+      })().finally(() => {
+        this.bucketsPending = null;
+      });
+    }
+    await this.bucketsPending;
+    return eras.some((E) => this.ownBuckets.has(E));
+  }
+
+  /** The account's bucket of era E for a poll (§11.5): looked up when unknown; throws (transient) when it stays so. */
+  private async ownBucket(E: number): Promise<number> {
+    await this.ensureBuckets([E]);
+    const g = this.ownBuckets.get(E);
+    if (g === undefined) throw new ApiError(0, `no inbox bucket known for era ${E}`);
+    return g;
+  }
+
+  /**
+   * A recipient's inbox bucket of era E (§6.12, §10.6): from its directory entry by uid prefix, cached for the
+   * session; an entry that does not cover E (the era moved on) is looked up again, fresh. Throws a transient
+   * ApiError when the bucket cannot be learnt, which leaves the recipient pending.
+   */
+  private async recipientBucket(uid: Bytes, E: number): Promise<number> {
+    for (const fresh of [false, true]) {
+      const u = await this.h.api.userByUidPrefix(uid, fresh);
+      const g = u ? bucketIn(u, E) : null;
+      if (g !== null) return g;
+    }
+    throw new ApiError(0, `no inbox bucket of era ${E} for the recipient`);
   }
 
   /**
@@ -1932,7 +1997,7 @@ export class Messaging {
    * after Δin. The catch-up every 300 s covers whatever these two miss.
    */
   private onInbox(E: number, g: number, rel: number): void {
-    if (g !== 0 || !this.live || this.stopped) return;
+    if (this.ownBuckets.get(E) !== g || !this.live || this.stopped) return;
     void this.h
       .track(
         this.h.enqueue(async () => {
@@ -1962,6 +2027,7 @@ export class Messaging {
       p,
       this.h.acc.regEra,
       (t) => this.h.warn(t),
+      (E) => this.ownBucket(E),
       await this.decrypter(),
     );
     this.h.check();

@@ -72,14 +72,15 @@ export interface DirPrefixQuery {
   who: string | null;
 }
 
-/** The JSON shape of a user in lookups (§10.6). */
-export const userJson = (u: DirUserRow) => ({
+/** The JSON shape of a user in lookups (§10.6), with its inbox buckets of E_now − 3 .. E_now + 1 (§9.3). */
+export const userJson = (u: DirUserRow, inbox: { E: number; g: number }[]) => ({
   uid: u.uid,
   handle: u.handle,
   bundle: u.bundle,
   sig: u.sig,
   regEra: u.regEra,
   dirseq: u.dirseq,
+  inbox,
 });
 
 const MAX_SIGNED_TEXT = 8 * 1024;
@@ -200,7 +201,7 @@ export class FakeDirectory {
       .sort((a, b) => (a.uid < b.uid ? -1 : a.uid > b.uid ? 1 : 0));
     return json(200, {
       p,
-      users: rows.slice(0, PREFIX_PAGE).map(userJson),
+      users: rows.slice(0, PREFIX_PAGE).map((u) => userJson(u, this.w.inboxOf(u.handle))),
       more: rows.length > PREFIX_PAGE,
     });
   }

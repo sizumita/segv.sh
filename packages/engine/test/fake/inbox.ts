@@ -1,6 +1,7 @@
 /**
- * InboxDO fake (docs/PROTOCOL.md §9.3), one per era, bucket 0 only (β = 0). It reads the world's *inbox* clock
- * (`now − inboxLagMs`); the Worker's checks in front of it (era bounds, 410) read the world clock.
+ * InboxDO fake (docs/PROTOCOL.md §9.3), one per era and bucket (the world's `inboxBuckets` of them per era, 1 by
+ * default). It reads the world's *inbox* clock (`now − inboxLagMs`); the Worker's checks in front of it (era bounds,
+ * 410, the bucket range) read the world clock. Every method takes the bucket last, defaulting to 0.
  *
  * With `D = Δin · 1000`, `ms = now − T0` and a per-row jitter j ∈ [0, D) (0 unless `inboxJitter` sets it):
  *   rel    = max(⌊(ms + j) / D⌋ + 1, closed_hw + 1)
@@ -59,6 +60,7 @@ export type InboxJitterFn = (D: number, row: { E: number; eid: Bytes }) => numbe
 class InboxEra {
   /** every row, kept sorted by (rel, eid) */
   readonly rows: InboxStoredRow[] = [];
+  readonly g: number;
   readonly byEid = new Map<string, InboxStoredRow>();
   closedHw = 0;
   /** D = Δin · 1000 pinned by the era's first write (null: not pinned yet, the deployment parameter applies) */
@@ -70,9 +72,14 @@ class InboxEra {
   /** rel of the newest committed slot, or −1 */
   lastSlot = -1;
   readonly slots: { rel: number; n: number; root: Bytes; head: Bytes }[] = [];
-  /** the largest slot announced on Tinbox(E, 0) (the DO's meta 'noticed', §9.3) */
+  /** the largest slot announced on Tinbox(E, g) (the DO's meta 'noticed', §9.3) */
   noticed = 0;
-  constructor(readonly E: number) {}
+  constructor(
+    readonly E: number,
+    g = 0,
+  ) {
+    this.g = g;
+  }
 }
 
 export const INBOX_DAY_CAP = 2000;
@@ -81,7 +88,8 @@ export class FakeInbox {
   /** INBOX_DAY_CAP (rows per era, bucket and day). */
   dayCap = INBOX_DAY_CAP;
   private dayOffset = 0;
-  private readonly eras = new Map<number, InboxEra>();
+  /** one object per (era, bucket), keyed "E/g" */
+  private readonly eras = new Map<string, InboxEra>();
   private jitterFn: InboxJitterFn | null = null;
   /** wrongEraOnce(): the eras the next posts are refused with (undefined: the era of the inbox clock) */
   private readonly forcedWrongEra: (number | undefined)[] = [];
@@ -96,9 +104,10 @@ export class FakeInbox {
   accept(
     E: number,
     rows: readonly { eid: Bytes; body: Bytes }[],
+    g = 0,
   ): { s: "wrong_era"; era: number } | { s: "ok"; results: InboxRowResult[] } {
     const now = this.w.inboxNow();
-    const s = this.prepare(E, now);
+    const s = this.prepare(E, now, g);
     if (this.forcedWrongEra.length > 0)
       return { s: "wrong_era", era: this.forcedWrongEra.shift() ?? era(now) };
     if (s.ended || now < eraStart(E) - this.w.params.skew * 1000 || now >= eraEnd(E))
@@ -111,9 +120,10 @@ export class FakeInbox {
     E: number,
     after: number,
     limit: number,
+    g = 0,
   ): { closed: number; more: boolean; rows: InboxStoredRow[]; ended: boolean } {
     const now = this.w.inboxNow();
-    const s = this.prepare(E, now);
+    const s = this.prepare(E, now, g);
     const closed = this.report(s, now);
     const out: InboxStoredRow[] = [];
     let more = false;
@@ -129,17 +139,17 @@ export class FakeInbox {
   }
 
   /** InboxDO.head: commits every closed slot, then `{head, tLast, ended}`. */
-  head(E: number): { head: Bytes; tLast: number; ended: boolean } {
+  head(E: number, g = 0): { head: Bytes; tLast: number; ended: boolean } {
     const now = this.w.inboxNow();
-    const s = this.prepare(E, now);
+    const s = this.prepare(E, now, g);
     this.report(s, now);
     return { head: s.head, tLast: Math.max(0, s.lastSlot), ended: s.ended };
   }
 
   /** `closed` as a read would report it now (without persisting anything). */
-  closedNow(E: number): number {
+  closedNow(E: number, g = 0): number {
     const now = this.w.inboxNow();
-    return this.closed(this.prepare(E, now), now);
+    return this.closed(this.prepare(E, now, g), now);
   }
 
   // ───────────── test / attacker controls ─────────────
@@ -170,35 +180,43 @@ export class FakeInbox {
   post(
     E: number,
     rows: readonly { eid: Bytes; body: Bytes }[],
-    opts: { rel?: number; ignoreCap?: boolean } = {},
+    opts: { rel?: number; ignoreCap?: boolean; bucket?: number } = {},
   ): InboxRowResult[] {
     const now = this.w.inboxNow();
-    const s = this.prepare(E, now);
+    const s = this.prepare(E, now, opts.bucket ?? 0);
     return rows.map((r) => this.insert(s, r, now, opts.ignoreCap ?? false, opts.rel));
   }
 
-  /** Every stored row of era E in (rel, eid) order. */
-  rowsOf(E: number): InboxStoredRow[] {
-    return [...this.eraState(E).rows];
+  /** Every stored row of bucket g of era E in (rel, eid) order. */
+  rowsOf(E: number, g = 0): InboxStoredRow[] {
+    return [...this.eraState(E, g).rows];
   }
 
-  /** Rows of era E posted but not yet visible to readers (rel > closed). */
+  /** Rows of era E (every bucket) posted but not yet visible to readers (rel > closed). */
   pending(E: number): number {
     const now = this.w.inboxNow();
-    const s = this.prepare(E, now);
-    return s.rows.length - firstAbove(s.rows, this.closed(s, now));
+    let n = 0;
+    for (const s of this.eras.values()) {
+      if (s.E !== E) continue;
+      this.prepare(E, now, s.g);
+      n += s.rows.length - firstAbove(s.rows, this.closed(s, now));
+    }
+    return n;
   }
 
   /** Rows of every era posted but not yet visible to readers (settle waits for 0). */
   pendingTotal(): number {
-    return [...this.eras.keys()].reduce((n, E) => n + this.pending(E), 0);
+    return [...new Set([...this.eras.values()].map((s) => s.E))].reduce(
+      (n, E) => n + this.pending(E),
+      0,
+    );
   }
 
-  /** Eras that hold rows. */
+  /** Eras that hold rows (in any bucket). */
   eraList(): number[] {
-    return [...this.eras.keys()]
-      .filter((E) => this.eras.get(E)!.rows.length > 0)
-      .sort((a, b) => a - b);
+    return [
+      ...new Set([...this.eras.values()].filter((s) => s.rows.length > 0).map((s) => s.E)),
+    ].sort((a, b) => a - b);
   }
 
   /** Starts a new cap day: every era's day counter restarts. */
@@ -208,15 +226,16 @@ export class FakeInbox {
 
   // ───────────── internals ─────────────
 
-  private eraState(E: number): InboxEra {
-    let s = this.eras.get(E);
-    if (!s) this.eras.set(E, (s = new InboxEra(E)));
+  private eraState(E: number, g: number): InboxEra {
+    const key = `${E}/${g}`;
+    let s = this.eras.get(key);
+    if (!s) this.eras.set(key, (s = new InboxEra(E, g)));
     return s;
   }
 
   /** The DO's prepare(): persists `ended` once `now ≥ end(E) + SKEW` by the inbox clock. */
-  private prepare(E: number, now: number): InboxEra {
-    const s = this.eraState(E);
+  private prepare(E: number, now: number, g: number): InboxEra {
+    const s = this.eraState(E, g);
     if (!s.ended && now >= eraEnd(E) + this.w.params.skew * 1000) s.ended = true;
     return s;
   }
@@ -253,9 +272,9 @@ export class FakeInbox {
       const rel = s.rows[i].rel;
       const leaves: Bytes[] = [];
       for (; i < s.rows.length && s.rows[i].rel === rel; i++)
-        leaves.push(leafInbox(s.E, 0, rel, s.rows[i].eid, s.rows[i].body));
+        leaves.push(leafInbox(s.E, s.g, rel, s.rows[i].eid, s.rows[i].body));
       const root = mth(leaves);
-      s.head = nextHead(inboxCid(s.E, 0), s.head, rel, leaves.length, root);
+      s.head = nextHead(inboxCid(s.E, s.g), s.head, rel, leaves.length, root);
       s.slots.push({ rel, n: leaves.length, root, head: s.head });
       s.lastSlot = rel;
     }
@@ -324,7 +343,7 @@ export class FakeInbox {
           next = Math.min(next, due);
           break;
         }
-        this.prepare(s.E, now);
+        this.prepare(s.E, now, s.g);
         const closed = this.report(s, now);
         if (closed <= s.noticed) {
           next = Math.min(next, now + 1000); // fired early (clock differences): again in a second, never at once
@@ -338,7 +357,7 @@ export class FakeInbox {
         )
           top = s.rows[i].rel;
         s.noticed = closed;
-        if (top !== null) this.w.notice(s.E, 0, top);
+        if (top !== null) this.w.notice(s.E, s.g, top);
       }
     }
     if (this.noticeTimer) clearTimeout(this.noticeTimer);

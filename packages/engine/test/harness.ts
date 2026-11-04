@@ -631,11 +631,12 @@ export function postRow(ep: Epoch, row: BuiltRow): void {
 
 // ═════════════════════════ builders: joins and claims ═════════════════════════
 
-/** An inbox invite of J to `to`, stored in era `era` (default: now) without proof of work. */
+/** An inbox invite of J to `to`, stored in era `era` (default: now) without proof of work, in `to`'s bucket. */
 export function forgeJoin(to: TestUser, J: P.Join, opts: { era?: number } = {}): void {
   const E = opts.era ?? current.era;
-  const r = P.makeInvite(to.id.kemPk, E, 0, J);
-  const res = current.inbox.accept(E, [{ eid: r.eid, body: r.body }]);
+  const g = current.bucketOf(E, to.handle);
+  const r = P.makeInvite(to.id.kemPk, E, g, J);
+  const res = current.inbox.accept(E, [{ eid: r.eid, body: r.body }], g);
   if (res.s !== "ok" || !("rel" in res.results[0])) throw new Error("forgeJoin: refused");
 }
 

@@ -153,6 +153,7 @@ fetch the two files from the canonical host, which answers them without a redire
 | `INBOX_SLOT_S`   | 10                           | Δin in seconds, 1–3600: the length of an inbox slot. Constant for the deployment                                                                                                                                                                 |
 | `E_FIRST`        | 42                           | The era of the first deployment                                                                                                                                                                                                                  |
 | `SHARD_MAP`      | unset (one shard per era)    | The shard count per era: `E:S` entries, comma-separated, `S` a power of two in 1–65536 in effect from era `E` on (§9.1 of the protocol). Add an entry only for an era that has not started; never change the count of an era that accepts writes |
+| `INBOX_MAP`      | unset (one bucket per era)   | The inbox bucket count per era, in the same form (§9.3 of the protocol): raise it for an era that has not started once the user count passes 2 · 16 384 · B; never change the count of an era that accepts posts                                 |
 | `PUSH_SHARDS`    | 4                            | The number of objects that index the push bells and of those that own the push registrations, 1–4096. May change at any deploy                                                                                                                   |
 | `RT_CONNS`       | 4                            | C, 1–4096: the number of objects that hold the realtime WebSockets; a client's sockets all go to one of them. May change at any deploy                                                                                                           |
 | `RT_FEEDS`       | 4                            | F, a power of two in 1–4096: the number of objects that fan new rows out to them by topic. May change at any deploy                                                                                                                              |
@@ -163,8 +164,8 @@ fetch the two files from the canonical host, which answers them without a redire
 | `ANDROID_APPS`   | unset                        | The Android apps' package names and certificate fingerprints, comma-separated, for `/.well-known/assetlinks.json` (404 while unset)                                                                                                              |
 
 A variable that is present but invalid (not a decimal number, out of range, a `DELTA_S` that does not divide 604 800, an
-`RT_FEEDS` or `BLOBREG_SHARDS` that is not a power of two, or a `SHARD_MAP` whose entries are not ascending `E:S` pairs
-with power-of-two counts)
+`RT_FEEDS` or `BLOBREG_SHARDS` that is not a power of two, or a `SHARD_MAP` or `INBOX_MAP` whose entries are not ascending
+`E:S` pairs with power-of-two counts)
 makes every `/api/v2/*` request answer 503 `server misconfigured`. Clients refuse a proof-of-work base above 26. The
 native apps' variables are the exception: an invalid one counts as unset and changes nothing else.
 
@@ -310,7 +311,8 @@ Custom Domain step after the new version is live. Apply both by hand (the next s
 - The blob registry became `BLOBREG_SHARDS` objects, and the directory got its single writer (the `DirSeqDO`,
   migration `v4`). Nothing is done by hand: each registry object copies its share of the first release's registry the
   first time it runs, and the old object stays, read-only. Set `BLOBREG_SHARDS` before the first deploy of this version
-  and never change it afterwards.
+  and never change it afterwards. The inbox got its bucket map (`INBOX_MAP`, unset = one bucket, so nothing changes
+  until it is set) and the `KeyDO` (migration `v5`), which holds the per-era bucket keys.
 - To change `routes`, deploy the change by hand from an account that has Workers Routes Write on the zone
   (`pnpm run deploy`, or `wrangler deploy --env canary` for canary.segv.sh), then push it to `main`.
 - Check a change to `wrangler.jsonc` with `pnpm run build` followed by `pnpm exec wrangler deploy --dry-run` and

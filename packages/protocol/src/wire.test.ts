@@ -165,8 +165,8 @@ const CORPUS: Case[] = [
     [1, 0, 1, 1],
     "exists mode",
   ),
-  inboxPost({ E: 41, bucket: 0, rows: [{ eid: label(), body: ibody() }] }),
-  inboxPost({ E: 41, bucket: 7, rows: [{ eid: label(), body: ibody() }, { eid: label(), body: ibody() }] }),
+  inboxPost({ E: 41, rows: [{ bucket: 0, eid: label(), body: ibody() }] }),
+  inboxPost({ E: 41, rows: [{ bucket: 7, eid: label(), body: ibody() }, { bucket: 0, eid: label(), body: ibody() }] }),
   inboxRead({ closed: 0, more: false, rows: [] }),
   inboxRead({
     closed: 99,
@@ -268,18 +268,21 @@ describe("layouts against the spec, byte for byte", () => {
 
   it("inbox post and read (§10.5)", () => {
     const rows = [
-      { eid: fill(16, 1), body: fill(1416, 2) },
-      { eid: fill(16, 3), body: fill(1416, 4) },
+      { bucket: 0, eid: fill(16, 1), body: fill(1416, 2) },
+      { bucket: 5, eid: fill(16, 3), body: fill(1416, 4) },
     ];
-    const post = cat(u16(41), u32(0), u8(2), ...rows.flatMap((r) => [r.eid, r.body]));
-    expect(post.length).toBe(7 + 1432 * 2);
-    expect(toHex(W.encodeInboxPost({ E: 41, bucket: 0, rows }))).toBe(toHex(post));
-    expect(W.decodeInboxPost(post)).toEqual({ E: 41, bucket: 0, rows });
+    const post = cat(u16(41), u8(2), ...rows.flatMap((r) => [u32(r.bucket), r.eid, r.body]));
+    expect(post.length).toBe(3 + 1436 * 2);
+    expect(toHex(W.encodeInboxPost({ E: 41, rows }))).toBe(toHex(post));
+    expect(W.decodeInboxPost(post)).toEqual({ E: 41, rows });
+    const stored = rows.map(({ eid, body }) => ({ eid, body }));
     const read = cat(u32(77), u8(1), u32(2), u32(70), rows[0].eid, rows[0].body, u32(71), rows[1].eid, rows[1].body);
-    const x: W.InboxRead = { closed: 77, more: true, rows: [{ rel: 70, ...rows[0] }, { rel: 71, ...rows[1] }] };
+    const x: W.InboxRead = { closed: 77, more: true, rows: [{ rel: 70, ...stored[0] }, { rel: 71, ...stored[1] }] };
     expect(toHex(W.encodeInboxRead(x))).toBe(toHex(read));
     expect(W.decodeInboxRead(read)).toEqual(x);
-    expect([W.INBOX_ROW_LEN, W.INBOX_MAX_ROWS, W.INBOX_READ_MAX_LIMIT]).toEqual([1432, 32, 1024]);
+    expect([W.INBOX_ROW_LEN, W.INBOX_POST_ROW_LEN, W.INBOX_MAX_ROWS, W.INBOX_READ_MAX_LIMIT]).toEqual([
+      1432, 1436, 32, 1024,
+    ]);
   });
 
   it("feed (§10.9): u8 more | u32 nb | (u32 t | u32 n | root | head | (label | u8 cls | body) × n) × nb", () => {
@@ -440,16 +443,16 @@ describe("limits", () => {
     expect(wireErr(() => W.decodePutRequest(r17))).toMatch(/count/);
   });
 
-  it("INBOX_MAX_BYTES = 45 831 is a valid 32-invite post; one more byte fails", () => {
-    expect(W.INBOX_MAX_BYTES).toBe(45_831);
-    expect(W.INBOX_MAX_BYTES).toBe(7 + 1432 * 32);
-    const rows = Array.from({ length: 32 }, () => ({ eid: label(), body: ibody() }));
-    const max = W.encodeInboxPost({ E: 41, bucket: 0, rows });
+  it("INBOX_MAX_BYTES = 45 955 is a valid 32-invite post; one more byte fails", () => {
+    expect(W.INBOX_MAX_BYTES).toBe(45_955);
+    expect(W.INBOX_MAX_BYTES).toBe(3 + 1436 * 32);
+    const rows = Array.from({ length: 32 }, (_, k) => ({ bucket: k, eid: label(), body: ibody() }));
+    const max = W.encodeInboxPost({ E: 41, rows });
     expect(max.length).toBe(W.INBOX_MAX_BYTES);
     expect(W.decodeInboxPost(max).rows).toEqual(rows);
     wireErr(() => W.decodeInboxPost(cat(max, u8(0))), "one more byte");
-    wireErr(() => W.encodeInboxPost({ E: 41, bucket: 0, rows: [...rows, rows[0]] }));
-    const p33 = cat(max.subarray(0, 6), u8(33), max.subarray(7), max.subarray(7, 7 + 1432));
+    wireErr(() => W.encodeInboxPost({ E: 41, rows: [...rows, rows[0]] }));
+    const p33 = cat(max.subarray(0, 2), u8(33), max.subarray(3), max.subarray(3, 3 + 1436));
     expect(wireErr(() => W.decodeInboxPost(p33))).toMatch(/count/);
   });
 
@@ -457,7 +460,7 @@ describe("limits", () => {
     for (const n of [0, 17, 255]) expect(wireErr(() => W.decodePutRequest(u8(n)), `put ${n}`)).toMatch(/count/);
     for (const n of [0, 17, 255]) expect(wireErr(() => W.decodePutResponse(u8(n)), `put response ${n}`)).toMatch(/count/);
     for (const n of [0, 257, 0xffff]) expect(wireErr(() => W.decodeGetRequest(u16(n)), `get ${n}`)).toMatch(/count/);
-    for (const n of [0, 33, 255]) expect(wireErr(() => W.decodeInboxPost(cat(u16(1), u32(0), u8(n))), `inbox ${n}`)).toMatch(/count/);
+    for (const n of [0, 33, 255]) expect(wireErr(() => W.decodeInboxPost(cat(u16(1), u8(n))), `inbox ${n}`)).toMatch(/count/);
     for (const op of [1, 2])
       for (const n of [0, 257, 0xffff]) {
         const fr = cat(u8(op), u16(n), new Uint8Array(16 * Math.min(n, 257)));
@@ -475,7 +478,7 @@ describe("limits", () => {
     wireErr(() => W.encodeGetRequest([]));
     wireErr(() => W.encodeGetRequest(Array.from({ length: 257 }, () => ({ E: 0, label: label(), mode: 0 as const }))));
     wireErr(() => W.encodeGetResponse([], []));
-    wireErr(() => W.encodeInboxPost({ E: 0, bucket: 0, rows: [] }));
+    wireErr(() => W.encodeInboxPost({ E: 0, rows: [] }));
     wireErr(() => W.encodeClientFrame({ f: "sub", topics: [] }));
     wireErr(() => W.encodeClientFrame({ f: "unsub", topics: [] }));
     wireErr(() => W.encodeClientFrame({ f: "sub", topics: Array.from({ length: 257 }, () => label()) }));
@@ -621,8 +624,8 @@ describe("strictness", () => {
   });
 
   it("inbox post and read lengths are exact", () => {
-    const one = W.encodeInboxPost({ E: 1, bucket: 0, rows: [{ eid: label(), body: ibody() }] });
-    expect(wireErr(() => W.decodeInboxPost(cat(one.subarray(0, 6), u8(2), one.subarray(7))))).toMatch(/length/);
+    const one = W.encodeInboxPost({ E: 1, rows: [{ bucket: 0, eid: label(), body: ibody() }] });
+    expect(wireErr(() => W.decodeInboxPost(cat(one.subarray(0, 2), u8(2), one.subarray(3))))).toMatch(/length/);
     const read = W.encodeInboxRead({ closed: 1, more: false, rows: [{ rel: 1, eid: label(), body: ibody() }] });
     expect(wireErr(() => W.decodeInboxRead(cat(read.subarray(0, 5), u32(2), read.subarray(9))))).toMatch(/length/);
     expect(wireErr(() => W.decodeInboxRead(cat(read.subarray(0, 5), u32(0xffffffff), read.subarray(9))))).toMatch(/length/);
@@ -662,9 +665,9 @@ describe("strictness", () => {
     wireErr(() => W.encodeGetResponse([{ s: "hit", t: 1, cls: 1, body: body(0) }], [0]), "hit body length");
     wireErr(() => W.encodeGetResponse([{ s: "skipped" }], [0, 0]), "modes length");
     wireErr(() => W.encodeGetResponse([{ s: "x" } as unknown as W.GetStatus], [0]), "unknown status");
-    wireErr(() => W.encodeInboxPost({ E: 1, bucket: 0, rows: [{ eid: L.subarray(1), body: ibody() }] }), "eid 15");
-    wireErr(() => W.encodeInboxPost({ E: 1, bucket: 0, rows: [{ eid: L, body: ibody().subarray(1) }] }), "body 1415");
-    wireErr(() => W.encodeInboxPost({ E: 1, bucket: 2 ** 32, rows: [{ eid: L, body: ibody() }] }), "bucket 2^32");
+    wireErr(() => W.encodeInboxPost({ E: 1, rows: [{ bucket: 0, eid: L.subarray(1), body: ibody() }] }), "eid 15");
+    wireErr(() => W.encodeInboxPost({ E: 1, rows: [{ bucket: 0, eid: L, body: ibody().subarray(1) }] }), "body 1415");
+    wireErr(() => W.encodeInboxPost({ E: 1, rows: [{ bucket: 2 ** 32, eid: L, body: ibody() }] }), "bucket 2^32");
     wireErr(() => W.encodeInboxRead({ closed: 2 ** 32, more: false, rows: [] }), "closed 2^32");
     wireErr(() => W.encodeInboxRead({ closed: 0, more: false, rows: [{ rel: 1, eid: L, body: ibody().subarray(1) }] }), "read body");
     const batch = { t: 1, n: 1, root: fill(32, 0), head: fill(32, 0), rows: [{ label: L, cls: 0, body: body(0) }] };

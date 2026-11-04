@@ -58,6 +58,8 @@ export interface Params {
   inboxDayCap: number;
   inboxBatch: number;
   shards: number;
+  /** 2^β of the current era (§9.3); informational, like `shards` */
+  inboxBuckets: number;
   /** the directory's P (§9.6) */
   p: number;
   efirst: number;
@@ -113,6 +115,7 @@ export function checkParams(x: unknown): Params {
   if (!isInt(x.efirst, 0, 0xfffe)) bad("efirst");
   if (
     !isInt(x.shards, 1, 65536) ||
+    !isInt(x.inboxBuckets, 1, 65536) ||
     !isInt(x.inboxBatch, 1, 32) ||
     !isInt(x.inboxRetention, 0, 0xfffe)
   )
@@ -218,6 +221,8 @@ export interface UserJson {
   sig: string;
   regEra: number;
   dirseq: number;
+  /** the user's inbox bucket of each era the server lists (E_now − 3 .. E_now + 1, §9.3, §10.6) */
+  inbox: { E: number; g: number }[];
 }
 
 export interface WrapJson {
@@ -243,6 +248,8 @@ export interface DirUser {
   dirseq: number;
   /** pin(u) (§2.2) */
   pin: Bytes;
+  /** the user's inbox bucket per era, as the server listed them (§10.6) */
+  inbox: { E: number; g: number }[];
 }
 
 function isUserJson(x: unknown): x is UserJson {
@@ -253,9 +260,15 @@ function isUserJson(x: unknown): x is UserJson {
     typeof x.bundle === "string" &&
     typeof x.sig === "string" &&
     isInt(x.regEra, 0, 0xfffe) &&
-    isInt(x.dirseq, 0, Number.MAX_SAFE_INTEGER)
+    isInt(x.dirseq, 0, Number.MAX_SAFE_INTEGER) &&
+    Array.isArray(x.inbox) &&
+    x.inbox.every((b) => isObj(b) && isInt(b.E, 0, 0xfffe) && isInt(b.g, 0, 0xffffffff))
   );
 }
+
+/** The bucket of era E that a directory entry lists, or null when the entry does not cover E (§10.6). */
+export const bucketIn = (u: { inbox: { E: number; g: number }[] }, E: number): number | null =>
+  u.inbox.find((b) => b.E === E)?.g ?? null;
 
 /** Verifies a directory user; null when its bundle does not verify or does not match the row. */
 export function verifyUser(u: UserJson): DirUser | null {
@@ -273,6 +286,7 @@ export function verifyUser(u: UserJson): DirUser | null {
       sig: u.sig,
       regEra: u.regEra,
       dirseq: u.dirseq,
+      inbox: u.inbox,
       pin: P.pin(u.bundle, P.fromB64u(u.sig)),
     };
   } catch {
@@ -760,14 +774,15 @@ export class Api {
   // ── inbox (§10.5) ──
 
   /**
-   * Posts 1..32 invites of era E (one burst, §6.12). A 409 `wrong era` throws an ApiError whose body names `era`.
+   * Posts 1..32 invites of era E (one burst, §6.12), each in its recipient's bucket. A 409 `wrong era` throws an
+   * ApiError whose body names `era`.
    */
   async postInbox(
     E: number,
     rows: readonly W.InboxPostRow[],
     onProgress?: Progress,
   ): Promise<W.InboxPostResult[]> {
-    const body = W.encodeInboxPost({ E, bucket: 0, rows: [...rows] });
+    const body = W.encodeInboxPost({ E, rows: [...rows] });
     const res = await this.postPow(
       "/api/v2/inbox",
       "inbox",
@@ -783,11 +798,11 @@ export class Api {
   }
 
   /**
-   * One page of `GET /api/v2/inbox/{E}/0?after=` (§10.5). A malformed page (decreasing rel, or `more = 1` without a
-   * row above `after`) is a failed read.
+   * One page of `GET /api/v2/inbox/{E}/{g}?after=` (§10.5), g the account's bucket of E. A malformed page (decreasing
+   * rel, or `more = 1` without a row above `after`) is a failed read.
    */
-  async readInbox(E: number, after: number): Promise<W.InboxRead> {
-    const res = await this.request(`/api/v2/inbox/${E}/0?after=${after}`);
+  async readInbox(E: number, g: number, after: number): Promise<W.InboxRead> {
+    const res = await this.request(`/api/v2/inbox/${E}/${g}?after=${after}`);
     if (!res.ok) throw await readError(res);
     let page: W.InboxRead;
     try {

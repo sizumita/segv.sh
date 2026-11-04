@@ -19,6 +19,7 @@ const PARAMS = {
   inboxRetention: 4,
   inboxDayCap: 2000,
   inboxBatch: 32,
+  inboxBuckets: 1,
   shards: 1,
   p: 0,
   efirst: 0,

@@ -20,7 +20,7 @@ import type { CheckpointDO } from "../src/ckpt-do";
 import type { ConnDO, RtLimits } from "../src/conn-do";
 import type { BlobRegDO } from "../src/blobreg-do";
 import type { ShardDO } from "../src/shard-do";
-import { blobRegStub, connName, shardStub, type ShardPutRow } from "../src/types";
+import { blobRegStub, connName, keyStub, shardStub, type ShardPutRow } from "../src/types";
 import {
   DIFF2,
   E_FIRST,
@@ -152,6 +152,7 @@ describe("GET /api/v2/params", () => {
       "inboxDayCap",
       "inboxBatch",
       "shards",
+      "inboxBuckets",
       "p",
       "efirst",
       "kcommit",
@@ -314,6 +315,7 @@ describe("GET /api/v2/era/{E}", () => {
       "end",
       "delta",
       "shards",
+      "inboxBuckets",
       "kcommit",
       "sealed",
     ]);
@@ -323,6 +325,7 @@ describe("GET /api/v2/era/{E}", () => {
       end: P.eraEnd(E),
       delta: 1,
       shards: 1,
+      inboxBuckets: 4,
       kcommit: P.b64u(P.kcommit(testKroute(E))),
       sealed: false,
     });
@@ -344,6 +347,7 @@ describe("GET /api/v2/era/{E}", () => {
       "end",
       "delta",
       "shards",
+      "inboxBuckets",
       "kcommit",
       "sealed",
     ]);
@@ -353,6 +357,7 @@ describe("GET /api/v2/era/{E}", () => {
       end: P.eraEnd(E),
       delta: 1,
       shards: 1,
+      inboxBuckets: 4,
       kcommit: P.b64u(P.kcommit(testKroute(E))),
       sealed: true,
     });
@@ -960,7 +965,11 @@ describe("inbox", () => {
       expect(rel).toBeGreaterThanOrEqual(Math.floor(before / 1000) + 1); // rel > ⌊ms / D⌋
       expect(rel).toBeLessThanOrEqual(Math.floor(after / 1000) + 2);
     }
-    const r2 = await inboxPostOk([i1, { eid: i2.eid, body: bigRandom(P.INBOX_BODY_LEN) }, i3]);
+    const r2 = await inboxPostOk([
+      i1,
+      { bucket: 0, eid: i2.eid, body: bigRandom(P.INBOX_BODY_LEN) },
+      i3,
+    ]);
     expect(r2[0]).toEqual({ rel: rels[0] }); // same eid, same body: idempotent
     expect(r2[1]).toEqual({ error: "conflict" });
     expect(Object.keys(r2[2])).toEqual(["rel"]);
@@ -995,29 +1004,29 @@ describe("inbox", () => {
     if (read.rows.length > one.rows.length) expect(one.more).toBe(true);
   });
 
-  it("409 {error, era} for a post outside the current era; 400 for bucket ≠ 0, a bad count or length; 413 above 45 831 B", async () => {
+  it("409 {error, era} for a post outside the current era; 400 for a bucket past the era's, a bad count or length; 413 above 45 955 B", async () => {
     const E = eraNow();
     for (const e of [E + 1, E - 1]) {
-      const res = await inboxPostRaw({ E: e, bucket: 0, rows: [randomInvite()] });
+      const res = await inboxPostRaw({ E: e, rows: [randomInvite()] });
       expect(res.status, String(e)).toBe(409);
       expectApiHeaders(res);
       expect(await res.json()).toEqual({ error: "wrong era", era: E });
     }
-    const one = W.encodeInboxPost({ E, bucket: 0, rows: [randomInvite()] });
-    const bucket1 = one.slice();
-    bucket1[5] = 1;
-    const count0 = one.slice(0, 7);
-    count0[6] = 0;
+    const one = W.encodeInboxPost({ E, rows: [randomInvite()] });
+    // u16 E | u8 count | (u32 bucket | eid | body) × count: the test deployment has 4 buckets (INBOX_MAP "0:4").
+    const bucket4 = one.slice();
+    bucket4[6] = 4;
+    const count0 = one.slice(0, 3);
+    count0[2] = 0;
     const count33 = W.encodeInboxPost({
       E,
-      bucket: 0,
-      rows: Array.from({ length: 32 }, randomInvite),
-    }).slice(0, 7 + 31 * 1432);
-    count33[6] = 33;
+      rows: Array.from({ length: 32 }, () => randomInvite()),
+    }).slice(0, 3 + 31 * 1436);
+    count33[2] = 33;
     const count2 = one.slice();
-    count2[6] = 2;
+    count2[2] = 2;
     const cases: [string, Bytes][] = [
-      ["bucket 1", bucket1],
+      ["bucket 4", bucket4],
       ["count 0", count0],
       ["count 33", count33],
       ["count 2, one row", count2],
@@ -1030,31 +1039,30 @@ describe("inbox", () => {
       expect(res.status, name).toBe(400);
       expectApiHeaders(res);
     }
-    expect(W.INBOX_MAX_BYTES).toBe(45831);
+    expect(W.INBOX_MAX_BYTES).toBe(45955);
     const full = W.encodeInboxPost({
       E,
-      bucket: 0,
-      rows: Array.from({ length: 32 }, randomInvite),
+      rows: Array.from({ length: 32 }, () => randomInvite()),
     });
-    expect(full.length).toBe(45831);
+    expect(full.length).toBe(45955);
     const big = P.concat(full, Uint8Array.of(0));
     expect(
       (await api("/api/v2/inbox", { method: "POST", body: big, headers: { "x-segv-pow": "0.0" } }))
         .status,
     ).toBe(413);
-    // 32 invites are one request (and one PoW priced by its size).
-    const res = await inboxPostOk(Array.from({ length: 32 }, randomInvite));
+    // 32 invites are one request (and one PoW priced by its size), whatever their buckets.
+    const res = await inboxPostOk(Array.from({ length: 32 }, (_, k) => randomInvite(k % 4)));
     expect(res.every((r) => "rel" in r)).toBe(true);
   });
 
-  it("reads: 410 below E_now − 3, 400 for a future era or bucket ≠ 0 or bad parameters; an ended era is immutable", async () => {
+  it("reads: 410 below E_now − 3, 400 for a future era, a bucket past the era's or bad parameters; an ended era is immutable", async () => {
     const E = eraNow();
     const gone = await inboxReadRaw(E - 4);
     expect(gone.status).toBe(410);
     expectApiHeaders(gone);
     for (const [name, res] of [
       ["future", await inboxReadRaw(E + 1)],
-      ["bucket 1", await inboxReadRaw(E, "", 1)],
+      ["bucket 4", await inboxReadRaw(E, "", 4)],
       ["limit 0", await inboxReadRaw(E, "?limit=0")],
       ["limit 1025", await inboxReadRaw(E, "?limit=1025")],
       ["after -1", await inboxReadRaw(E, "?after=-1")],
@@ -1162,6 +1170,7 @@ describe("directory: POST /api/v2/register and /api/v2/wraps", () => {
     expect(u.headers.get("cache-control")).toBe("no-store");
     const { user } = (await u.json()) as { user: DirUserJson };
     expect(user).toEqual({
+      inbox: expect.any(Array), // the inbox buckets (§10.6), checked in "inbox buckets" below
       uid: a.uidB64,
       handle: a.handle,
       bundle: a.bundle,
@@ -1397,6 +1406,9 @@ describe("directory lookups", () => {
       sig: a.sig,
       regEra: eraNow(),
       dirseq,
+      // the inbox buckets the server lists (§10.6): the same in every lookup, checked in "inbox buckets" below
+      inbox: ((await (await api(`/api/v2/dir/uid/${a.uidB64}`)).json()) as { user: DirUserJson })
+        .user.inbox,
     };
     for (const p of [0, 1, Math.min(32, Pnow + 1)]) {
       expect(
@@ -1789,7 +1801,7 @@ interface PowTarget {
 
 async function powTargets(): Promise<PowTarget[]> {
   const put = W.encodePutRequest([makeRow()]);
-  const inbox = W.encodeInboxPost({ E: eraNow(), bucket: 0, rows: [randomInvite()] });
+  const inbox = W.encodeInboxPost({ E: eraNow(), rows: [randomInvite()] });
   const register = jsonBytes(registerBody(makeAccount()));
   const wrap = jsonBytes(makeAccount().passkey);
   const { blob, id } = P.encryptBlob(P.utf8("pow"));
@@ -1901,7 +1913,7 @@ describe("proof of work", () => {
     });
     expect(res.status).toBe(200);
     expect(W.decodePutResponse(await bytesOf(res))[0].s).toBe("ok");
-    const inbox = W.encodeInboxPost({ E: eraNow(), bucket: 0, rows: [randomInvite()] });
+    const inbox = W.encodeInboxPost({ E: eraNow(), rows: [randomInvite()] });
     const res2 = await api("/api/v2/inbox", {
       method: "POST",
       body: inbox,
@@ -1962,7 +1974,6 @@ describe("rate limiting", () => {
   it("RL_INBOX: 10 posts per minute per IP, one token per request", async () => {
     const body = W.encodeInboxPost({
       E: eraNow(),
-      bucket: 0,
       rows: Array.from({ length: 2 }, randomInvite),
     });
     const statuses = await inOneRateWindow(async () => {
@@ -2472,7 +2483,7 @@ describe("era bounds (§9.7): no Durable Object for out-of-range eras", () => {
     ]);
     // Inbox posts: 409 {error: "wrong era", era} outside [era(now − SKEW), era(now + SKEW)] (SKEW = 0 here).
     for (const e of [65000, 0, E + 1, E - 1]) {
-      const post = W.encodeInboxPost({ E: e, bucket: 0, rows: [randomInvite()] });
+      const post = W.encodeInboxPost({ E: e, rows: [randomInvite()] });
       const r = await direct("/api/v2/inbox", await powInit("inbox", post), spies);
       expect(r.status, String(e)).toBe(409);
       expect(await r.json()).toEqual({ error: "wrong era", era: E });
@@ -2543,10 +2554,7 @@ describe("server time (x-segv-now) and cache before limits", () => {
         "409 inbox",
         await direct(
           "/api/v2/inbox",
-          await powInit(
-            "inbox",
-            W.encodeInboxPost({ E: 65000, bucket: 0, rows: [randomInvite()] }),
-          ),
+          await powInit("inbox", W.encodeInboxPost({ E: 65000, rows: [randomInvite()] })),
         ),
       ],
       ["400 dir", await api("/api/v2/dir/h/33/0")],
@@ -2929,7 +2937,6 @@ describe("Worker logic (fake Durable Objects)", () => {
     );
     const body = W.encodeInboxPost({
       E,
-      bucket: 0,
       rows: [randomInvite(), randomInvite(), randomInvite()],
     });
     let res = await direct("/api/v2/inbox", await powInit("inbox", body), { INBOX });
@@ -3426,5 +3433,54 @@ describe("blob registry shards (§9.2, §10.7)", () => {
     expect((await direct(`/api/v2/blob/${id0}/meta`, {}, { BLOBREG_SHARDS: "1" })).status).toBe(
       200,
     ); // still shard 0
+  });
+});
+describe("inbox buckets (§9.3, §10.5, §10.6)", () => {
+  it("posts land in their bucket's object, reads are per bucket, and the directory lists each user's buckets", async () => {
+    const E = eraNow();
+    // The test deployment has four buckets in every era (INBOX_MAP "0:4").
+    expect((await fetchParams()).inboxBuckets).toBe(4);
+    const rows = [0, 1, 2, 3, 1].map((g) => randomInvite(g));
+    const res = await inboxPostOk(rows);
+    expect(res.every((r) => "rel" in r)).toBe(true);
+    for (let g = 0; g < 4; g++) {
+      const mine = rows.filter((r) => r.bucket === g).map((r) => P.b64u(r.eid));
+      await until(async () => {
+        const page = W.decodeInboxRead(await bytesOf(await inboxReadRaw(E, "?limit=1024", g)));
+        return mine.every((eid) => page.rows.some((r) => P.b64u(r.eid) === eid));
+      }, `bucket ${g} readable`);
+      const page = W.decodeInboxRead(await bytesOf(await inboxReadRaw(E, "?limit=1024", g)));
+      // Nothing of another bucket shows up here (other tests' rows of this bucket may).
+      const others = rows.filter((r) => r.bucket !== g).map((r) => P.b64u(r.eid));
+      for (const r of page.rows) expect(others).not.toContain(P.b64u(r.eid));
+    }
+    // Every directory entry lists bucket(E, handle) of E_now − 1 .. E_now + 1, from the KeyDO's key of each era.
+    const a = makeAccount();
+    await registerOk(a);
+    const bucketKey = (e: number) => keyStub(env).bucketKey(e);
+    const expected = async (e: number) =>
+      P.inboxBucketOf(new Uint8Array(await bucketKey(e)), 2, P.inboxPrefixOf(P.hpre(a.handle), 2));
+    const want = []; // the eras a reader reads (E_now − 3 ..) and a sender posts into (.. E_now + 1), §10.6
+    for (const e of [E - 3, E - 2, E - 1, E, E + 1])
+      if (e >= E_FIRST) want.push({ E: e, g: await expected(e) });
+    const own = (await (await api(`/api/v2/dir/uid/${a.uidB64}`)).json()) as { user: DirUserJson };
+    expect(own.user.inbox).toEqual(want);
+    expect(Object.keys(own.user)).toEqual([
+      "uid",
+      "handle",
+      "bundle",
+      "sig",
+      "regEra",
+      "dirseq",
+      "inbox",
+    ]);
+    const listed = await prefixFind("h", 0, 0, a.uidB64);
+    expect(listed?.inbox).toEqual(want);
+    for (const b of want) expect(b.g).toBeLessThan(4);
+    // The same handle maps to the same bucket for everyone who asks, and the key stays with the KeyDO.
+    const again = (await (await api(`/api/v2/dir/uid/${a.uidB64}`)).json()) as {
+      user: DirUserJson;
+    };
+    expect(again.user.inbox).toEqual(want);
   });
 });

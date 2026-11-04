@@ -50,6 +50,8 @@ export interface DeliveryHost {
   warn(text: string): void;
   /** the recipients' kemPk by b64u uid, from the epoch's bundle (never the directory, §6.12 step 2) */
   pks(job: DeliveryJob): Promise<Map<string, Bytes>>;
+  /** the recipient's inbox bucket of era E, from its directory entry (§9.3, §10.6; a transient failure throws) */
+  bucketOf(uid: Bytes, E: number): Promise<number>;
   handleOf(uidB: string): string;
   /** a 1:1 copy in which a WELCOME to `uid` qualifies (§6.12 step 1), or null */
   welcomeChannel(uid: Bytes): Promise<unknown | null>;
@@ -153,6 +155,7 @@ export class Deliveries {
             wait: (ms) => this.h.wait(ms),
             check: () => this.h.check(),
             progress: () => {},
+            bucketOf: (uid, E) => this.h.bucketOf(uid, E),
           },
           job.J,
           invites,

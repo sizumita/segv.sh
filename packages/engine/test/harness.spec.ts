@@ -66,12 +66,16 @@ async function get(keys: W.GetKey[], who?: string): Promise<W.GetStatus[]> {
   );
 }
 
-const invite = (): W.InboxPostRow => ({ eid: P.random(16), body: P.random(P.INBOX_BODY_LEN) });
+const invite = (): W.InboxPostRow => ({
+  bucket: 0,
+  eid: P.random(16),
+  body: P.random(P.INBOX_BODY_LEN),
+});
 
 const inboxPost = (E: number, rows: W.InboxPostRow[], who?: string) =>
   fetch("/api/v2/inbox", {
     method: "POST",
-    body: W.encodeInboxPost({ E, bucket: 0, rows }) as BodyInit,
+    body: W.encodeInboxPost({ E, rows }) as BodyInit,
     headers: whoHeader(who),
   });
 
@@ -327,6 +331,7 @@ describe("clock and response headers", () => {
       inboxRetention: 4,
       inboxDayCap: 2000,
       inboxBatch: 32,
+      inboxBuckets: 1,
       shards: 1,
       p: 0,
       pow: { register: 0, wrap: 0, put: 0, inbox: 0, blob: 0 },
@@ -498,6 +503,7 @@ describe("shard", () => {
     const open = await era(E);
     expect(open.j).toEqual({
       era: E,
+      inboxBuckets: 1,
       start: P.eraStart(E),
       end: P.eraEnd(E),
       delta: 1,
@@ -520,6 +526,7 @@ describe("shard", () => {
       end: P.eraEnd(E + 1),
       delta: 1,
       shards: 1,
+      inboxBuckets: 1,
       kcommit: P.b64u(world.kcommitOf(E + 1)),
       sealed: true,
     });
@@ -877,7 +884,10 @@ describe("inbox", () => {
     expect(W.parseInboxPostResults(res, 32)).toHaveLength(32);
 
     const again = (await (
-      await inboxPost(E, [rows[0], { eid: rows[1].eid, body: P.random(P.INBOX_BODY_LEN) }])
+      await inboxPost(E, [
+        rows[0],
+        { bucket: 0, eid: rows[1].eid, body: P.random(P.INBOX_BODY_LEN) },
+      ])
     ).json()) as {
       results: W.InboxPostResult[];
     };
@@ -892,8 +902,8 @@ describe("inbox", () => {
     expect(
       (await fetch("/api/v2/inbox", { method: "POST", body: P.random(10) as BodyInit })).status,
     ).toBe(400);
-    const bad = W.encodeInboxPost({ E, bucket: 0, rows: [invite()] });
-    bad[5] = 1; // bucket 1
+    const bad = W.encodeInboxPost({ E, rows: [invite()] });
+    bad[6] = 1; // bucket 1 (the world has one bucket)
     expect((await fetch("/api/v2/inbox", { method: "POST", body: bad as BodyInit })).status).toBe(
       400,
     );
@@ -966,7 +976,7 @@ describe("inbox", () => {
     const post = async (E: number, rows: W.InboxPostRow[]) => {
       const res = await world.fetch("/api/v2/inbox", {
         method: "POST",
-        body: W.encodeInboxPost({ E, bucket: 0, rows }) as BodyInit,
+        body: W.encodeInboxPost({ E, rows }) as BodyInit,
       });
       expect(res.status).toBe(200);
       return ((await res.json()) as { results: W.InboxPostResult[] }).results;
@@ -1042,7 +1052,11 @@ describe("inbox", () => {
     // No draw for an idempotent retry, a conflict or a full row.
     world.inbox.dayCap = world.inbox.rowsOf(E).length;
     expect(
-      await relOf([first, { eid: first.eid, body: P.random(P.INBOX_BODY_LEN) }, invite()]),
+      await relOf([
+        first,
+        { bucket: 0, eid: first.eid, body: P.random(P.INBOX_BODY_LEN) },
+        invite(),
+      ]),
     ).toEqual([s + 1, "conflict", "full"]);
     expect(calls).toHaveLength(cases.length);
     world.inbox.dayCap = 2000;
@@ -1147,8 +1161,8 @@ describe("inbox", () => {
 
     // Posts the Worker refuses itself (a bad bucket, an era outside its bounds) never reach it.
     world.inbox.wrongEraOnce(E + 7);
-    const bad = W.encodeInboxPost({ E, bucket: 0, rows: [invite()] });
-    bad[5] = 1; // bucket 1
+    const bad = W.encodeInboxPost({ E, rows: [invite()] });
+    bad[6] = 1; // bucket 1 (the world has one bucket)
     expect((await fetch("/api/v2/inbox", { method: "POST", body: bad as BodyInit })).status).toBe(
       400,
     );

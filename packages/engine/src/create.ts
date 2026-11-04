@@ -114,6 +114,11 @@ export interface DeliverCtx {
   wait(ms: number): Promise<void>;
   check(): void;
   progress(text: string): void;
+  /**
+   * The recipient's inbox bucket of era E (§9.3, §10.6), from its directory entry; throws a transient ApiError when
+   * no entry covers E (the recipient stays pending).
+   */
+  bucketOf(uid: Bytes, E: number): Promise<number>;
 }
 
 /** The outcome of one round of invites: who got one, and the longest `retry-after` a refusal asked for (s). */
@@ -142,7 +147,18 @@ export async function deliverInvites(
     const tried = new Set<number>();
     for (let attempt = 0; attempt < 4; attempt++) {
       ctx.check();
-      const rows = batch.map((r) => P.makeInvite(r.kemPk, E, 0, J));
+      let rows: { bucket: number; eid: Bytes; body: Bytes }[];
+      try {
+        rows = await Promise.all(
+          batch.map(async (r) => {
+            const bucket = await ctx.bucketOf(r.uid, E);
+            return { bucket, ...P.makeInvite(r.kemPk, E, bucket, J) };
+          }),
+        );
+      } catch (e) {
+        if (isTransient(e)) break; // pending: the delivery queue retries
+        throw e;
+      }
       try {
         const results = await ctx.api.postInbox(E, rows, (m) => ctx.progress(m));
         results.forEach((x, k) => {
