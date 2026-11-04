@@ -1,14 +1,19 @@
 /**
  * Deployment parameters and server secrets for the v2 API (docs/PROTOCOL.md §3.1, §4.4, §9.5, §9.7).
  *
- * Vars (wrangler.jsonc "vars", strings): DELTA_S (Δ), SKEW_S (SKEW), INBOX_SLOT_S (Δin), E_FIRST. A var that is
- * present but invalid (not decimal, out of range, or a Δ that does not divide 604 800) makes the Worker answer
- * 503 "server misconfigured" on /api/v2/* (v2ParamsValid() is false); v2Params() falls back to the default.
+ * Vars (wrangler.jsonc "vars", strings): DELTA_S (Δ), SKEW_S (SKEW), INBOX_SLOT_S (Δin), E_FIRST, RT_CONNS (C),
+ * RT_FEEDS (F, a power of two; §9.4), BLOBREG_SHARDS (B, a power of two, a constant of the deployment; §9.2),
+ * DIR_SHARDS (K, the directory's user databases, a power of two that is only ever raised; §9.6), SHARD_MAP (the shard
+ * count per era, "E:S" entries; §9.1) and INBOX_MAP (the inbox bucket count per era, the same form; §9.3). A var that
+ * is present but invalid (not decimal, out of range, a Δ that does not divide 604 800, a malformed shard map, a
+ * DIR_SHARDS without its databases) makes the Worker answer 503 "server misconfigured" on /api/v2/* (v2ParamsValid()
+ * is false); v2Params() falls back to the default.
+ * D1: DIRLOG is the directory's log database and DB, DB1 … DB{K−1} its user databases (§9.6).
  * Secrets: ROUTE_KEY (32 bytes, b64u) and SRV_KEY (32-byte Ed25519 seed, b64u). When either is missing or
  * malformed the Worker answers 503 "server misconfigured" on /api/v2/* (serverKeys() returns null).
  * Shared by the Worker and every v2 Durable Object (they must agree on Δ and SKEW).
  */
-import { ERA_MS, ERA_NONE, era, fromB64u, kcommit, kroute, sigPub, sign } from "@segv/protocol/proto";
+import { ERA_MS, ERA_NONE, era, fromB64u, kblob, kcommit, kfeed, kroute, ktag, sigPub, sign } from "@segv/protocol/proto";
 import { appHosts } from "./hosts";
 import { parseVapidKey, vapidPublicKey } from "./webpush";
 
@@ -21,7 +26,73 @@ export interface V2Params {
   inboxSlot: number;
   /** Era of the first deploy: lower eras are answered "sealed / not found" without any DO call. */
   eFirst: number;
+  /** C: the number of ConnDOs (§9.4). Default 1. */
+  rtConns: number;
+  /** F: the number of FeedDOs, a power of two (§9.4). Default 1. */
+  rtFeeds: number;
+  /** B: the number of BlobRegDO shards, a power of two, fixed for the deployment (§9.2). Default 1. */
+  blobShards: number;
+  /** K: the number of user databases of the directory, a power of two, only ever raised (§9.6). Default 1. */
+  dirShards: number;
+  /** The shard map (§9.1): entries ascending by `from`; s_E is the `bits` of the last entry at or below E, 0 without one. */
+  shardMap: ShardMapEntry[];
+  /** The inbox bucket map (§9.3 "Buckets"), the same form: β_E is the `bits` of the last entry at or below E. */
+  inboxMap: ShardMapEntry[];
 }
+
+/** One SHARD_MAP entry: from era `from` on, 2^bits shards per era. */
+export interface ShardMapEntry {
+  from: number;
+  bits: number;
+}
+
+/** The largest shard count (2^16; shardOf() takes at most 16 bits). */
+const SHARDS_MAX = 65536;
+/** The largest DIR_SHARDS (and so the number of DB{d} bindings a deployment may need; §9.6). */
+export const DIR_SHARDS_MAX = 256;
+
+/**
+ * Parses SHARD_MAP ("E:S,E:S,…", §9.1 "Shard map"): [] when the var is absent or empty, null when it is malformed
+ * (an entry that is not `E:S`, an E above 0xFFFE or not strictly ascending, an S that is not a power of two in
+ * 1..65536).
+ */
+export function parseShardMap(raw: unknown): ShardMapEntry[] | null {
+  if (raw === undefined || raw === null) return [];
+  if (typeof raw !== "string") return null;
+  const s = raw.trim();
+  if (s === "") return [];
+  const out: ShardMapEntry[] = [];
+  for (const part of s.split(",")) {
+    const m = /^\s*(\d{1,5}):(\d{1,5})\s*$/.exec(part);
+    if (!m) return null;
+    const from = Number(m[1]);
+    const S = Number(m[2]);
+    if (from > ERA_NONE - 1 || S < 1 || S > SHARDS_MAX || (S & (S - 1)) !== 0) return null;
+    if (out.length > 0 && from <= out[out.length - 1].from) return null;
+    out.push({ from, bits: 31 - Math.clz32(S) });
+  }
+  return out;
+}
+
+/** s_E: the bits of the last entry at or below E (0 when there is none). */
+export function shardBitsOf(map: readonly ShardMapEntry[], E: number): number {
+  let bits = 0;
+  for (const e of map) {
+    if (e.from > E) break;
+    bits = e.bits;
+  }
+  return bits;
+}
+
+/** S_E = 2^s_E. */
+export const shardsOf = (map: readonly ShardMapEntry[], E: number): number => 2 ** shardBitsOf(map, E);
+
+/** b of the blob registry: B = 2^b shards (§9.2). */
+export const blobBitsOf = (B: number): number => 31 - Math.clz32(B);
+
+/** β_E: the bits of the last INBOX_MAP entry at or below E (0 when there is none); 2^β_E inbox buckets (§9.3). */
+export const inboxBitsOf = (map: readonly ShardMapEntry[], E: number): number => shardBitsOf(map, E);
+export const inboxBucketsOf = (map: readonly ShardMapEntry[], E: number): number => 2 ** inboxBitsOf(map, E);
 
 /** Inbox constants (§9.3, §10.9). */
 export const INBOX_DAY_CAP = 2000;
@@ -39,13 +110,17 @@ interface VarSpec {
 /** Seconds per era. */
 const ERA_S = ERA_MS / 1000;
 
-const VARS: Readonly<Record<keyof V2Params, VarSpec>> = {
+const VARS: Readonly<Record<Exclude<keyof V2Params, "shardMap" | "inboxMap">, VarSpec>> = {
   // Δ must divide 604 800: the first rows of an era get t = sec(start(E)), and a BlobReg MISS at now ≥ t_row is
   // final (§6.4(g)) only if tpub(now) ≥ t_row, i.e. only if every sec(start(E)) is a multiple of Δ.
   delta: { name: "DELTA_S", dflt: 10, min: 1, max: 3600, ok: (n) => ERA_S % n === 0 },
   skew: { name: "SKEW_S", dflt: 2, min: 0, max: 60 },
   inboxSlot: { name: "INBOX_SLOT_S", dflt: 10, min: 1, max: 3600 },
   eFirst: { name: "E_FIRST", dflt: 0, min: 0, max: ERA_NONE - 1 },
+  rtConns: { name: "RT_CONNS", dflt: 1, min: 1, max: 4096 },
+  rtFeeds: { name: "RT_FEEDS", dflt: 1, min: 1, max: 4096, ok: (n) => (n & (n - 1)) === 0 },
+  blobShards: { name: "BLOBREG_SHARDS", dflt: 1, min: 1, max: 4096, ok: (n) => (n & (n - 1)) === 0 },
+  dirShards: { name: "DIR_SHARDS", dflt: 1, min: 1, max: DIR_SHARDS_MAX, ok: (n) => (n & (n - 1)) === 0 },
 };
 
 /** The var's value; undefined when it is absent, null when it is present but invalid. */
@@ -61,15 +136,83 @@ function intVar(env: Env, v: VarSpec): number | null | undefined {
 /** The deployment parameters, with the default for any absent or invalid var (the Durable Objects use this). */
 export function v2Params(env: Env): V2Params {
   const get = (v: VarSpec): number => intVar(env, v) ?? v.dflt;
-  return { delta: get(VARS.delta), skew: get(VARS.skew), inboxSlot: get(VARS.inboxSlot), eFirst: get(VARS.eFirst) };
+  return {
+    delta: get(VARS.delta),
+    skew: get(VARS.skew),
+    inboxSlot: get(VARS.inboxSlot),
+    eFirst: get(VARS.eFirst),
+    rtConns: get(VARS.rtConns),
+    rtFeeds: get(VARS.rtFeeds),
+    blobShards: get(VARS.blobShards),
+    dirShards: get(VARS.dirShards),
+    shardMap: parseShardMap((env as unknown as Record<string, unknown>).SHARD_MAP) ?? [],
+    inboxMap: parseShardMap((env as unknown as Record<string, unknown>).INBOX_MAP) ?? [],
+  };
 }
 
 /**
- * False when a deployment var is present but invalid (not decimal, out of range, or a DELTA_S that does not divide
- * 604 800): the Worker then answers 503 "server misconfigured" on /api/v2/* instead of running on a fallback.
+ * False when a deployment var is present but invalid (not decimal, out of range, a DELTA_S that does not divide
+ * 604 800, an RT_FEEDS, BLOBREG_SHARDS or DIR_SHARDS that is not a power of two, a malformed SHARD_MAP or INBOX_MAP,
+ * or a directory database that DIR_SHARDS needs but the deployment does not bind): the Worker then answers 503
+ * "server misconfigured" on /api/v2/* instead of running on a fallback.
  */
 export function v2ParamsValid(env: Env): boolean {
-  return Object.values(VARS).every((v) => intVar(env, v) !== null);
+  return (
+    Object.values(VARS).every((v) => intVar(env, v) !== null) &&
+    parseShardMap((env as unknown as Record<string, unknown>).SHARD_MAP) !== null &&
+    parseShardMap((env as unknown as Record<string, unknown>).INBOX_MAP) !== null &&
+    dirDbsBound(env)
+  );
+}
+
+// ───────────── the directory's databases (§9.6) ─────────────
+
+/** The binding of user database d: DB for 0, DB{d} above. */
+export const dirDbBinding = (d: number): string => (d === 0 ? "DB" : `DB${d}`);
+
+const isD1 = (x: unknown): x is D1Database =>
+  typeof x === "object" && x !== null && typeof (x as D1Database).prepare === "function";
+
+/** The log database (dirlog, dirmeta; §9.6). */
+export function logDb(env: Env): D1Database {
+  const db = (env as unknown as Record<string, unknown>).DIRLOG;
+  if (!isD1(db)) throw new Error("directory: the log database is not bound");
+  return db;
+}
+
+/** User database d (§9.6); throws when the deployment does not bind it. */
+export function userDb(env: Env, d: number): D1Database {
+  const db = (env as unknown as Record<string, unknown>)[dirDbBinding(d)];
+  if (!isD1(db)) throw new Error(`directory: user database ${d} is not bound`);
+  return db;
+}
+
+/** Every user database of the deployment, 0 .. K − 1 (K = DIR_SHARDS). */
+export const userDbs = (env: Env): D1Database[] =>
+  Array.from({ length: v2Params(env).dirShards }, (_, d) => userDb(env, d));
+
+/** Whether the log database and the K user databases are bound. */
+function dirDbsBound(env: Env): boolean {
+  try {
+    logDb(env);
+    userDbs(env);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** dirShard(uid) = the top `bits` bits of upre (§9.6): the user database of a uid under K = 2^bits. */
+export function dirShardOf(upre: number, bits: number): number {
+  if (!Number.isInteger(bits) || bits < 0 || bits > 8) throw new Error("bad directory shard bits");
+  return Math.floor(upre / 2 ** (32 - bits));
+}
+
+/** log2 of a power of two in 1..DIR_SHARDS_MAX. */
+export function dirBitsOf(K: number): number {
+  const bits = Math.log2(K);
+  if (!Number.isInteger(bits) || bits < 0 || K > DIR_SHARDS_MAX) throw new Error("DIR_SHARDS is not a power of two");
+  return bits;
 }
 
 /**
@@ -84,6 +227,12 @@ export function eraBounds(nowMs: number, skewS: number): { now: number; lo: numb
 
 export interface ServerKeys {
   routeKey: Uint8Array;
+  /** ktag: the key of the opaque client tag (§4.4) */
+  tagKey: Uint8Array;
+  /** kfeed: the key of the topic feed hash (§4.4) */
+  feedKey: Uint8Array;
+  /** kblob: the key that routes blob ids to the registry shards (§4.4, §9.2) */
+  blobKey: Uint8Array;
   /** Ed25519 seed (SRV_SK) */
   srvSeed: Uint8Array;
   /** srvKey, published in params */
@@ -110,7 +259,15 @@ export function serverKeys(env: Env): ServerKeys | null {
   if (route === null || srv === null) return null;
   if (keyCache && keyCache.route === route && keyCache.srv === srv) return keyCache.keys;
   const srvSeed = fromB64u(srv);
-  const keys: ServerKeys = { routeKey: fromB64u(route), srvSeed, srvPk: sigPub(srvSeed) };
+  const routeKey = fromB64u(route);
+  const keys: ServerKeys = {
+    routeKey,
+    tagKey: ktag(routeKey),
+    feedKey: kfeed(routeKey),
+    blobKey: kblob(routeKey),
+    srvSeed,
+    srvPk: sigPub(srvSeed),
+  };
   keyCache = { route, srv, keys };
   krouteCache.clear();
   signKey = null;
@@ -177,10 +334,8 @@ export interface PushConfig {
   hosts: readonly string[];
   /** POW_PUSH */
   powBase: number;
-  /** PUSH_MAX_SUBS */
-  maxSubs: number;
-  /** PUSH_DAY_SUBS */
-  daySubs: number;
+  /** PUSH_SHARDS: the number of QuietDOs (§9.8) */
+  shards: number;
   /** The first APP_HOSTS host: the payload's `navigate` is https://<appHost>/ */
   appHost: string;
 }
@@ -191,8 +346,7 @@ const PUSH_HOST_RE = new RegExp(`^(?:\\*\\.)?${HOST_LABEL}(?:\\.${HOST_LABEL})+$
 /** Push vars with bounds. The spec gives no upper bounds; these keep a typo from becoming an unbounded setting. */
 const PUSH_INT_VARS = {
   powBase: { name: "POW_PUSH", dflt: 20, re: /^\d{1,2}$/, min: 0, max: 64 },
-  maxSubs: { name: "PUSH_MAX_SUBS", dflt: 100_000, re: /^\d{1,8}$/, min: 1, max: 10_000_000 },
-  daySubs: { name: "PUSH_DAY_SUBS", dflt: 2_000, re: /^\d{1,6}$/, min: 1, max: 100_000 },
+  shards: { name: "PUSH_SHARDS", dflt: 1, re: /^\d{1,4}$/, min: 1, max: 4096 },
 } as const;
 
 type PushParse = { ok: true; cfg: PushConfig } | { ok: false; bad: string | null };
@@ -216,7 +370,7 @@ function parsePush(env: Env): PushParse {
     hosts = hostsRaw.split(",").map((h) => h.trim().toLowerCase());
     if (hosts.length === 0 || !hosts.every((h) => PUSH_HOST_RE.test(h))) return { ok: false, bad: "PUSH_HOSTS" };
   }
-  const ints: Record<keyof typeof PUSH_INT_VARS, number> = { powBase: 0, maxSubs: 0, daySubs: 0 };
+  const ints: Record<keyof typeof PUSH_INT_VARS, number> = { powBase: 0, shards: 0 };
   for (const [k, v] of Object.entries(PUSH_INT_VARS) as [keyof typeof PUSH_INT_VARS, (typeof PUSH_INT_VARS)[keyof typeof PUSH_INT_VARS]][]) {
     const raw = rawVar(env, v.name);
     if (raw === undefined || raw === null) {
@@ -240,8 +394,7 @@ function parsePush(env: Env): PushParse {
       pushKey: fromB64u(pk),
       hosts,
       powBase: ints.powBase,
-      maxSubs: ints.maxSubs,
-      daySubs: ints.daySubs,
+      shards: ints.shards,
       appHost: app[0],
     },
   };
@@ -259,7 +412,21 @@ function validVapidSub(s: string): boolean {
   }
 }
 
-const PUSH_VAR_NAMES = ["VAPID_SK", "PUSH_KEY", "VAPID_SUB", "PUSH_HOSTS", "POW_PUSH", "PUSH_MAX_SUBS", "PUSH_DAY_SUBS", "APP_HOSTS"];
+const PUSH_VAR_NAMES = ["VAPID_SK", "PUSH_KEY", "VAPID_SUB", "PUSH_HOSTS", "POW_PUSH", "PUSH_SHARDS", "APP_HOSTS"];
+
+/**
+ * PUSH_SHARDS alone (§9.8): the value, 1 when the var is absent, null when it is present but malformed. The daily
+ * expiry routes by it whether or not push is on (a malformed value then counts as 1).
+ */
+export function pushShardsOf(env: Env): number | null {
+  const v = PUSH_INT_VARS.shards;
+  const raw = rawVar(env, v.name);
+  if (raw === undefined || raw === null) return v.dflt;
+  const s = typeof raw === "number" ? String(raw) : raw;
+  if (typeof s !== "string" || !v.re.test(s)) return null;
+  const n = Number(s);
+  return n < v.min || n > v.max ? null : n;
+}
 let pushCache: { sig: string; cfg: PushConfig | null } | null = null;
 const pushLogged = new Set<string>();
 

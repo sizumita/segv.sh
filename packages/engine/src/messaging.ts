@@ -3,7 +3,15 @@
 // routing, HEADS writes and the views. The engine (engine.ts) owns accounts and the session lifecycle and creates one
 // Messaging per unlocked session.
 import * as P from "@segv/protocol/proto";
-import { isTransient, type Api, type DirUser, type Params } from "./api";
+import {
+  ApiError,
+  bucketIn,
+  isTransient,
+  pushParams,
+  type Api,
+  type DirUser,
+  type Params,
+} from "./api";
 import { controlSettled, settleControl, type ControlHost } from "./claims";
 import { CANNOT_CHANGE, commit, waitCommitTime, type CommitHost, type Plan } from "./commit";
 import {
@@ -28,6 +36,7 @@ import {
   type Copy,
   type Epoch,
   type KnownUser,
+  type LaneBell,
   type Slot,
   type Winner,
 } from "./conv";
@@ -143,8 +152,12 @@ export interface SessionAccount {
   id: P.Identity;
   handle: string;
   regEra: number;
+  /** the account's inbox buckets as the account check saw them (§10.6 `inbox`, §9.3) */
+  inbox: readonly { E: number; g: number }[];
   /** the key of copy refs (`refKeyOf(AK)`) */
   refKey: Bytes;
+  /** the account's bell secret key bS (§2.1, §4.1) */
+  bellKey: Bytes;
 }
 
 /** What Messaging needs from the engine. */
@@ -204,6 +217,13 @@ export class Messaging {
   private readonly rts: Realtime[] = [];
   /** monotonic time of the last periodic catch-up */
   private lastPeriodic = -Infinity;
+  /** the eras whose inbox notice topics are subscribed (§10.8) */
+  private inboxEras: number[] = [];
+  /** The account's own inbox bucket per era (§9.3, §10.6), from its directory entry; refreshed when an era is missing. */
+  private readonly ownBuckets = new Map<number, number>();
+  private bucketsPending: Promise<void> | null = null;
+  /** the poll Δin after a notice whose slot the read had not reached (§10.8); at most one pending */
+  private inboxRetry: EngineTimer | null = null;
   private WS: WebSocketCtor | null = null;
   private seqCounter = 0;
   private localCounter = 0;
@@ -229,6 +249,10 @@ export class Messaging {
   private readonly settleTimers = new Set<string>();
   /** LEAVE records being written, by copy key and epoch (one write per session, §6.9) */
   private readonly leaveWrites = new Map<string, Promise<void>>();
+  /** BELL rows being posted, by copy key and epoch (§11.13) */
+  private readonly bellWrites = new Map<string, Promise<void>>();
+  /** by the same key: when a failed BELL put may be tried again (monotonic) */
+  private readonly bellRetryAt = new Map<string, number>();
   /** the checkpoint chain this session verified (§12.3, §12.4) */
   readonly ckpt: Checkpoints;
   /** the hello probing of the account's links (§5.5) */
@@ -252,6 +276,7 @@ export class Messaging {
   private unloadedHashes = new Map<string, Bytes | null>();
 
   constructor(private readonly h: MessagingHost) {
+    for (const b of h.acc.inbox) this.ownBuckets.set(b.E, b.g);
     this.ckpt = new Checkpoints({
       api: h.api,
       storage: () => {
@@ -273,6 +298,7 @@ export class Messaging {
       track: (p) => h.track(p),
       warn: (t) => h.warn(t),
       pks: (job) => this.pksOf(job),
+      bucketOf: (uid, E) => this.recipientBucket(uid, E),
       handleOf: (uidB) => this.handleOfUid(uidB),
       welcomeChannel: async (uid) => this.welcomeChannel(uid),
       sendWelcome: (c, uid, J) => this.sendWelcome(c as Copy, uid, J),
@@ -319,9 +345,10 @@ export class Messaging {
     this.repeatLeaves();
   }
 
-  /** Starts realtime and the periodic inbox poll and catch-up (§11.5, §11.6). */
+  /** Starts realtime and the periodic catch-up (§11.6); the inbox is read on notices and at catch-ups (§11.5). */
   start(): void {
     this.live = true;
+    this.lastPeriodic = this.h.clock.mono(); // the restore just synced everything; the connect runs its own catch-up
     // §11.4 step 10: a snapshot when the era has none or many records were applied since the latest one.
     void this.h.track(this.maybeSnapshot()).catch(() => {});
     const WS =
@@ -329,15 +356,17 @@ export class Messaging {
       (typeof WebSocket === "undefined" ? null : (WebSocket as unknown as WebSocketCtor));
     this.WS = WS;
     this.subscribe();
-    this.every(
-      () => Math.max(this.params().inboxSlot, 2) * 1000,
-      () => this.h.enqueue(() => this.pollInbox()),
-    );
+    this.ensureBells();
+    // The notice topics need the account's buckets (§10.8): subscribe again once they are known.
+    void this.h
+      .track(this.ensureBuckets(this.inboxErasNow()).then((changed) => changed && this.subscribe()))
+      .catch(() => {});
     // The loop ticks at the short interval, so a socket that drops gets the short cadence at once, not after the
-    // long wait that was scheduled while it was connected.
+    // long wait that was scheduled while it was connected. Each tick also keeps the inbox notice topics on E_now.
     this.every(
       () => this.h.delays.catchUpInterval,
       () => {
+        this.refreshInboxTopics();
         const now = this.h.clock.mono();
         if (this.rts[0]?.connected && now - this.lastPeriodic < CONNECTED_CATCH_UP_MS)
           return Promise.resolve();
@@ -352,6 +381,8 @@ export class Messaging {
     for (const rt of this.rts) rt.stop();
     this.rts.length = 0;
     for (const t of this.timers) t.cancel();
+    this.inboxRetry?.cancel();
+    this.inboxRetry = null;
     void this.inbox?.then((x) => x.worker?.terminate());
   }
 
@@ -423,6 +454,7 @@ export class Messaging {
     });
     this.resumeDeliveries();
     this.repeatLeaves();
+    this.ensureBells();
     await this.flushHeads();
     await this.maybeSnapshot();
   }
@@ -1314,6 +1346,40 @@ export class Messaging {
             ep.left.set(uidB, { t: rec.t, row: { ...rec.row }, key: null, order: null });
         }
     }
+    // The bells of the HEADS epoch, from the BELLS record beside the entry, as if read at its lane positions (§7.3,
+    // §11.4 step 5): a BELL row processed from those positions on replaces them.
+    const bells = this.bellsOfCopy(c, ep.e);
+    if (bells) {
+      for (const b of bells.entries) {
+        if (b.lane >= ep.lanes.length || b.lane === ep.myIndex) continue;
+        ep.lanes[b.lane].bell = {
+          g: 0,
+          bell: b.bell,
+          at: { ...ep.lanes[b.lane].next },
+          seeded: true,
+        };
+      }
+      if (bells.g !== P.BELLS_NO_GEN && ep.myIndex >= 0) {
+        const bell = P.bellOf(P.bellSecret(this.h.acc.bellKey, c.conv, bells.g));
+        ep.lanes[ep.myIndex].bell = {
+          g: bells.g,
+          bell,
+          at: { ...ep.lanes[ep.myIndex].next },
+          seeded: true,
+        };
+      }
+    }
+  }
+
+  /** The copy's BELLS record for epoch e among its sources (§7.2, §7.3), or null. */
+  private bellsOfCopy(c: Copy, e: number): P.BellsRec | null {
+    const f = this.h.self.fold;
+    for (const s of this.sources(c)) {
+      if (e < s.lo || e >= s.hi) continue;
+      const r = f.bells.get(s.key);
+      if (r && r.e === e) return r;
+    }
+    return null;
   }
 
   /**
@@ -1501,6 +1567,11 @@ export class Messaging {
         this.welcome({ c, ep, j, at, J, old });
       },
       onValidRow: (c, ep, j) => this.corroborate(c, ep, j),
+      onBell: (c, ep, j) => {
+        if (c.probe) return;
+        this.markHeads(); // HEADS rows carry the bells (§7.3)
+        if (j === ep.myIndex) this.h.changed(); // the registration set may have changed (§11.13)
+      },
       takeEcho: (key, body) => {
         const x = this.echoes.get(key);
         if (!x || !P.equalBytes(x.body, body)) return undefined;
@@ -1905,6 +1976,7 @@ export class Messaging {
         onMissed: () => void this.catchUpSoon(),
         onSubscribed: () => void this.catchUpSoon(),
         onHello: (s, sent, recv) => this.h.api.time.add(s, sent, recv),
+        onInbox: (E, g, rel) => this.onInbox(E, g, rel),
         onState: () => this.h.setConnected(this.rts.some((x) => x.connected)),
       },
       this.h.api.origin,
@@ -1914,13 +1986,18 @@ export class Messaging {
   }
 
   /**
-   * The topics, in priority order (§10.8): Tself, the current epochs of accepted copies by recent activity, the old
-   * epochs with followed lanes (§11.2), then the live links' Tlink. Requests are never subscribed. At most 256 per
-   * socket and 2 sockets; the rest are covered by catch-up.
+   * The topics, in priority order (§10.8): Tself, the inbox notice topics (§9.3), the current epochs of accepted
+   * copies by recent activity, the old epochs with followed lanes (§11.2), then the live links' Tlink. Requests are
+   * never subscribed. At most 256 per socket and 2 sockets; the rest are covered by catch-up.
    */
   private subscribe(): void {
     if (!this.live || !this.WS) return;
     const topics: Bytes[] = [P.topicSelf(this.h.acc.id.nS)];
+    this.inboxEras = this.inboxErasNow();
+    for (const E of this.inboxEras) {
+      const g = this.ownBuckets.get(E);
+      if (g !== undefined) topics.push(P.topicInbox(E, g));
+    }
     const accepted = [...this.copies.values()]
       .filter((c) => !c.request && !c.removed)
       .sort((a, b) => b.lastTs - a.lastTs);
@@ -1952,8 +2029,127 @@ export class Messaging {
 
   // ───────────────────────── inbox and joins (§6.7, §11.5) ─────────────────────────
 
-  /** Reads the inbox, accepts the joins found (in order) and moves the cursor (§11.5). */
-  async pollInbox(): Promise<void> {
+  /** The eras whose inbox notices are watched (§10.8): E_now − 1 .. E_now + 1, within retention and below 0xFFFF. */
+  private inboxErasNow(): number[] {
+    const p = this.params();
+    const En = P.era(this.h.api.serverNow());
+    const lo = Math.max(p.efirst, En - 3);
+    return [En - 1, En, En + 1].filter((E) => E >= lo && E <= 0xfffe);
+  }
+
+  /** Subscribes again when the era moved on, so that the notice topics follow E_now (§10.8). */
+  private refreshInboxTopics(): void {
+    const want = this.inboxErasNow();
+    const same =
+      want.length === this.inboxEras.length && want.every((E, i) => E === this.inboxEras[i]);
+    const known = want.every((E) => this.ownBuckets.has(E));
+    if (same && known) return;
+    void this.h
+      .track(
+        this.ensureBuckets(want).then((changed) => {
+          if (!same || changed) this.subscribe();
+        }),
+      )
+      .catch(() => {});
+  }
+
+  /**
+   * The account's own inbox bucket of each of `eras` (§9.3 "Buckets"): seeded from the account check (§11.1 step
+   * 2), then one lookup of its own entry (`dir/uid`, §10.6, which lists E_now − 3 .. E_now + 1) when any is missing.
+   * Returns whether a bucket was learnt. A failed lookup leaves the map as it was: the next catch-up tries again, and
+   * a poll of an era without a bucket fails like a transient error.
+   */
+  private async ensureBuckets(eras: readonly number[]): Promise<boolean> {
+    if (eras.every((E) => this.ownBuckets.has(E))) return false;
+    if (!this.bucketsPending) {
+      this.bucketsPending = (async () => {
+        const u = await this.h.api.userByUid(this.h.acc.uid);
+        if (!u) throw new ApiError(0, "own directory entry missing");
+        for (const b of u.inbox) this.ownBuckets.set(b.E, b.g);
+      })().finally(() => {
+        this.bucketsPending = null;
+      });
+    }
+    await this.bucketsPending;
+    return eras.some((E) => this.ownBuckets.has(E));
+  }
+
+  /** The account's bucket of era E for a poll (§11.5): looked up when unknown; throws (transient) when it stays so. */
+  private async ownBucket(E: number): Promise<number> {
+    await this.ensureBuckets([E]);
+    const g = this.ownBuckets.get(E);
+    if (g === undefined) throw new ApiError(0, `no inbox bucket known for era ${E}`);
+    return g;
+  }
+
+  /**
+   * A recipient's inbox bucket of era E (§6.12, §10.6): from its directory entry by uid prefix, cached for the
+   * session; an entry that does not cover E (the era moved on) is looked up again, fresh. Throws a transient
+   * ApiError when the bucket cannot be learnt, which leaves the recipient pending.
+   */
+  private async recipientBucket(uid: Bytes, E: number): Promise<number> {
+    for (const fresh of [false, true]) {
+      const u = await this.h.api.userByUidPrefix(uid, fresh);
+      const g = u ? bucketIn(u, E) : null;
+      if (g !== null) return g;
+    }
+    throw new ApiError(0, `no inbox bucket of era ${E} for the recipient`);
+  }
+
+  /** the slots announced by the notices that wait for one poll (§10.8), era → largest rel; null when none waits */
+  private inboxNotice: Map<number, number> | null = null;
+
+  /**
+   * An INBOX notice (§10.8): slot `rel` of bucket `g` of era `E` closed with rows. Poll the inbox after a uniform
+   * random delay of up to `max(0, Δin − SKEW − 2)` s, so that the devices that get the same notice spread their reads
+   * over the rest of the slot, where the edge cache serves all but the first of them (§10.5); a notice that comes
+   * while a poll waits joins it. When the read of an announced era did not reach its `rel` (a response cached before
+   * the close, or an era this device does not read yet), poll once more after Δin. The catch-up every 300 s covers
+   * whatever these miss.
+   */
+  private onInbox(E: number, g: number, rel: number): void {
+    if (this.ownBuckets.get(E) !== g || !this.live || this.stopped) return;
+    const waiting = this.inboxNotice;
+    if (waiting) {
+      waiting.set(E, Math.max(waiting.get(E) ?? -1, rel));
+      return;
+    }
+    const want = new Map([[E, rel]]);
+    this.inboxNotice = want;
+    const run = (): void => {
+      if (!this.live || this.stopped) {
+        if (this.inboxNotice === want) this.inboxNotice = null;
+        return;
+      }
+      void this.h
+        .track(
+          this.h.enqueue(async () => {
+            if (this.inboxNotice === want) this.inboxNotice = null; // from here on a notice waits for the next poll
+            const closed = await this.pollInbox();
+            if (this.inboxRetry || [...want].every(([e, r]) => (closed.get(e) ?? -1) >= r)) return;
+            this.inboxRetry = this.h.clock.setTimer(() => {
+              this.inboxRetry = null;
+              if (!this.live || this.stopped) return;
+              void this.h.track(this.h.enqueue(() => this.pollInbox())).catch(() => {});
+            }, this.params().inboxSlot * 1000);
+          }),
+        )
+        .catch(() => {})
+        .finally(() => {
+          if (this.inboxNotice === want) this.inboxNotice = null;
+        });
+    };
+    const p = this.params();
+    const spread = Math.max(0, (p.inboxSlot - p.skew - 2) * 1000);
+    if (spread === 0) run();
+    else this.h.clock.setTimer(run, Math.floor(Math.random() * (spread + 1)));
+  }
+
+  /**
+   * Reads the inbox, accepts the joins found (in order) and moves the cursor (§11.5). Returns the `closed` each era
+   * read reported.
+   */
+  async pollInbox(): Promise<Map<number, number>> {
     this.h.api.beginOperation(); // a poll's joins share one fresh answer per prefix (§10.6)
     const p = await this.h.api.params();
     const scan = await scanInbox(
@@ -1963,6 +2159,7 @@ export class Messaging {
       p,
       this.h.acc.regEra,
       (t) => this.h.warn(t),
+      (E) => this.ownBucket(E),
       await this.decrypter(),
     );
     this.h.check();
@@ -1970,6 +2167,7 @@ export class Messaging {
       scan.joins.map((x) => ({ J: x.J, at: { E: x.E, rel: x.rel } })),
       scan.cursor,
     );
+    return scan.closed;
   }
 
   private joinCtx(pending: NewCopy[], quiet = false): JoinCtx {
@@ -2355,6 +2553,7 @@ export class Messaging {
     c.request = false;
     this.subscribe();
     this.h.changed();
+    this.ensureBells();
     void this.h
       .track(
         this.h.enqueue(async () => {
@@ -3146,39 +3345,122 @@ export class Messaging {
     };
   }
 
+  // ───────────────────────── bells (§4.1, §11.13) ─────────────────────────
+
   /**
-   * The bells a TEXT, IMAGE or FILE stored in `ep` rings (§11.13): every other lane of `ep`, and, when the copy holds
-   * `ep.e − 1`, the bell there of each member of both epochs, other than self, of whom no valid row in `ep` was seen
-   * (a device that has not processed the epoch change still has that bell registered).
+   * The generation of epoch e of a copy (§11.13): the latest epoch at or below e that started one, that is, the copy's
+   * root epoch or an epoch whose D lacks a member of the previous epoch's (a member removed, or dropped after leaving).
+   * An epoch the copy does not hold counts as a start.
    */
+  private genOf(c: Copy, e: number): number {
+    for (let k = e; k > c.rootE; k--) {
+      const cur = c.epochs.get(k);
+      const prev = c.epochs.get(k - 1);
+      if (!cur || !prev) return k;
+      if (prev.D.members.some((m) => P.memberIndex(cur.D, m.uid) < 0)) return k;
+    }
+    return c.rootE;
+  }
+
+  /** A member's latest BELL row among the held epochs `lo..hi`, the newest epoch first, or null. */
+  private latestBell(c: Copy, uid: Bytes, hi: number, lo: number): LaneBell | null {
+    for (let k = hi; k >= lo; k--) {
+      const ep = c.epochs.get(k);
+      if (!ep) continue;
+      const j = P.memberIndex(ep.D, uid);
+      if (j < 0) continue;
+      const b = ep.lanes[j].bell;
+      if (b) return b;
+    }
+    return null;
+  }
+
+  /**
+   * A member's bell as a send in `ep` rings it (§11.13 "Ringing"): its latest BELL row in ep's generation, or, when ep
+   * started its generation and the copy holds ep.e − 1 with the member in it, its latest BELL row in the previous
+   * generation (a device closed at the change still has that bell registered). For self, the same rule gives the
+   * generation the registration set uses (§11.13 "The registration set").
+   */
+  private memberBell(c: Copy, ep: Epoch, uid: Bytes): LaneBell | null {
+    const g = this.genOf(c, ep.e);
+    const cur = this.latestBell(c, uid, ep.e, g);
+    if (cur) return cur;
+    if (g !== ep.e || ep.e <= c.rootE) return null;
+    const prev = c.epochs.get(ep.e - 1);
+    if (!prev || P.memberIndex(prev.D, uid) < 0) return null;
+    return this.latestBell(c, uid, ep.e - 1, this.genOf(c, ep.e - 1));
+  }
+
+  /** The bells a TEXT, IMAGE or FILE stored in `ep` rings (§11.13): one per other member that has a bell, no repeats. */
   private ringBells(c: Copy, ep: Epoch): Bytes[] {
     const out: Bytes[] = [];
-    ep.D.members.forEach((_, l) => {
-      if (l !== ep.myIndex) out.push(P.bell(ep.keys.nk, l));
-    });
-    const prev = c.epochs.get(ep.e - 1);
-    prev?.D.members.forEach((m, j) => {
-      const k = P.memberIndex(ep.D, m.uid);
-      if (k >= 0 && k !== ep.myIndex && !ep.lanes[k].seen) out.push(P.bell(prev.keys.nk, j));
+    const seen = new Set<string>();
+    ep.D.members.forEach((m, l) => {
+      if (l === ep.myIndex) return;
+      const b = this.memberBell(c, ep, m.uid);
+      if (!b || seen.has(P.b64u(b.bell))) return;
+      seen.add(P.b64u(b.bell));
+      out.push(b.bell);
     });
     return out;
   }
 
   /**
-   * The registration set (§11.13): for each copy that is not a request, has not ended, whose leave is not current and
-   * whose `rootBy` is self or a contact (frozen copies included), the bell of self's lane in its current epoch; the
-   * copies with the newest `lastTs` first.
+   * §11.13 "Bells": self's BELL row in the current epoch of every copy the registration set would hold (muted or not),
+   * once per epoch and device (a sibling's row counts), after a random delay, while params carry `push`. A failed put
+   * is tried again after the retry delay.
    */
-  pushBells(): Bytes[] {
-    return this.notifiable().map((x) => x.bell);
-  }
-
-  /** The copies of the registration set (§11.13) with their bells, newest `lastTs` first. */
-  private notifiable(): { c: Copy; ep: Epoch; bell: Bytes }[] {
-    const out: { c: Copy; ep: Epoch; bell: Bytes }[] = [];
+  private ensureBells(): void {
+    if (this.stopped || !this.live) return;
+    const p = this.h.api.cachedParams;
+    if (!p || pushParams(p) === null) return;
+    const now = this.h.clock.mono();
     for (const c of this.copies.values()) {
       const ep = this.bellEpoch(c);
-      if (ep) out.push({ c, ep, bell: P.bell(ep.keys.nk, ep.myIndex) });
+      if (!ep || !ep.lanesOn || ep.lanes[ep.myIndex].bell) continue;
+      const key = `${copyKeyOf(c)}:${ep.e}`;
+      if (this.bellWrites.has(key) || (this.bellRetryAt.get(key) ?? 0) > now) continue;
+      const delay = Math.floor(Math.random() * (this.h.delays.bellDelay + 1));
+      const run = this.h
+        .wait(delay)
+        .then(() => this.chain(c.key, () => this.putBell(c, ep.e)))
+        .catch(() => {
+          this.bellRetryAt.set(key, this.h.clock.mono() + this.h.delays.retryMax);
+        })
+        .finally(() => this.bellWrites.delete(key));
+      this.bellWrites.set(key, run);
+      void this.h.track(run).catch(() => {});
+    }
+  }
+
+  /** Puts self's BELL row in epoch e of the copy (§11.13), unless its lane there has one by now. */
+  private async putBell(c: Copy, e: number): Promise<void> {
+    const ep = c.epochs.get(c.current);
+    if (!ep || ep.e !== e || ep.myIndex < 0 || ep.lanes[ep.myIndex].bell || !this.bellEpoch(c))
+      return;
+    const g = this.genOf(c, ep.e);
+    const bell = P.bellOf(P.bellSecret(this.h.acc.bellKey, c.conv, g));
+    await sendRow(this.sendCtx(c, null), c, { type: P.MT.BELL, bell: { g, bell } });
+  }
+
+  /**
+   * The registration set (§11.13): for each copy that is not a request, has not ended, whose leave is not current and
+   * whose `rootBy` is self or a contact (frozen copies included), the account's bell secret in the copy for the
+   * generation `memberBell` gives self; the copies with the newest `lastTs` first.
+   */
+  pushSecrets(): Bytes[] {
+    return this.notifiable().map((x) => x.secret);
+  }
+
+  /** The copies of the registration set (§11.13) with their secrets and bells, newest `lastTs` first. */
+  private notifiable(): { c: Copy; ep: Epoch; secret: Bytes; bell: Bytes }[] {
+    const out: { c: Copy; ep: Epoch; secret: Bytes; bell: Bytes }[] = [];
+    for (const c of this.copies.values()) {
+      const ep = this.bellEpoch(c);
+      if (!ep) continue;
+      const g = this.memberBell(c, ep, this.h.acc.uid)?.g ?? this.genOf(c, ep.e);
+      const secret = P.bellSecret(this.h.acc.bellKey, c.conv, g);
+      out.push({ c, ep, secret, bell: P.bellOf(secret) });
     }
     return out.sort((a, b) => b.c.lastTs - a.c.lastTs);
   }
@@ -3279,6 +3561,7 @@ export class Messaging {
 
   private markHeads(): void {
     this.headsDue = true;
+    this.ensureBells(); // a copy may have entered an epoch without self's BELL row (§11.13)
     if (this.headsTimer || this.stopped || !this.live) return;
     this.headsTimer = true;
     const d = this.h.delays;
@@ -3301,7 +3584,9 @@ export class Messaging {
    * ride in the same row (§7.3). While a WELCOME's J found on a lane of epoch e′ is parked, the entry describes e′, or
    * e′ + 1 with that lane followed, and holds the lane's position before the row (§7.3 "Durability order").
    */
-  private headsEntry(c: Copy): { entry: P.HeadsEntry; lefts: P.LeftRec[] } | null {
+  private headsEntry(
+    c: Copy,
+  ): { entry: P.HeadsEntry; lefts: P.LeftRec[]; bells: P.BellsRec } | null {
     const cur = c.epochs.get(c.current);
     if (!cur || cur.Estart === null || !cur.lanesOn) return null;
     const parked = this.parkedWelcomes.filter((x) => x.c === c);
@@ -3342,6 +3627,22 @@ export class Messaging {
           t: src.t,
           row: { ...src.row },
         });
+    // The bells of the entry's epoch (§7.3 "Bells"): self's generation when it has posted in the current one, and
+    // every other member's bell of that generation that this device knows.
+    const gen = this.genOf(c, ep.e);
+    const bells: P.BellsRec = {
+      rtype: P.RT.BELLS,
+      conv: c.conv,
+      root: c.root,
+      e: ep.e,
+      g: this.latestBell(c, this.h.acc.uid, ep.e, gen)?.g ?? P.BELLS_NO_GEN,
+      entries: [],
+    };
+    ep.D.members.forEach((m, j) => {
+      if (j === ep.myIndex) return;
+      const b = this.latestBell(c, m.uid, ep.e, gen);
+      if (b) bells.entries.push({ lane: j, bell: b.bell });
+    });
     return {
       entry: {
         conv: c.conv,
@@ -3353,6 +3654,7 @@ export class Messaging {
         followed,
       },
       lefts,
+      bells,
     };
   }
 
@@ -3367,10 +3669,10 @@ export class Messaging {
         this.cursor ?? cursorAt(P.eraStart(this.h.acc.regEra), p, P.era(this.h.api.serverNow()));
       const all = [...this.copies.values()]
         .map((c) => this.headsEntry(c))
-        .filter((x): x is { entry: P.HeadsEntry; lefts: P.LeftRec[] } => x !== null);
+        .filter((x): x is NonNullable<ReturnType<typeof this.headsEntry>> => x !== null);
       const sig = JSON.stringify([
         cursor,
-        all.map(({ entry: x, lefts }) => [
+        all.map(({ entry: x, lefts, bells }) => [
           P.b64u(x.conv),
           x.e,
           x.ctl,
@@ -3378,6 +3680,8 @@ export class Messaging {
           x.followed,
           x.lastTs,
           lefts.map((l) => [P.b64u(l.uid), l.t, l.row]),
+          bells.g,
+          bells.entries.map((b) => [b.lane, P.b64u(b.bell)]),
         ]),
       ]);
       // A copy: records queued while the rows below are being written (learnUser outside the queue, recordEnd) are not
@@ -3386,7 +3690,7 @@ export class Messaging {
       if (sig === this.lastHeads && recs.length === 0) return;
       // Split everything over as many self rows as needed (§7.3 "HEADS splitting"): every row stays within the cls-3
       // budget and the record cap, ends with a HEADS record (the cursor, and the entries placed in it), and holds
-      // each of its entries in the same row as the LEFT records of that entry's epoch.
+      // each of its entries in the same row as the LEFT records of that entry's epoch and its BELLS record.
       const HEADS_FIXED = 3 + 2 + 4 + 2;
       const rows: { recs: P.SelfRecord[]; entries: P.HeadsEntry[]; size: number }[] = [];
       const place = (bytes: number, count: number) => {
@@ -3401,14 +3705,15 @@ export class Messaging {
         return row;
       };
       for (const r of recs) place(P.encodeRecord(r).length, 1).recs.push(r);
-      for (const { entry: x, lefts } of all) {
+      for (const { entry: x, lefts, bells } of all) {
         const bytes =
           68 +
           6 * x.lanes.length +
           12 * x.followed.length +
-          lefts.reduce((n, l) => n + P.encodeRecord(l).length, 0);
-        const row = place(bytes, lefts.length);
-        row.recs.push(...lefts);
+          lefts.reduce((n, l) => n + P.encodeRecord(l).length, 0) +
+          P.encodeRecord(bells).length;
+        const row = place(bytes, lefts.length + 1);
+        row.recs.push(...lefts, bells);
         row.entries.push(x);
       }
       if (rows.length === 0) rows.push({ recs: [], entries: [], size: HEADS_FIXED });
@@ -3688,7 +3993,7 @@ export class Messaging {
       if (!x) continue;
       const bytes = 68 + 6 * x.entry.lanes.length + 12 * x.entry.followed.length;
       if (entries.length && size + bytes > 60_000) flush();
-      out.push(...x.lefts);
+      out.push(...x.lefts, x.bells);
       entries.push(x.entry);
       size += bytes;
     }

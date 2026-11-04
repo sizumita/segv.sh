@@ -9,19 +9,17 @@
  * the fields to merge into the error JSON: the HTTP layer answers `{error: e.message, ...e.extra}`, i.e.
  * `{error, p: P}` (§10.6).
  *
- * D1 is authoritative: there is no outbox and no log fallback. Every write is one atomic D1 `batch()` that
- * appends to the hash-chained `dirlog` with explicit, contiguous seqs (optimistic concurrency: a concurrent
- * writer makes the `dirlog.seq` insert fail, and the write is retried on the new head).
+ * D1 is authoritative: there is no outbox and no log fallback beyond the DirSeqDO's write-ahead log. The directory is
+ * one log database (dirlog, dirmeta) and K user databases (user, wrap), a user's rows in the database of the top bits
+ * of its upre (§9.6). Every write goes through the DirSeqDO (dirseq-do.ts), the only writer, which appends to the
+ * hash-chained `dirlog` with contiguous seqs in one atomic batch per round of writes and then writes the rows; reads
+ * go to D1 from here, asking every user database and merging the answers, so a lookup never depends on where a row
+ * is.
  */
 import {
-  DIRLOG_USER,
-  DIRLOG_WRAP,
   MAX_ID_LEN,
   ZERO32,
   checkUserKeys,
-  dirlogH,
-  dirlogRefUser,
-  dirlogRefWrap,
   era,
   fromB64u,
   hpre,
@@ -32,7 +30,9 @@ import {
   type WrapRecord,
 } from "@segv/protocol/proto";
 import { b64Len, dec64, enc64 } from "./b64";
+import { logDb, userDbs } from "./env";
 import { HttpError, exactKeys, logErr } from "./http";
+import { dirSeqStub, type DirWrite, type DirWriteResult } from "./types";
 import { checkBundleShape, checkRecordShape, verifyBundleSig, verifyRecordSig } from "./validate";
 
 export interface DirUser {
@@ -70,8 +70,11 @@ export const MAX_WRAPS_PER_ID = 64;
 export const PREFIX_PAGE = 256;
 /** Largest dirlog page (§10.6). */
 export const DIRLOG_PAGE_MAX = 1000;
-/** Optimistic write attempts before 503 (§9.6). */
-export const WRITE_ATTEMPTS = 16;
+/**
+ * `retry-after` (s) of a directory write's 503 (§9.6): past the replay one second after a failed batch, after which a
+ * registration sent again answers as the logged one (§2.5 step 8).
+ */
+export const DIR_RETRY_AFTER_S = 2;
 /** currentP() cache lifetime per isolate. */
 export const P_CACHE_MS = 60_000;
 /** After a failed dirmeta read, currentP() serves the last good P (0 if none) without asking D1 for this long. */
@@ -124,69 +127,32 @@ export function uniqueFailure(e: unknown): string | null {
   return null;
 }
 
-const CONFLICTS: Readonly<Record<string, string>> = {
+/** The 409 of each UNIQUE key a directory write can hit (§9.6); the DirSeqDO maps D1's failures through it. */
+export const CONFLICTS: Readonly<Record<string, string>> = {
   "user.handle": "handle already taken",
   "user.uid": "uid already registered",
   "wrap.uid": "duplicate wrap record",
   "wrap.id": "duplicate wrap record",
 };
 
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-
-const HEAD_SQL = "SELECT seq, h FROM dirlog ORDER BY seq DESC LIMIT 1";
-const DIRLOG_INSERT_SQL = "INSERT INTO dirlog (seq, kind, ref, h) VALUES (?1, ?2, ?3, ?4)";
-
-interface Entry {
-  kind: number;
-  ref: Uint8Array;
-}
-
-interface AppendOpts {
-  /** Statements that need the seqs: the user / wrap inserts (dirseq = their dirlog seq). */
-  rows: (seqs: number[]) => D1PreparedStatement[];
-  /** Statements run after the dirlog inserts in the same batch (the dirmeta increment). */
-  tail?: () => D1PreparedStatement[];
-  /** Reads taken in the same snapshot as the head, checked by `check` before writing. */
-  reads?: () => D1PreparedStatement[];
-  check?: (results: D1Result[]) => void;
-}
+export const HEAD_SQL = "SELECT seq, h FROM dirlog ORDER BY seq DESC LIMIT 1";
 
 /**
- * §9.6 writes: read the head, chain `entries` after it, and run one atomic batch (rows, dirlog inserts with
- * explicit seqs, tail). Seqs stay contiguous: a committed batch always takes head + 1, so a writer that read
- * an older head fails on the `dirlog.seq` UNIQUE key; it then waits 5–50 ms × attempt and retries on the new
- * head (16 attempts, then 503). For the same reason, `reads` taken together with the head are still current
- * when the batch commits. Other UNIQUE failures are 409; anything else is 503.
+ * §9.6 writes: the DirSeqDO appends the write to the dirlog in one atomic D1 batch (with every other write of its
+ * round). A refusal (400 over the wrap cap, 409 on a taken handle, uid or wrap) comes back as a result; a failure of
+ * the object or of D1 is 503 "directory unavailable" with `retry-after`.
  */
-async function appendDir(env: Env, entries: Entry[], opts: AppendOpts): Promise<number[]> {
-  const db = env.DB;
-  for (let attempt = 1; ; attempt++) {
-    const [headRes, ...reads] = await d1("head read", () =>
-      db.batch([db.prepare(HEAD_SQL), ...(opts.reads?.() ?? [])]),
-    );
-    opts.check?.(reads);
-    const head = (headRes.results as { seq: number; h: string }[])[0];
-    const base = head?.seq ?? 0;
-    let prev = head ? dec64(head.h) : ZERO32;
-    const seqs = entries.map((_, i) => base + 1 + i);
-    const hs = entries.map((en, i) => (prev = dirlogH(prev, seqs[i], en.kind, en.ref)));
-    try {
-      const log = entries.map((en, i) =>
-        db.prepare(DIRLOG_INSERT_SQL).bind(seqs[i], en.kind, enc64(en.ref), enc64(hs[i])),
-      );
-      await db.batch([...opts.rows(seqs), ...log, ...(opts.tail?.() ?? [])]);
-      return seqs;
-    } catch (e) {
-      const col = uniqueFailure(e);
-      if (col === "dirlog.seq") {
-        if (attempt >= WRITE_ATTEMPTS) throw unavailable(`write (${WRITE_ATTEMPTS} attempts)`, e);
-        await sleep((5 + Math.random() * 45) * attempt);
-        continue;
-      }
-      if (col !== null && CONFLICTS[col]) throw new HttpError(409, CONFLICTS[col]);
-      throw unavailable("write", e);
-    }
+async function dirWrite(env: Env, write: DirWrite): Promise<number[]> {
+  const retry = { "retry-after": String(DIR_RETRY_AFTER_S) };
+  let r: DirWriteResult;
+  try {
+    r = (await dirSeqStub(env).append(write)) as DirWriteResult;
+  } catch (e) {
+    logFailure("write", e);
+    throw new HttpError(503, "directory unavailable", retry);
   }
+  if (!r.ok) throw new HttpError(r.status, r.error, r.status === 503 ? retry : undefined);
+  return r.seqs;
 }
 
 // ───────────── parameter checks ─────────────
@@ -219,13 +185,6 @@ function checkWrapId(id: unknown): string {
 }
 
 // ───────────── writes ─────────────
-
-const USER_INSERT_SQL =
-  "INSERT INTO user (uid, upre, handle, hpre, bundle, sig, reg_era, dirseq) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
-const WRAP_INSERT_SQL = "INSERT INTO wrap (uid, id, record, sig, dirseq) VALUES (?1, ?2, ?3, ?4, ?5)";
-const USERS_INC_SQL = "UPDATE dirmeta SET v = v + 1 WHERE k = 'users'";
-
-const wrapEntry = (r: WrapRecord): Entry => ({ kind: DIRLOG_WRAP, ref: dirlogRefWrap(r.record, fromB64u(r.sig)) });
 
 /**
  * POST /api/v2/register: body `{bundle, sig, wraps: [{record, sig}, …1..4]}` (§10.6). Checks the canonical
@@ -263,49 +222,34 @@ export async function dirRegister(env: Env, body: Record<string, unknown>, nowMs
     throw new HttpError(400, `invalid bundle (${e instanceof Error ? e.message : "unusable keys"})`);
   }
 
-  const regEra = era(nowMs);
-  const uidHash = upre(fromB64u(user.uid));
-  const handleHash = hpre(user.handle);
-  const db = env.DB;
-  const entries: Entry[] = [
-    { kind: DIRLOG_USER, ref: dirlogRefUser(user.bundle, fromB64u(user.bundleSig)) },
-    ...records.map(wrapEntry),
-  ];
-  const seqs = await appendDir(env, entries, {
-    rows: (s) => [
-      db
-        .prepare(USER_INSERT_SQL)
-        .bind(user.uid, uidHash, user.handle, handleHash, user.bundle, user.bundleSig, regEra, s[0]),
-      ...records.map((r, i) => db.prepare(WRAP_INSERT_SQL).bind(r.uid, enc64(r.id), r.record, r.sig, s[1 + i])),
-    ],
-    tail: () => [db.prepare(USERS_INC_SQL)],
+  const seqs = await dirWrite(env, {
+    kind: "user",
+    uid: user.uid,
+    upre: upre(fromB64u(user.uid)),
+    handle: user.handle,
+    hpre: hpre(user.handle),
+    bundle: user.bundle,
+    sig: user.bundleSig,
+    regEra: era(nowMs),
+    wraps: records.map((r) => ({ uid: r.uid, id: enc64(r.id), record: r.record, sig: r.sig })),
   });
   return { dirseq: seqs[0] };
 }
 
 /**
  * POST /api/v2/wraps: body `{record, sig}` (§10.6). 404 for an unknown uid, 400 for a bad signature or more
- * than 64 wraps for the uid, 409 for a duplicate (uid, id). Returns the record's dirseq.
+ * than 64 wraps for the uid (the DirSeqDO counts them, §9.6), 409 for a duplicate (uid, id). Returns the record's
+ * dirseq.
  */
 export async function dirAddWrap(env: Env, body: Record<string, unknown>): Promise<{ dirseq: number }> {
   const o = exactKeys(body, ["record", "sig"], "wrap");
   const rec = checkRecordShape(o.record, o.sig);
-  const db = env.DB;
-  const row = await d1("user read", () =>
-    db.prepare("SELECT bundle, sig FROM user WHERE uid = ?1").bind(rec.uid).first<{ bundle: string; sig: string }>(),
-  );
+  const row = await d1("user read", () => userByUid(env, rec.uid));
   if (!row) throw new HttpError(404, "unknown uid");
   const owner = parseBundle(row.bundle, row.sig); // validated at registration
   if (!(await verifyRecordSig(rec, owner.sigPk))) throw new HttpError(400, "bad wrap signature");
 
-  const seqs = await appendDir(env, [wrapEntry(rec)], {
-    reads: () => [db.prepare("SELECT count(*) AS n FROM wrap WHERE uid = ?1").bind(rec.uid)],
-    check: ([count]) => {
-      const n = (count.results as { n: number }[])[0]?.n ?? 0;
-      if (n >= MAX_WRAPS_PER_UID) throw new HttpError(400, `too many wraps (at most ${MAX_WRAPS_PER_UID} per uid)`);
-    },
-    rows: (s) => [db.prepare(WRAP_INSERT_SQL).bind(rec.uid, enc64(rec.id), rec.record, rec.sig, s[0])],
-  });
+  const seqs = await dirWrite(env, { kind: "wrap", wrap: { uid: rec.uid, id: enc64(rec.id), record: rec.record, sig: rec.sig } });
   return { dirseq: seqs[0] };
 }
 
@@ -321,6 +265,31 @@ interface UserRow {
 }
 
 const USER_COLS = "uid, handle, bundle, sig, reg_era, dirseq";
+
+/** The user row of `uid` from whichever user database has it (§9.6 "Reads"), or null. */
+async function userByUid(env: Env, uid: string): Promise<UserRow | null> {
+  const rows = await Promise.all(
+    userDbs(env).map((db) => db.prepare(`SELECT ${USER_COLS} FROM user WHERE uid = ?1`).bind(uid).first<UserRow>()),
+  );
+  return rows.find((r) => r !== null) ?? null;
+}
+
+/** Byte order of b64u uid text (ASCII, so JavaScript's string order is the SQLite BINARY order). */
+const byUid = (a: { uid: string }, b: { uid: string }): number => (a.uid < b.uid ? -1 : a.uid > b.uid ? 1 : 0);
+
+/**
+ * The pages of every user database merged in uid order, a uid listed twice (a row in its old and its new database
+ * while a raise of K moves it, §9.6) once. Each page holds a database's first rows after `after`, so the first n
+ * rows of the merge are the first n of the union whenever every page has at least n rows or is complete.
+ */
+export function mergeByUid<T extends { uid: string }>(pages: T[][]): T[] {
+  const out: T[] = [];
+  for (const r of pages.flat().sort(byUid)) {
+    if (out.length === 0 || out[out.length - 1].uid !== r.uid) out.push(r);
+  }
+  return out;
+}
+
 const toDirUser = (r: UserRow): DirUser => ({
   uid: r.uid,
   handle: r.handle,
@@ -372,23 +341,41 @@ export async function dirByPrefix(
   if (size === null) throw new HttpError(503, "directory unavailable"); // already logged by dirSize
   if (p > Math.min(32, size.P + 1)) throw new PrefixBitsError(size.P);
   const { lo, hi } = prefixRange(p, x);
-  const wide = widePrefix(size.users, p);
-  const { results } = await d1("prefix read", () =>
-    (after === null
-      ? env.DB.prepare(prefixSql(kind, false, wide)).bind(lo, hi, PREFIX_PAGE + 1)
-      : env.DB.prepare(prefixSql(kind, true, wide)).bind(lo, hi, PREFIX_PAGE + 1, after)
-    ).all<UserRow>(),
+  const dbs = userDbs(env);
+  const wide = widePrefix(size.users / dbs.length, p); // each database holds about users / K rows
+  const sql = prefixSql(kind, after !== null, wide);
+  const pages = await d1("prefix read", () =>
+    Promise.all(
+      dbs.map((db) =>
+        (after === null
+          ? db.prepare(sql).bind(lo, hi, PREFIX_PAGE + 1)
+          : db.prepare(sql).bind(lo, hi, PREFIX_PAGE + 1, after)
+        ).all<UserRow>(),
+      ),
+    ),
   );
-  return { p, users: results.slice(0, PREFIX_PAGE).map(toDirUser), more: results.length > PREFIX_PAGE };
+  const rows = mergeByUid(pages.map((pg) => pg.results));
+  return { p, users: rows.slice(0, PREFIX_PAGE).map(toDirUser), more: rows.length > PREFIX_PAGE };
 }
 
-/** GET /api/v2/dir/uid/{uid}: null when unknown (→ 404); 400 for a malformed uid. */
+/**
+ * GET /api/v2/dir/uid/{uid}: null when unknown (→ 404); 400 for a malformed uid. The row of whichever user database
+ * answers with it; 503 when none has it and a database did not answer.
+ */
 export async function dirByUid(env: Env, uid: string): Promise<DirUser | null> {
   checkUid(uid, "uid");
-  const row = await d1("uid read", () =>
-    env.DB.prepare(`SELECT ${USER_COLS} FROM user WHERE uid = ?1`).bind(uid).first<UserRow>(),
+  const rows = await d1("uid read", async () =>
+    Promise.allSettled(
+      userDbs(env).map(async (db) => db.prepare(`SELECT ${USER_COLS} FROM user WHERE uid = ?1`).bind(uid).first<UserRow>()),
+    ),
   );
-  return row ? toDirUser(row) : null;
+  let failure: unknown = null;
+  for (const r of rows) {
+    if (r.status === "fulfilled" && r.value !== null) return toDirUser(r.value);
+    if (r.status === "rejected") failure ??= r.reason;
+  }
+  if (failure !== null) throw unavailable("uid read", failure);
+  return null;
 }
 
 /**
@@ -400,11 +387,23 @@ export async function dirWrapsById(env: Env, id: string, uid: string | null): Pr
   if (uid !== null) checkUid(uid, "uid");
   const where = uid === null ? "id = ?1" : "id = ?1 AND uid = ?3";
   const sql = `SELECT uid, record, sig, dirseq FROM wrap WHERE ${where} ORDER BY dirseq LIMIT ?2`;
-  const { results } = await d1("wraps read", () => {
-    const stmt = env.DB.prepare(sql);
-    return (uid === null ? stmt.bind(id, MAX_WRAPS_PER_ID) : stmt.bind(id, MAX_WRAPS_PER_ID, uid)).all<DirWrap>();
-  });
-  return results.map((r) => ({ uid: r.uid, record: r.record, sig: r.sig, dirseq: r.dirseq }));
+  const pages = await d1("wraps read", () =>
+    Promise.all(
+      userDbs(env).map((db) => {
+        const stmt = db.prepare(sql);
+        return (uid === null ? stmt.bind(id, MAX_WRAPS_PER_ID) : stmt.bind(id, MAX_WRAPS_PER_ID, uid)).all<DirWrap>();
+      }),
+    ),
+  );
+  // Merged by dirseq; a record in two databases (while a raise of K moves its uid, §9.6) once.
+  const seen = new Set<number>();
+  const out: DirWrap[] = [];
+  for (const r of pages.flatMap((pg) => pg.results).sort((a, b) => a.dirseq - b.dirseq)) {
+    if (seen.has(r.dirseq)) continue;
+    seen.add(r.dirseq);
+    out.push({ uid: r.uid, record: r.record, sig: r.sig, dirseq: r.dirseq });
+  }
+  return out.slice(0, MAX_WRAPS_PER_ID);
 }
 
 const emptyHead = (): { seq: number; h: string } => ({ seq: 0, h: enc64(ZERO32) });
@@ -420,7 +419,7 @@ export async function dirlogPage(
 ): Promise<{ entries: DirlogEntry[]; head: { seq: number; h: string } }> {
   if (!Number.isSafeInteger(after) || after < 0) throw new HttpError(400, "invalid after");
   if (!Number.isInteger(limit) || limit < 1 || limit > DIRLOG_PAGE_MAX) throw new HttpError(400, "invalid limit");
-  const db = env.DB;
+  const db = logDb(env);
   const [page, head] = await d1("dirlog read", () =>
     db.batch([
       db.prepare("SELECT seq, kind, ref, h FROM dirlog WHERE seq > ?1 ORDER BY seq LIMIT ?2").bind(after, limit),
@@ -434,7 +433,7 @@ export async function dirlogPage(
 
 /** The dirlog head `{seq, h}` (b64u h; `{0, b64u(ZERO32)}` while empty), e.g. for the CheckpointDO (§9.5). */
 export async function dirlogHead(env: Env): Promise<{ seq: number; h: string }> {
-  const row = await d1("head read", () => env.DB.prepare(HEAD_SQL).first<{ seq: number; h: string }>());
+  const row = await d1("head read", () => logDb(env).prepare(HEAD_SQL).first<{ seq: number; h: string }>());
   return row ? { seq: row.seq, h: row.h } : emptyHead();
 }
 
@@ -460,7 +459,7 @@ async function dirSize(env: Env): Promise<{ users: number; P: number } | null> {
   if (pCache !== null && now < pCache.until) return pCache;
   if (now < pRetryAt) return pCache;
   try {
-    const row = await env.DB.prepare("SELECT v FROM dirmeta WHERE k = 'users'").first<{ v: number }>();
+    const row = await logDb(env).prepare("SELECT v FROM dirmeta WHERE k = 'users'").first<{ v: number }>();
     const users = row?.v ?? 0;
     pCache = { users, P: serverP(users), until: now + P_CACHE_MS };
     return pCache;

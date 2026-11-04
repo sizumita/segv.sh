@@ -1,25 +1,39 @@
-/** InboxDO (docs/PROTOCOL.md §9.3): slot clock, Δin pin, closed_hw, era end, posts, paging, slot commitments. */
+/** InboxDO (docs/PROTOCOL.md §9.3): slot clock, Δin pin, closed_hw, era end, posts, paging, slot commitments, notices. */
 import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import * as P from "@segv/protocol/proto";
 import { INBOX_DAY_CAP } from "../src/env";
-import type { InboxDO } from "../src/inbox-do";
+import type { InboxDO, InboxFeedLink } from "../src/inbox-do";
 import { inboxStub, type InboxHead, type InboxPostOut, type InboxReadOut } from "../src/types";
 
 /** Δin = INBOX_SLOT_S = 1 s and SKEW = 0 in ../wrangler.test.jsonc. */
 const D = 1000;
 const E_NOW = P.era(Date.now());
+/**
+ * The era most tests use: the next one, so that every test time lies in the future. workerd runs an alarm as soon as
+ * its time has passed, and a post arms the notice alarm of its slot (§9.3); an alarm run by the runtime between two
+ * steps of a test, with whatever clock the test last fixed, would settle `closed_hw` behind the test's back.
+ */
+const E_NEXT = E_NOW + 1;
 const DAY_MS = 86_400_000;
 
 /** The RPC methods plus the protected / private fields the tests drive. */
-type Inner = Pick<InboxDO, "post" | "read" | "head"> & {
+type Inner = Pick<InboxDO, "post" | "read" | "head" | "alarm"> & {
   clock: () => number;
   jitter: (D: number) => number;
   skewMs: number;
   inboxSlot: number;
   dayCap: number;
+  feeds: (j: number) => InboxFeedLink;
+  noticed: number;
 };
+
+/** feed(Tinbox(E, g)) under the test deployment (ROUTE_KEY, RT_FEEDS of ../wrangler.test.jsonc). */
+const KFEED = P.kfeed(P.fromB64u(env.ROUTE_KEY));
+const FBITS = P.feedBits(Number(env.RT_FEEDS));
+const feedJOf = (E: number, g: number): number =>
+  P.feedOf(P.feedHash(KFEED, P.topicInbox(E, g)), FBITS);
 
 /** Unix ms at the start of slot `s` (slot = ⌊(ms − T0)/D⌋) plus `off` ms. */
 const atSlot = (s: number, off = 0): number => P.T0_MS + s * D + off;
@@ -31,7 +45,7 @@ const invites = (n: number) => Array.from({ length: n }, invite);
 let gNext = 1 + Math.floor(Math.random() * 50_000);
 
 /** A fresh InboxDO ("inbox/v2/{E}/{g}" with an unused g) and helpers that run calls at a chosen time. */
-function box(E = E_NOW) {
+function box(E = E_NEXT) {
   const g = gNext++;
   const stub = inboxStub(env, E, g);
   /** Runs `fn` inside the object with the clock at `now` (and the jitter fixed at `j` when given). */
@@ -55,10 +69,10 @@ function box(E = E_NOW) {
       now: number,
       rows: { eid: Uint8Array; body: Uint8Array }[],
       j = 0,
-      bucket = 0,
+      bucket = g, // the object is its bucket (§9.3)
     ): Promise<InboxPostOut> => at(now, (i) => i.post(E, g, bucket, rows), j),
     read: (now: number, after = 0, limit = 1024): Promise<InboxReadOut> =>
-      at(now, (i) => i.read(E, g, 0, after, limit)),
+      at(now, (i) => i.read(E, g, g, after, limit)),
     head: (now: number): Promise<InboxHead> => at(now, (i) => i.head(E, g)),
     meta: (k: string) =>
       runInDurableObject(
@@ -76,7 +90,7 @@ const rels = (out: InboxPostOut): (number | string)[] => {
 };
 
 /** A time well inside era E (one hour after its start), on an exact slot boundary. */
-const inside = (E = E_NOW): number => P.eraStart(E) + 3_600_000;
+const inside = (E = E_NEXT): number => P.eraStart(E) + 3_600_000;
 
 describe("InboxDO slot clock", () => {
   it("rel and closed with fixed jitter: a row is invisible until its slot closes", async () => {
@@ -136,7 +150,7 @@ describe("InboxDO slot clock", () => {
         const storage = (inst as unknown as { ctx: DurableObjectState }).ctx.storage;
         const spy = vi.spyOn(storage, "transactionSync");
         try {
-          inst.read(b.E, b.g, 0, 0, 10);
+          inst.read(b.E, b.g, b.g, 0, 10);
           inst.head(b.E, b.g);
           return spy.mock.calls.length;
         } finally {
@@ -179,9 +193,9 @@ describe("InboxDO slot clock", () => {
       // A redeploy raises Δin to 3 s: closed_hw and rel stay in 1 s slots, so the new row closes a slot later.
       await evictDurableObject(b.stub);
       expect(
-        rels(await deployed(b, 3, t + 1_000, (i) => i.post(b.E, b.g, 0, [invite()]), 0)),
+        rels(await deployed(b, 3, t + 1_000, (i) => i.post(b.E, b.g, b.g, [invite()]), 0)),
       ).toEqual([S + 2]);
-      let r = await deployed(b, 3, t + 2_000, (i) => i.read(b.E, b.g, 0, 0, 10));
+      let r = await deployed(b, 3, t + 2_000, (i) => i.read(b.E, b.g, b.g, 0, 10));
       expect(r.closed).toBe(S + 2);
       expect(r.rows.map((x) => x.rel)).toEqual([S + 2]);
       expect(await b.meta("slot")).toBe(1);
@@ -197,13 +211,13 @@ describe("InboxDO slot clock", () => {
       expect(rels(await c.post(t, [invite()], 0))).toEqual([S + 1]);
       expect(await c.meta("slot")).toBe(1);
       await evictDurableObject(c.stub);
-      r = await deployed(c, 3, t + 1_000, (i) => i.read(c.E, c.g, 0, 0, 10));
+      r = await deployed(c, 3, t + 1_000, (i) => i.read(c.E, c.g, c.g, 0, 10));
       expect(r.closed).toBe(S + 1);
       expect(r.rows.map((x) => x.rel)).toEqual([S + 1]);
 
       // Before any write the deployment value applies, and the first write pins it.
       const d = box();
-      r = await deployed(d, 3, t, (i) => i.read(d.E, d.g, 0, 0, 10));
+      r = await deployed(d, 3, t, (i) => i.read(d.E, d.g, d.g, 0, 10));
       expect(r.closed).toBe(Math.floor((t - P.T0_MS) / 3_000));
       expect(await d.meta("slot")).toBe(3);
       await evictDurableObject(d.stub); // back to INBOX_SLOT_S = 1
@@ -227,9 +241,7 @@ describe("InboxDO posts", () => {
       runInDurableObject(
         bb.stub,
         (_i: InboxDO, s) =>
-          s.storage.sql
-            .exec<{ n: number }>("SELECT n FROM cnt WHERE bucket = 0 AND day = ?", day)
-            .one().n,
+          s.storage.sql.exec<{ n: number }>("SELECT n FROM cnt WHERE day = ?", day).one().n,
       );
     expect(await count(b)).toBe(32);
 
@@ -237,11 +249,7 @@ describe("InboxDO posts", () => {
     const c = box();
     await c.post(now, invites(1), 0);
     await runInDurableObject(c.stub, (_i: InboxDO, s) => {
-      s.storage.sql.exec(
-        "UPDATE cnt SET n = ? WHERE bucket = 0 AND day = ?",
-        INBOX_DAY_CAP - 10,
-        day,
-      );
+      s.storage.sql.exec("UPDATE cnt SET n = ? WHERE day = ?", INBOX_DAY_CAP - 10, day);
     });
     const rows = invites(32);
     const res = rels(await c.post(now, rows, 0));
@@ -271,9 +279,7 @@ describe("InboxDO posts", () => {
     const n = await runInDurableObject(
       b.stub,
       (_i: InboxDO, s) =>
-        s.storage.sql
-          .exec<{ n: number }>("SELECT n FROM cnt WHERE bucket = 0 AND day = ?", day)
-          .one().n,
+        s.storage.sql.exec<{ n: number }>("SELECT n FROM cnt WHERE day = ?", day).one().n,
     );
     expect(n).toBe(2);
   });
@@ -309,7 +315,7 @@ describe("InboxDO posts", () => {
         now,
         (inst) => {
           inst.skewMs = 2_000;
-          return inst.post(c.E, c.g, 0, invites(1));
+          return inst.post(c.E, c.g, c.g, invites(1));
         },
         0,
       );
@@ -330,7 +336,7 @@ describe("InboxDO posts", () => {
         (inst) => {
           inst.skewMs = 2_000;
           inst.dayCap = cap;
-          return inst.post(b.E, b.g, 0, invites(n));
+          return inst.post(b.E, b.g, b.g, invites(n));
         },
         0,
       );
@@ -346,7 +352,7 @@ describe("InboxDO posts", () => {
     const firstDay = P.secOf(start) / 86_400;
     const cnt = await runInDurableObject(b.stub, (_i: InboxDO, s) =>
       s.storage.sql
-        .exec<{ day: number; n: number }>("SELECT day, n FROM cnt WHERE bucket = 0 ORDER BY day")
+        .exec<{ day: number; n: number }>("SELECT day, n FROM cnt ORDER BY day")
         .toArray(),
     );
     expect(cnt).toEqual(Array.from({ length: 7 }, (_, d) => ({ day: firstDay + d, n: cap })));
@@ -359,18 +365,18 @@ describe("InboxDO posts", () => {
       expect(() => inst.post(b.E + 1, b.g, 0, invites(1))).toThrow(/does not match/);
       expect(() => inst.read(b.E, b.g + 1, 0, 0, 10)).toThrow(/does not match/);
       expect(() => inst.head(b.E + 1, b.g)).toThrow(/does not match/);
-      expect(() => inst.post(b.E, b.g, 0, [])).toThrow(TypeError);
-      expect(() => inst.post(b.E, b.g, 0, invites(33))).toThrow(TypeError);
+      expect(() => inst.post(b.E, b.g, b.g, [])).toThrow(TypeError);
+      expect(() => inst.post(b.E, b.g, b.g, invites(33))).toThrow(TypeError);
       expect(() =>
-        inst.post(b.E, b.g, 0, [{ eid: P.random(15), body: P.random(P.INBOX_BODY_LEN) }]),
+        inst.post(b.E, b.g, b.g, [{ eid: P.random(15), body: P.random(P.INBOX_BODY_LEN) }]),
       ).toThrow(TypeError);
       expect(() =>
-        inst.post(b.E, b.g, 0, [{ eid: P.random(16), body: P.random(P.INBOX_BODY_LEN - 1) }]),
+        inst.post(b.E, b.g, b.g, [{ eid: P.random(16), body: P.random(P.INBOX_BODY_LEN - 1) }]),
       ).toThrow(TypeError);
       expect(() => inst.post(b.E, b.g, -1, invites(1))).toThrow(TypeError);
-      expect(() => inst.read(b.E, b.g, 0, -1, 10)).toThrow(RangeError);
-      expect(() => inst.read(b.E, b.g, 0, 0, 0)).toThrow(RangeError);
-      expect(() => inst.read(b.E, b.g, 0, 0, 1025)).toThrow(RangeError);
+      expect(() => inst.read(b.E, b.g, b.g, -1, 10)).toThrow(RangeError);
+      expect(() => inst.read(b.E, b.g, b.g, 0, 0)).toThrow(RangeError);
+      expect(() => inst.read(b.E, b.g, b.g, 0, 1025)).toThrow(RangeError);
     });
   });
 
@@ -379,10 +385,10 @@ describe("InboxDO posts", () => {
     const now = inside(b.E);
     await b.at(now, () => undefined, 250);
     const rows = invites(2);
-    const out = await b.stub.post(b.E, b.g, 0, rows);
+    const out = await b.stub.post(b.E, b.g, b.g, rows);
     expect(rels(out)).toEqual([slotOf(now) + 1, slotOf(now) + 1]);
     await b.at(now + 3_000, () => undefined);
-    const r = await b.stub.read(b.E, b.g, 0, 0, 10);
+    const r = await b.stub.read(b.E, b.g, b.g, 0, 10);
     expect(r.rows.map((x) => P.b64u(x.eid)).sort()).toEqual(rows.map((x) => P.b64u(x.eid)).sort());
     expect(r.rows.every((x) => x.body.length === P.INBOX_BODY_LEN)).toBe(true);
   });
@@ -438,7 +444,7 @@ describe("InboxDO era end", () => {
     expect(alarm).toBeNull();
     expect(await old.meta("ended")).toBeUndefined();
     const r = await runInDurableObject(old.stub, (inst: InboxDO) =>
-      inst.read(old.E, old.g, 0, 0, 10),
+      inst.read(old.E, old.g, old.g, 0, 10),
     ); // real clock
     expect(r.ended).toBe(true);
     expect(r.closed).toBe(0); // no rows and nothing ever reported: closed_hw = 0
@@ -528,20 +534,20 @@ describe("InboxDO era end", () => {
         D - 1,
       );
     const x = invite();
-    const [rel] = rels(await call(end - D / 2, (i) => i.post(b.E, b.g, 0, [x]))) as number[];
+    const [rel] = rels(await call(end - D / 2, (i) => i.post(b.E, b.g, b.g, [x]))) as number[];
     expect(rel).toBe((end - P.T0_MS) / D + 1);
     for (const now of [end - D / 2, end - 1, end, end + D / 2, end + D - 1]) {
-      const r = await call(now, (i) => i.read(b.E, b.g, 0, 0, 1024));
+      const r = await call(now, (i) => i.read(b.E, b.g, b.g, 0, 1024));
       expect(r.ended, String(now - end)).toBe(false);
       expect(r.closed, String(now - end)).toBeLessThan(rel);
       expect(r.rows).toEqual([]);
     }
     // Posts closed at end(E); once the era has ended, a read returns the row and closed covers it.
-    expect(await call(end, (i) => i.post(b.E, b.g, 0, [invite()]))).toEqual({
+    expect(await call(end, (i) => i.post(b.E, b.g, b.g, [invite()]))).toEqual({
       s: "wrong_era",
       era: b.E + 1,
     });
-    const r = await call(end + SKEW_MS, (i) => i.read(b.E, b.g, 0, 0, 1024));
+    const r = await call(end + SKEW_MS, (i) => i.read(b.E, b.g, b.g, 0, 1024));
     expect(r).toMatchObject({ closed: rel, ended: true, more: false });
     expect(r.rows.map((y) => [y.rel, P.b64u(y.eid)])).toEqual([[rel, P.b64u(x.eid)]]);
 
@@ -605,6 +611,134 @@ describe("InboxDO era end", () => {
   });
 });
 
+describe("InboxDO notices (§9.3)", () => {
+  type Call = { j: number; E: number; g: number; rel: number };
+  /** Replaces the FeedDO link with a recorder; the first `fail` calls throw. */
+  async function record(b: ReturnType<typeof box>, fail = 0): Promise<Call[]> {
+    const calls: Call[] = [];
+    let left = fail;
+    await b.at(Date.now(), (i) => {
+      i.feeds = (j) => ({
+        inbox: async (E, g, rel) => {
+          calls.push({ j, E, g, rel });
+          if (left-- > 0) throw new Error("feed down");
+        },
+      });
+    });
+    return calls;
+  }
+  const alarmOf = (b: ReturnType<typeof box>) =>
+    runInDurableObject(b.stub, (_i: InboxDO, s) => s.storage.getAlarm());
+  /** Runs the scheduled alarm with the object's clock at `now`. */
+  const fire = async (b: ReturnType<typeof box>, now: number) => {
+    await b.at(now, () => {});
+    expect(await runDurableObjectAlarm(b.stub)).toBe(true);
+  };
+
+  it("a post arms the alarm at T0 + rel·D + (SKEW + 1)·1000 of its smallest new rel; the alarm settles, announces the newest closed slot with rows and persists noticed", async () => {
+    const b = box();
+    const calls = await record(b);
+    const S = slotOf(inside());
+    expect(await alarmOf(b)).toBe(P.eraEnd(b.E)); // the seal
+    expect(rels(await b.post(atSlot(S, 400), [invite(), invite()], 0))).toEqual([S + 1, S + 1]);
+    expect(await alarmOf(b)).toBe(atSlot(S + 1) + 1000);
+    expect(rels(await b.post(atSlot(S + 2, 400), [invite()], 0))).toEqual([S + 3]);
+    expect(await alarmOf(b)).toBe(atSlot(S + 1) + 1000); // the earlier one is kept
+    // At its time slot S + 1 has closed (so has S + 2, which is empty): one notice, noticed = closed, the next slot armed.
+    await fire(b, atSlot(S + 1) + 1000);
+    expect(calls).toEqual([{ j: feedJOf(b.E, b.g), E: b.E, g: b.g, rel: S + 1 }]);
+    expect(await b.meta("noticed")).toBe(S + 2);
+    expect(await b.meta("closed_hw")).toBe(S + 2); // the alarm settled: a read right after sees the slot
+    expect((await b.read(atSlot(S + 2, 0))).rows.map((x) => x.rel)).toEqual([S + 1, S + 1]);
+    expect(await alarmOf(b)).toBe(atSlot(S + 3) + 1000);
+    await fire(b, atSlot(S + 3) + 1000);
+    expect(calls.map((c) => c.rel)).toEqual([S + 1, S + 3]);
+    expect(await b.meta("noticed")).toBe(S + 4);
+    expect(await alarmOf(b)).toBe(P.eraEnd(b.E)); // nothing pending: the seal only
+    // Nothing new: an alarm announces nothing.
+    await b.at(atSlot(S + 9), () => {});
+    await runDurableObjectAlarm(b.stub);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("several slots closed since the last notice give one notice, naming the newest", async () => {
+    const b = box();
+    const calls = await record(b);
+    const S = slotOf(inside());
+    expect(rels(await b.post(atSlot(S, 100), [invite()], 0))).toEqual([S + 1]);
+    expect(rels(await b.post(atSlot(S + 1, 100), [invite()], 0))).toEqual([S + 2]);
+    expect(rels(await b.post(atSlot(S + 4, 100), [invite()], 0))).toEqual([S + 5]);
+    // The alarm ran late (the object was away): slots S + 1 and S + 2 are closed, S + 5 is not.
+    await fire(b, atSlot(S + 4, 500));
+    expect(calls.map((c) => c.rel)).toEqual([S + 2]);
+    expect(await b.meta("noticed")).toBe(S + 4);
+    expect(await alarmOf(b)).toBe(atSlot(S + 5) + 1000);
+  });
+
+  it("an alarm before the slot closed announces nothing and comes back at the slot's time, never within a second", async () => {
+    const b = box();
+    const calls = await record(b);
+    const S = slotOf(inside());
+    expect(rels(await b.post(atSlot(S, 100), [invite()], 0))).toEqual([S + 1]);
+    await fire(b, atSlot(S + 1) - 20); // 1.02 s early by this object's clock
+    expect(calls).toEqual([]);
+    expect(await b.meta("noticed")).toBe(S); // the closed slots so far, none with rows
+    expect(await alarmOf(b)).toBe(atSlot(S + 1) + 1000);
+    await fire(b, atSlot(S + 1) + 1000 - 600); // again a little early, but the slot has closed: announced
+    expect(calls.map((c) => c.rel)).toEqual([S + 1]);
+  });
+
+  it("a FeedDO call that fails is made once more, then given up; the slot counts as announced", async () => {
+    const S = slotOf(inside());
+    const once = box();
+    const c1 = await record(once, 1);
+    expect(rels(await once.post(atSlot(S, 100), [invite()], 0))).toEqual([S + 1]);
+    await fire(once, atSlot(S + 1) + 1000);
+    expect(c1.map((c) => c.rel)).toEqual([S + 1, S + 1]);
+
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const down = box();
+      const c2 = await record(down, 99);
+      expect(rels(await down.post(atSlot(S, 100), [invite()], 0))).toEqual([S + 1]);
+      await fire(down, atSlot(S + 1) + 1000);
+      expect(c2).toHaveLength(2);
+      expect(errors).toHaveBeenCalledTimes(1);
+      expect(await down.meta("noticed")).toBe(S + 2);
+      expect(await alarmOf(down)).toBe(P.eraEnd(down.E));
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it("the seal announces whatever is still pending once closed is final", async () => {
+    const b = box();
+    const calls = await record(b);
+    const end = P.eraEnd(b.E);
+    const r = rels(await b.post(end - 100, [invite()], 0));
+    expect(r).toEqual([slotOf(end - 100) + 1]); // a slot that closes after end(E)
+    expect(await alarmOf(b)).toBe(end); // the seal (SKEW = 0) comes before that slot's notice time
+    await fire(b, end);
+    expect(await b.meta("ended")).toBe(1);
+    expect(calls.map((c) => c.rel)).toEqual(r);
+    expect(await alarmOf(b)).toBeNull();
+  });
+
+  it("noticed starts at closed_hw in an object without the key, and at the key once it exists", async () => {
+    const b = box();
+    const S = slotOf(inside());
+    await b.read(atSlot(S, 10)); // closed_hw = S
+    await evictDurableObject(b.stub);
+    expect(await b.at(atSlot(S, 20), (i) => i.noticed)).toBe(S);
+    const calls = await record(b);
+    expect(rels(await b.post(atSlot(S, 100), [invite()], 0))).toEqual([S + 1]);
+    await fire(b, atSlot(S + 1) + 1000);
+    expect(calls.map((c) => c.rel)).toEqual([S + 1]);
+    await evictDurableObject(b.stub);
+    expect(await b.at(atSlot(S + 2, 20), (i) => i.noticed)).toBe(S + 2);
+  });
+});
+
 describe("InboxDO slot commitments", () => {
   it("one slot per closed rel with rows: leaves leafInbox ordered by eid, chained with t = rel", async () => {
     const b = box();
@@ -626,7 +760,7 @@ describe("InboxDO slot commitments", () => {
       const slots: { rel: number; n: number; root: string; head: string }[] = [];
       for (const rel of [...new Set(all.map((r) => r.rel))].sort((x, y) => x - y)) {
         const grp = all.filter((r) => r.rel === rel).sort((x, y) => P.byteCmp(x.eid, y.eid));
-        const root = P.mth(grp.map((r) => P.leafInbox(b.E, 0, rel, r.eid, r.body)));
+        const root = P.mth(grp.map((r) => P.leafInbox(b.E, b.g, rel, r.eid, r.body)));
         head = P.nextHead(cid, head, rel, grp.length, root);
         slots.push({ rel, n: grp.length, root: P.b64u(root), head: P.b64u(head) });
       }

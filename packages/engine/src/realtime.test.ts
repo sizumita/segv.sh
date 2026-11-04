@@ -71,6 +71,7 @@ const g = globalThis as unknown as { document?: Doc; window?: EventTarget };
 describe("realtime: liveness and reconnect", () => {
   let clock: FakeClock;
   let states: boolean[];
+  let inbox: number[][];
   let doc: Doc;
   let win: EventTarget;
   let rt: Realtime;
@@ -85,6 +86,7 @@ describe("realtime: liveness and reconnect", () => {
     FakeSocket.all = [];
     clock = new FakeClock();
     states = [];
+    inbox = [];
     doc = Object.assign(new EventTarget(), { visibilityState: "visible" });
     win = new EventTarget();
     g.document = doc;
@@ -94,9 +96,19 @@ describe("realtime: liveness and reconnect", () => {
       onMissed: () => {},
       onSubscribed: () => {},
       onHello: () => {},
+      onInbox: (E, g, rel) => inbox.push([E, g, rel]),
       onState: (c) => states.push(c),
     });
     rt.start();
+  });
+
+  it("passes an INBOX frame to onInbox (§10.8)", () => {
+    last().open();
+    last().onmessage?.({
+      data: W.encodeServerFrame({ f: "inbox", E: 7, g: 0, rel: 123 }).slice().buffer,
+    });
+    expect(inbox).toEqual([[7, 0, 123]]);
+    expect(last().closed).toBe(false);
   });
 
   afterEach(() => {

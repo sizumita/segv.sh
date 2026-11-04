@@ -751,7 +751,7 @@ describe("a sibling's ENDED record (§11.7)", () => {
 
   it("a failed get in the sweep after the record is retried at the next catch-up", async () => {
     const {
-      users: [alice, bob],
+      users: [, bob],
       engines: [A, B, C],
       id,
     } = await group(["alice", "bob", "carol"]);

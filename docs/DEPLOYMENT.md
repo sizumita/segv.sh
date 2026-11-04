@@ -1,7 +1,7 @@
 # Deployment
 
-segv.sh runs on Cloudflare: one Worker with static assets, five Durable Object classes with SQLite storage, a D1
-database, an R2 bucket and the Workers rate-limiting binding. The web app's `apps/web/wrangler.jsonc` configures the
+segv.sh runs on Cloudflare: one Worker with static assets, its Durable Object classes with SQLite storage, D1
+databases (one to start), an R2 bucket and the Workers rate-limiting binding. The web app's `apps/web/wrangler.jsonc` configures the
 deployment at <https://segv.sh>; to run your own instance, change the values that the steps below name.
 
 ## Decide these first
@@ -32,19 +32,24 @@ Some settings cannot change once people use a deployment.
 
 Run the commands of these steps in `apps/web`, the directory of `wrangler.jsonc`.
 
-1. Create the D1 database, and put its id into `d1_databases[0].database_id` in `wrangler.jsonc`:
+1. Create the D1 database, and put its id into both entries of `d1_databases` in `wrangler.jsonc`: `DB` (user
+   database 0) and `DIRLOG` (the log database) are the same database until the directory is split
+   ([PROTOCOL.md §9.6](PROTOCOL.md)):
 
    ```bash
    pnpm exec wrangler d1 create segv
    ```
 
-2. Create the R2 bucket. If you choose another name, change `r2_buckets[0].bucket_name`.
+2. Create the R2 bucket. It holds the blobs (`b/…`) and, once an era is sealed, its rows, index and manifest
+   (`seal/v2/{E}/{i}/…`, §9.1 of the protocol); the Worker is its only reader. If you choose another name, change
+   `r2_buckets[0].bucket_name`.
 
    ```bash
    pnpm exec wrangler r2 bucket create segv-blobs
    ```
 
-3. Apply the D1 migrations (`packages/server/migrations`):
+3. Apply the D1 migrations (`packages/server/migrations`); every database of the directory gets the same schema, so
+   repeat this for each further database you add later (`DB1`, …):
 
    ```bash
    pnpm exec wrangler d1 migrations apply DB --remote
@@ -83,7 +88,16 @@ Run the commands of these steps in `apps/web`, the directory of `wrangler.jsonc`
 ### Notifications (optional)
 
 Web Push is off until you set its secrets. With it on, params report `push`, and users can turn notifications on per
-device ([PROTOCOL.md §9.8](PROTOCOL.md)).
+device ([PROTOCOL.md §9.8](PROTOCOL.md)). The registrations live in a KV namespace, and pushes due later than the
+Worker can wait travel through a queue; both are named in `wrangler.jsonc`.
+
+0. Create the KV namespace and the queue once per deployment, and put the namespace's id into `wrangler.jsonc`
+   (`kv_namespaces`, binding `PUSH_KV`); the queue is named there already (`segv-push`, or `segv-push-canary`):
+
+   ```bash
+   pnpm exec wrangler kv namespace create segv-push
+   pnpm exec wrangler queues create segv-push
+   ```
 
 1. Set the VAPID key (a P-256 private scalar, 32 bytes base64url), the key that seals the stored registrations
    (32 random bytes base64url), and a contact the push services can reach:
@@ -130,23 +144,31 @@ fetch the two files from the canonical host, which answers them without a redire
 
 ### Variables
 
-| Name            | Value at segv.sh             | Meaning                                                                                                                                                                                      |
-| --------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `POW_REGISTER`  | 20                           | Proof-of-work difficulty (leading zero bits) for registration                                                                                                                                |
-| `POW_WRAP`      | 18                           | Difficulty for adding a key wrap (a passkey or the recovery code)                                                                                                                            |
-| `POW_PUT`       | 16                           | Base difficulty for writing rows; larger bodies need more                                                                                                                                    |
-| `POW_INBOX`     | 18                           | Base difficulty for posting inbox invites; larger bodies need more                                                                                                                           |
-| `POW_BLOB`      | 18                           | Base difficulty for uploading an image or a key bundle; larger uploads need more                                                                                                             |
-| `DELTA_S`       | 10                           | Δ in seconds, 1–3600: the granularity of row times. It must divide 604 800 (one week). Constant for the deployment                                                                           |
-| `SKEW_S`        | 2                            | SKEW in seconds, 0–60: the bound on clock differences between server components. Constant within an era                                                                                      |
-| `INBOX_SLOT_S`  | 10                           | Δin in seconds, 1–3600: the length of an inbox slot. Constant for the deployment                                                                                                             |
-| `E_FIRST`       | 42                           | The era of the first deployment                                                                                                                                                              |
-| `APP_HOSTS`     | `segv.sh,localhost`          | The host names the Worker answers on, comma-separated; the first is canonical. Pages on other hosts are redirected to it (308), and API requests are refused (421). Empty disables the check |
-| `APP_ORIGINS`   | four origins (above)         | The origins of the native apps' pages, comma-separated, which may read API answers and open the realtime socket. Empty by default                                                            |
-| `APPLE_APP_IDS` | `NBDP5VK335.sh.segv.desktop` | The Apple apps' app IDs, comma-separated, for `/.well-known/apple-app-site-association` (404 while unset)                                                                                    |
-| `ANDROID_APPS`  | unset                        | The Android apps' package names and certificate fingerprints, comma-separated, for `/.well-known/assetlinks.json` (404 while unset)                                                          |
+| Name             | Value at segv.sh             | Meaning                                                                                                                                                                                                                                                                                                                          |
+| ---------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POW_REGISTER`   | 20                           | Proof-of-work difficulty (leading zero bits) for registration                                                                                                                                                                                                                                                                    |
+| `POW_WRAP`       | 18                           | Difficulty for adding a key wrap (a passkey or the recovery code)                                                                                                                                                                                                                                                                |
+| `POW_PUT`        | 16                           | Base difficulty for writing rows; larger bodies need more                                                                                                                                                                                                                                                                        |
+| `POW_INBOX`      | 18                           | Base difficulty for posting inbox invites; larger bodies need more                                                                                                                                                                                                                                                               |
+| `POW_BLOB`       | 18                           | Base difficulty for uploading an image or a key bundle; larger uploads need more                                                                                                                                                                                                                                                 |
+| `DELTA_S`        | 10                           | Δ in seconds, 1–3600: the granularity of row times. It must divide 604 800 (one week). Constant for the deployment                                                                                                                                                                                                               |
+| `SKEW_S`         | 2                            | SKEW in seconds, 0–60: the bound on clock differences between server components. Constant within an era                                                                                                                                                                                                                          |
+| `INBOX_SLOT_S`   | 10                           | Δin in seconds, 1–3600: the length of an inbox slot. Constant for the deployment                                                                                                                                                                                                                                                 |
+| `E_FIRST`        | 42                           | The era of the first deployment                                                                                                                                                                                                                                                                                                  |
+| `SHARD_MAP`      | unset (one shard per era)    | The shard count per era: `E:S` entries, comma-separated, `S` a power of two in 1–65536 in effect from era `E` on (§9.1 of the protocol). Add or change an entry only for eras at least two after the current one (`E ≥ era(now + SKEW) + 2`); an era whose count changed after it has rows answers 503 for every key             |
+| `INBOX_MAP`      | unset (one bucket per era)   | The inbox bucket count per era, in the same form (§9.3 of the protocol): raise it once the user count passes 2 · 16 384 · B, only for eras at least two after the current one (`E ≥ era(now + SKEW) + 2`, since the directory already lists the next era's buckets); a changed count of a listed era makes directory answers 503 |
+| `PUSH_SHARDS`    | 4                            | The number of objects that own the push registrations, one per range of accounts, 1–4096. May change at any deploy                                                                                                                                                                                                               |
+| `RT_CONNS`       | 4                            | C, 1–4096: the number of objects that hold the realtime WebSockets; a client's sockets all go to one of them. May change at any deploy                                                                                                                                                                                           |
+| `RT_FEEDS`       | 4                            | F, a power of two in 1–4096: the number of objects that fan new rows out to them by topic. May change at any deploy                                                                                                                                                                                                              |
+| `BLOBREG_SHARDS` | 64                           | B, a power of two in 1–4096: the number of blob registry objects (§9.2 of the protocol). A constant of the deployment: never change it once a blob is registered, since ids would route to another object                                                                                                                        |
+| `APP_HOSTS`      | `segv.sh,localhost`          | The host names the Worker answers on, comma-separated; the first is canonical. Pages on other hosts are redirected to it (308), and API requests are refused (421). Empty disables the check                                                                                                                                     |
+| `APP_ORIGINS`    | four origins (above)         | The origins of the native apps' pages, comma-separated, which may read API answers and open the realtime socket. Empty by default                                                                                                                                                                                                |
+| `APPLE_APP_IDS`  | `NBDP5VK335.sh.segv.desktop` | The Apple apps' app IDs, comma-separated, for `/.well-known/apple-app-site-association` (404 while unset)                                                                                                                                                                                                                        |
+| `ANDROID_APPS`   | unset                        | The Android apps' package names and certificate fingerprints, comma-separated, for `/.well-known/assetlinks.json` (404 while unset)                                                                                                                                                                                              |
 
-A variable that is present but invalid (not a decimal number, out of range, or a `DELTA_S` that does not divide 604 800)
+A variable that is present but invalid (not a decimal number, out of range, a `DELTA_S` that does not divide 604 800, an
+`RT_FEEDS` or `BLOBREG_SHARDS` that is not a power of two, or a `SHARD_MAP` or `INBOX_MAP` whose entries are not ascending
+`E:S` pairs with power-of-two counts)
 makes every `/api/v2/*` request answer 503 `server misconfigured`. Clients refuse a proof-of-work base above 26. The
 native apps' variables are the exception: an invalid one counts as unset and changes nothing else.
 
@@ -161,7 +183,7 @@ native apps' variables are the exception: an invalid one counts as unset and cha
 | `VAPID_SUB` | `mailto:` or `https:` URI (with `VAPID_SK`)     | The contact sent to push services                                  |
 
 Optional push variables: `PUSH_HOSTS` (the push service hosts that may receive pushes; default Apple, Google, Mozilla
-and Microsoft), `POW_PUSH` (20), `PUSH_MAX_SUBS` (100 000) and `PUSH_DAY_SUBS` (2 000).
+and Microsoft), `POW_PUSH` (20) and `PUSH_SHARDS` (1).
 
 ### Rate limits
 
@@ -277,6 +299,15 @@ Custom Domain step after the new version is live. Apply both by hand (the next s
   Without the workflow, deploy new code with `pnpm run deploy` (segv.sh) or `pnpm run build` followed by
   `pnpm exec wrangler deploy --env canary` (canary.segv.sh).
 
+- The version that splits the realtime path ([PROTOCOL.md §9.4](PROTOCOL.md)) and moves the push registrations to
+  the KV store (§9.8) carries the Durable Object migrations `v3` to `v5`. Migration `v3` deletes the `RealtimeDO` and
+  the `PushDO` with everything they stored, and nothing imports the `PushDO`'s registrations: each device that has
+  notifications on registers its bells again at its next start, or within a day while it keeps running (§11.13), and
+  gets no push until then. Before deploying it, create the KV namespace and the queue and put the namespace's id into
+  `wrangler.jsonc` ([Notifications](#notifications-optional), step 0), for both deployments. Leave `SHARD_MAP` and
+  `INBOX_MAP` unset at that deploy; when you set them later, add or change entries only for eras
+  `E ≥ era(now + SKEW) + 2` ([Variables](#variables)).
+
 - When a change adds a D1 migration, apply it to each deployment before deploying the code that needs it: to
   canary.segv.sh before merging the pull request, and to segv.sh before pushing the release tag. In `apps/web`:
 
@@ -289,6 +320,18 @@ Custom Domain step after the new version is live. Apply both by hand (the next s
   release working. Changes to Durable Object classes are declared in `migrations` in `wrangler.jsonc`, which both
   deployments share.
 
+- The directory became a log database (`DIRLOG`) and `DIR_SHARDS` user databases (`DB`, `DB1`, …). Bind `DIRLOG`
+  to the existing database (the same database as `DB`, until you move the log out), leave `DIR_SHARDS` unset (one
+  user database) and deploy: nothing moves. Before that database nears its size limit (10 GB; about 1.5 million
+  accounts), create `K − 1` further databases, apply the migrations to each, bind them as `DB1` … `DB{K−1}`, set
+  `DIR_SHARDS` to `K` (a power of two) and deploy; the `DirSeqDO` then moves each account's rows to its database in
+  the background, a page at a time, and lookups keep working meanwhile. Never lower `DIR_SHARDS` (the `DirSeqDO`
+  refuses writes until it is restored), and raise it only in a deploy after the one that introduced the `DirSeqDO`.
+- The blob registry became `BLOBREG_SHARDS` objects, and the directory got its single writer (the `DirSeqDO`,
+  migration `v4`). Nothing is done by hand: each registry object copies its share of the first release's registry the
+  first time it runs, and the old object stays, read-only. Set `BLOBREG_SHARDS` before the first deploy of this version
+  and never change it afterwards. The inbox got its bucket map (`INBOX_MAP`, unset = one bucket, so nothing changes
+  until it is set) and the `KeyDO` (migration `v5`), which holds the per-era bucket keys.
 - To change `routes`, deploy the change by hand from an account that has Workers Routes Write on the zone
   (`pnpm run deploy`, or `wrangler deploy --env canary` for canary.segv.sh), then push it to `main`.
 - Check a change to `wrangler.jsonc` with `pnpm run build` followed by `pnpm exec wrangler deploy --dry-run` and

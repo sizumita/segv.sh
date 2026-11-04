@@ -71,6 +71,8 @@ interface Account {
   handle: string;
   /** era of registration, from the directory (§11.1); null until the account check */
   regEra: number | null;
+  /** the account's inbox buckets (§10.6 `inbox`), from the same directory entry */
+  inbox: { E: number; g: number }[];
 }
 
 /** What the registering device knows of its registration: its server time, when the response arrived (§11.1). */
@@ -184,7 +186,7 @@ export class SegvEngine implements Engine {
         return p ? pushParams(p) : null;
       },
       deltaMs: () => (this.api.cachedParams?.delta ?? 10) * 1000,
-      bells: () => this.msg?.pushBells() ?? [],
+      secrets: () => this.msg?.pushSecrets() ?? [],
       quiet: () => this.quietKeys()?.Q ?? null,
       onOff: () => {
         void this.dropCache();
@@ -667,7 +669,7 @@ export class SegvEngine implements Engine {
     const id = P.deriveIdentity(AK);
     const uidB = P.b64u(uid);
     this.resetData();
-    this.account = { uid, uidB, AK, id, handle, regEra: null };
+    this.account = { uid, uidB, AK, id, handle, regEra: null, inbox: [] };
     this.self = new SelfLane(this.api, id, {
       warn: (t, critical) => this.warn(t, critical),
       applied: () => {
@@ -748,7 +750,9 @@ export class SegvEngine implements Engine {
           return acc.handle;
         },
         regEra: acc.regEra!,
+        inbox: acc.inbox,
         refKey: refKeyOf(acc.AK),
+        bellKey: P.bellKey(acc.AK),
       },
       self: this.self!,
       check: () => this.assertSession(acc, gen),
@@ -811,6 +815,7 @@ export class SegvEngine implements Engine {
     }
     acc.handle = u.handle;
     acc.regEra = u.regEra;
+    acc.inbox = u.inbox;
     if (this.state.me) this.patch({ me: { ...this.state.me, handle: u.handle } });
   }
 

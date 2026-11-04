@@ -28,23 +28,17 @@ texts.
   forever, and the server never sees a secret of an account or a conversation. It has no sessions. Writes are
   anonymous. Abuse control is proof of work plus per-IP rate limits, and no address is stored.
 - **The exception: push registrations.** A deployment MAY offer push notifications (§9.8, §10.10, §11.13): Web Push for
-  browsers, and APNs and FCM for its native apps (§11.14). Then one component, PushDO, stores data that is never served:
-  for each device that turned notifications on, its push endpoint (the URL at which its browser's push service accepts
-  messages for it, or the token under which a native app receives them) with the keys to which its pushes are encrypted,
-  sealed under a server secret, keyed hashes of the bells it registered (§4.2) and of its account's quiet tag (§4.1),
-  and the day of its last registration. It stores no uid, handle, conversation, topic, IP address or sender, and
+  browsers, and APNs and FCM for its native apps (§11.14). Then one store, a KV namespace, holds data that is never
+  served: for each device that turned notifications on, its push endpoint (the URL at which its browser's push service
+  accepts messages for it, or the token under which a native app receives them) with the keys to which its pushes are
+  encrypted, sealed under a server secret, keyed hashes of the bells it registered (§4.1) and of its account's quiet tag
+  (§4.1), and the day of its last registration. It stores no uid, handle, conversation, topic, IP address or sender, and
   nothing about a ring or about a device in use: which devices a message reached, and which rows an account marked
-  seen, are held in memory only, for at most a few minutes, and never written. Bells are independent PRF outputs, so
-  the stored registrations link no conversation or account to another; the devices of one account register the same
-  bells and the same quiet tag, so theirs are linked (§13.4). The platform keeps a history of this storage for 30 days, so a
-  registration, and its deletion, can be recovered from it for up to 30 days after it changed. PushDO applies each
-  change in memory at once and writes it into the registrations only after the UTC day in which it was made has ended,
-  in a pass that starts at 00:00 UTC, so that history dates a change by its day only: it shows, per day, which
-  endpoints were registered, which changed their bells and which were deleted, and on a day with few changes,
-  endpoints whose bells changed, or that were deleted, that day may belong to members of one conversation (§13.4).
-  Until then it keeps the day's changes, sealed, in a journal that gets one row of one length every minute whatever
-  has changed, so that a restart of the object loses only the changes of its last minute, and those rows date nothing
-  in that history.
+  seen, are held in the memory of the push objects only, for at most a few minutes, and never written. Bells are
+  hashes of secrets that only the account's devices hold, one per conversation (§4.1), so the stored registrations link
+  no conversation or account to another; the devices of one account register the same bells and the same quiet tag, so
+  theirs are linked (§13.4). The store keeps no history of a
+  key's earlier values (§9.8), so a registration that was replaced or deleted is gone once the change is written.
 - Conversation data is stored as **rows** `(E, label) → (t, cls, body)`:
   - `E` is the **era**, one week (§3.1).
   - `label` is 16 bytes. Only the parties that the row is meant for can compute it (a PRF output).
@@ -55,17 +49,25 @@ texts.
   row: no sender, recipient, conversation, epoch, counter, arrival order or address.
 - Clients find the rows meant for them by **computing the labels they expect and looking them up by key**. They also
   receive new rows over a WebSocket topic that they subscribe to (topics are never stored). No client downloads or
-  scans data that is not addressed to it, with one exception: first-contact invites in the global inbox (β = 0,
-  §5.3).
+  scans data that is not addressed to it, with one exception: first-contact invites in its bucket of the global
+  inbox (§5.3, §9.3).
 - Server components:
-  - one **ShardDO** per era (stage 1: one shard, S = 1);
-  - one **InboxDO** per era;
-  - one **BlobRegDO**, which registers R2 blobs and their registration time;
-  - one **RealtimeDO**, which holds the WebSocket connections and the live feed;
+  - `S_E` **ShardDOs** per era, a power of two the deployment sets per era (`SHARD_MAP`, §9.1; 1 until it is
+    raised);
+  - `2^{β_E}` **InboxDOs** per era, one per inbox bucket (`INBOX_MAP`; one until it is raised, §9.3);
+  - one **KeyDO**, which holds the per-era inbox bucket keys (§9.3);
+  - `B` **BlobRegDOs** (`BLOBREG_SHARDS`, a power of two fixed for the deployment, §9.2), which register R2 blobs
+    and their registration time, each for the blob ids routed to it;
+  - one **DirSeqDO**, the only writer of the directory (§9.6);
+  - `C` **ConnDOs**, which hold the WebSocket connections, and `F` **FeedDOs**, which keep which ConnDOs' sockets
+    subscribed to each topic and forward published rows to them (`C` and `F` are deployment parameters, §9.4);
   - one **CheckpointDO**, which signs the heads of the public data every 60 s;
-  - the **directory** in D1 (accounts and key wraps);
-  - R2 for blobs;
-  - optionally, one **PushDO**, which holds the push registrations and sends contentless pushes (§9.8).
+  - the **directory** in D1 (accounts and key wraps): one log database and `K` user databases (`DIR_SHARDS`,
+    §9.6);
+  - R2 for blobs, and for the rows of sealed eras (§9.1 "Paging");
+  - optionally, for push, the push store (a KV namespace), `PUSH_SHARDS` **QuietDOs**, which hold nothing durable, a
+    queue and a daily Cron Trigger (§9.8); the Worker looks the bells of a ring up in the store and sends the
+    contentless pushes.
 
 ### 0.2 Adversaries
 
@@ -88,7 +90,9 @@ texts.
    independent PRF outputs. P learns the era, `t` (Δ-rounded), the size class of each row, inbox counts per slot, the
    public directory, and, once per hour, whether any blob was registered (§9.5). §13.1 lists the timing patterns.
 3. **Recipient anonymity of invites against P, including a quantum P.** Inbox invites are found by X-Wing trial
-   decapsulation, so no detection tag exists. In v1 this held against a classical P only.
+   decapsulation, so no detection tag exists. In v1 this held against a classical P only. The anonymity set is all
+   users while an era has one bucket, and the invite's bucket, about K = 2^14 users, once `INBOX_MAP` splits the era
+   (§9.3, §13.1).
 4. **Authenticity among members.** Every conversation row is signed with Ed25519 by its sender inside the AEAD.
    Replays into another slot, era, epoch or conversation fail, because the AAD and the signature bind `E`, `label`,
    `conv` and `e`.
@@ -137,18 +141,14 @@ These hold in stage 1. §13 has the full leakage table and the explicit list of 
   package, §11.14); a malicious member who signs an unusable claim (freezing membership for the whole conversation,
   attributably, and messaging too when the claim removes someone) or spams; anyone who fills the global inbox day cap
   (§9.3), which delays first contact and inbox deliveries for everyone, for as long as it keeps refilling the cap every
-  day; where push is offered, anyone who fills PushDO's endpoint cap with registrations (§9.8), which keeps every new
-  device from turning notifications on until they expire, or its cap of registrations changed in a day, which keeps
-  every device from registering a new or changed set until the next day, or who keeps more pushes due than the one
-  PushDO sends, which delays everyone's notifications; and directory key substitution by O (detected only by fingerprint
+  day; and directory key substitution by O (detected only by fingerprint
   comparison, TOFU pins (CONTACT, MEMBER) and disagreement with the keys in descriptors).
 - **Push notifications** (optional; §9.8, §11.13, §13.4):
   - Delivery is best effort. A push service may drop or delay a push, a browser may revoke a subscription and an
     operating system a token, the pushes to one device are coalesced to at most one per `PUSH_WINDOW` (60 s), except
-    across a restart of PushDO, and a registration expires 30 days after its device last refreshed it. A restart (an
-    eviction or a deploy) loses the pushes then due and the registration changes of its last minute, which the journal
-    does not hold yet, so a device that registered in that minute may get the notifications of its earlier set, or
-    none, until it registers again at its next start, or within 24 hours while it runs (§9.8, §11.13). Messages from
+    across a restart of its QuietDO, and a registration expires 30 days after its device last refreshed it. A restart
+    (an eviction or a deploy) of a QuietDO loses the pushes then due and the marks it held; the registrations are in
+    the store and survive it (§9.8). Messages from
     a client that does not ring (the first release, §7.1) notify nobody, and a contact that the first release recorded
     when a third member's row accepted a request counts (§7.3): that conversation, and the later ones that user
     starts, ring although the user never accepted them.
@@ -162,30 +162,36 @@ These hold in stage 1. §13 has the full leakage table and the explicit list of 
     `message`, every push makes the device read its conversation's rows, also while the app is closed, so O learns at
     each push the device's IP address and that it received the push, and can link its endpoint to that address; a
     member can cause this by ringing, and O by sending a push.
-  - A device that is closed while the epoch of a conversation changes twice gets no notification for it until it is
-    opened (senders ring the bells of the current and the previous epoch only), and one that is closed while it
-    changes once stops getting them as soon as another device of its account posts in the new epoch.
+  - A device that is closed while a member of a conversation is removed keeps the old bell registered (§11.13): senders
+    ring it until another device of its account posts the new bell, or until the epoch changes once more, and the
+    device then gets no notification for that conversation until it is opened. Additions and renames change no bell.
+  - A member that joins a conversation learns the other members' bells only from their BELL rows in the epochs it
+    holds, from its join epoch on (§11.13). A member that has posted no BELL row there (its devices have all stayed
+    closed since the join) is not rung by the joiner's messages until one of its devices posts one; the other members'
+    messages ring it meanwhile.
   - **Seen elsewhere** (§11.13). While a device of an account is in use, as that device judges it (visible, focused,
     and the user's last input on it at most a minute old), the account's devices get no push for the rows it shows,
     in any conversation. A device whose user left it within that minute still silences the others for the rows that
     arrive before the minute ends. Every push waits at least `PUSH_HOLD` = 5 s after its ring (§9.8) so that the
-    device's mark can arrive first; a mark that comes later, that is lost, or that a restart of PushDO forgets,
+    device's mark can arrive first; a mark that comes later, that is lost, or that a restart of its QuietDO forgets,
     changes nothing, and the push is sent.
   - O learns, at every ring, the bells of the conversation's other members and the devices registered under them,
     also devices that are offline, and links them to the conversation through the topic of the row's put; a device's
     endpoint stays the same across its IP addresses. N learns when each of its devices is notified, and can guess from
     the times which devices share a conversation.
   - A member can make the other members' devices show a notification (at most one per device per `PUSH_WINDOW`, a
-    restart of PushDO aside), and can take the 8 places of another member's bell with its own endpoints first, which
-    keeps that member's devices from registering under it, and so from notifications for that conversation, for as long
-    as it holds them (the bells change with each epoch, and it can take the new ones too), without letting it read
-    anything new. Registering its own endpoints and ringing them also tells it how many places other devices hold, and
-    so whether that member has notifications on; and holding all but one place of that member's new bell after an epoch
-    change (which any member can cause), and probing the free place every few minutes, tells it when the member's first
-    device registered that bell, that is, when it was first open after the change. A member removed at an epoch change
-    can do the same with the previous epoch's bells of the members silent in the new epoch, and learn when messages are
-    sent there and, since a sender never rings its own bell, which of those members sends each, until each of them
-    posts in the new epoch or the epoch changes again.
+    restart of its QuietDO aside), without letting it read anything new. A member removed at an epoch change (or
+    dropped after leaving) knows the bells of the generations it was in (§4.1), and senders keep ringing a silent
+    member's old bell in the new epoch (§11.13): the removed member can still make the devices of each such member
+    show notifications, at most one per device per `PUSH_WINDOW`, until that member posts its new bell or the epoch
+    changes again. It learns nothing from ringing, since the answer is the same whatever the ring reaches (§10.10), and
+    it cannot register under the bells: registering needs the bell's secret, which only its owner's devices hold.
+  - **BELL rows** (§11.13). A device posts a BELL row in every epoch of a conversation, additions and renames included,
+    within `BELL_DELAY` = 60 s of first finding self's lane there without one, whether or not it has notifications on.
+    The row's `t` (Δ-rounded) lies on a lane that every member reads, so the members learn, at every epoch change, when
+    the first device of each other member processed the new epoch, to within about `BELL_DELAY` + Δ (70 s): when that
+    member's first device was online after the change, or, when all its devices were closed, when it came back. The
+    random delay only blurs the moment.
   - Notifications are shown also while the app is open.
   - **Native apps** (§11.14). A native app's notification code may be unable to read its keys before the device is
     first unlocked after a restart, and then shows the fixed text. Android may deliver a push late while the device
@@ -298,6 +304,7 @@ kS = HKDF(AK, "", "segv.sh/v2/self/aead",   32)       // self lane (§4.1)
 rS = HKDF(AK, "", "segv.sh/v2/self/route",  32)
 nS = HKDF(AK, "", "segv.sh/v2/self/notify", 32)
 qS = HKDF(AK, "", "segv.sh/v2/self/quiet",  16)       // quiet secret (§4.1, §11.13)
+bS = HKDF(AK, "", "segv.sh/v2/self/bell",   32)       // bell secret (§4.1, §11.13)
 kN = HKDF(AK, "", "segv.sh/v2/self/note",   32)       // sync notes (§11.16)
 ```
 
@@ -399,9 +406,12 @@ A failed unlock MUST NOT create keys or write anything.
    forget the credential and abort.
 6. Build the passkey and recovery records and `POST /api/v2/register`.
 7. On a 4xx: forget the credential (409 means "taken").
-8. On a network error or 5xx: query the handle prefix. The registration landed only if the directory returns exactly
-   this `bundleBytes` for the handle. Otherwise fail, and forget the credential only if another bundle holds the
-   handle.
+8. On a network error, a 429 or a 5xx: send the identical body again, after the answer's `retry-after` or a backoff
+   (1 s, doubling), whichever is longer, at most 10 s, and at most 5 sends in all. The proof of work is reused while
+   its window is accepted (§10.2) and solved again otherwise. The directory answers a registration it already logged
+   as it answered the first time (§9.6 step 2), so a 200 means registered: the client keeps the credential and
+   continues at step 9. A 4xx is handled as in step 7 (a 409 now means that another account holds the handle). When
+   the last send gets no answer either, fail and keep the credential.
 9. Show the recovery code once.
 
 **Login**:
@@ -517,9 +527,9 @@ body = aeadSeal(mk_e, pad(M ‖ sig, CLASSES), aad = enc("segv.sh/v2/msg", u16 E
 
 | field | meaning |
 | ----- | ------- |
-| `type` | 1 TEXT, 2 IMAGE, 3 REACTION, 4 FILE, 8 WELCOME, 16 CLAIM, 17 LEAVE. Every other value is invalid. |
+| `type` | 1 TEXT, 2 IMAGE, 3 REACTION, 4 FILE, 5 BELL, 8 WELCOME, 16 CLAIM, 17 LEAVE. Every other value is invalid. |
 | `from` | The sender's index in `D_e` (§5.1). |
-| `lane` | For lane rows (types 1, 2, 3, 4, 8, 17): equal to `from` (stage 1: one lane per member). For CLAIM: `0xFFFF`. |
+| `lane` | For lane rows (types 1, 2, 3, 4, 5, 8, 17): equal to `from` (stage 1: one lane per member). For CLAIM: `0xFFFF`. |
 | `n` | The slot within era `E`: the lane counter, or `k` for CLAIM. |
 | `Eprev, nprev, prevh` | Lane rows only: the position of the sender's previous **valid** row on this lane in this epoch, and `prevh = t16(H(enc("segv.sh/v2/prev", label_prev, body_prev)))`, where `body_prev` is that row's stored body. For the first row of the lane in the epoch, and for every CLAIM: NONE and `ZERO16`. |
 | `ts` | The sender's clock in ms (display only, §11.8). |
@@ -531,7 +541,7 @@ of these hold:
 
 1. `unpad` (§1.3) succeeds. The result x has `len(x) ≥ 62 + 64`; `M` = x without its last 64 bytes, and `sig` = the
    last 64 bytes.
-2. `ver = 2` and `type ∈ {1, 2, 3, 4, 8, 16, 17}`.
+2. `ver = 2` and `type ∈ {1, 2, 3, 4, 5, 8, 16, 17}`.
 3. `from < 32`.
 4. `type = 16` (CLAIM): `lane = 0xFFFF` and `(Eprev, nprev)` = NONE. Every other type: `lane = from`.
 5. `(Eprev, nprev)` obeys the position rule (§3.1).
@@ -571,6 +581,9 @@ Content rules:
 - **FILE (4)**: `id[32] | k[32] | u32 size | u8 nlen | name[nlen]` (69 + nlen B, so the row is class 0 for a name of
   at most 60 B and class 1 otherwise), with `1 ≤ nlen ≤ 255` and `name` valid UTF-8 (§1.2): a file of `size` bytes,
   sent as the blob `id` under the key `k` (§8.3). `size` has no parse rule, and neither has the name's content (§8.3).
+- **BELL (5)**: `u32 g | bell[16]` (20 B, so the row is always class 0): the sender's bell in this conversation, which
+  the other members ring (§11.13), and the generation `g` it belongs to, from which the sender's own devices derive it
+  (§4.1). Any other length is malformed; `g` and `bell` have no parse rule.
 - **WELCOME (8)**: a join payload `J` (§5.2), 90 B.
 - **CLAIM (16)**: see §6.2.
 - **LEAVE (17)**: `len = 0`.
@@ -584,6 +597,8 @@ Lself(E, n) = t16(HMAC(rS, enc("segv.sh/v2/lab/self", u16 E, u32 n)))     device
 Lsnap(E, j) = t16(HMAC(rS, enc("segv.sh/v2/lab/snap", u16 E, u32 j)))     snapshot pointers (§7.4)
 Tself       = t16(HMAC(nS, utf8("segv.sh/v2/topic/self")))                 realtime topic
 Qself       = t16(H(enc("segv.sh/v2/quiet", qS)))                           push quiet tag (§9.8, §11.13)
+s(conv, g)  = t16(HMAC(bS, enc("segv.sh/v2/bell/secret", conv, u32 g)))    the account's bell secret in conversation conv, generation g (§11.13)
+bell(s)     = t16(H(enc("segv.sh/v2/bell", s)))                             its bell: what its BELL rows tell the members, and what rings carry
 ```
 
 - **Quiet tag.** All devices of an account compute the same `qS` and `Qself`, without any record. `Qself` is a hash of
@@ -591,6 +606,15 @@ Qself       = t16(H(enc("segv.sh/v2/quiet", qS)))                           push
   either from that conversation's keys, bells, topics or labels. A device registers `Qself` with its push endpoint,
   and a device of the account that is in use sends `qS` to tell the server that the account has seen some rows
   (§10.10, §11.13).
+- **Bells.** A bell belongs to one account in one conversation. Its secret `s` is known to the account's devices alone,
+  so only they can register under the bell (§10.10); every other member learns the bell from the account's BELL rows
+  (§3.3, §11.13) and rings it. `g`, the bell's **generation**, is the epoch at which the account's current bell
+  started (§11.13): the epoch at which the account entered the conversation, or the latest later epoch whose
+  descriptor lacks a member of the previous epoch's (a member removed, or dropped after leaving, §6.3). So a bell stays
+  the same through additions, renames and rotations that drop nobody, and changes whenever someone who knew it is no
+  longer a member: a member removed at the change to e + 1 knows the bells of the generations it was in and none
+  after. Bells, quiet tags, topics and labels are independent PRF outputs, so bells link no conversation, epoch or
+  account to another without `bS`, and no bell of an account tells its secret or another of its bells.
 
 ### 4.2 Conversation epochs
 
@@ -608,15 +632,12 @@ ekc_e = H(enc("segv.sh/v2/ekc", conv, u32 e, EK_e))
 Lmsg_e(ℓ, E, n) = t16(HMAC(rk_e, enc("segv.sh/v2/lab/msg", u16 ℓ, u16 E, u32 n)))   member lane ℓ = index in D_e
 Lctl_e(E, k)    = t16(HMAC(rk_e, enc("segv.sh/v2/lab/ctl", u16 E, u32 k)))          control lane (claims)
 T_e             = t16(HMAC(nk_e, utf8("segv.sh/v2/topic/conv")))                     realtime topic of epoch e
-B_e(ℓ)          = t16(HMAC(nk_e, enc("segv.sh/v2/bell", u16 ℓ)))                    push bell of lane ℓ of epoch e
 ```
 
 - **Lanes.** In stage 1 there is one lane per member, `L_e = |D_e| ≤ 32`, and lane `ℓ` belongs to
   `D_e.members[ℓ]`. Only that member's devices write it, and they share the counter (§11.7).
-- **Bells.** `B_e(ℓ)` is the push bell of `D_e.members[ℓ]` in epoch e (§11.13). Every member of e can compute every
-  bell of e, and nobody else can: a member removed at the change to e + 1 knows the bells of e but none of e + 1.
-  Bells, topics and labels are independent PRF outputs, so bells link no conversation, epoch or member to another
-  without `nk_e`. All devices of one account compute the same bells, without any record.
+- **Bells** are per account, not per epoch (§4.1): a member's bell in the conversation is what its BELL rows say
+  (§11.13).
 - **Counters.** `n` (and `k`) restart at 0 in every era.
 - **Dense prefixes.** Slots fill densely within an era: honest writers always write the first empty slot. The **dense
   prefix** of a lane in era `E` is the slots `(E, 0..h−1)` up to and including the last one before the first empty slot
@@ -658,7 +679,18 @@ These derivations are the server's only (§9.1).
 kroute_E = HMAC(ROUTE_KEY, enc("segv.sh/v2/route", u16 E))                ROUTE_KEY: 32-byte Worker secret
 kcommit_E = H(enc("segv.sh/v2/kroute", kroute_E))                         published in params / era info
 v(E, label) = u64(HMAC(kroute_E, label)[0..8]) >> 1                       63-bit routing value; stored as 8-byte big-endian
-shard(E, label) = v >> (63 − s_E)                                         stage 1: s_E = 0 ⇒ shard 0
+shard(E, label) = v >> (63 − s_E)                                         S_E = 2^s_E shards per era (SHARD_MAP, §9.1); s_E = 0 ⇒ shard 0
+ktag = HMAC(ROUTE_KEY, utf8("segv.sh/v2/ws-tag"))
+tag(ck) = HMAC(ktag, utf8("ws|" ‖ ck))[0..16]                              the opaque client tag; ck = the client's rate-limit key (§10.2)
+conn(ck) = u32(tag(ck)[0..4]) mod C                                       the client's ConnDO "conn/v2/{c}" (§9.4)
+kfeed = HMAC(ROUTE_KEY, utf8("segv.sh/v2/feed"))
+h(T) = HMAC(kfeed, T)[0..8]                                               the feed hash of topic T
+feed(T) = u64(h(T)) >> (64 − f)                                           the topic's FeedDO "feed/v2/{j}", F = 2^f (f = 0 ⇒ j = 0)
+kblob = HMAC(ROUTE_KEY, utf8("segv.sh/v2/blob"))
+blobShard(id) = u32(HMAC(kblob, id)[0..4]) >> (32 − b)                   the blob id's BlobRegDO "blobreg/v2/{j}", B = 2^b (b = 0 ⇒ j = 0)
+kbucket_E                                                                 32 random bytes per era, made and kept by the KeyDO (§9.3); never derived
+x(handle) = topBits(hpre(handle), min(32, β_E + 5))                       the inbox prefix of a handle (about K/32 users each)
+bucket(E, handle) = u32(HMAC(kbucket_E, enc("segv.sh/v2/inbox/bucket", u16 β_E, u32 x))[0..4]) mod 2^β_E     (β_E = 0 ⇒ 0)
 ```
 
 ## 5. Descriptors, joins and key bundles
@@ -741,18 +773,19 @@ J reaches its recipient by one of:
 
 J itself is not signed. Authenticity comes from `dsig` over the descriptor stored in the bundle (§6.7).
 
-### 5.3 Inbox invite (stage 1: β = 0, one bucket `0`)
+### 5.3 Inbox invite
 
 ```
-eid = random(16); bucket = 0
+eid = random(16); bucket = bucket(E, recipient's handle)      (§4.4; the sender takes it from the directory, §10.6)
 (kct, ss) = KEM.encap(kemPk_recipient)
 k    = HKDF(ss, H(kct), enc("segv.sh/v2/inv", u16 E, u32 bucket, eid), 32)
 body = kct ‖ aeadSeal(k, pad(J, [256]), aad = enc("segv.sh/v2/inv", u16 E, u32 bucket, eid))       (1416 B)
 ```
 
-`E` is the era of the InboxDO that accepts the row (the current era).
+`E` is the era of the InboxDO that accepts the row (the current era), and `bucket` the recipient's bucket of that
+era, which the invite is posted into (§10.5).
 
-**Scanning.** For every inbox row the client fetches (§11.5):
+**Scanning.** For every row the client fetches from its own bucket (§11.5), with that bucket in the context:
 
 1. `ss' = KEM.decap(kct, kemSk)`. A throw (§1.1) means "not for me".
 2. Derive `k`, then `aeadOpen`. A failure means "not for me" and is **silent**: it is the normal case, and a junk
@@ -1591,6 +1624,7 @@ body = aeadSeal(kS, pad(S, CLASSES), aad = enc("segv.sh/v2/self", u16 E, label))
 | 0x12 | ENDED | `conv[16] | root[32] | u32 e | u16 claimE | u32 claimK` (58 B). The copy has ended in its epoch e (§6.6 step 3): the final winning claim of e, at `(claimE, claimK)` on `Lctl_e` (a position other than NONE), removed or dropped self. Written with the next HEADS row after that claim is processed, and kept by snapshots (§7.3, §7.4), so a restore neither probes that control lane nor fetches the claim's bundle (§11.4 step 5). The first release skips it (§7.1). |
 | 0x13 | READ | `conv[16] | root[32] | u32 e | u8 flags | u8 m | (u16 E | u32 cnt) × m` (54 + 6m B). The account's read positions in epoch e of the copy: on lane ℓ of `D_e`, every row before `(E, cnt)` has been read on one of its devices (§11.8). `flags` bit0: the user marked the copy unread. The first release skips it (§7.1). |
 | 0x14 | CONV_PREFS | `conv[16] | root[32] | u8 key | value[len − 49]`. A setting of the copy that every device of the account applies. Key 1, mute: `value = u32 until`, the time (seconds since T0) until which the copy is muted, 0 for not muted and `0xFFFFFFFF` for until the user unmutes it (§11.13). The first release skips it (§7.1). |
+| 0x15 | BELLS | `conv[16] | root[32] | u32 e | u32 g | u8 k | (u8 ℓ | bell[16]) × k` (57 + 17k B). The bells of epoch e of the copy as the writing device knows them (§11.13): `g` is that of self's latest BELL row among the held epochs of e's generation, or `0xFFFFFFFF` when the device knows none there, and each entry gives, for lane ℓ of `D_e` other than self's, that member's bell of the same generation. Written beside every HEADS entry for epoch e, in the same row or snapshot (§7.3), and read at restore with it (§11.4 step 5). The first release skips it (§7.1). |
 | 0x20 | SNAP | `blobId[32] | key[32] | u32 size | u16 Eh | u32 nh` (74 B). Allowed only in rows at `Lsnap`. |
 
 **Why TREG is a record of its own**. Appending `u32 t_reg` to CONV_JOIN and EPOCH would make them 141 and
@@ -1674,6 +1708,8 @@ written, without a warning, and is marked ⚠ while it is contested (§6.7 step 
 - EPOCH_PENDING and DELIVERED: `a ≤ 32` (honest writers write at most 31; `a = 0` is valid). The uids form a set; a
   repeated uid is not a parse error.
 - HEADS entry: `1 ≤ m ≤ 32` and `f ≤ 32`. `c` may be any u16 (`c = 0` records only the cursor).
+- BELLS: `k ≤ 32`, the `ℓ` distinct and ascending, each `< 32`. A reader ignores an entry whose `ℓ ≥ |D_e|` or that
+  names self's lane.
 - A record that breaks a count rule is malformed (§7.1).
 - When a reader uses a HEADS entry for epoch e of a copy, it MUST ignore the entry (the copy restores as if it had no
   HEADS entry, §11.4 step 5) if `m ≠ |D_e|`, or if two followed lanes with `ef = e − 1` name the same ℓ, or one of
@@ -1731,6 +1767,7 @@ records are idempotent:
 | CONTACT | `uid` | the first one wins (see the pin check below) |
 | READ | `(conv, root)` | per epoch, each lane's position is the maximum over the records, so positions only move forward whichever device wrote them; the copy's read positions are those of the highest epoch named; flag bit0 is that of the copy's latest READ in self-lane order (§11.8). A reader ignores a record whose `m` is not `|D_e|` |
 | CONV_PREFS | `(conv, root, key)` | the latest wins |
+| BELLS | `(conv, root)` | the latest wins; a reader uses it only beside the HEADS entry it was written with (§7.3, §11.4 step 5) |
 | LINK | `s` | |
 | CONFIRMED | `(conv, root)` | (written for a confirming row or claim, §6.7 step 6); one of a legacy copy's key that the first release wrote after a bit1 record, in a row without a HEADS record, belongs to the copy that §7.2 assigns it to |
 | HEADS | per copy | the latest entry wins (an entry of a legacy copy belongs to the copy that §7.2 assigns its epoch to); `(Ein, relIn)` takes the maximum. A record may hold any subset of copies. A restore also keeps, per epoch of a copy, the furthest control position `(ctlE, ctlCnt)` of the entries it applied, the replaced ones included (§11.4 step 5). |
@@ -1802,6 +1839,12 @@ upgrade, where a conversation that the first release continued by a skip shows t
   snapshot records as left in e (an earlier row does not count, because a snapshot may have compacted
   it away). Whichever HEADS entry a restore uses thus has the LEFT records of its epoch beside it, whatever snapshots or
   sibling rows came between, and lane positions may pass the LEAVE rows.
+- **Bells.** Every HEADS entry for epoch e, in a self row or a snapshot, is accompanied **in the same row or
+  snapshot** by one BELLS record of the copy (§7.2): the generation of self's latest BELL row in e's generation when
+  the device knows one, and for each other member of `D_e` whose bell of that generation the device knows (§11.13),
+  that bell. A restore takes the bells of its HEADS epoch from it, at the lane positions of the entry (§11.4 step 5),
+  since it processes lanes only from those positions on, and the BELL rows that told the device the bells lie before
+  them.
 - Epochs accepted through the account's own bundle entry are **not** written as self rows: restore re-derives them from
   the control lane (§11.4), and snapshots carry them. So no self row follows a claim observed from another member
   (§13.1), and no self row of new code holds an EPOCH record: a re-add starts a separate copy with a CONV_JOIN or
@@ -1819,9 +1862,10 @@ upgrade, where a conversation that the first release continued by a skip shows t
   lane among its followed lanes, and holds that lane's position before the J, even after the copy has moved on:
   restore processes lanes only from the HEADS epoch on (§11.4). A failed write is retried before the cursor advances.
 - **HEADS** is written in every snapshot; as a self row at most every 30 minutes (after a random delay of up to 5
-  minutes), when processed positions advanced or new CONTACT, MEMBER, LEFT, ENDED or CONFIRMED records wait; and once
-  right after registration, with the registration cursor (§11.1, §11.5). A writer splits HEADS over several records and
-  rows so that each row fits cls 3, keeping each entry in the same row as the LEFT records of its epoch (above), and
+  minutes), when processed positions advanced, a bell changed (§11.13), or new CONTACT, MEMBER, LEFT, ENDED or
+  CONFIRMED records wait; and once right after registration, with the registration cursor (§11.1, §11.5). A writer
+  splits HEADS over several records and rows so that each row fits cls 3, keeping each entry in the same row as the
+  LEFT records of its epoch and its BELLS record (above), and
   spreads the records that wait for a HEADS row over those rows in the same way: each row holds at most 255 records
   (§7.1) and a HEADS record.
 - Writes use CAS at the first empty slot of era `max(E_now, the era of the self-lane head, regEra)`, never below the
@@ -1859,7 +1903,8 @@ blob = aeadSeal(skey, padme(S2), aad = utf8("segv.sh/v2/snapshot")); skey = rand
     left in e" after a restore as live), CONFIRMED, its ENDED record (the fold's whenever the fold holds one, also while
     the writer has not yet brought the copy to that epoch, else one for a claim that the writer processed), the HEADS
     entry that the writer would write for the copy at that moment (§7.3: its own
-    processed positions, which a parked J holds at an earlier epoch), and the LEFT records naming that entry's epoch:
+    processed positions, which a parked J holds at an earlier epoch), its BELLS record (§7.3), and the LEFT records
+    naming that entry's epoch:
     for each member that the fold or the snapshot's writer records as left in that epoch, exactly one, the least of the
     fold's record and the writer's kept source (§6.9), as §7.3 requires (a snapshot holds at most one LEFT record per
     member, so repeated HEADS rows and snapshots never pile up copies). Every held epoch above the root was reached
@@ -1935,8 +1980,9 @@ as `(id, size, t_reg)`, where `t_reg = tpub(BlobReg clock at the first registrat
   it.
 - **Who can see it.** `t_reg` and `size` are readable by anyone who knows the id (`GET …/meta`). There is no
   enumeration API in stage 1, so P cannot list blob ids: they appear only inside encrypted rows and inside key bundles
-  that are referenced by encrypted claims. The registry's head enters the public checkpoints at most once per hour
-  (§9.5), so P learns at most, per hour, whether any blob (image, file, snapshot or bundle) was registered.
+  that are referenced by encrypted claims. The registry enters the public checkpoints as one value per hour that
+  changes every hour whether or not anything was registered (§9.5), so the checkpoints tell P nothing about
+  registrations.
 - **Same mechanism for every blob.** SGB2 bundles, snapshots, images and files all use it. Only SGB2 bundles rely on
   `t_reg` (§6.4(g)).
 
@@ -1997,7 +2043,7 @@ head'       = H(enc("segv.sh/v2/head", cid, head, u32 t, u32 n, root))         h
 | --------- | --- |
 | shard | `"shard/{E}/{i}"` |
 | inbox | `"inbox/{E}/{g}"` |
-| blob registry | `"blobreg"` |
+| blob registry | `"blobreg/{j}"` (shard j, §9.2); `"blobreg"` is the hourly value over every shard in the checkpoint list (§9.5) |
 | directory log | `"dirlog"` (a separate chain, §9.6) |
 
 In every cid, numbers are decimal without padding.
@@ -2007,18 +2053,20 @@ In every cid, numbers are decimal without padding.
 created by name. Every RPC also carries `E` and `i`; a mismatch is a programming error and throws. The constructor runs
 `blockConcurrencyWhile`: if the era has not ended (the object's state is not sealed (ShardDO) or `ended` is not set
 (InboxDO), and `now < end(E) + SKEW·1000`), it sets the alarm to `min(getAlarm(), due)`, where `due` is the earliest
-of the seal time and an open batch's close time. A DO of an era that has already ended arms nothing; it seals
-synchronously in `prepare()`. Every write that opens a batch arms `min(current alarm, batch due)` in the same
-synchronous block as the commit. An alarm handler that still has work due re-arms at `max(due, now + 1000)` ms; it
-never arms a time in the past, so an early alarm or a clock that steps back cannot make it fire in a loop.
+of the seal time and an open batch's close time. A DO of an era that has already ended arms nothing for the era; it
+seals synchronously in `prepare()` (a sealed ShardDO that still holds rows then arms its paging, §9.1). Every write
+that opens a batch arms `min(current alarm, batch due)` in the same synchronous block as the commit. An alarm handler
+that still has work due re-arms at `max(due, now + 1000)` ms; it never arms a time in the past, so an early alarm or a
+clock that steps back cannot make it fire in a loop.
 
-### 9.1 ShardDO (`shard/v2/{E}/{i}`, SQLite; stage 1 has one per era, i = 0)
+### 9.1 ShardDO (`shard/v2/{E}/{i}`, SQLite; S_E per era, 0 ≤ i < S_E)
 
 ```sql
 CREATE TABLE meta  (k TEXT PRIMARY KEY, v BLOB NOT NULL) WITHOUT ROWID;
-  -- 'state' 'open'|'sealed' | 'last_t' u32 | 'open_t' u32 (absent = no open batch)
+  -- 'state' 'open'|'sealed'|'paged' | 'last_t' u32 | 'open_t' u32 (absent = no open batch)
   -- 'closed_t' u32 (t of the newest closed batch; absent = none) | 'head' 32 B (ZERO32 initially)
   -- 'delta' u16 (Δ, pinned by the first put that inserts a row; the deployment Δ applies until then; §3.1)
+  -- 'sbits' u8 (s_E, pinned by the same put, and in shard 0 also by pinShards; "Shard map" below)
 CREATE TABLE row   (id INTEGER PRIMARY KEY,
                     v BLOB NOT NULL CHECK (length(v) = 8), label BLOB NOT NULL CHECK (length(label) = 16),
                     t INTEGER NOT NULL, cls INTEGER NOT NULL CHECK (cls BETWEEN 0 AND 3),
@@ -2032,13 +2080,36 @@ Bodies (296–16 424 B) live in a rowid table: SQLite advises against WITHOUT RO
 internal and never exposed; feed and batches order by `(t, label)`. `bh` MUST equal `H(body)`. It is written with the
 row and is internal (no RPC returns it); it exists so that closing a batch never reads, hashes or holds a body.
 
+**Shard map.** An era has `S_E = 2^{s_E}` shards, `0 ≤ s_E ≤ 16`, and a row lives in shard `i = shard(E, label)`
+(§4.4). `S_E` comes from the deployment variable `SHARD_MAP`: a comma-separated list of `E:S` entries, `E` the first
+era the count applies to (0..0xFFFE, strictly ascending) and `S` a power of two in 1..65536; the count of era E is
+the `S` of the last entry whose `E` is at most E, and 1 when there is none (or no variable). A present but malformed
+value is a misconfiguration (§3.1: every `/api/v2/*` request answers 503). An entry MAY be added or changed only if
+every era whose count it changes has `E ≥ era(now + SKEW·1000) + 2` at the deploy, so that the era opens a whole era
+after the deploy, when no Worker or object runs the old map any more; the count of an era MUST NOT change once the era
+accepts writes, since rows already routed would no longer be found. As a tripwire, the count is pinned per era. The
+first put that inserts a row into a shard pins `s_E` in its `meta 'sbits'` (like Δ), and shard 0 holds the count of
+the whole era: a shard `i > 0` that has no pin of its own calls `pinShards(E, 0, s_E)` on shard 0 before its first
+`put` or `get` from `start(E) − SKEW·1000` on (before that no row of the era exists anywhere, and it does not ask), at
+most once per instance while the answer agrees; shard 0 pins the `s_E` it is offered when it has none and answers its
+pin. `put`, `get`, `feedBatches` and `feedRows` throw when the deployment's `s_E` differs from the shard's pin or from
+shard 0's answer, and `put` and `get` throw for a well-formed key whose `shard(E, label)` is not this object's `i`:
+the Worker answers 503 `storage unavailable` (§10.3, §10.4) instead of silently storing or missing the row. A map
+changed for an era that has rows therefore fails for every key of the era, whichever shard the key routes to under the
+new map; `head()` and paging keep using the pin. A shard count is chosen once per era, before the era starts: at
+least four times the previous era's measured need (`S_E ≥ 4·bytes_{E−1} / 4 GiB` and
+`S_E ≥ 4·peak_rps_{E−1} / 1 000`, rounded up to a power of two). Empty shards cost nothing. There is no split within an era: `v` is a keyed PRF of the label, so nobody can aim rows at one shard,
+and filling every shard of an era costs `S_E` times the proof of work.
+
 **Era state.**
 
 - `now` = `Date.now()`, and `s = sec(now)`.
 - `prepare()` runs first in every RPC: if `now ≥ end(E) + SKEW·1000` and the state is open, close the open batch and
   persist `state = sealed`, in one transaction.
 - The seal alarm, due at `end(E) + SKEW·1000`, does the same.
-- `MISS(sealed = 1)` is returned only once `state = sealed` is persisted.
+- `MISS(sealed = 1)` is returned only once `state = sealed` (or `paged`) is persisted.
+- A sealed shard that holds rows and is not paged yet arms its paging alarm (`now + 1 s`) whenever its constructor or
+  an RPC finds it so ("Paging" below); `state = paged` is persisted by paging, after the rows left the object.
 - **Accept window.** Writes are accepted while `start(E) − SKEW·1000 ≤ now < end(E)`. Opening SKEW early means two
   shards whose clocks differ by at most SKEW never both refuse a write at an era boundary.
 
@@ -2068,7 +2139,7 @@ if storage.sql.databaseSize > 8 GiB:                                every row �
 t = max(tpub(now), last_t, sec(start(E)), closed_t + Δ if closed_t exists)
 if open_t exists and t > open_t: closeBatch(open_t)
 for each row (in order):
-  if len(body) ≠ CLASSES[cls] + 40 or len(label) ≠ 16 or len(v) ≠ 8:  BAD
+  if len(body) ≠ CLASSES[cls] + 40 or len(label) ≠ 16 or len(v) ≠ 8 or v ≥ 2^63:  BAD
   o = SELECT t, cls, body FROM row WHERE v = ? AND label = ?
   if o:  CONFLICT(o.t, o.cls, o.body)
   else:  INSERT row (v, label, t, cls, bh, body); open_t = t; last_t = t; OK(t)
@@ -2082,16 +2153,18 @@ CONFLICT with the first copy.
 **`get(E, i, keys: {v, label, mode}[])`** calls `prepare()` and then, for each key:
 
 - if the row exists: `HIT(t, cls, body if mode = 0)`;
-- otherwise `MISS(sealed = state = sealed ? 1 : 0)`.
+- otherwise `MISS(sealed = state ≠ open ? 1 : 0)`.
 
-The Worker enforces the response budget (§10.4).
+A paged shard throws `shard: paged` instead ("Paging" below). The Worker enforces the response budget (§10.4).
 
 **`head(E, i)`** calls `prepare()`, closes the open batch if `tpub(now) > open_t`, and returns
-`{head, t_last, sealed, size}`, where `t_last` is `closed_t` or 0 and `size` is `databaseSize`.
+`{head, t_last, sealed, size, paged}`, where `t_last` is `closed_t` or 0, `size` is `databaseSize` and `paged` says
+that nothing is left to page: a paged shard, or a sealed one without rows.
 
 **Feed RPCs** (internal; the HTTP page is §10.9). Both call `prepare()` and only read: they never close an open batch,
 even a due one (the batch alarm, `head()`, a later `put` or sealing does), and the open batch is never readable. No
-result carries more than the caller's `budget` of row bytes, because Workers RPC values are limited to 32 MiB.
+result carries more than the caller's `budget` of row bytes, because Workers RPC values are limited to 32 MiB. A
+paged shard throws `shard: paged` ("Paging" below).
 
 - `feedBatches(E, i, after_t, budget)` returns the closed batches with `t > after_t`, ascending, each with its §10.9
   encoded size `72 + Σ(17 + len(body))`, computed without reading bodies. It stops before the first batch that would
@@ -2103,21 +2176,98 @@ result carries more than the caller's `budget` of row bytes, because Workers RPC
 
 This is the public enumeration of the database.
 
-**Retention and capacity.** Old era DOs are kept and stay readable. Paging into R2 and deletion come in stage 2. A DO
-stores at most 10 GB, and one object handles about 1 000 requests/s, so a single shard per era bounds stage 1 (§13.2
-item 13). The CheckpointDO logs (§9.7) when a shard's `size` passes 4 GiB. The emergency path is S = 2 by
-parameter for the next era, since routing by `v` already exists (stage-2 work).
+**Paging.** A sealed shard that holds rows is paged into the deployment's R2 bucket (the one that holds the blobs
+of §8; the keys `b/…` and `seal/…` never meet) and then emptied, so that the Durable Objects hold only the eras that
+still accept writes: the current one and, until it is paged, the previous one. Four objects under `seal/v2/{E}/{i}/`:
 
-### 9.2 BlobRegDO (`blobreg/v2`, SQLite, one instance)
+```
+rows     = batch × nb                                            the closed batches in ascending t, each as §10.9 encodes it
+batch    = u32 t | u32 n | root[32] | head[32] | (label[16] | u8 cls | body[CLASSES[cls] + 40]) × n      rows by label
+batches  = (u32 t | u32 n | root[32] | head[32] | u64 off) × nb   ascending t; off = the batch's offset in rows
+idx      = (label[16] | u32 t | u8 cls | u8 0 | u48 off) × n      sorted by (v, label) (§4.4); off = the row's offset in rows
+manifest = JSON (below)
+```
+
+`rows` is the feed: a feed page is a 5-byte header followed by a contiguous range of it, and the pages without their
+headers, one after the other, are `rows`. A batch ends where the next one starts, the last at the end of `rows`. `idx`
+is read by **buckets**: with `n` rows, `b = 0` if `n ≤ 1024`, else `min(16, ⌈log2(n / 1024)⌉)`, and the bucket of a
+row is the `b` bits of its `v` below the shard bits, `bucket(v) = (v >> (63 − s_E − b)) mod 2^b`, so that the entries
+of bucket `k` are `idx[28·dir[k] .. 28·dir[k+1])`, with `dir` the `2^b + 1` cumulative counts (`dir[0] = 0`,
+`dir[2^b] = n`). Every stored `v` is below 2^63 (§4.4; `put` refuses any other as BAD), so the order by `v` keeps
+each bucket in one run. Nobody can aim rows at a bucket: `v` is a keyed PRF of the label. The manifest:
+
+```json
+{"v":1, "era":E, "shard":i, "sbits":s_E, "kroute":"<b64u kroute_E>", "head":"<b64u final head>", "tLast":closed_t,
+ "part":16777216,
+ "rows":{"size":<bytes>, "n":n, "sha256":["<b64u>", …]},
+ "idx":{"size":28·n, "b":b, "dir":"<b64u u32 × (2^b + 1)>", "sha256":[…]},
+ "batches":{"size":80·nb, "nb":nb, "sha256":[…]},
+ "sig":"<b64u>"}
+```
+
+Each file is a sequence of parts of `part` bytes (the last one shorter), and `sha256[k]` is the SHA-256 of its part k.
+`kroute_E` (§4.4) is published here, once the era is sealed: with it anyone can check `kcommit_E` of the era info,
+compute `v` and the shard of any label of the era, and rebuild `idx` from `rows`. The signature is
+
+```
+sig = SIG.sign(enc("segv.sh/v2/seal", u16 E, u16 i, u8 s_E, kroute_E, head, u32 closed_t, u32 part, u32 n, u8 b, H(dir),
+                   u32 nb, u64 size(rows), H(sha of rows), u64 size(idx), H(sha of idx), u64 size(batches), H(sha of batches)),
+               SRV_SK)
+```
+
+where `H(dir)` is over the big-endian `u32` counts and each `H(sha of f)` over the file's part hashes, concatenated in
+order.
+
+The object pages itself, alarm by alarm, once it is sealed and has a closed batch: it writes `rows`, then `idx`, then
+`batches`, in parts of `part` bytes, persisting after every part where to resume (a restart repeats at most one part),
+then verifies what it wrote the way the Worker will read it (the batch table; a sample of its rows looked up by label
+through `idx`; a random label, which it does not hold, looked up under a random routing value whose top `s_E` bits are
+`i`), writes the manifest last, and only then persists `state = paged`, drops its
+row and batch tables and `deleteAll()`s its storage, re-creating the meta it still needs (`state`, `head`, `closed_t`,
+`last_t`, `delta`, `sbits`). The manifest's existence is what "paged" means: until it exists, the shard answers every
+read itself. From `state = paged` on, `head()` answers as before (`sealed`, the final head, `paged = true`), `get`,
+`feedBatches` and `feedRows` throw `shard: paged` (the Worker then reads the files, §10.4, §10.9), and `put` answers
+WRONG_ERA. An object of an ended era that finds no state of its own but a manifest for itself in R2 (its storage was
+lost after the manifest was written) restores that meta from the manifest. A sealed shard without rows is never paged:
+there is nothing to move, and it keeps answering MISS(sealed = 1) and an empty feed; `head()` reports `paged = true`
+for both (nothing is left to page). A failed step is retried by the next alarm, and the CheckpointDO wakes the shards
+of past eras once an hour (§9.5 "Sweep"), so a shard sealed before paging existed, or whose alarm was lost, is paged
+too. The Worker never asks a shard to page.
+
+**Capacity.** A DO stores at most 10 GB, and one object handles about 1 000 requests/s, so an era holds `S_E` times
+that (§13.2 item 13), set before the era starts. The CheckpointDO logs (§9.7) when a shard's `size` passes 2 GiB: the
+cue to raise the count for the next era ("Shard map" above). Paging keeps the objects' storage to about two eras of
+rows.
+
+### 9.2 BlobRegDO (`blobreg/v2/{j}`, SQLite; B shards, 0 ≤ j < B)
 
 ```sql
 CREATE TABLE meta  (k TEXT PRIMARY KEY, v BLOB NOT NULL) WITHOUT ROWID;   -- 'last_t', 'open_t', 'closed_t', 'head', 'hw',
                                                                           -- 'delta' (u16 Δ, pinned by the first write:
-                                                                          -- a registration or a 'hw' raise; §3.1)
+                                                                          -- a registration or a 'hw' raise; §3.1),
+                                                                          -- 'bbits' (u8 b, pinned by the same write or the
+                                                                          -- import), 'imported' (the import ran; below)
 CREATE TABLE blob  (id BLOB PRIMARY KEY CHECK (length(id) = 32), size INTEGER NOT NULL, t INTEGER NOT NULL) WITHOUT ROWID;
 CREATE INDEX blob_t ON blob (t);
 CREATE TABLE batch (t INTEGER PRIMARY KEY, n INTEGER NOT NULL, root BLOB NOT NULL, head BLOB NOT NULL);
 ```
+
+**Shards.** A blob id is registered and looked up in shard `j = blobShard(id)` (§4.4: a keyed hash, so nobody can
+aim ids at one shard, and the same id always meets the same `hw`, which is what §6.4(g) needs). `B = 2^b` is the
+deployment variable `BLOBREG_SHARDS`, a power of two in 1..4096 (default 1; §3.1: a present but malformed value is a
+misconfiguration). It is a constant of the deployment: it MUST NOT change once any shard holds a registration, since
+ids would route to another shard, whose MISS would then contradict a registration. As a tripwire, the first write of
+a shard (a registration, a `hw` raise, or the import below) pins `b` in `meta 'bbits'`, and a `register` or `meta` of
+an id whose `blobShard(id)` under the pinned `b` is not this shard's `j` throws: the Worker answers 503
+`storage unavailable` (§10.7) instead of registering or missing the id in the wrong place.
+
+**Import.** `blobreg/v2`, the single registry of the first release, is read-only from this version on, and keeps its
+rows, batches and head (its chain is final; its head stands in the checkpoints made before the change). A shard that
+runs for the first time (no `imported`) copies, before it answers anything, the rows of `blobreg/v2` whose
+`blobShard(id)` is its `j` (`exportShard(j, b, after, limit)`, which the legacy object alone answers: the rows in id
+order after `after`, their `t` unchanged, with its `hw` and `last_t`), raises its own `hw` and `last_t` to the legacy
+values, pins `b`, and persists `imported`. Imported rows keep their `t` and join no batch of the shard: the legacy
+chain committed them. A deployment that never had the first release imports an empty page.
 
 **`register(id, size)`** returns `{t, size, created}`:
 
@@ -2130,14 +2280,16 @@ high-water mark: if `⌊sec(now)/Δ⌋ > ⌊hw/Δ⌋`, persist `hw = sec(now)`. 
 that every later registration gets `t ≥ tpub(every now ever reported)`, even if the clock steps back, which is what
 makes §6.4(g) final.
 
-**Batches.** Each leaf is `leaf(enc("segv.sh/v2/leaf/blob", H(id), u32 size, u32 t))`, ordered by `H(id)`.
+**Batches.** Each leaf is `leaf(enc("segv.sh/v2/leaf/blob", H(id), u32 size, u32 t))`, ordered by `H(id)`, under the
+shard's cid `blobreg/{j}`.
 
 **`head()`** works as for the shard. There is no enumeration RPC.
 
-### 9.3 InboxDO (`inbox/v2/{E}/{g}`, SQLite; stage 1: β = 0, g = 0, bucket 0)
+### 9.3 InboxDO (`inbox/v2/{E}/{g}`, SQLite; 2^{β_E} buckets per era, 0 ≤ g < 2^{β_E})
 
 ```sql
 CREATE TABLE meta (k TEXT PRIMARY KEY, v BLOB NOT NULL) WITHOUT ROWID;     -- 'head', 'closed_hw', 'ended',
+  -- 'noticed' (the last slot announced, "Notices" below),
   -- 'slot' (Δin in seconds, pinned by the first write: a post that inserts a row, or the first persisted closed_hw;
   -- every rel and closed_hw is in units of it; §3.1)
 CREATE TABLE inv  (id INTEGER PRIMARY KEY, bucket INTEGER NOT NULL, rel INTEGER NOT NULL,
@@ -2147,6 +2299,34 @@ CREATE INDEX inv_rel ON inv (bucket, rel, eid);
 CREATE TABLE cnt  (bucket INTEGER NOT NULL, day INTEGER NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (bucket, day)) WITHOUT ROWID;
 CREATE TABLE slot (rel INTEGER PRIMARY KEY, n INTEGER NOT NULL, root BLOB NOT NULL, head BLOB NOT NULL);
 ```
+
+**Buckets.** An era has `2^{β_E}` buckets, `0 ≤ β_E ≤ 16`, one InboxDO each, and an invite for a user goes into the
+user's bucket of the era, `bucket(E, handle)` (§4.4): a keyed hash of the top `β_E + 5` bits of the handle's `hpre`,
+under `kbucket_E`, a 32-byte secret that the KeyDO (`keys/v2`, one instance) draws at random the first time the
+Worker asks for an era in `era(now − SKEW·1000) − 3 .. era(now + SKEW·1000) + 1` and keeps until the era leaves the
+inbox retention (it deletes the keys of eras below `era(now − SKEW·1000) − 3` at every call, so that a KeyDO whose
+clock runs up to SKEW ahead of the Worker's still serves the oldest era the Worker lists; no key is made for an era
+with one bucket). The key is never derived from another secret and never leaves the server: the Worker caches it per
+isolate. The KeyDO also pins `β_E` beside the keys: the Worker asks it, once per isolate, about every era a
+directory answer lists (§10.6), with its `β_E`, `β_E = 0` included (then no key is made, and none is returned); the
+first ask about an era records `β_E`, and an ask with another `β_E` throws, so that the Worker answers 503
+`storage unavailable` instead of listing buckets other than those already listed. A reader therefore reads one bucket
+of about `N_E / 2^{β_E}` users instead of every invite. An invite's bucket is public, and so is each user's bucket of
+an era while the directory lists it: every prefix page names the buckets of `E_now − 3 .. E_now + 1` of each user it
+holds (§10.6), so whoever walks the directory in that time narrows the recipient of each invite of those eras to the
+users of its bucket, about K of them by the rule below (§13.1). `kbucket_E` only keeps that map out of the public
+archive, which holds the buckets but no directory answer (those are `no-store`, §10.1), and lets it end with the key:
+once the KeyDO deletes the key, the map survives only in directory answers that someone kept. `β_E` comes from the
+deployment variable `INBOX_MAP`, with the form and the
+rules of `SHARD_MAP` (§9.1): `E:B` entries, `B = 2^{β}` a power of two in 1..65536, the last entry at or below E, and
+0 without one; an entry MAY be added or changed only if every era whose count it changes is one that no answer has
+listed yet, `E ≥ era(now + SKEW·1000) + 2` at the deploy (the directory lists `E_now + 1`, and clients keep the
+buckets it listed for the session), since readers and senders would otherwise use different buckets than those the
+era's invites were posted into. The rule for raising it:
+`β_E = max(0, ⌊log2(N_E / K)⌋)` with `K = 2^14` and `N_E` the user count expected at `start(E)`: every bucket then
+holds about K users, the anonymity set of an invite against anyone who read the directory. Clients never
+compute buckets: the directory lists each user's bucket of `E_now − 3 .. E_now + 1` (§10.6), the sender posts into the
+recipient's, and the reader reads and watches its own.
 
 The slot clock uses milliseconds since T0 and `Δin` = `INBOX_SLOT` seconds (a deployment parameter; production 10,
 tests 1). Let `D = Δin·1000` and `ms = now − T0`. D is computed from the pinned `'slot'` once it exists; a deployment
@@ -2170,7 +2350,7 @@ rel     = max(⌊(ms + j) / D⌋ + 1, closed_hw + 1)        j uniform in [0, D),
 - **Monotonic.** `closed` MUST never decrease: every `read` and `head` reports a `closed` that is ≥ every `closed`
   reported before, before and after `ended`.
 
-**`post(E, bucket, rows: {eid, body}[])`** (1..32 rows) returns one result per row:
+**`post(E, bucket, rows: {eid, body}[])`** (1..32 rows; `bucket` is the object's own `g`) returns one result per row:
 
 - If posts are not accepted (above), the whole call returns `WRONG_ERA(era(now))`.
 - If `(bucket, eid)` exists with the same body, the row's result is its `rel` (an idempotent retry). With another body:
@@ -2180,7 +2360,7 @@ rel     = max(⌊(ms + j) / D⌋ + 1, closed_hw + 1)        j uniform in [0, D),
   against that day.
 - Otherwise insert, increment `cnt`, and return `OK(rel)`.
 
-**`read(bucket, after, limit)`** returns `{closed, rows}`:
+**`read(bucket, after, limit)`** (`bucket` the object's own `g`) returns `{closed, rows}`:
 
 - `closed` as above.
 - `rows` are those with `after < rel ≤ closed`, ordered by `(rel, eid)`.
@@ -2189,38 +2369,75 @@ rel     = max(⌊(ms + j) / D⌋ + 1, closed_hw + 1)        j uniform in [0, D),
 
 **Slot commitments.** Before `read` and `head` answer, in the transaction that persists `closed_hw`, close every slot
 with `rel ≤ closed` that has rows and no `slot` row yet. Each leaf is
-`leaf(enc("segv.sh/v2/leaf/inbox", u16 E, u32 bucket, u32 rel, eid, H(body)))`, ordered by `(eid, bucket)` (bucket
-breaks ties only in stage 2), and the chain uses `t = rel`.
+`leaf(enc("segv.sh/v2/leaf/inbox", u16 E, u32 bucket, u32 rel, eid, H(body)))`, ordered by `eid` (one bucket per
+object), and the chain uses `t = rel`.
 
 **`head(E, g)`** settles as `read` does (persisting `closed_hw` and committing slots) and returns
 `{head, t_last, ended}`: `t_last` is the `rel` of the newest slot row (0 when there is none), and `ended` says whether
 `ended` is persisted.
 
+**Notices.** Each bucket has a public realtime topic,
+
+```
+Tinbox(E, g) = t16(H(enc("segv.sh/v2/topic/inbox", u16 E, u32 g)))
+```
+
+on which the InboxDO announces a slot that closed with rows in it, so that clients read the bucket when there is
+something to read instead of polling it every slot (§10.8, §11.5). `noticed` is the largest slot announced so far: 0
+in a new object, and `closed_hw` in an object that finds no `'noticed'` key (every slot up to it was readable before
+the key existed). A post that inserts rows arms the alarm at `T0 + rel·D + (SKEW + 1)·1000` for the smallest `rel` it
+assigned (`min(current alarm, due)`, in the same synchronous block as the insert; the alarm is the one of §9 "Identity
+and alarms", shared with the seal). By then every cached read from before the close has expired (§10.5; the extra
+second covers the rounding of a cached read's lifetime to whole seconds). When the alarm fires, the object settles as
+`head` does (persisting `closed_hw` and committing the closed slots), persists `noticed = closed`, and calls
+`inbox(E, g, rel)` on the FeedDO of `Tinbox(E, g)` (§9.4) with the largest `rel` that has rows and
+`noticed_before < rel ≤ closed`, if there is one: one call, however many slots closed since the last notice. A call
+that fails is made once more and then given up (a notice is best effort: clients catch up within 300 s, §11.6). The
+alarm is then re-armed for the smallest `rel` above `closed` that has rows, if any, never sooner than 1 s. After
+`ended`, `closed` is final (above), so the seal alarm announces whatever was still pending, whether or not its slot's
+nominal close time has come. Notices are not stored, numbered or replayed: a client not subscribed when one is sent
+learns of the rows at its next catch-up. A notice says only what a read of the bucket shows, that slot `rel` holds
+rows, and goes out at a time that depends on `rel` alone: it reveals neither when a post was made nor how many rows
+or posts a slot holds, and nothing about a sender or a recipient (§13.1).
+
 **Retention.** Clients never read inbox eras older than `E_now − 3`, and the Worker answers 410 for them. The rows are
 still stored (and committed).
 
-**Size under attack.** The day cap bounds an era to 14 000 rows: 7 days of 2 000, the SKEW early window included
-(about 19.8 MB of bodies). The 4 retained eras hold at most 56 000 rows (about 79.3 MB, 56 000 X-Wing
-decapsulations). Only a device with no inbox cursor reads that much (§11.5).
+**Size under attack.** The day cap bounds a bucket's era to 14 000 rows: 7 days of 2 000, the SKEW early window
+included (about 19.8 MB of bodies). A reader's 4 retained eras hold at most 56 000 rows of its bucket (about
+79.3 MB, 56 000 X-Wing decapsulations), whatever the other buckets hold. Only a device with no inbox cursor reads that
+much (§11.5).
 
-### 9.4 RealtimeDO (`rt/v2/0`, SQLite meta only, hibernatable WebSockets, one instance)
+### 9.4 ConnDO (`conn/v2/{c}`, hibernatable WebSockets, C instances) and FeedDO (`feed/v2/{j}`, F instances)
 
-**State.**
+The realtime path is two kinds of objects. A **ConnDO** holds WebSocket connections: all of a client's sockets go to
+one ConnDO, `conn(ck)` of §4.4, which the Worker picks from the client's rate-limit key. A **FeedDO** keeps, for each
+topic of its range (`feed(T)` of §4.4), which ConnDOs hold a socket subscribed to it, and forwards published rows to
+them. `C` (`RT_CONNS`, 1..4096) and `F` (`RT_FEEDS`, a power of two, 1..4096) are deployment parameters, 1 by default;
+§3.1's rule for a present but malformed value applies. Both may change at any deploy: a client's next connection goes
+to its ConnDO under the new `C`, sockets live at most an hour (below), and a change of `F` is complete once every
+ConnDO has reported its topics again (`RT_RESYNC`, below). Neither object has storage of its own: nothing about topics,
+subscriptions, rows or notes is ever written, and every index below is rebuilt from the open sockets.
 
-- Storage: a `meta` table holding `ws-tag-key`, 32 random bytes that key the opaque per-client tag.
+**ConnDO state.**
+
 - Per socket:
   - tags `[clientTag, "h:" + ⌊acceptMs / 3 600 000⌋, "t:" + acceptMs]`;
-  - the attachment `{t: acceptMs, topics: Uint8Array(16·n), win, frames, changes, notes}` with at most 256 topics (4
-    KiB; attachments may hold up to 16 KiB), `notes` being true once the socket has sent NOTES (§10.8).
+  - the attachment `{t: acceptMs, topics: Uint8Array(16·n), feeds: Uint8Array(8·n), win, frames, changes, notes}`
+    with at most 256 topics, `feeds` holding `h(T)` (§4.4) of each topic in the order of `topics` (6 KiB in all;
+    attachments may hold up to 16 KiB), `notes` being true once the socket has sent NOTES (§10.8). The runtime keeps
+    an attachment with its socket, not in the object's storage, and drops it with the socket.
 - In memory:
-  - `boot` = 8 random bytes chosen at construction, and `seq`, a u64 counter of published rows that starts at 0 per
-    boot;
-  - the index from an 8-byte topic prefix to sockets (the full 16 bytes are compared on delivery), rebuilt lazily from
-    the attachments after a wake, and the total number of (topic, socket) pairs;
-  - a **ring** of published rows, `(seq, topic, E, label, t, cls, body)`, keeping the last 10 minutes, at most 8192
+  - `boot` = 8 random bytes chosen at construction, and `seq`, a u64 counter that starts at 0 per boot and counts
+    delivered rows and withdrawals (below);
+  - the index from an 8-byte topic prefix to sockets (the full 16 bytes are compared on delivery), the total number
+    of (topic, socket) pairs, and, per FeedDO `j`, its **interest**: the distinct topics of its open sockets with
+    `feed(T) = j` and the lingering ones (below), each with the number of sockets that hold it and `from`, the `seq`
+    at which it entered the interest; all rebuilt lazily from the attachments after a wake (with `from = 0`);
+  - a **ring** of delivered rows, `(seq, topic, E, label, t, cls, body)`, keeping the last 10 minutes, at most 8192
     rows and at most 16 MiB, counting each row as `47 + len(body)` bytes (its ROWS encoding).
 
-**Limits.**
+**ConnDO limits.**
 
 - 8 sockets per client tag, and 20 000 sockets in total. Both are counted with `getWebSockets(tag)` and
   `getWebSockets()`, without deserialising attachments. Only sockets in state OPEN count (closing or closed sockets do
@@ -2259,33 +2476,104 @@ RESUME.
 **`webSocketMessage`:**
 
 - Text `"ping"` is answered `"pong"` (auto-response).
-- Binary SUB, UNSUB, RESUME and NOTES are handled as in §10.8.
+- Binary SUB, UNSUB, RESUME and NOTES are handled as in §10.8. A SUB or RESUME computes `h(T)` of each topic new to the
+  socket and stores it in the attachment.
 - Anything else closes the socket with 1008: another text, a malformed binary frame, more than 256 topics on the
   socket, a frame over 8 KiB, a second RESUME or NOTES, or a control-frame rate above the limits.
 - A SUB that would push the total above 250 000 pairs closes the socket with 1013 (try again later).
 
-**`publish(rows)`** (RPC from the Worker):
+**Interest.** A ConnDO keeps every FeedDO's picture of it current, and nothing else does:
+
+- A topic enters the interest when its first socket subscribes to it, with `from` = the current `seq`. When its last
+  socket unsubscribes or closes, it **lingers** for `RT_LINGER` = 120 s: it stays in the interest, so rows for it keep
+  arriving, are numbered and enter the ring, and a socket that subscribes to it meanwhile (a client that reconnects
+  and RESUMEs) holds it again without any call. Then it is **withdrawn**, at the first event after that time or at an
+  alarm at most 30 s later (so that the withdrawals of sockets that closed together share one alarm), and `seq` is
+  advanced by one past each event's withdrawals, so that a topic that enters the interest again has a `from` above
+  every `seq` assigned before it left.
+- Whenever the set of distinct topics in its interest at FeedDO `j` changes (a topic enters it or is withdrawn), it
+  calls `j.interest(c, added, removed)`. Its calls to one FeedDO are made one after the other, in the order of the
+  changes, so that none overtakes another.
+- Every `RT_RESYNC` = 300 s while its interest is not empty (an alarm, re-armed in the handler; an alarm that fires
+  only for a linger sends nothing else), and after a call that failed (then after 1 s, doubling to 60 s), it calls
+  `j.replace(c, topics)` with its full set at every FeedDO at which it has topics, and at every FeedDO at which a
+  failed call left a change unreported.
+- `topicsFor(j)` (RPC from a FeedDO) answers its full set at `j`, lingering topics included.
+- After a wake it rebuilds its interest from the attachments; the FeedDOs still hold what it reported before, and a
+  socket that closes while the object is evicted wakes it, so the removal is reported. Lingering topics are not
+  rebuilt (the new `boot` sends every RESUME to GAP anyway); a FeedDO keeps them until a row or notice for one of
+  them reaches the ConnDO (below), until its next `replace` there, or for `RT_FORGET`.
+
+**`deliver(rows)`** (RPC from a FeedDO):
 
 1. Give each row the next `seq` and append it to the ring.
 2. For each socket subscribed to a row's topic, send one ROWS frame with the matching rows.
 3. Drop sockets that fail to receive.
 
-**`note(topic, note)`** (RPC from the Worker, §10.11): for each socket subscribed to `topic` whose `notes` is true, send
-one NOTE frame (§10.8), and drop the sockets that fail to receive. A note gets no `seq`, enters no ring and is never
+A row whose topic no socket holds any more (it was unsubscribed while the row was on its way) is numbered and kept in
+the ring like any other. A row or an inbox notice whose topic is not in the interest at all (an entry that a FeedDO
+kept from before a wake of this object, or that a late pull added back) has its topic withdrawn at its FeedDO again,
+with `interest(c, [], [topic])`; this numbers nothing, since the topic was not held.
+
+**`deliverNote(topic, note)`** (RPC from a FeedDO, §10.11): for each socket subscribed to `topic` whose `notes` is true,
+send one NOTE frame (§10.8), and drop the sockets that fail to receive. A note gets no `seq`, enters no ring and is never
 replayed, so a socket that is not open when it comes never gets it.
 
-**Durability.** Nothing about topics, rows or notes is persisted. After a restart, `boot` changes, so a RESUME gets GAP.
-A hibernatable DO is also evicted after a short time without events (an auto-answered `ping` is not an event): its
-in-memory state, the ring and `boot` included, is reset, and the constructor runs again on the next event. The 10-minute
-window is therefore an upper bound, reached only while the DO stays resident; at low traffic most RESUMEs after a
-reconnect get GAP, which costs a catch-up (§11.6), never a lost row.
+**`deliverInbox(E, g, rel)`** (RPC from a FeedDO, §9.3): for each socket subscribed to `Tinbox(E, g)`, send one INBOX
+frame (§10.8), and drop the sockets that fail to receive. Like a note, an inbox notice gets no `seq`, enters no ring and
+is never replayed.
+
+**FeedDO state.** In memory only: for each topic of its range, the ConnDOs with interest in it, and for each ConnDO the
+time of its last `interest` or `replace`. A FeedDO that starts (at its first request, or its first after an eviction)
+**pulls** the interest of every ConnDO `c < C` with `topicsFor(j)`, so that a restart loses no subscription. The pull
+runs in the background, at most 32 calls at a time, and blocks nothing, however many ConnDOs are slow to answer: the
+FeedDO answers every request from the start with the interest it knows so far. Until its pull has answered, a
+ConnDO is **pending**; one that fails to answer within 5 s stays pending and is pulled again at a later request, at
+most once a second. A pull that answers after an `interest` or `replace` from the same ConnDO arrived only adds
+topics, since the call may be newer than what the pull read; a topic added this way that the ConnDO no longer holds
+is withdrawn again at its next delivery (above) or `RT_RESYNC`. While any ConnDO is pending, the FeedDO **holds** each
+row and notice it is given, for 10 s, at most 4 096 of them and at most 8 MiB (counting each row as `47 + len(body)`
+bytes), oldest dropped first, and when a ConnDO's pull answers it delivers to that ConnDO, once, the held rows and
+notices of the topics it answered that did not reach it already. Interest from a ConnDO that has made no call for
+`RT_FORGET` = 900 s is dropped. `c` is not bounded by `C` here: a ConnDO above a lowered `C` keeps reporting, and so
+keeps delivering to its sockets until they age out.
+
+**`publish(rows)`** (RPC from the Worker): for each ConnDO with interest in the topic of at least one row, one
+`deliver` with those rows, in the order published, and the rows are held while a ConnDO is pending (above). A
+`deliver` that fails is made once more, and then those rows are dropped for that ConnDO, whose clients catch up
+(§11.6). The call returns once every delivery has been made or given up, and, when it held its rows, once the pulls in
+flight have answered or 10 s have passed.
+
+**`note(topic, note)`** (RPC from the Worker, §10.11): one `deliverNote` to each ConnDO with interest in `topic`.
+
+**`inbox(E, g, rel)`** (RPC from an InboxDO, §9.3): one `deliverInbox` to each ConnDO with interest in `Tinbox(E, g)`,
+made once more when it fails; the notice is held, and the call returns, as for `publish`.
+
+**`interest(c, added, removed)`** and **`replace(c, topics)`** (RPC from a ConnDO): as above. `c` is an integer in
+`0..2^31 − 1` and each topic 16 bytes; anything else throws.
+
+**Durability.** Nothing about topics, rows, notes or notices is persisted. After a ConnDO restart, `boot` changes, so
+a RESUME gets GAP. A hibernatable DO is also evicted after a short time without events (an auto-answered `ping` is not
+an event): its in-memory state, the ring and `boot` included, is reset, and the constructor runs again on the next event.
+The 10-minute window is therefore an upper bound, reached only while the ConnDO stays resident; at low traffic most
+RESUMEs after a reconnect get GAP, which costs a catch-up (§11.6), never a lost row. A socket that closes leaves its
+topics lingering, so a client that reconnects within `RT_LINGER` is replayed what was published meanwhile; after
+that, the topics are withdrawn and the RESUME gets GAP (§10.8): rows published while no socket held a topic never
+reached the ConnDO, and a RESUME is never answered as though they had. A FeedDO restart loses nothing it can hold: it
+pulls, and holds what is published until the pulls answer. Rows published while a FeedDO's picture of a ConnDO lags
+otherwise (a call that failed, a `deliver` given up, a pull that answers after its rows left the hold) are not
+delivered to that ConnDO; the catch-up bounds that loss.
+
+**Memory.** A FeedDO holds about 150 B per (topic, ConnDO) pair; a deployment chooses `F` so that `C · 250 000 / F`
+stays near 1 000 000 or below.
 
 ### 9.5 CheckpointDO (`ckpt/v2`, SQLite, one instance)
 
 ```sql
 CREATE TABLE cp   (q INTEGER PRIMARY KEY, sec INTEGER NOT NULL, hd BLOB NOT NULL, heads BLOB NOT NULL,
-                   C BLOB NOT NULL, sig BLOB NOT NULL);
-CREATE TABLE meta (k TEXT PRIMARY KEY, v BLOB NOT NULL) WITHOUT ROWID;   -- 'final:<cid>', 'blobreg:hour', 'blobreg:head'
+                   C BLOB NOT NULL, sig BLOB NOT NULL);   -- heads: empty; the list is in R2 ("Storing the list")
+CREATE TABLE meta (k TEXT PRIMARY KEY, v BLOB NOT NULL) WITHOUT ROWID;   -- 'final:<cid>', 'blobreg:hour', 'blobreg:head',
+                    -- 'blobreg:head:<j>', 'page:hour', 'page:era', 'page:at', 'paged:<E>', 'paged:<E>:<i>'
 ```
 
 An alarm runs every 60 s and is re-armed in the same commit. When no alarm is set, the constructor (inside
@@ -2296,30 +2584,53 @@ Worker calls the DO's `ensure()` at most once per isolate (a module-level flag),
 **Collecting heads.**
 
 - Collect `(cid, head)` from:
-  - `shard/{E_now}/0` and `inbox/{E_now}/0`;
-  - `shard/{E_now−1}/0` and `inbox/{E_now−1}/0`, when `E_now − 1 ≥ max(E_FIRST, 0)`, until the component reports
+  - `shard/{E_now}/{i}` for every `i < S_{E_now}` (§9.1) and `inbox/{E_now}/{g}` for every `g < 2^{β_{E_now}}` (§9.3);
+  - those of era `E_now − 1`, when `E_now − 1 ≥ max(E_FIRST, 0)`,
+    until the component reports
     `sealed` (shard) or `ended` (inbox) and that final head has appeared once; then `final:<cid>` is persisted in the
     same transaction as that checkpoint (alone when `hd` is unchanged) and the cid is no longer collected. Eras before
     `E_now − 1` are never collected: if no checkpoint succeeds between `end(E) + SKEW·1000` and `end(E+1)`, era E's
     final head never appears (accepted in stage 1);
-  - `blobreg`, **at most once per hour**: with `hour = ⌊now / 3 600 000⌋` (Unix ms, so UTC hours), the first alarm
-    whose `hour` exceeds the stored `blobreg:hour` reads the registry head; on success it persists
-    `blobreg:hour = hour` and `blobreg:head` in the same transaction as the checkpoint (alone when `hd` is unchanged).
-    A failed read changes nothing, so the next alarm retries within the same hour. Every other checkpoint reuses
-    `blobreg:head` (before any successful read, the previous checkpoint's head, else blobreg is left out). P therefore
-    learns at most, per hour, whether any blob was registered;
-  - `dirlog`, read from D1 (`SELECT seq, h FROM dirlog ORDER BY seq DESC LIMIT 1`), or ZERO32 while the dirlog is
-    empty (a table that does not exist yet counts as empty); any other D1 error is a failure.
-- Each component call has 10 s to answer. A component that fails (an error or no answer in time) keeps its head from
-  the previous checkpoint's list; one that has no head there (it has never answered) is left out of the list, never
-  listed as ZERO32. A failing component never delays or blocks the checkpoint.
+  - `blobreg`, **once per hour**: with `hour = ⌊now / 3 600 000⌋` (Unix ms, so UTC hours), the first alarm whose
+    `hour` exceeds the stored `blobreg:hour` reads `head()` of every registry shard `j < B` (§9.2; at most 32 calls in
+    flight) and persists, in the same transaction as the checkpoint (alone when `hd` is unchanged),
+    `blobreg:hour = hour`, each head that answered as `blobreg:head:<j>`, and the item
+
+    ```
+    blobreg = H(enc("segv.sh/v2/blobreg/all", u32 hour, head_0, …, head_{B−1}))
+    ```
+
+    where a shard that did not answer keeps its `blobreg:head:<j>` (ZERO32 if it never answered: an empty shard's
+    head). Every other checkpoint reuses `blobreg:head` (before the first hour's value, the previous checkpoint's,
+    else blobreg is left out). The hour is mixed in so that the value changes every hour whether or not anything was
+    registered: P learns nothing about registrations from the checkpoints. The per-shard heads are kept for a later
+    stage's mirror feed (§14), not published;
+  - `dirlog`, read from the log database (`SELECT seq, h FROM dirlog ORDER BY seq DESC LIMIT 1`, §9.6), or ZERO32
+    while the dirlog is empty (a table that does not exist yet counts as empty); any other D1 error is a failure.
+- Each component call has 10 s to answer, and at most 32 calls are in flight at a time. A component that fails (an
+  error or no answer in time) keeps its head from the previous checkpoint's list; one that has no head there (it has
+  never answered) is left out of the list, never listed as ZERO32. A failing component never delays or blocks the
+  checkpoint.
 - A component with no closed batch (shard) or slot (inbox) reports `head = ZERO32` and is listed with it, in the
   current and the previous era alike.
 - A previous-era component's final head (its head once it reports `sealed` or `ended`) has *appeared* once it is in
   the list of a checkpoint: the one built from this collection, or, when `hd` equals the previous `hd` and no
   checkpoint is made, checkpoint q−1, whose list is identical.
 - Sort the list by cid (byte order).
-- Log (§9.7) when a shard reports `size` above 4 GiB.
+- Log (§9.7) when a shard reports `size` above 2 GiB.
+
+**Sweep.** Once per UTC hour (`page:hour`), after collecting, the CheckpointDO wakes shards of past eras so that
+each gets paged (§9.1 "Paging"): it calls `head()` on at most 16 shards per hour. It walks the shards `(E, i)`,
+`i < S_E`, of the eras from the lowest era not yet known to be paged (`page:era`, initially `E_FIRST`) up to
+`E_now − 2`, in order of E and then i, starting where the previous hour stopped (`page:at` = `E·65536 + i` of the
+next shard) and wrapping around to `page:era` at the end, and it skips the shards found paged before
+(`paged:<E>:<i>`) and the eras marked paged (`paged:<E>`). A shard that answers `paged` is marked; once every shard
+of an era is, the era is marked instead, its shard marks are deleted, and `page:era` moves past the marked eras. A
+call that fails or does not answer in time leaves its shard unmarked, and the shard comes round again after every
+other unpaged shard: a shard that never pages costs one call per round and never holds up the other shards or later
+eras. (`head()` runs `prepare()`, which seals an ended era and makes a sealed shard that holds rows arm its paging.)
+The eras `E_now` and `E_now − 1` are left to their own alarms. The marks and the cursors are written with the
+checkpoint, like the other meta.
 
 **Building and signing.**
 
@@ -2330,13 +2641,27 @@ sig = SIG.sign(enc("segv.sh/v2/ckpt-sig", u32 q, C_q), SRV_SK)
 ```
 
 where `sec = max(sec(now), sec_{q−1})` (`sec_0 = 0`): checkpoint times never decrease, even when the clock steps back.
-If `hd` equals the previous `hd`, no new checkpoint is made, so `q` grows at most once per 60 s. `heads` stores the
-encoded list for audit.
+If `hd` equals the previous `hd`, no new checkpoint is made, so `q` grows at most once per 60 s.
+
+**Storing the list.** The encoded list `enc("segv.sh/v2/ckpt/heads", [cid_1, head_1, …])`, whose hash is `hd`, is
+written to the deployment's R2 bucket (the one of §8 and §9.1 "Paging"; the keys `b/…`, `seal/…` and `ckpt/…` never
+meet) as the object `ckpt/v2/{q}`, and only then is the row `(q, sec, hd, C, sig)` committed, with an empty `heads`:
+one row per minute stays a few hundred bytes whatever the number of components, while the lists, tens of kilobytes
+each at large shard and bucket counts, live in R2, written once and never changed. When the R2 write fails, no
+checkpoint is made in that alarm: the other meta of the alarm is committed, except the `final:<cid>` marks, which
+wait for the checkpoint that carries their heads; the next alarm builds checkpoint `q` again and writes its list
+again (an object left by an alarm whose commit failed was never named by a row, never served, and is overwritten).
+`latest()` and `get(q)` (§10.9) return the row with its list: from the row's `heads` when it is not empty (rows
+written before the lists moved to R2 keep theirs), else from memory for the latest checkpoint, else from
+`ckpt/v2/{q}`, whose bytes MUST hash to the row's `hd`; a list that is missing or does not match is an error (5xx),
+never served. The previous checkpoint's list, which collecting needs, is read the same way.
 
 **Server key.** `SRV_SK` is a 32-byte Ed25519 seed held as a Worker secret. Its public key, `srvKey`, is in params.
 The same key signs receipts (§10.3).
 
 ### 9.6 Directory (D1)
+
+Every database of the directory (below) is created with this schema; the tables a database does not use stay empty.
 
 ```sql
 CREATE TABLE user (
@@ -2371,26 +2696,86 @@ h_seq    = H(enc("segv.sh/v2/dirlog", h_{seq−1}, u64 seq, u8 kind, ref))      
 
 Each `ref` and `h` is stored as b64u text, and `dirseq` = the dirlog `seq` of the row.
 
-**Writes.**
+**Databases.** The directory is one **log database** (`dirlog`, `dirmeta`) and `K = 2^κ` **user databases**
+`0 .. K − 1` (`user`, `wrap`), `K` the deployment variable `DIR_SHARDS` (a power of two, 1 .. 256; 1 when unset).
+The log database MAY be the same database as user database 0: a deployment starts that way, with one database, which
+is the layout of the first release. A user's rows live in user database `dirShard(uid) = ⌊upre / 2^(32 − κ)⌋`, the
+top κ bits of `upre` (§2.5): the user row and all its wrap rows together. `K` is only ever raised (the DirSeqDO then
+moves the rows, below), never lowered: a lookup reads the `K` databases of the deployment, so a lower `K` would hide
+rows, and the DirSeqDO refuses writes while the deployment's `K` is below the one it pinned.
 
-1. Read the dirlog head.
-2. Compute the new entries.
-3. Run one D1 `batch()`, which is atomic: `INSERT user`, `INSERT wrap…`, `INSERT dirlog…` with explicit seqs, and, for
-   a registration, `UPDATE dirmeta SET v = v + 1 WHERE k = 'users'`.
-4. Handle failures:
-   - a `UNIQUE` failure on `dirlog.seq` (a concurrent writer) means: wait a random 5–50 ms times the attempt number,
-     re-read the head and retry, up to 16 attempts, then answer 503;
-   - a failure on `user.handle` or `user.uid` means 409;
-   - a failure on `wrap (uid, id)` means 409.
+**Reads.** A lookup asks every user database and merges the answers, so its result never depends on where a row is
+(rows are in their database except while a raise of `K` moves them, when a row may be in its old and its new
+database at once, never in neither): a uid lookup takes the row from whichever database has it, and answers 503 only
+when none has it and a database did not answer; a prefix page reads up to 257 rows (`uid > after`, ordered by `uid`) from each database, merges them in `uid` order, drops a uid listed
+twice, answers the first 256 and sets `more` iff a 257th remains; a wraps lookup merges by `dirseq`. The dirlog, its
+head and `dirmeta` are read from the log database.
 
-At most 64 wraps per uid (400 beyond that). D1 is authoritative: there is no outbox and no log fallback. If D1 is
-unavailable, directory writes and directory reads (register, wraps, prefix, uid and wraps lookups, dirlog) answer 503
-`{error: "directory unavailable"}`. The one exception is `p` in `/api/v2/params` (§10.9), which MUST NOT fail or wait
-because of D1. `users` (and so `P`) is read from `dirmeta` and cached per isolate for at most 60 s while D1 answers.
-While the `dirmeta` read fails, params reports the `P` of that isolate's last successful read, or 0 when there is none;
-the failure is logged, and after a failed read the isolate MUST NOT query `dirmeta` again for 5 s. A prefix lookup
-uses the same cached value and answers 503 while the isolate has none; it never treats the count as 0. `dirmeta.users`
-never decreases, so a cached or stale `P` is never above the current one.
+**Writes: the DirSeqDO (`dirseq/v2`, one instance, SQLite).** The Worker validates a registration or a wrap record
+(§10.6) and hands it to the DirSeqDO, the only writer of the directory. Its storage holds the write-ahead log of the
+rounds in flight and the pinned κ; D1 stays authoritative.
+
+1. It keeps the dirlog head in memory, read from the log database when it starts and again after any failed write.
+2. A **round** is every write that arrived since the previous round started, at most 32 (a burst is a few rounds,
+   with no fixed wait). The round first replays the write-ahead log (below); then it reads, from every user database,
+   the handles and uids of its registrations and the wrap rows of the uids of its wrap writes, and counts the earlier
+   writes of the round and the rows still in the write-ahead log as well. It refuses, without logging them, a handle
+   or uid that is registered (409), a wrap whose `(uid, id)` exists (409) and a wrap that would take its uid above
+   64 (400). A registration whose uid, handle, bundle, signature and wrap records (in order) are those of a
+   registration already logged, in the write-ahead log or landed with all those wrap rows, is that registration sent
+   again (§2.5 step 8): it answers as that one did, 200 with its seqs, and is not logged again; while that one's step 3
+   has an unknown outcome (below) it answers 503. Another body for the same handle or uid is refused (409). While a
+   user database does not answer these reads, or holds rows of the write-ahead log that do not land, the round
+   answers 503.
+3. It assigns the next contiguous seqs to the writes that remain and computes `h`; writes each of them, with its seqs
+   and its user database, to the write-ahead log; then runs one atomic `batch()` on the log database: `INSERT
+   dirlog…` with explicit seqs, and `UPDATE dirmeta SET v = v + 1 WHERE k = 'users'` for each registration.
+4. Then, per user database, one atomic `batch()` of the round's rows for it: `INSERT user`, `INSERT wrap…`. A write
+   whose rows landed answers with its seqs and leaves the write-ahead log.
+5. Failures:
+   - a `UNIQUE` failure on `dirlog.seq` in step 3 (another writer: only a Worker of the previous release, during a
+     deploy) drops the round from the write-ahead log, re-reads the head and retries the round once from step 2,
+     then answers 503 for the round;
+   - any other failure of step 3 may still have committed: the head is re-read, and the round is in the log iff the
+     entry at its last seq carries its `h`. If it is, step 4 follows; if not, the round leaves the write-ahead log
+     and answers 503;
+   - a failure of step 4 is retried once at once; then the write answers 503 while its rows stay in the write-ahead
+     log, and they land at the next replay: the next round, or an alarm one second later (and then every 5 s while
+     any row waits). The dirlog is thus never ahead of the user databases for longer than a replay, and a row never
+     lands without its dirlog entries;
+   - a `UNIQUE` failure of step 4 on a row that is not the round's own (another writer took the key between step 2
+     and the batch: only during the deploy that introduced the DirSeqDO) answers 409, and the write leaves the
+     write-ahead log: its dirlog entries stand and refer to a bundle or record the directory does not serve. A
+     `UNIQUE` failure on the round's own row (the replay of a batch that had landed) counts as landed.
+
+   Every 503 of a write carries `retry-after: 2`: by then the replay one second after a failed batch has run. A
+   registration that answered 503 after its step 3 committed is in the dirlog: sent again, it answers 200 (step 2).
+
+   The write-ahead log is replayed only between rounds: rounds, replays and the pages of a move (below) run one at a
+   time, so a replay never judges a round whose step 3 is in flight, and no row lands in a database while a page of a
+   move is between its read and its `DELETE`. A replay runs the rows of the write-ahead log as step 4, oldest first,
+   per user database of the placement in force when it runs (a raise of `K` may have begun since a row was logged). A
+   row whose step 3 had an unknown outcome lands once the entry at its last seq carries its `h`, and leaves the
+   write-ahead log once that entry is absent or carries another `h`.
+
+**Raising `K`.** The DirSeqDO pins κ in its storage the first time it runs (from `DIR_SHARDS`; 0 for a deployment
+with one database). When the deployment's κ is above the pinned one, new rows are placed by the new κ from then on,
+and the object moves the rows that are no longer in their database, a page at a time from an alarm: for each old
+database in turn, up to 32 users in `uid` order with their wrap rows, `INSERT OR IGNORE` into their new databases,
+then `DELETE` from the old one, with the last uid of the page kept as the cursor; when every old database has been
+walked, the new κ is pinned. A lookup during the move sees a moving row in its old database, in both, or in its new
+one, and merges them (above). A deployment κ below the pinned one is an operator error: the object refuses writes
+(503) and logs it until the deployment's value is restored.
+
+D1 is authoritative: there is no outbox and no log fallback beyond the write-ahead log of a round in flight, and
+reads go to D1 from the Worker. If a database is unavailable, the directory writes and the directory reads that need
+it (register, wraps, prefix, uid and wraps lookups, dirlog) answer 503 `{error: "directory unavailable"}`. The one
+exception is `p` in `/api/v2/params` (§10.9), which MUST NOT fail or wait because of D1. `users` (and so `P`) is read
+from `dirmeta` in the log database and cached per isolate for at most 60 s while it answers. While the `dirmeta` read
+fails, params reports the `P` of that isolate's last successful read, or 0 when there is none; the failure is logged,
+and after a failed read the isolate MUST NOT query `dirmeta` again for 5 s. A prefix lookup uses the same cached value
+and answers 503 while the isolate has none; it never treats the count as 0. `dirmeta.users` never decreases, so a
+cached or stale `P` is never above the current one.
 
 **Prefix reads.** A lookup of the top `p` bits equal to `x` returns exactly the rows with `lo ≤ hpre ≤ hi` (or `upre`),
 and with `uid > after` when `after` is given, ordered by `uid` (the stored b64u text, §10.6), at most 256 per page. The
@@ -2400,8 +2785,9 @@ MUST accept every `p` with `0 ≤ p ≤ min(32, P + 1)`; stage 1 has no lower bo
 the query plan. The server SHOULD bound the rows one page reads: it reads the range through the `hpre`/`upre` index
 when `users / 2^p ≤ 257 · 2^p`, and otherwise walks the `uid` primary key in order and filters by the prefix (for
 SQLite: `+hpre BETWEEN …`, which keeps the planner off the prefix index). No page then reads more than about
-`√(257 · users)` rows, and a `p = 0` page reads about 257. The user count `P` is derived from `dirmeta.users`, never
-from `count(*)`.
+`√(257 · users)` rows, and a `p = 0` page reads about 257. Each user database is read with this query, with
+`users / K` as its size for the choice of plan, and the pages are merged ("Reads" above). The user count `P` is derived
+from `dirmeta.users`, never from `count(*)`.
 
 ### 9.7 Hardening (all endpoints)
 
@@ -2449,22 +2835,33 @@ New in stage 1:
   An `APP_ORIGINS` that is not such a list counts as empty, so the native apps are refused and nothing else changes; the
   Worker logs the reason once per isolate, naming the setting but never its value (as for push, §9.8).
 
-The Worker passes Durable Objects only what they need. Client addresses and headers never reach a DO; the RealtimeDO
-gets the opaque client tag only.
+The Worker passes Durable Objects only what they need. Client addresses and headers never reach a DO; a ConnDO gets
+the opaque client tag only, and a FeedDO topics and rows.
 
-### 9.8 PushDO (`push/v2`, SQLite, one instance; optional)
+### 9.8 Push: the store (`PUSH_KV`), QuietDO (`quiet/v2/{k}`) and the Worker (optional)
 
 A push reaches a device through one of three **transports**: **Web Push** (RFC 8030, 8291 and 8292) for browsers, and
 for the native apps (§11.14) **APNs**, Apple's push service, for the iOS and macOS apps, and **FCM**, Firebase Cloud
 Messaging, for the Android app. A transport is on when its secret is set and its settings below are valid: `VAPID_SK`
 for Web Push, `APNS_KEY` for APNs, `FCM_KEY` for FCM. Push is **on** when the Worker secret `PUSH_KEY` is set and valid,
 `APP_HOSTS` is not empty, the other settings below are valid, and at least one transport is on. The Worker then serves
-the three endpoints of §10.10 and params `push` (§10.9), and PushDO, which the Worker reaches with
-`getByName("push/v2")`, stores the registrations of the devices that turn notifications on (§11.13) and sends their
-notifications. Otherwise push is **off** and none of this exists: params carry no `push`, all three paths are unknown
-(404), and no PushDO is ever addressed. PushDO is the one component that stores data that is not public (§0.1): nothing
-serves it, and no checkpoint covers it (§9.5). The Worker passes it the fields of these requests and of `sync` (§10.11)
-only (for `seen` and `sync`, the quiet tag that it computes from the request's secret).
+the three endpoints of §10.10 and params `push` (§10.9). The registrations of the devices that turn notifications on
+(§11.13) live in the **push store**, a KV namespace (`PUSH_KV`), which the Worker reads at a ring and never writes:
+one kind of Durable Object, which holds nothing durable, writes it. A **QuietDO**, `quiet/v2/{k}`, owns the endpoints
+of one range of accounts: it applies their registrations to the store, under their records and their bells, holds
+what rings cause and the marks of rows seen, and decides what is sent when. The **Worker** sends the pushes, after waiting the hold in `waitUntil`, or,
+for a push due later, from a message it put on the **push queue** (`PUSH_QUEUE`); a Cron Trigger once a day expires
+old registrations. Otherwise push is **off** and none of this exists: params carry no `push`, all three paths are
+unknown (404), and no QuietDO is ever addressed, except by the daily expiry, which needs no key. The store is
+the one place that holds data that is not public (§0.1): nothing serves it, and no checkpoint covers it (§9.5). The
+Worker passes the objects the fields of these requests and of `sync` (§10.11) only (for `push/sub`, the bells that
+it computes from the request's secrets; for `seen` and `sync`, the quiet tag that it computes from the request's
+secret).
+
+```
+owner(ep, qh) = qh, the keyed hash of the endpoint's quiet tag (below); ep for a record of the first release, which registered none
+k = u32(owner[0..4]) mod PUSH_SHARDS                      the QuietDO of an endpoint: all endpoints of one account share it
+```
 
 **Configuration:**
 
@@ -2482,8 +2879,7 @@ only (for `seen` and `sync`, the quiet tag that it computes from the request's s
 | `FCM_EMAIL` | var, required with `FCM_KEY` | The service account's e-mail address (its `client_email`). |
 | `FCM_PROJECT` | var, required with `FCM_KEY` | The Firebase project's ID, 6 to 30 characters of `[a-z0-9-]`. Reported as params `push.fcm`. |
 | `POW_PUSH` | var | The PoW base of `push/sub` (§10.2), default 20. |
-| `PUSH_MAX_SUBS` | var | The most endpoints stored, default 100 000. |
-| `PUSH_DAY_SUBS` | var | The most endpoints whose registration may change in one day, default 2 000 ("Memory", below). |
+| `PUSH_SHARDS` | var | The number of QuietDOs, 1..4096, default 1. It may change at any deploy: the store is the truth, and each object reads what it needs from it. |
 
 A deployment that offers push MUST also set `APP_HOSTS` (§9.7), whose first host gives the payload's `navigate` URL.
 **An invalid push setting turns off what it belongs to, and nothing else.** An invalid setting of a transport turns that
@@ -2491,28 +2887,31 @@ transport off: for Web Push, `VAPID_SK` not a valid P-256 scalar, `VAPID_SUB` mi
 URI, or `PUSH_HOSTS` malformed; for APNs, `APNS_KEY` not a valid P-256 scalar, or `APNS_KEY_ID`, `APNS_TEAM` or
 `APNS_TOPICS` missing or malformed; for FCM, `FCM_KEY` not an RSA key in PKCS #8, or `FCM_EMAIL` or `FCM_PROJECT`
 missing or malformed. Push is off, exactly as when no transport's secret is set, when `PUSH_KEY` is missing or not 32
-bytes, when `POW_PUSH`, `PUSH_MAX_SUBS` or `PUSH_DAY_SUBS` is present but malformed or out of range, when `APP_HOSTS` is
-empty, or when no transport is on: params omit `push` and `pow.push` (§10.9), and `push/sub`, `ring` and `seen` answer
-as when push is not configured (§10.10). The Worker logs the reason once per isolate, naming the setting but never its
-value (§9.7), and every other endpoint works as before: push settings never make the Worker answer 503 "server
-misconfigured" (§3.1). While push is off, PushDO sends nothing, and its daily pass deletes only the endpoints whose day
-has expired (below): it never deletes one because its `box` does not open, since `PUSH_KEY` may be the setting that is
-missing or malformed. A new `PUSH_KEY` invalidates every registration (none of them matches or opens under it): the next
-daily pass deletes them, they count toward `PUSH_MAX_SUBS` until then, and devices register again at each device's next
-start (§11.13); so it SHOULD NOT change. A new `VAPID_SK` makes every push to an existing subscription fail until its
-device subscribes again with the new key, at its next start (§11.13), so it SHOULD NOT change either. A new APNs or FCM
-key changes nothing for the devices: their tokens stay valid.
+bytes, when `POW_PUSH` or `PUSH_SHARDS` is present but malformed or out of range, when `APP_HOSTS` is empty, or when no
+transport is on: params omit `push` and `pow.push` (§10.9), and `push/sub`, `ring` and `seen` answer as when push is not
+configured (§10.10). The Worker logs the reason once per isolate, naming the setting but never its value (§9.7), and
+every other endpoint works as before: push settings never make the Worker answer 503 "server misconfigured" (§3.1).
+While push is off, nothing is sent, and the daily expiry deletes only the endpoints whose day has passed (below): it
+never deletes one because its `box` does not open, since `PUSH_KEY` may be the setting that is missing or malformed. A
+new `PUSH_KEY` invalidates every registration (none of them matches or opens under it): each is deleted at its first
+push, or by the daily expiry after 30 days, and devices register again at each device's next start (§11.13); so it
+SHOULD NOT change. A new `VAPID_SK` makes every push to an existing subscription fail until its device subscribes
+again with the new key, at its next start (§11.13), so it SHOULD NOT change either. A new APNs or FCM key changes
+nothing for the devices: their tokens stay valid.
 
-**Storage.** Durable storage holds the registrations as the daily passes wrote them (below), the journal of the changes
-that no pass has written yet (below), the day of the last completed pass, and nothing else:
+**The store.** `PUSH_KV` holds the registrations, written at once, and nothing else: nothing about a ring, a mark or a
+note is ever written anywhere. A KV namespace keeps no history of a key's earlier values: a value that is replaced or
+deleted is gone, apart from the copies that its replication may still serve for up to a minute (§13.4). Its keys and
+values:
 
-```sql
-CREATE TABLE sub (ep BLOB PRIMARY KEY CHECK (length(ep) = 16), box BLOB NOT NULL, day INTEGER NOT NULL) WITHOUT ROWID;
-CREATE INDEX sub_day ON sub (day);
-CREATE TABLE tok (tk BLOB NOT NULL CHECK (length(tk) = 16), ep BLOB NOT NULL, PRIMARY KEY (tk, ep)) WITHOUT ROWID;
-CREATE INDEX tok_ep ON tok (ep);
-CREATE TABLE jr (slot INTEGER PRIMARY KEY, box BLOB NOT NULL);
-CREATE TABLE meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL) WITHOUT ROWID;
+```
+e/<hex ep>   →  u32 day ‖ u8 notes ‖ qh[16] ‖ kh[16] ‖ tk[16] × n   the endpoint's record: its day, whether it takes notes, its
+                                                                   quiet tag's keyed hash (zero bytes when it registered none), the
+                                                                   keyed hash of its keys and the tk it holds; metadata
+                                                                   {"d": day, "o": hex(owner(ep, qh))}, which the expiry reads
+b/<hex tk>   →  (ep[16] ‖ qh[16] ‖ kh[16] ‖ u16 len ‖ box) × m, m ≤ 8   the endpoints registered under a bell, with their keys: those
+                                                                   of the bell's account, since registering needs its secret
+n/<hex nk>   →  (ep[16] ‖ u16 len ‖ box) × m, m ≤ 8            the account's endpoints that take notes
 ```
 
 - `ep` names an endpoint: `t16(HMAC(PUSH_KEY, enc("segv.sh/v2/push/ep", endpoint)))`. An **endpoint** is the address of
@@ -2520,235 +2919,163 @@ CREATE TABLE meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL) WITHOUT ROWID;
   `apns:<env>:<topic>:<token>` or `fcm:<token>`.
 - `box` holds the endpoint and the keys its pushes are encrypted to (a Web Push subscription's, or a native app's own,
   §11.13): `aeadSeal(PUSH_KEY, enc(endpoint, p256dh, auth), aad = enc("segv.sh/v2/push/sub", ep))`.
-- `tk` stands for a bell registered for the endpoint: `t16(HMAC(PUSH_KEY, enc("segv.sh/v2/push/bell", bell)))`, or
-  for its account's quiet tag `Q` (§4.1): `t16(HMAC(PUSH_KEY, enc("segv.sh/v2/push/quiet", Q)))`, and, for an endpoint
-  that takes notes (§10.10), for the same `Q` once more, as its **note tag**: `t16(HMAC(PUSH_KEY,
-  enc("segv.sh/v2/push/note", Q)))`. The three labels differ, so no `tk` of one kind matches one of another: a ring
-  reaches an endpoint through a bell only, a `seen` through a quiet tag only, and a note through a note tag only. A bell
-  is a capability (whoever holds it can ring it or register under it), so it is never stored in the clear; neither is a
-  quiet tag, although it is none (`seen` and `sync` take its preimage, §10.10, §10.11).
-- `day` is the UTC day of the endpoint's last registration, `⌊Unix ms / 86 400 000⌋`, the only time kept for a
-  registration.
-- `jr` is the journal: `JR_SLOTS` = 2 880 rows of one length, each the sealed changes of one minute ("The journal",
-  below).
-- `meta` holds one row, `pass`, whose `v` is the UTC day of the last daily pass that went through every endpoint.
+- `tk` stands for a bell, `bell = bell(s)` computed from the secret `s` that `push/sub` carries (§4.1, §10.10):
+  `t16(HMAC(PUSH_KEY, enc("segv.sh/v2/push/bell", bell)))`; `qh` for the account's quiet tag `Q`
+  (§4.1): `t16(HMAC(PUSH_KEY, enc("segv.sh/v2/push/quiet", Q)))`; and `nk`, for an endpoint that takes notes (§10.10),
+  for the same `Q` once more, as its **note tag**: `t16(HMAC(PUSH_KEY, enc("segv.sh/v2/push/note", Q)))`. The three
+  labels differ, so no hash of one kind matches one of another: a ring reaches an endpoint through a bell only, a `seen`
+  through a quiet tag only, and a note through a note tag only. A bell is a capability (whoever holds it can ring it,
+  and whoever holds its secret can register under it), so neither is ever stored, and the bell not even in the clear;
+  neither is a quiet tag, although it is none (`seen` and `sync` take its preimage, §10.10, §10.11).
+- `kh` is the keyed hash of the endpoint's keys, `t16(HMAC(PUSH_KEY, enc("segv.sh/v2/push/keys", p256dh, auth)))`: a
+  registration with other keys places the endpoint's kept bells again, and a `gone` at a push deletes the registration
+  only while its `kh` is still that of the push's box.
+- `day` is the UTC day of the endpoint's last registration, `⌊Unix ms / 86 400 000⌋`, the only time kept.
 
-`PUSH_KEY` protects all of it against a leak of the storage alone, not against O. The platform keeps a point-in-time
-history of a Durable Object's storage for 30 days, so a registration, its changes and its deletion stay recoverable from
-that history for up to 30 days. That is why nothing about a ring or a `seen` is ever written, why only the daily pass
-writes the registrations, and a change only after the UTC day in which it was made has ended, and why the journal is
-written on a fixed cadence, one row of one length a minute whatever has changed: the history then shows, per day,
-which endpoints were registered, which changed their bell sets and which were deleted, and nothing finer than a day.
-The journal's rows, ciphertexts of one length written at times that the clock alone sets, add nothing to that for
-whoever does not hold `PUSH_KEY`; whoever holds it can open them and date each change to its minute. A day's changes
-still tell something: an epoch change makes the open devices of every member replace one bell, a creation,
-an accepted request, a leave or an ended copy adds or removes one, and a ring can make several stale endpoints of one
-conversation's members refuse their pushes and be deleted, so on a day with few changes, endpoints whose sets changed,
-or that were deleted, that day may be co-members (§13.4).
+`PUSH_KEY` protects the boxes against a leak of the store alone, not against O. Each key has one writer, the QuietDO of
+its account: an `e/` or `n/` key that of its endpoint's owner, the account its record names, and a `b/` key that of the
+bell's account, since only that account's devices hold the secret that registers under the bell (§10.10). An endpoint
+whose registration comes from another account (a second account on the same browser or phone) changes owner: its old
+owner's QuietDO takes it out of its bells and deletes its record first, and only then does the new owner's register it
+(§10.10, `sub`); a QuietDO never writes the keys of a record whose owner's QuietDO is another. So no write races
+another, and the limit of one write per key per second is kept by that writer, which lets later changes to the same
+key wait for the next write and go into it. A write that the store refuses is tried once more, a second later; when
+that fails too, the changes it carried are dropped from the writer's memory, which again holds what the store holds,
+and the calls that made them fail.
 
-**Memory.** The object's memory holds four things:
+**QuietDO** (`quiet/v2/{k}`, no storage of its own). The owner of the endpoints of its range (`owner`, above): all the
+endpoints of one account are in one QuietDO, since they register the same quiet tag. In memory: a bounded cache of
+their `e/` records and of the `b/` values of their bells, each read from the store the first time the object touches
+it, and which it alone writes; **everything a ring causes**, never written: per endpoint with a push in
+flight, the time of its last push (`last`), the time of its next one (`due`) and the attempts made for that one
+(`tries`), each kept at most `PUSH_WINDOW` after the endpoint's last push, the bells that rang it since its last push
+(`rang`: those of its registered bells that the rings carried, newest first, at most `PUSH_BELLS` = 4), the rows that
+rang it since its last push (`rows`: a hash of each row's `(E, label)`, at most `PUSH_PENDING` = 16; once more rows ring
+it, `rows` is dropped for that push, which then can no longer be cancelled), the bells and rows of the rings that came
+while its push was in flight (`later`, bounded as `rang` and `rows` are), and the rows that rang it in the last
+`RING_DEDUP` = 120 s (at most 64; a ring of one of them changes nothing, so a sender's repeat of a ring, §11.13, adds no
+push); **the rows marked seen** per account (quiet tag): each for `SEEN_TTL` = 120 s, at most `PUSH_SEEN` = 64 (the mark
+that expires first goes); and **the notes** per endpoint that takes notes, newest first, at most `PUSH_NOTES` = 4, each
+for `NOTE_TTL` = 600 s.
 
-- **The day's registration changes.** Every `sub` (below), and every deletion at a push, takes effect in memory at
-  once, noted with its UTC day, and replaces any earlier change of that endpoint: from then on rings and pushes use the
-  stored registrations with the changes in memory applied. Only the daily pass (below) writes them into the
-  registrations, once their day has ended. A `sub` whose keys, bells, quiet tag and note tag equal those **stored** for
-  its endpoint is kept as its day alone (a refresh); any other `sub` is kept whole, also when it repeats a change
-  already in memory. Each change also waits for the journal's next row (below), which seals a copy of it; a change
-  that equals the one already in memory for its endpoint waits for nothing, and one that replaces a change still
-  waiting takes its place.
-- **Everything a ring causes**, which is never written: per endpoint with a push in flight, the time of its last push
-  (`last`), the time of its next one (`due`) and the attempts made for that one (`tries`), each kept at most
-  `PUSH_WINDOW` after the endpoint's last push, the bells that rang it since its last push (`rang`: those of its
-  registered bells that the rings carried, newest first, at most `PUSH_BELLS` = 4), and the rows that rang it since
-  its last push (`rows`: a hash of each row's `(E, label)`, at most `PUSH_PENDING` = 16; once more rows ring it,
-  `rows` is dropped for that push, which then can no longer be cancelled), both kept until that push is sent, dropped
-  or cancelled; while a request for that push is out, the bells and rows of the rings that came since it was made
-  (`later`: bells and rows kept as `rang` and `rows` are), until its answer; and the rings of the last `RING_DEDUP` =
-  120 s, each identified by a hash of its row and of its distinct bells in ascending byte order.
-- **The rows that an account marked seen** (`seen`, below), which are never written: per endpoint, a hash of each
-  row's `(E, label)` with the time it expires, `SEEN_TTL` = 120 s after its last mark, at most `PUSH_SEEN` = 64 per
-  endpoint (a mark beyond them drops the one that expires first).
-- **The notes** (`note`, below), which are never written: per endpoint that takes notes, the last `PUSH_NOTES` = 4 notes
-  that reached it, newest first, each kept `NOTE_TTL` = 600 s after it came, and whether a quiet push to it is due.
+**`sub(endpoint, p256dh, auth, secrets, quiet, notes)`** (from `push/sub`, whose fields the Worker has checked,
+§10.10; `secrets` are the bell secrets, `quiet` the account's quiet tag and `notes` whether the endpoint takes notes)
+replaces the endpoint's registration as a whole:
 
-A restart of the object (an eviction, or a deploy) loses the last three, and of the first the changes that no row of
-the journal holds yet: the pushes then due and the windows, so the limit of one push per `PUSH_WINDOW` and the dedup of
-rings hold except across a restart; the rows marked seen, so a push that a mark made before the restart would have
-prevented is sent; the notes, so a quiet push then due is not sent and no later push carries them; and the changes made
-since the journal's last row, at most `PUSH_JOURNAL` = 60 s before the restart, so an endpoint whose registration
-changed then is notified as before that change. The first call or run after the restart reads the other changes back
-from the journal (below). Devices send their sets again at their next start and at least once a day while they run
-(§11.13), and an endpoint whose deletion was lost is deleted again at its first push, since a device ends its
-subscription, or gives up its token, before it deletes its registration (§11.13) and a refused push is refused again.
-All of this is best effort (§0.4). The object's alarm, which the platform stores, holds only the time of its next run,
-which follows the clock alone (below).
+0. Read the record. When it names an owner whose QuietDO is another (the Worker hands such an endpoint over first,
+   §10.10, but its read of the store may be up to a minute old), call `drop(ep)` there, which deletes the registration
+   as step 1 does, and go on as if there were no record; this object never takes the endpoint out of that owner's bells
+   itself.
+1. With `secrets` empty, delete the registration: take the endpoint out of every bell its record holds (below), out of
+   `n/` when it took notes, delete its record, and forget its push state and notes. Answer OK.
+2. Otherwise compute the bells' `tk` (from `bell(s)` of each secret, §4.1), `qh` and `box`. For
+   each `tk` of the record that the set no longer holds, take the endpoint out of the bell; for each `tk` new to the
+   set, and for each kept `tk` when the keys or the quiet tag changed, put the endpoint under the bell: replacing its
+   own earlier entry, or, when 8 other endpoints hold the bell, leaving it out ("full"), never taking another
+   endpoint's place (a bell's 8 places go to the account's endpoints that take them first, for as long as they hold
+   them). A bell with no endpoint left loses its key. The bells are read at once, and their writes go out at once. Once
+   they are all in the store, write the record when anything in it changed, the day included (a refresh that changes
+   nothing but the day is one write); write `n/` when `notes` or the keys changed. Answer OK. When a write fails (the
+   store refused it twice), the call fails, and the record is not written: it never names a bell that the store does
+   not list it under. Bells written before the failure keep the endpoint, which the device's next registration, after
+   the 503 (§10.10), puts in its record.
 
-**Limits.** At most `PUSH_TOKENS` = 256 bells, one quiet tag and one note tag per endpoint (params `push.maxTokens`,
-equal to `limits.topics`, counts the bells), at most `PUSH_PER_BELL` = 8 endpoints per bell, per quiet tag and per note
-tag, at most `PUSH_BELLS` = 4 bells named by one push, at most `PUSH_MAX_SUBS` endpoints in all, at most `PUSH_DAY_SUBS`
-endpoints with changes in memory that register them or change their keys, bells, quiet tag or note tag (a deletion, or a
-refresh of the day alone, does not count), and at most `PUSH_ROWS` = 20 000 rows read, written or deleted by one alarm
-run's part of the daily pass.
+**`drop(ep)`** deletes the registration as `sub` step 1 does: at a `gone` (below), and for another owner's `sub`
+(step 0, §10.10).
 
-**`sub(endpoint, p256dh, auth, tokens, quiet, notes)`** (from `push/sub`, whose fields the Worker has checked, §10.10;
-`quiet` is the account's quiet tag, or none, and `notes` whether the endpoint takes notes) changes the registrations in
-memory, at once:
+Only the device, its push service and O know an endpoint, so only they can replace or delete its registration. There
+is no cap on the endpoints stored: proof of work and `RL_WRITE` bound the registrations (§10.10), and the daily expiry
+their life.
 
-1. With `tokens` empty, delete the endpoint's registration, its push state and its rows marked seen, and answer OK.
-2. If the endpoint is not registered and `PUSH_MAX_SUBS` endpoints are, answer FULL. If the call registers the
-   endpoint, or changes its keys, bells, quiet tag or note tag, while `PUSH_DAY_SUBS` other endpoints have such changes
-   in memory, answer FULL.
-3. Set its registration: the given keys, `day` = today, each distinct bell, the quiet tag when one is given, and the
-   note tag when `notes` is true, except a bell, quiet tag or note tag that 8 other endpoints already hold: that one is
-   left out for this endpoint, which takes no other endpoint's place. Answer OK.
+**`ring(targets, row)`** (from `ring`, after the Worker found the row fresh and read its bells' entries from the store,
+§10.10; `targets` are the entries of this QuietDO's endpoints among them, each with the bells it was found under, in
+the order of the ring's bells):
 
-When step 1 or 3 would make a change wait for the journal (below), and the journal's next row could not hold it along
-with the changes already waiting, the call answers BUSY instead and changes nothing. So every change that `sub` accepts
-is in the journal's next row, however many come at once; a burst is spread over the following minutes, as devices send
-again what was refused (§11.13). With a typical endpoint, a row holds about 15 registrations of a few bells each, or
-one of 256.
+1. For each endpoint, unless its account marked the row seen (below) or the row rang it within `RING_DEDUP`: put the
+   bells it was found under at the front of its `rang`, in that order, removing their earlier places there and keeping
+   the first `PUSH_BELLS`. Then, if a push to it is due, add the row to its `rows` (when it has `rows`) and, when that
+   push is in flight (`due` below), also to its `later`, putting the bells at the front of `later`'s bells as above:
+   the attempt out was made without them, and its answer leaves them due. Otherwise set `due = max(now +
+   PUSH_HOLD·1000, last + PUSH_WINDOW·1000) + j` (`now + PUSH_HOLD·1000 + j` when there is no `last`), `tries = 0` and
+   `rows` = this row, where `PUSH_HOLD` = 5 s and j is uniform in `[0, PUSH_JITTER·1000]` ms, drawn per endpoint and
+   push.
+2. Answer the time until the earliest `due` of the endpoints that step 1 reached whose push is not in flight, or, when
+   a push in flight was given up since the last `due` (below), until the earliest `due` of the object; or none.
 
-Each call thus replaces an endpoint's registration as a whole and refreshes it; a bell's places go to the endpoints
-that hold them first, for as long as they keep refreshing them. Only an account's own devices know its quiet tag, so
-only they take its places and those of its note tag; an endpoint left out of them is notified as if it had registered
-none, and gets no notes.
+A ring writes nothing. So an endpoint gets at most one push per `PUSH_WINDOW` = 60 s, except across a restart of its
+QuietDO, however many rows ring it (later rings within the window coalesce into one push at its end), and every push is
+delayed by at least `PUSH_HOLD` after its first ring, which gives a device of the account that shows the row time to
+mark it seen (below), then by an independent jitter of up to `PUSH_JITTER` = Δ seconds.
 
-**`ring(E, label, tokens)`** (from `ring`, after the Worker found the row fresh, §10.10):
+**`due(max)`** (from the Worker, when a time that `ring`, `due` or `sent` answered has passed) answers at most `max`
+pushes due now, `max` ≤ `DUE_BATCH` = 24, each `(ep, box, rang, notes)`, earliest `due` first, and marks them in
+flight, with `later` empty: a mark no longer cancels them. It also answers the time until the Worker is to call `due`
+again: none when no push is due; 0 when more are due now; else the time until the earliest `due` not in flight, or none
+when an answer of `due` or `sent` given in the last 30 s brings a Worker back by then. The Worker sends them (below) and
+reports each with **`sent(ep, outcome, retryAfter)`**, which answers that time as well:
 
-1. If the ring (its row and bells) is among the rings of the last `RING_DEDUP`, stop; otherwise remember it. A repeat
-   of a ring (the sender's retry) thus changes nothing, while a ring of the same row with other bells, which a third
-   party who read the row's label in the public feed could send first, never suppresses the sender's.
-2. For each distinct endpoint registered under the `tk` of one of `tokens`, except one whose rows marked seen hold
-   this row: put the bells of `tokens` under which it is registered at the front of its `rang`, in their order in
-   `tokens`, removing their earlier places there and keeping the first `PUSH_BELLS`. Then, if a push to it is due,
-   add the row to its `rows` (when it has `rows`); when a request for that push is out, also put those bells and the
-   row in its `later` in the same way, since that request was made without them: its answer leaves them due (below),
-   while a retry carries them. Change nothing else. Otherwise set
-   `due = max(now + PUSH_HOLD·1000, last + PUSH_WINDOW·1000) + j` (`now + PUSH_HOLD·1000 + j` when there is no
-   `last`), `tries = 0` and `rows` = this row, where `PUSH_HOLD` = 5 s and j is uniform in `[0, PUSH_JITTER·1000]` ms,
-   drawn per endpoint and push.
-3. Answer the time until the earliest `due` of the endpoints that step 2 reached, when it is at most `RING_WAIT` =
-   20 s away, and otherwise none.
+- `sent`: `last` = now, nothing is due, and `rang` and `rows` are emptied;
+- `retry` (a 429, a 5xx, a network error, no answer within 10 s, or, for FCM, a failed request for its access token):
+  once (`tries = 1`), `due` = now plus `retryAfter` when that is at most 60 s, else plus 10 s; the retry carries the
+  rings that came meanwhile, which are in `rang` and `rows`. When the retry fails as well, the push is dropped: `last`
+  = its first attempt, `rang` and `rows` emptied, the endpoint kept. A push all of whose rows were marked seen while its
+  attempt was out is cancelled instead of retried;
+- `gone` (an answer that refuses the device, a `box` that does not open, a host no longer in `PUSH_HOSTS`, or keys that
+  cannot be encrypted to): the registration is deleted as `sub` step 1 deletes it.
 
-A ring writes nothing, not even the alarm (below). The Worker waits for the time that the ring answered, inside the
-request's `waitUntil` (§10.10), where waiting costs nothing, and then calls `flush`; a push that no `flush` sends,
-because it was due later or the Worker's wait was cut short, goes out at the alarm's next run. So an endpoint gets at
-most one push per `PUSH_WINDOW` = 60 s, except across a restart, however many rows ring it (later rings within the
-window coalesce into one push at its end), and every push is delayed by at least `PUSH_HOLD` after its first ring,
-which gives a device of the account that shows the row time to mark it seen (below), then by an independent jitter of
-up to `PUSH_JITTER` = Δ seconds, and, when no `flush` sends it, until the alarm's next run, at most `PUSH_TICK` later.
+A push sent or dropped leaves due the rings that came while its last attempt was out: unless every row of `later` was
+marked seen meanwhile, `due = max(now + PUSH_HOLD·1000, last + PUSH_WINDOW·1000) + j` with `rang` and `rows` those of
+`later`, so that the next push, at the window's end, names the bells of those rings alone. A push that `due` handed out
+and that no `sent` reports within `INFLIGHT_MS` = 60 s, longer than a batch takes to send, counts as an attempt that
+failed: retried once, due at once, or dropped when it was the retry.
 
-**`flush()`** (from `ring`, §10.10, once the time that `ring` answered has passed) sends the pushes then due, as step 3
-of an alarm run does (below), until none is due or `FLUSH` = 5 s have passed; the next run sends the rest. The object
-sends in one loop at a time: a `flush` during a run, or a run during a `flush`, waits for the loop under way. The limit
-of one batch a second holds across the loops: a loop that starts less than a second after the last batch began, in
-that loop or an earlier one, waits for the second to end, or leaves the pushes to the next run or `flush` when its own
-time would end first. `flush` writes nothing.
+**`seen(qh, rows)`** (from `seen`, §10.10; `qh` is the keyed hash of the quiet tag that the Worker computed from the
+request's secret, and `rows` are 1 to 16 distinct `(E, label)`) records that a device of the account has shown these
+rows while it was in use (§11.13): each row enters the account's rows marked seen, expiring `SEEN_TTL` after now
+(renewed when it is there), and leaves the `rows` of every push due to one of the account's endpoints; when that empties
+a push's `rows` and the push is not in flight, it is cancelled: nothing is due, `tries = 0`, `rang` and `rows` are
+emptied, and `last` stays. A later ring of a marked row reaches none of the account's endpoints (`ring` step 1). `seen`
+writes nothing; the marks of at most 65 536 accounts are held at once, the account marked longest ago going first, and
+an account that has no endpoint here only takes a place among them until its marks expire. So a push is cancelled only
+when every row that
+rang it was marked seen by its own account, and only while it waits: a mark that comes after the push was sent changes
+nothing, and one that comes while it is in flight only keeps it from being retried when that attempt fails. A dropped
+`rows` makes the push impossible to cancel, and a push to an endpoint that registered no quiet tag never is.
 
-**`seen(Q, rows)`** (from `seen`, §10.10; `Q` is the quiet tag that the Worker computed from the request's secret, and
-`rows` are 1 to 16 distinct `(E, label)`) records that a device of the account that registered `Q` has shown these
-rows while it was in use (§11.13). For each endpoint registered under the `tk` of `Q`, and each row:
+**`note(qh, n)`** (from `sync`, §10.11; `n` is the sealed note, 552 bytes) passes a sync note (§11.16) to the account's
+endpoints that take notes (`n/`, read from the store when the object does not hold it): for each, put `n` at the front
+of its notes, dropping those older than `NOTE_TTL` and those beyond the first `PUSH_NOTES`, and, unless a push to it is
+due, make a **quiet push** due now, which the Worker's next `due` takes. A quiet push carries the endpoint's notes and no
+bell, is not held, and is never retried. Every push to the endpoint, quiet or not, carries the notes that the endpoint
+holds at the time, so a note reaches the device in each push that follows it until `PUSH_NOTES` newer notes have come or
+`NOTE_TTL` has passed; a push that rings made due carries the notes too, and a quiet push due to the same endpoint is
+then no longer due.
 
-1. add the row to the endpoint's rows marked seen, expiring `SEEN_TTL` after now (renewing it when it is there);
-2. remove the row from the `rows` of the push due to the endpoint, if any, and from its `later`. When that empties its
-   `rows`, and the push is not being sent at that moment, cancel it: nothing is due, `tries = 0`, `rang` and `rows`
-   are emptied, and `last` stays.
+**The Worker's part.** `ring` (§10.10) reads the `b/` key of each of the ring's bells from the store (a read may be
+served from the edge's cache for up to 60 s, so a registration reaches the rings at every edge within a minute), groups
+the entries by their endpoints' QuietDO and calls each one's `ring`. The Worker reads the store once more at each
+`push/sub`: the metadata of the endpoint's record, which names its owner (§10.10). A Worker's `waitUntil` ends 30 s
+after its answer, and it waits for the headers of at most 6 requests at once, so it sends 6 pushes at a time and keeps
+within these bounds. For each time a `ring` answered that ends within `RING_WAIT` = 15 s of the answer to the ring, it
+waits in `waitUntil` and then calls `due(6)`, sends what that answers (one round, at most 10 s) and reports it; any
+other time, and whatever time `due` or `sent` then answers, it puts a message naming the QuietDO (`k`, and nothing
+else) on the push queue with that delay, at least 1 s. The queue's consumer, the same Worker, calls `due(24)` when the
+message comes, sends, reports, and asks again while more are due, for up to 60 s, then queues a message for the rest.
+Each batch is reported before the next is asked for, so a Worker stopped midway leaves at most one batch unreported:
+its pushes are due again `INFLIGHT_MS` later (`due` above) and go out with the next `due` of their QuietDO, which the
+next ring to any endpoint there (whose answer then includes them), or any queued message for it, causes. A push whose
+Worker was stopped before its wait ended goes out the same way.
 
-A later ring of a marked row reaches none of these endpoints (`ring` step 2). `seen` writes nothing, not even the
-alarm, and does nothing when no endpoint is registered under the `tk` of `Q`. So a push is cancelled only when every
-row that rang it was marked seen by its own account, and only while it waits: a mark that comes after the push was
-sent changes nothing, and one that comes while it is being sent only keeps it from being retried when that attempt
-fails (it is then cancelled instead). A dropped `rows` (more than `PUSH_PENDING` rows) makes the push impossible to
-cancel, and a push to an endpoint that registered no quiet tag never is.
-
-**`note(Q, n)`** (from `sync`, §10.11; `Q` is the quiet tag that the Worker computed from the request's secret, and `n`
-the sealed note, 552 bytes) passes a sync note (§11.16) to the account's endpoints that take notes. For each endpoint
-registered under the note tag of `Q`:
-
-1. put `n` at the front of its notes, dropping those older than `NOTE_TTL` and those beyond the first `PUSH_NOTES`;
-2. unless a quiet push to it is due, make one due.
-
-`note` writes nothing, not even the alarm, and does nothing when no endpoint is registered under the note tag of `Q`. A
-**quiet push** carries the endpoint's notes and no bell. It is not held: the alarm's next run sends it, at most
-`PUSH_TICK` later (below), and it is never retried. Every push to the endpoint, quiet or not, carries the notes that the
-endpoint holds at the time, so a note reaches the device in each push that follows it until `PUSH_NOTES` newer notes
-have come or `NOTE_TTL` has passed: a quiet push that is lost, or that a later one replaces, loses no note that a later
-push still carries. A push that rings made due carries the notes too, and a quiet push due to the same endpoint is then
-no longer due.
-
-**Alarm.** The alarm runs on a fixed cadence that nothing else moves: at every multiple of `PUSH_TICK` = 10 s of Unix
-time, whether push is on or off and whatever is registered or due. Each run first arms the next multiple. When no
-alarm is set, the constructor (inside `blockConcurrencyWhile`) arms it at the next multiple, as CheckpointDO's does
-(§9.5): at the object's first start, and after the platform has lost the alarm. That is the only write at the time of
-an event; otherwise the stored alarm time follows the clock alone, and neither a ring nor a registration writes it. As
-every alarm handler of §9, it never arms a time in the past. Each run then does, in this order:
-
-1. its part of the daily pass (below), in one transaction;
-2. while push is on, at the first run of each minute of Unix time, the journal's row for that minute (below);
-3. while push is on, the pushes that are due, those that rings made due earliest `due` first and then the quiet pushes,
-   in batches of at most 50 and at most one batch a second, until none is due or the next run's time has come; the rest
-   wait for the next run. While push is off, it sends nothing and drops what is due.
-
-**The journal** keeps the registration changes that no daily pass has written yet, so that a restart loses only those
-of its last minute, without dating any of them in the storage's history. It has `JR_SLOTS` = 2 880 rows, one per
-minute of 48 hours, so that a day's changes stay in it until the next day's pass has written them. The run that writes
-it at minute `m = ⌊Unix ms / 60 000⌋` sets row `slot = m mod JR_SLOTS` to `box = aeadSeal(PUSH_KEY, payload,
-aad = enc("segv.sh/v2/push/jr", u32(m)))`, where `payload` has exactly `JR_BYTES` = 5 376 bytes:
-`u32 prev ‖ (u16 len ‖ record)* ‖ zero bytes`. `prev` is the minute of the latest earlier row that holds a record
-(0 when there is none), and the records are the changes waiting for the journal, oldest first, as many as fit; the
-others wait for the next row. Only deletions at a push can be left waiting so: `sub` refuses a change that would not
-fit (BUSY, above). A **record** is `u8 kind ‖ u32 day ‖ ep`, `day` being the UTC day of the change:
-kind 1, a registration, followed by `enc(endpoint, p256dh, auth, tks)`, `tks` being the `tk` that it keeps, in
-ascending order, one after another; kind 2, a refresh; kind 3, a deletion. `JR_BYTES` leaves room for the largest
-registration (an endpoint of 1024 bytes, 256 bells, a quiet tag and a note tag). A change waits for the journal from the
-moment it takes effect in memory, and stops waiting once a row holds it or the daily pass writes it. Every row is as
-long as every other and sealed under a fresh nonce, and one is written at the first run of every minute while push is
-on, whether or not a change waits; no run writes the row of a minute that is already written, whichever start of the
-object wrote it.
-
-Before the first call or run after a start, the object reads the journal back. It takes the latest row that opens under
-its minute, looking back at most 48 hours and no further than the start of the day that `meta` holds, then each row
-that the `prev` of the last one names, within the same bounds, until one does not open; and it applies their records
-oldest first, as `sub` and a deletion at a push applied them, except a record whose day lies before the day in `meta`,
-which that day's pass has written. A refresh applies only to an endpoint that is stored. A row that does not open (a
-minute that no run wrote, a row of two days before, or one sealed under an earlier `PUSH_KEY`) ends the walk.
-
-**The daily pass** is the only writer of `sub` and `tok`. A pass starts at the first run of each UTC day (normally the
-one at 00:00), and at the first run after the object starts unless `meta` holds that day, and goes through the stored
-endpoints and those with a change in memory in ascending order of `ep`, a part at each run, until it has gone through
-all of them; the part that goes through the last of them also sets `meta` to the day, in its transaction, when push is
-on and the object read the journal back in full at its start. A pass that could not (push off, or a read-back that
-failed) leaves `meta` as it is: the next start then reads back the records that this pass never saw, which a later day
-in `meta` would make it skip.
-
-- It deletes every endpoint whose day lies more than `PUSH_EXPIRY` = 30 days before today, its day being that of its
-  change in memory when it has one (today's included), else its stored `day`; so a refresh in memory always keeps its
-  endpoint. While push is on, it also deletes every stored endpoint whose `box` does not open under the current
-  `PUSH_KEY`; while push is off, it deletes by day only.
-- It writes every change in memory made on an earlier UTC day (a deletion; a registration, with its `box` and bells;
-  or a refresh, the new `day` alone), which then leaves memory. Changes made today wait for the next day's pass.
-
-A run's part reads, writes and deletes at most `PUSH_ROWS` rows and never splits an endpoint's rows; the next run
-continues after the last `ep` that it committed. A part whose transaction fails changes nothing: its changes stay in
-memory, and the next run tries that part again. The position of a pass lives in memory, so after a restart the pass
-that the first run starts goes through every endpoint again from the lowest `ep`, and finds done what earlier parts
-committed; of the changes read back from the journal, it writes again those that they had written. The order of `ep`,
-a keyed hash, keeps the parts of a pass from following the order in which the changes
-were made. So a run's work stays bounded however much expires or changes on one day: with `PUSH_ROWS` = 20 000, the
-worst day, on which all `PUSH_MAX_SUBS` endpoints expire with 256 bells each and a full day of changes is written
-(about 27 million rows), takes about 1 400 runs, some 4 hours.
-
-**Sending a push.** For a due endpoint, the run or `flush` that sends it takes the endpoint and its keys from its
-registration, opening `box` for a stored one. When the `box` does not open, when a Web Push endpoint's host is no
-longer in `PUSH_HOSTS`, or when an APNs endpoint's topic is no longer in `APNS_TOPICS`, it deletes the endpoint
-instead; when the endpoint's transport is off, it drops the push (as after a failed retry, below) and keeps the
-endpoint. Otherwise it sends one request of the endpoint's transport, never following a redirect (`fetch` with
-`redirect: "manual"`). Every push carries the
-endpoint's **bells block**: its `rang` at the time of the attempt, 16 bytes per bell, followed by zero bytes up to
-`16·PUSH_BELLS` = 64 bytes (all zero in a quiet push). A push of a native transport (APNs, FCM) also carries the **notes
-block**: the endpoint's notes at the time of the attempt, newest first, 552 bytes each, followed by zero bytes up to
-`552·PUSH_NOTES` = 2 208 bytes. The two blocks, 2 272 bytes, keep each push within the 4 096 bytes that APNs and FCM
-accept. A Web Push message carries no notes block: a Web Push endpoint never takes notes (§10.10).
+**Sending a push.** For each push that `due` answered, the Worker opens the endpoint's `box`. When it does not open,
+when a Web Push endpoint's host is no longer in `PUSH_HOSTS`, or when an APNs endpoint's topic is no longer in
+`APNS_TOPICS`, it reports `gone` instead; when the endpoint's transport is off, it reports the push dropped and keeps
+the endpoint. Otherwise it sends one request of the endpoint's transport, never following a redirect (`fetch` with
+`redirect: "manual"`), and reports the answer as `sent` says above. Every push carries the endpoint's **bells block**:
+its `rang` at the time of the attempt, 16 bytes per bell, followed by zero bytes up to `16·PUSH_BELLS` = 64 bytes (all
+zero in a quiet push). A push of a native transport (APNs, FCM) also carries the **notes block**: the endpoint's notes
+at the time of the attempt, newest first, 552 bytes each, followed by zero bytes up to `552·PUSH_NOTES` = 2 208 bytes.
+The two blocks, 2 272 bytes, keep each push within the 4 096 bytes that APNs and FCM accept. A Web Push message carries
+no notes block: a Web Push endpoint never takes notes (§10.10).
 
 **Web Push**: one Web Push message (RFC 8030), `POST <endpoint>`, with:
 
@@ -2788,7 +3115,7 @@ message and names no sender or count. Its bells tell the device alone, once the 
   by the next one, as `Topic` does for Web Push;
 - `authorization: bearer <JWT>`: a JWT signed with ES256 under `APNS_KEY`, with the header
   `{"alg":"ES256","kid":"<APNS_KEY_ID>"}` and the claims `iss` (`APNS_TEAM`) and `iat` (seconds since the Unix epoch).
-  PushDO makes a new JWT at most once every 20 minutes and uses each for at most 50 minutes, the bounds that APNs sets;
+  the Worker makes a new JWT at most once every 20 minutes and uses each for at most 50 minutes, the bounds that APNs sets;
 - `content-type: application/json` and this body, where `<c>` is the unpadded b64u (3 167 characters) of the bells block
   followed by the notes block, encrypted to the endpoint's keys as RFC 8291 says (`aes128gcm`: a fresh P-256 key pair
   and a random 16-byte salt per push, one record, record size 4096):
@@ -2824,7 +3151,7 @@ It is a data message: it names no notification, and the app's messaging service 
 (§11.13). The access token comes from Google's OAuth 2.0 token endpoint, `POST https://oauth2.googleapis.com/token`
 with the JWT bearer grant (RFC 7523), for a JWT signed with RS256 under `FCM_KEY` with the claims `iss` (`FCM_EMAIL`),
 `scope` (`https://www.googleapis.com/auth/firebase.messaging`), `aud` (`https://oauth2.googleapis.com/token`), `iat`
-and `exp` (at most one hour after `iat`); PushDO reuses it until five minutes before it expires.
+and `exp` (at most one hour after `iat`); the Worker reuses it until five minutes before it expires.
 
 A **quiet push** to FCM has `"priority":"NORMAL"`, `"ttl":"600s"` and `"collapse_key":"segv-note"` in place of the three
 values above. FCM delivers it at once to a device that is awake, and holds it while the device sleeps, keeping only the
@@ -2833,33 +3160,51 @@ of the other pushes, so it never replaces one of them. The app shows nothing for
 
 Every push of a transport thus has the same fixed text, every quiet push the same headers, and the encrypted part of
 every push of a transport the same length; no push carries the text of a message, a sender or a count. The answer
-decides the rest:
+decides what the Worker reports (`sent`, above):
 
-- a 2xx: the push is sent; `last` = when it was sent, `tries = 0`, and `rang` and `rows` become the bells and rows of
-  the request's `later`. When a ring came while the request was out, and `seen` has not emptied the rows of `later`
-  since, a push of them is due as `ring` step 2 would make it due now:
-  `due = max(now + PUSH_HOLD·1000, last + PUSH_WINDOW·1000) + j`, with j drawn afresh, which is
-  `last + PUSH_WINDOW·1000 + j` since a request takes at most 10 s. Otherwise nothing is due;
-- a 429, a 5xx, a network error, no answer within 10 s, or, for FCM, a failed request for its access token: retry once
-  (`tries = 1`), after the answer's `retry-after` when that is at most 60 s, else after 10 s; when the retry fails as
-  well, drop the push (`last` = its first attempt, then `rang`, `rows` and what is due as after a 2xx), and keep the
-  endpoint;
+- a 2xx: `sent`;
+- a 429, a 5xx, a network error, no answer within 10 s, or, for FCM, a failed request for its access token: `retry`,
+  with the answer's `retry-after`;
 - an answer that refuses the device: for Web Push anything else, a 3xx or any 4xx other than 429 (404 and 410 for a
   subscription that expired or was revoked, 400, 401, 403, 413); for APNs a 410, or a 400 whose reason is
   `BadDeviceToken` or `DeviceTokenNotForTopic`; for FCM a 404 (`UNREGISTERED`), or a 403 whose error code is
-  `SENDER_ID_MISMATCH`: delete the endpoint, so that an endpoint that its push service no longer accepts is gone at
-  its first push;
+  `SENDER_ID_MISMATCH`: `gone`, so that an endpoint that its push service no longer accepts is deleted at its first
+  push;
 - any other answer of APNs or FCM (a 3xx, or a 4xx other than these and 429), which comes from the operator's
-  configuration rather than from the device: drop the push and keep the endpoint.
+  configuration rather than from the device: the push is dropped and the endpoint kept.
 
 A quiet push is never retried and changes neither `last` nor what rings made due: after any answer it is no longer due,
 and an answer that refuses the device deletes the endpoint as above.
 
 A dropped push is reported only as a count in the logs (§9.7).
 
-**Capacity.** One PushDO holds every registration in stage 1, within the limits above, and sends at most about 50
-pushes a second, quiet pushes included; a flood of registrations or rings can fill it or delay everyone's notifications
-(§0.4). §14 has the path beyond it.
+**Expiry.** A Cron Trigger runs the Worker once a day. It lists the `e/` keys of the store, with their metadata only,
+and for the endpoints whose `d` lies more than `PUSH_EXPIRY` = 30 days before today puts messages on the push queue,
+each naming at most 64 of them (their `ep`) and today to their owner's QuietDO (`o` gives the owner). The consumer calls
+**`expire(eps, day)`** there, which deletes, as `sub` step 1 does, each endpoint whose record that object holds is
+still its own and still lies more than `PUSH_EXPIRY` days before `day`: a device that registered again since the
+listing keeps its registration. A run lists at most 50 pages of 1 000 keys and then puts the listing's cursor (and
+today) on the queue, whose consumer lists on from there in the same way, so no invocation runs unbounded, and one that
+is stopped loses nothing it queued; a message that fails is retried, and what is still left goes with the next day's
+run, which lists from the start. It runs whether push is on or off, and never reads a `box`.
+
+**Restarts and memory.** The object stores nothing, so a restart (an eviction or a deploy) loses only what memory held:
+the pushes then due, marks, recent rows, notes and its caches; the registrations are in the store, and the next call
+reads them back. A QuietDO keeps its records and its bells in caches bounded by an estimate of their bytes, about 32 MB
+each, holding each stored value as one buffer (the least recently used go first; a key whose change waits for its write
+never goes), and at most 32 768 push states (an idle one goes for a new one; when none is idle, a ring reaches no new
+endpoint there until one is), so that it stays well within an isolate's 128 MB however many endpoints a deployment
+has; `PUSH_SHARDS` spreads them further. Due pushes are kept in time order, pushes in flight, idle states and marks in
+the order in which they expire, and states by account, so that a call looks only at what it changes, and expired
+entries are swept at most once a second. A record that is not the object's own, or no record, is read from the store
+again at the next change, since another object may write it meanwhile.
+A change of `PUSH_SHARDS` moves accounts to other objects at the next deploy, which read them from the store; the
+pushes then due are lost, as at a restart.
+
+**Capacity.** The store holds any number of registrations; proof of work and `RL_WRITE` bound how fast they come. A ring
+costs one store read per bell, which no object bounds, and one `ring` per QuietDO its endpoints fall in, so the
+QuietDOs take about 1 000 rings a second (§9.1) times `PUSH_SHARDS`. The Worker sends in parallel, so no object bounds
+the pushes a second. Nothing runs while nothing happens: no alarm, no pass.
 
 ## 10. HTTP and WebSocket API
 
@@ -2876,7 +3221,7 @@ pushes a second, quiet pushes included; a flood of registrations or rings can fi
   alike: the 421 of host pinning (§9.7), the 503 `server misconfigured`, the router's 404 and 405, and every non-101
   answer of `/api/v2/rt` (426, 403, 429, 503). The header is set on the response object the Worker returns, after any
   `caches.default` lookup, and is never stored in `caches.default` (§9.7). The one exception is the `101` WebSocket
-  upgrade of `/api/v2/rt`, which the RealtimeDO returns with immutable headers; the Worker passes it on unchanged, and
+  upgrade of `/api/v2/rt`, which the ConnDO returns with immutable headers; the Worker passes it on unchanged, and
   HELLO carries the server time instead (§10.8). `x-segv-now` (and params `now`) is the Worker's `Date.now()` taken
   when it starts handling the request, before any cache lookup or DO call: the same value it uses for era bounds and
   the PoW window. Clients take clock samples **only from responses whose `cache-control` is `no-store`**, and from
@@ -3046,8 +3391,8 @@ The Worker:
    stored. A client MUST treat this 503, like any 5xx, network error or timeout, as "outcome unknown" and resolve each
    row by probing its slot (§11.3 step 6); a HIT with its own body is its own write.
 5. Signs a receipt for every OK.
-6. Publishes OK rows that carry a topic to the RealtimeDO through `ctx.waitUntil` (one `publish` call, at most one
-   retry). Publishing never delays or changes the response.
+6. Publishes OK rows that carry a topic to the FeedDOs of their topics (`feed(T)`, §4.4) through `ctx.waitUntil` (one
+   `publish` call per FeedDO, at most one retry each). Publishing never delays or changes the response.
 
 Clients MUST verify receipts against the pinned `srvKey` and keep the receipts of their own rows for the session.
 
@@ -3065,8 +3410,18 @@ status   = u8 0 (HIT)     | u32 t | u8 cls | [body[CLASSES[cls] + 40] if mode = 
 
 The Worker groups keys by `(E, shard)` for the DO calls and answers in request order. Keys with `E < E_FIRST` get
 `MISS(sealed = 1)` and keys with `E > era(now + SKEW)` get NO_ERA, both without a DO call (§9.7).
-`MISS(sealed = 1)` is final: era E can no longer gain that row. If any ShardDO `get` call throws, the Worker answers
-503 `{error: "storage unavailable"}` with `retry-after: 5` for the whole request.
+`MISS(sealed = 1)` is final: era E can no longer gain that row. If any ShardDO `get` call throws for a reason other
+than paging (below), or a read of a paged shard's files fails, the Worker answers 503 `{error: "storage unavailable"}`
+with `retry-after: 5` for the whole request.
+
+**Paged shards.** A ShardDO that has been paged (§9.1 "Paging") throws `shard: paged` instead of answering; the Worker
+then answers its keys from the shard's files in R2. It remembers per isolate which shards it found paged, and looks
+for a shard's manifest before the DO call once the era is sealed by its clock. It verifies the manifest (`sig` under
+`SRV_SK`, `era`, `shard`, and `sbits = s_E` of the shard map: a manifest that fails is 503 `storage unavailable`),
+reads the bucket of each key (`bucket(v)`: one Range read of `idx`) and finds the label there: HIT(t, cls) and, in
+body mode, the row at `off` in `rows` (one Range read of `17 + CLASSES[cls] + 40` bytes, whose `label` and `cls` MUST
+match the key's and the entry's), else MISS(sealed = 1): the manifest is complete, so the answer is as final as the
+DO's. The budget below applies as to any other answer.
 
 **Response budget.** The Worker MUST then walk the keys in request order with a budget of 4 194 304 bytes (4 MiB) of
 HIT bodies:
@@ -3086,18 +3441,20 @@ it never ends a dense prefix) and MUST ask for the key again in a later request.
 ### 10.5 Inbox
 
 `POST /api/v2/inbox` (binary; PoW `inbox`, priced by the body length; `RL_INBOX`, one token per request; body =
-exactly `7 + 1432·count` B, at most 45 831 B):
+exactly `3 + 1436·count` B, at most 45 955 B):
 
 ```
-request  = u16 E | u32 bucket | u8 count (1..32) | (eid[16] | body[1416]) × count
+request  = u16 E | u8 count (1..32) | (u32 bucket | eid[16] | body[1416]) × count
 response = 200, JSON {"results": [{"rel": <u32>} | {"error": "conflict"} | {"error": "full"}, …]}     same order
 ```
 
-One request carries the invites of one delivery burst (§6.12), so a 32-member creation needs one request, not 31.
-Errors:
+Each row names its recipient's bucket of E (§5.3, §10.6). One request carries the invites of one delivery burst
+(§6.12), whatever their buckets, so a 32-member creation needs one request, not 31: the Worker hands each bucket's
+rows to its InboxDO together, and answers in request order. Errors:
 
-- 400: `bucket ≠ 0` in stage 1, a bad count, or a bad length.
-- 409: `{error: "wrong era", era}` when E is not accepted (§9.3, §9.7).
+- 400: a `bucket` at or above `2^{β_E}` (§9.3), a bad count, or a bad length.
+- 409: `{error: "wrong era", era}` when E is not accepted (§9.3, §9.7) by any of the objects called (the rows the
+  others accepted are returned again by a retry: posts are eid-idempotent).
 - Per row: `conflict` (the eid is taken with another body) and `full` (the day cap).
 
 `GET /api/v2/inbox/{E}/{bucket}?after=<rel>&limit=<1..1024, default 1024>` (binary; `RL_READ`):
@@ -3116,7 +3473,7 @@ that holds no row with `rel > after` is a failed read.
 Errors, checked in this order before any cache lookup, rate limit or DO call (`E_now = era(Worker now)`):
 
 1. 400 for a path whose E is above 0xFFFE or whose bucket is not a u32;
-2. 400 for `bucket ≠ 0`;
+2. 400 for a `bucket` at or above `2^{β_E}` (§9.3);
 3. 400 for `E > era(now + SKEW)`;
 4. 410 for `E < E_now − 3`, also when E is below `E_FIRST`;
 5. 404 for `E_now − 3 ≤ E < E_FIRST`;
@@ -3128,13 +3485,18 @@ Cache rules:
 
 - A 200 response for an era whose InboxDO has persisted `ended` (§9.3) and that has `more = 0` is immutable
   (`public, max-age=31536000, immutable`).
-- Every other 200 response is `public, max-age=Δin`: the current era, a past era whose InboxDO has not yet persisted
-  `ended` (normally the SKEW seconds after `end(E)`), and any response with `more = 1`.
+- Every other 200 response is `public, max-age=m`, with `m` the whole seconds from the Worker's `now` to the end of
+  the slot it reports, `T0 + (closed + 1)·D`, at least 1 and at most Δin: the current era, a past era whose InboxDO
+  has not yet persisted `ended` (normally the SKEW seconds after `end(E)`), and any response with `more = 1`. A
+  response expires with the slot it reports, so a read made on an INBOX notice (sent `SKEW + 1` s after the slot
+  closed, §9.3) is not served from before the close.
 - The Worker serves every inbox read from `caches.default` when present, before the rate limiter (§9.7). Entries are
   keyed by the canonical `(E, bucket, after, limit)` (an absent `after` is 0 and an absent `limit` is 1024), and each
   200 response is stored with its own `cache-control`. Every row up to the reported `closed` is final, so a response
-  at most Δin old is still correct; most clients poll with the same `after` (the last `closed`), and §11.5 step 3's
-  `2·Δin` margin covers the cache age.
+  at most Δin old is still correct; the clients that read on the same notice use the same `after` (their last
+  `closed`), so once a colo has stored a response the others are served from it, and §11.5 step 3's `2·Δin` margin
+  covers the cache age. Reads that reach a colo before its first response is stored all go to the InboxDO; the
+  clients' random delay (§10.8) keeps those few.
 
 ### 10.6 Directory (JSON)
 
@@ -3147,7 +3509,8 @@ Cache rules:
 - Every failed check is 400: shape, size, canonical form, handle, `bundleSig`, `checkUserKeys`, a record `uid` that
   differs from the bundle's, a repeated id, a bad `recordSig`, and 0 or more than 4 wraps. 409 is only for a handle or
   uid that is already registered.
-- It writes the user, the wraps and the dirlog entries atomically (§9.6).
+- It appends the dirlog entries atomically, then writes the user and the wraps (§9.6: the request answers 200 only
+  once its rows landed, and rows that a failure leaves behind land from the DirSeqDO's write-ahead log).
 - On success: 200 `{"dirseq": n}`, where n is the dirlog seq of the user entry (kind 1), i.e. the user's `dirseq` in
   lookups; its wrap entries take the following seqs n+1 … n+w in request order.
 
@@ -3155,8 +3518,8 @@ Cache rules:
 
 - Body `{"record": text, "sig": b64u}`.
 - The server checks, in this order: body and record shape, size and canonical form (400); unknown uid (404);
-  `recordSig` under the uid's registered bundle key (400); the cap of 64 records per uid, counted in the same D1
-  snapshot as the dirlog head (400 when the uid already has 64); then the insert, where a duplicate `(uid, id)` is 409.
+  `recordSig` under the uid's registered bundle key (400); the cap of 64 records per uid, counted by the DirSeqDO
+  before the write (§9.6; 400 when the uid already has 64); then the insert, where a duplicate `(uid, id)` is 409.
   A request that is both over the cap and a duplicate therefore answers 400.
 - On success: 200 `{"dirseq": n}`, the seq of the wrap's dirlog entry.
 - A client MUST NOT take a 400 or a 409 as proof that its record is stored. After a network error, a timeout or a
@@ -3197,7 +3560,12 @@ Cache rules:
   time (then a MEMBER record is written, §7.3). Commits and J deliveries take every other `kemPk` from the bundles
   (§5.4, §6.12).
   Restores and catch-ups use MEMBER records and make no lookup for known members (§11.4).
-- Response: `{"p": p, "users": [{"uid", "handle", "bundle", "sig", "regEra", "dirseq"}], "more": bool}`.
+- Response: `{"p": p, "users": [{"uid", "handle", "bundle", "sig", "regEra", "dirseq", "inbox"}], "more": bool}`, where
+  `inbox` is `[{"E": E, "g": g}, …]` for `E = E_now − 3 .. E_now + 1` within `E_FIRST..0xFFFE`, `g =
+  bucket(E, handle)` (§9.3): the user's inbox bucket of each era a reader reads (§11.5) or a sender posts into. A sender
+  takes a recipient's bucket from here (§6.12 step 2: from its entry, looked up by uid prefix when the session holds
+  none, and again, fresh, when the entry does not cover the era), and a reader takes its own from
+  `GET /api/v2/dir/uid/{uid}`.
 - Clients MUST verify every bundle they use (`verifyBundle`, `checkUserKeys`, `uid` and `handle` match), filter
   locally, and compare with their CONTACT and MEMBER pins (§7.3).
 - **Transient failures.** Only a complete answer (every page fetched, the last with `more = false`) that lacks the
@@ -3214,8 +3582,8 @@ Cache rules:
   complete is retried, or fails the operation with that error; it never makes a handle unknown (§6.1 step 1, §6.3) or a
   member unknown (§11.2), and a join that needs the lookup is parked (§6.7).
 
-**`GET /api/v2/dir/uid/{uid}`** is the exact lookup of one user. Clients use it only for their own account.
-Response: `{"user": {…} }`, or 404.
+**`GET /api/v2/dir/uid/{uid}`** is the exact lookup of one user, in the same shape (`inbox` included). Clients use it
+only for their own account: at unlock, and for their own inbox buckets (§11.5). Response: `{"user": {…} }`, or 404.
 
 **`GET /api/v2/dir/wraps/{id}[?uid=<b64u>]`** returns `{"wraps": [{"uid", "record", "sig", "dirseq"}]}`:
 
@@ -3233,6 +3601,8 @@ value out of range → 400. While the dirlog is empty, `head` is `{"seq": 0, "h"
 
 - The Worker checks, in this order (§10.1): the rate limit; Content-Length (411 without it, 400 when malformed, 413
   over 12 MiB, 400 below 41 bytes); the PoW, priced by the declared Content-Length.
+- The registry of the id is shard `blobShard(id)` (§4.4, §9.2); every BlobReg call below goes to it, and a call that
+  throws (the shard found the id routed elsewhere: `BLOBREG_SHARDS` changed) is 503 `storage unavailable`.
 - If BlobReg already has the id, respond `201 {"id", "size", "t"}` with the registered values, without reading the
   body (the Worker cancels it).
 - Otherwise, if R2 already holds `b/{id}` with a stored SHA-256 equal to the id (an earlier upload was stored but never
@@ -3269,7 +3639,7 @@ The upgrade is refused:
 - with 403 when an `Origin` header is present, its host differs from the request host, and it is not an app origin
   (`APP_ORIGINS`, §9.7).
 
-The Worker forwards only `{upgrade, x-segv-client: hex(HMAC(wsTagKey, "ws|" + clientKey))[0..32]}` to the RealtimeDO.
+The Worker forwards only `{upgrade, x-segv-client: hex(tag(ck))}` (§4.4) to the client's ConnDO, `conn(ck)`.
 
 **Client → server.** Each binary frame is ≤ 8 KiB.
 
@@ -3294,35 +3664,56 @@ ROWS    = 0x81 | u16 n (1..65535) | (u64 seq | topic[16] | u16 E | label[16] | u
 GAP     = 0x82 | u64 since_seq                                    rows published after since_seq may have been missed
 RESUMED = 0x83                                                    the replay for RESUME is complete
 NOTE    = 0x84 | topic[16] | note[552]                            a sync note for one of the socket's topics (§11.16)
+INBOX   = 0x85 | u16 E | u32 g | u32 rel                          slot rel of inbox bucket g of era E closed with rows (§9.3)
 ```
 
 The server MUST NOT send a ROWS frame with `n = 0`; a client treats one as unparseable (close and reconnect, as for
 any frame it cannot parse). A ROWS frame holds rows in ascending `seq`. The server starts a new frame before a row
 that would push the frame's rows above 512 KiB, counting each row as `47 + len(body)` bytes (its encoding); one row
-(at most 16 471 B) always fits. A publish is one put of at most 16 rows, so it always fits one frame.
+(at most 16 471 B) always fits. A `deliver` (§9.4) carries the rows of one put that share a FeedDO, at most 16, so it
+always fits one frame; a put whose rows belong to several FeedDOs reaches a socket in several frames, in any order
+between them.
 
 **RESUME.** The server replays only if all of these hold:
 
-- `boot` equals the server's boot;
+- `boot` equals the ConnDO's boot (a client whose rate-limit key changed, on another network, reaches another ConnDO,
+  whose boot differs);
 - `since_seq ≤` the last assigned `seq`;
 - the ring still holds every row with `seq > since_seq`;
+- every topic of the RESUME's set is in the ConnDO's interest (§9.4: held by another socket, or lingering after the
+  client's own socket closed) with `from ≤ since_seq`, before the RESUME's set is installed: only then did every row
+  on it after `since_seq` reach the ConnDO. A topic that was withdrawn after `since_seq` fails this even when it has
+  entered the interest again, since `seq` was advanced past the withdrawal;
 - the rows to replay (those with `seq > since_seq` whose topic is in the RESUME's set) take at most 2 MiB
   (2 097 152 B), counting `47 + len(body)` per row.
 
 It then sends them in ascending `seq` as ROWS frames (none when `since_seq` equals the last assigned `seq`), then
 RESUMED. Otherwise it sends `GAP(since_seq)` and no row. In both cases the RESUME's topic set is installed. Sequence
-numbers are per boot and strictly increasing, so rows published in the same millisecond are never skipped. A GAP only
-costs a catch-up (§11.6), never a lost row.
+numbers are per boot and strictly increasing, so rows published in the same millisecond are never skipped; a number
+that a withdrawal took is never a row's. A GAP only costs a catch-up (§11.6), never a lost row.
 
 **Client behaviour.**
 
-- Keep the highest `seq` received, or HELLO's `seq`.
+- Keep the highest `seq` received, or HELLO's `seq`. After a GAP, take the `seq` of that socket's HELLO: the
+  catch-up the GAP starts covers every row before it, and a client that keeps an older `seq` would get GAP at every
+  later RESUME until a row reaches it.
 - Subscribe to at most 256 topics per socket and use at most 2 sockets per tab, in priority order: `Tself`, the
-  current epochs of accepted copies by recent activity, followed old epochs (§11.2), then links. Request copies are
-  never subscribed (§11.5). Copies beyond the budget are covered by catch-up (§11.6).
+  inbox notice topics (below), the current epochs of accepted copies by recent activity, followed old epochs (§11.2),
+  then links. Request copies are never subscribed (§11.5). Copies beyond the budget are covered by catch-up (§11.6).
 - On reconnect, send RESUME, and SUB any further topics.
 - Send NOTES on every socket: right after its RESUME, or as its first frame when it sends none. On a NOTE frame for
   `Tself`, apply the note (§11.16); ignore a NOTE frame for any other topic.
+- Subscribe, on the first socket and right after `Tself` in priority, to the notice topics `Tinbox(E, g_E)` (§9.3) of
+  the eras `E_now − 1`, `E_now` and `E_now + 1` that lie in `max(E_FIRST, E_now − 3)..0xFFFE`, with `g_E` the
+  account's own bucket of E (from its directory entry, §10.6, §11.5; an era whose bucket is not known yet is left out
+  until it is), and recompute that set at least every 300 s (the era changes once a week). On an INBOX frame for one
+  of them, poll the inbox (§11.5) after a delay drawn uniformly from `[0, max(0, Δin − SKEW − 2)]` seconds (6 s in
+  production); an INBOX frame that comes while such a poll waits joins it instead of starting another. When the poll's
+  read of an era it was for reports `closed < rel`, poll once more after Δin. Ignore an INBOX frame for any other
+  bucket. Every online device of the bucket gets the same notice at the same moment, `SKEW + 1` s after the slot
+  closed (§9.3); the delay spreads their reads over the rest of that slot, where every read reports the same `closed`
+  and a response stays in the edge cache until the slot ends (§10.5), so that a colo sends the InboxDO only the reads
+  that arrive before its first response is stored, instead of all of them at once.
 - After GAP, run catch-up (§11.6). After a SUB of a topic that was not subscribed before, run a one-shot probe of that
   topic's expected slots, since rows published before the SUB are not replayed.
 - Reconnect with backoff of 1 s, doubling to 30 s, with jitter. After a close with 1008 or 1013, wait at least 60 s and
@@ -3343,14 +3734,16 @@ costs a catch-up (§11.6), never a lost row.
 
 ```json
 {"v":2, "now":<ms>, "T0":1767639600000, "eraMs":604800000, "era":<E_now>, "delta":Δ, "skew":SKEW,
- "inboxSlot":Δin, "inboxRetention":4, "inboxDayCap":2000, "inboxBatch":32, "shards":1, "p":P, "efirst":E_FIRST,
+ "inboxSlot":Δin, "inboxRetention":4, "inboxDayCap":2000, "inboxBatch":32, "shards":S_E_now, "inboxBuckets":2^β_E_now,
+ "p":P, "efirst":E_FIRST,
  "kcommit":"<b64u kcommit_E_now>", "srvKey":"<b64u Ed25519 pk>",
  "pow":{"register":20,"wrap":18,"put":16,"inbox":18,"blob":18},
  "limits":{"putRows":16,"putBytes":263345,"getKeys":256,"topics":256,"blobMax":12582912,"textMax":12000}}
 ```
 
 `p` is `P` as §9.6 says; during a D1 outage it may be a stale value or 0, and params never fails because of D1.
-Clients bound it from below by the dirlog size (`P*`, §10.6).
+Clients bound it from below by the dirlog size (`P*`, §10.6). `shards` is `S_{E_now}` (§9.1) and `inboxBuckets` is `2^{β_{E_now}}`
+(§9.3): a client needs them for nothing and accepts any value in 1..65536.
 
 A deployment whose push is on (§9.8) also reports `"push":{"window":60,"maxTokens":256}` and `pow.push`, and in `push`
 the transports that are on: `"vapid":"<b64u 65-byte P-256 public key>"` while Web Push is on, `"apns":["<topic>", …]`
@@ -3362,14 +3755,14 @@ integer, or that comes without `pow.push`, as no push; a native app does the sam
 does not list its bundle ID, or an `fcm` that is not its project.
 
 **`GET /api/v2/era/{E}`** (JSON; `RL_READ`) returns `{"era": E, "start": start(E), "end": end(E), "delta": Δ,
-"shards": 1, "kcommit": b64u(kcommit_E), "sealed": bool}`. `start` and `end` (§3.1) are Unix milliseconds, the unit of
+"shards": S_E, "inboxBuckets": 2^{β_E}, "kcommit": b64u(kcommit_E), "sealed": bool}`. `start` and `end` (§3.1) are Unix milliseconds, the unit of
 params `T0` and `now`; `delta` is in seconds. The Worker answers it alone and MUST NOT address any Durable Object for
 it. `E > era(now + SKEW·1000)` or `E < E_FIRST` → 404 (§9.7); a malformed E → 400. `sealed = (now ≥ end(E) +
 SKEW·1000)` by the Worker's clock: by the SKEW bound no component of era E accepts a write from then on, so every field
 is final, and a response with `sealed = true` is `public, max-age=31536000, immutable`; any other is `no-store`.
 `sealed` is informational: it does not mean that the ShardDO has persisted `state = sealed`, and clients MUST NOT use
-it as the finality of a key (only `MISS(sealed = 1)`, §10.4, is). Publishing `kroute_E` for sealed eras belongs to
-stage 2 (paging, §14) and is not part of stage 1.
+it as the finality of a key (only `MISS(sealed = 1)`, §10.4, is). `kroute_E` of a sealed era is published by the
+manifests of its shards (§9.1 "Paging", `/api/v2/seal/{E}/{i}` below), never by the era info.
 
 **`GET /api/v2/ckpt/latest`** returns `{"q", "sec", "hd", "C", "sig", "heads": [{"cid", "head"}]}` (binary fields in
 b64u). 404 when there is none yet.
@@ -3396,7 +3789,8 @@ response = u8 more | u32 nb | batch × nb
 batch    = u32 t | u32 n | root[32] | head[32] | (label[16] | u8 cls | body[CLASSES[cls]+40]) × n     rows ordered by label
 ```
 
-A page holds the closed batches with `t > after`, ascending: whole batches while the sum of their encodings stays
+An `i` at or above `S_E` (§9.1) is 404, like an era outside `E_FIRST..era(now + SKEW·1000)`. A page holds the closed
+batches with `t > after`, ascending: whole batches while the sum of their encodings stays
 ≤ 4 MiB (4 194 304 B), and always at least one when one exists. An empty page is `more = 0, nb = 0`. `more = 1` iff
 another closed batch follows the page. Batches are never split, so a page whose first batch alone exceeds 4 MiB holds
 only that batch and is as large as it; the Worker streams such a page, pulling the batch's rows from the DO in
@@ -3418,12 +3812,23 @@ that took the shard's whole write capacity for a Δ. Page composition is determi
 the response ends abnormally: it is truncated, never altered. Feed readers MUST reject a page whose bytes end before its
 `nb` batches and their `n` rows are complete, and fetch it again.
 
+A paged shard's page (§9.1 "Paging") is served from R2: the Worker composes it from the shard's `batches` table by the
+same rule and sends the 5-byte header followed by one Range of `rows`, so the page is, byte for byte, the one the
+ShardDO served; a ShardDO that answers `shard: paged` is read that way from then on. The tokens, the cache rule and
+the streaming of a page above 4 MiB are the same.
+
 Rows of a batch are strictly ascending by label (bytewise). A feed consumer recomputes each batch's `root` over the rows
 in the order received, and `head` from the previous batch, so misordered rows fail that check and decoders need not
 check the order. Every head in a checkpoint was obtained through `head()`, which closes a due batch first, so its batch
 is already in the feed; the feed may hold later batches. Auditors check that each checkpointed `shard/{E}/{i}` head
 occurs in the feed's head chain (not that it is the last head). Clients never use the feed. It exists so that the
 database stays public and mirrors and auditors can verify batch roots and the head chain against checkpoints.
+
+**`GET /api/v2/seal/{E}/{i}`** (JSON; `RL_READ`) is the manifest of a paged shard (§9.1 "Paging"), as stored, and is
+`public, max-age=31536000, immutable`. 404 `{error: "not paged"}` (`no-store`) while the shard has no manifest (not
+paged yet, or sealed without rows); an `E` outside `E_FIRST..era(now + SKEW·1000)` or an `i ≥ S_E` is 404 like a
+feed's. Clients never use it. It exists for auditors and mirrors: `kroute_E` of the sealed era, the batch table, and the
+hashes of the files whose bytes `/api/v2/feed/{E}/{i}` serves.
 
 ### 10.10 Push: `POST /api/v2/push/sub`, `POST /api/v2/ring` and `POST /api/v2/seen`
 
@@ -3452,22 +3857,27 @@ its bells, replacing everything that endpoint had:
   APNs and FCM are reached at fixed hosts only (§9.8), so neither form lets a client choose where the server sends.
 - `p256dh` is 65 bytes, an uncompressed P-256 point on the curve (`0x04 ‖ x ‖ y`), and `auth` is 16 bytes: the
   subscription's `getKey("p256dh")` and `getKey("auth")`, or a native app's own push keys (§11.13).
-- `tokens` holds 0 to `PUSH_TOKENS` = 256 bells of 16 bytes; a repeated bell counts once. An empty list deletes the
-  endpoint's registration.
-- `quiet`, which may be absent, is 16 bytes: the account's quiet tag `Qself` (§4.1). An endpoint registered without
-  one gets its pushes whatever its account marks seen (a tab still open on an earlier release sends none).
+- `tokens` holds 0 to `PUSH_TOKENS` = 256 bell secrets `s` of 16 bytes (§4.1), one per copy of the registration set
+  (§11.13); a repeated secret counts once. The endpoint is registered under their bells, `bell(s)`, which the Worker
+  computes. An empty list deletes the endpoint's registration.
+- `quiet` is 16 bytes: the account's quiet tag `Qself` (§4.1). Every device of an account registers it, so all the
+  account's endpoints are owned by one QuietDO, which alone writes their keys and their bells' (§9.8). It MAY be absent
+  only when `tokens` is empty (a tab still open on an earlier release deletes without one): the Worker then takes the
+  endpoint's owner from its record's metadata (§9.8), and a deletion of an endpoint that has no record changes
+  nothing.
 - `notes`, which may be absent, is `true` or `false` (absent: `false`): whether the endpoint also takes its account's
-  sync notes, in quiet pushes (§9.8, §11.13). `true` is allowed only with `quiet` and with an APNs or FCM endpoint: a
+  sync notes, in quiet pushes (§9.8, §11.13). `true` is allowed only with an APNs or FCM endpoint: a
   browser must show a notification for every push (`userVisibleOnly`), and a quiet push shows none.
 
-A body that breaks any of these rules, or holds another key, is 400. Otherwise PushDO replaces the endpoint's
-registration as a whole and refreshes it (§9.8), and the answer is 204 with no body, also when a bell whose 8 places
-other endpoints hold was left out. For a new endpoint while PushDO holds `PUSH_MAX_SUBS` endpoints, and for a new
-or changed registration while it holds the day's changes of `PUSH_DAY_SUBS` other endpoints (§9.8), the answer is 503
-`{error: "push full"}` with `retry-after: 3600`; for a change that the journal's next row cannot hold (BUSY, §9.8), 503
-`{error: "push busy"}` with `retry-after: 60`; and for a failed PushDO call 503 `{error: "storage unavailable"}` with
-`retry-after: 5`. Knowing an endpoint is what allows replacing or deleting its registration: only the device, its push
-service and the operator know it (§13.4).
+A body that breaks any of these rules, or holds another key, is 400. Otherwise the Worker reads the owner that the
+endpoint's record names (§9.8). When the record names another owner than the request's (another account registers the
+same endpoint, as a second account on the same browser or phone does), the old owner's QuietDO first deletes the
+registration (`drop`), taking the endpoint out of that account's bells; then the request's owner's QuietDO replaces the
+endpoint's registration as a whole and refreshes it (§9.8). The answer is 204 with no body, also when a bell whose 8
+places the account's other endpoints hold was left out; for a failed call, a failed read of the record or a write
+that the store refused (§9.8), 503 `{error: "storage unavailable"}` with `retry-after: 5`, after which no record names
+a bell that the store lacks. Knowing an endpoint is what allows replacing or deleting its registration: only the
+device, its push service and the operator know it (§13.4).
 
 **`POST /api/v2/ring`** (binary; `RL_RING`; no PoW; body ≤ 1044 B) asks the server to notify the devices registered
 under some bells, about a row stored in the last minute:
@@ -3482,20 +3892,23 @@ through `ctx.waitUntil`:
 
 1. it goes on only if `max(E_FIRST, era(now − (RING_FRESH + Δ + SKEW)·1000)) ≤ E ≤ era(now + SKEW·1000)`, with
    `RING_FRESH` = 60 s;
-2. it reads the row with one ShardDO `get` of `(E, label)` in exists mode (§9.1), and goes on only for a HIT whose
+2. it reads the row with one `get` of `(E, label)` in exists mode, from the ShardDO (§9.1) or, once the shard is
+   paged, from its files in R2 (§10.4), and goes on only for a HIT whose
    stored time, which is rounded down to Δ (§3.1), satisfies `t + Δ ≥ sec(now) − RING_FRESH`; a MISS, sealed or not,
    ends it;
-3. it calls PushDO's `ring(E, label, tokens)` (§9.8), which ignores a ring of the same row and bells within
-   `RING_DEDUP`;
-4. when PushDO answers a time, at most `RING_WAIT` = 20 s, which `waitUntil` allows, it waits that long and then calls
-   PushDO's `flush()` (§9.8), so that the push goes out at its `due` rather than at PushDO's next alarm run.
+3. it reads from the store the endpoints registered under each bell (`b/` of its keyed hash, §9.8), and calls `ring`
+   on the QuietDO of each endpoint found, which ignores a row that rang the same endpoint within `RING_DEDUP`;
+4. for each QuietDO that answers a time: when it ends within `RING_WAIT` = 15 s of the answer, which leaves
+   `waitUntil` room for one round of sending, it waits that long and then calls `due` and sends what it answers (§9.8
+   "Sending a push"); otherwise, and for whatever is due after that round, it puts a message naming that QuietDO on the
+   push queue with that delay, and sends from the message when it comes (§9.8 "The Worker's part").
 
 A failure in these steps is logged (§9.7) and changes nothing else. The answer thus never depends on whether a bell is
 registered, whether the row exists or was rung before, or how long these steps take, so a member learns nothing about
 other members' devices from it. A ring needs no proof of work: it needs the `(E, label)` of a row stored in the last
 minute, such as the one its sender has just put (any fresh row serves), and `RL_RING` bounds the rings per address.
-What rings can cause is bounded by PushDO: one ring per row and set of bells, and at most one push per endpoint per
-`PUSH_WINDOW`, except across a restart of PushDO, which empties its memory (§9.8).
+What rings can cause is bounded by the QuietDOs: one push per endpoint and row, and at most one push per endpoint per
+`PUSH_WINDOW`, except across a restart of a QuietDO, which empties its memory (§9.8).
 
 **`POST /api/v2/seen`** (binary; `RL_SEEN`; no PoW; body ≤ 306 B) tells the server that a device of an account has
 shown some rows while it was in use, so that no device of that account is notified of them (§11.13):
@@ -3506,15 +3919,15 @@ request = u8 ver (= 1) | qS[16] | u8 n (1..16) | (u16 E | label[16]) × n       
 
 A body whose `ver` is not 1, whose `n` is out of range or whose length is not `18 + 18n` is 400; a repeated row counts
 once. Once a request has passed steps 1–8 of §10.1, the Worker answers **204** with no body, and only then, through
-`ctx.waitUntil`, computes `Q = t16(H(enc("segv.sh/v2/quiet", qS)))` and calls PushDO's `seen(Q, rows)` (§9.8). A
+`ctx.waitUntil`, computes `Q = t16(H(enc("segv.sh/v2/quiet", qS)))` and calls `seen` on the account's QuietDO (§9.8). A
 failure is logged (§9.7) and changes nothing else. The answer thus never depends on whether `Q` is registered, or on
 the rows.
 
-- **Who can mark.** Only the account's devices know `qS` (§2.1, §4.1). A member of a conversation can compute every
-  bell of it (§4.2) but not `qS`, so it cannot keep another member's devices from being notified; neither can a third
+- **Who can mark.** Only the account's devices know `qS` (§2.1, §4.1). A member of a conversation knows every
+  bell of it (§11.13) but not `qS`, so it cannot keep another member's devices from being notified; neither can a third
   party who read a row's `(E, label)` in the public feed.
-- **Why the secret.** A request carries `qS`, while `push/sub` registers its hash `Qself` and PushDO stores only a
-  keyed hash of that (§9.8): whoever learns a registration, from a leak of PushDO's storage and `PUSH_KEY`, or from a
+- **Why the secret.** A request carries `qS`, while `push/sub` registers its hash `Qself` and the store holds only a
+  keyed hash of that (§9.8): whoever learns a registration, from a leak of the store and `PUSH_KEY`, or from a
   logged `push/sub` body, still cannot mark rows for the account. Any secret sent to the server is known to O, which
   can withhold any push anyway (§13.4).
 - **What a mark can do.** It only cancels or prevents pushes to the account's own endpoints, for the rows it names,
@@ -3531,8 +3944,9 @@ request = u8 ver (= 1) | qS[16] | topic[16] | note[552]          585 bytes
 ```
 
 A body whose `ver` is not 1 or whose length is not 585 is 400. Once a request has passed steps 1–8 of §10.1, the Worker
-answers **204** with no body, and only then, through `ctx.waitUntil`, calls RealtimeDO's `note(topic, note)` (§9.4) and,
-while push is on, computes `Q = t16(H(enc("segv.sh/v2/quiet", qS)))` and calls PushDO's `note(Q, note)` (§9.8). A
+answers **204** with no body, and only then, through `ctx.waitUntil`, calls `note(topic, note)` on the topic's FeedDO
+(§9.4) and, while push is on, computes `Q = t16(H(enc("segv.sh/v2/quiet", qS)))` and calls `note` on the account's QuietDO
+(§9.8). A
 failure is logged (§9.7) and changes nothing else. The answer never depends on whether a socket or an endpoint gets the
 note.
 
@@ -3541,7 +3955,7 @@ note.
 - **Who can send.** A device sends its account's `qS` and `Tself` (§4.1), which only the account's devices know, and O,
   which sees them in `seen`, `sync` and SUB frames. The note is sealed under `kN` (§11.16), which the server never sees,
   and a note that does not open is dropped by every device: whoever sends a request with the account's secrets but not
-  its key only wakes the account's devices, within `RL_SYNC` and PushDO's limits.
+  its key only wakes the account's devices, within `RL_SYNC` and the QuietDO's limits.
 - **What it tells.** The server cannot read a note, and every note has the same length. It learns that a device of the
   account sent one at that moment, from that IP, and that `Tself` and `Qself` belong to one account (§13.4).
 
@@ -3565,7 +3979,8 @@ time (§6.3 step 5) use the injectable clock.
      "the public keys registered for your account do not match your passkey's keys".
    - Otherwise take `handle` and `regEra` from the response.
 3. Load and verify checkpoints (§12.3).
-4. Restore (§11.4), open the realtime socket, and start the inbox poll.
+4. Restore (§11.4), open the realtime socket, which subscribes to the inbox notices (§10.8), and start the catch-up
+   loop (§11.6).
 
 After `register`, the client writes its first self row: a HEADS record (`c = 0`) whose cursor is the registration
 cursor of §11.5, taken once from the register response's `x-segv-now` and kept by every retry of the write, so its
@@ -3577,8 +3992,8 @@ than `regEra` (§7.3).
 | item | contents |
 | ---- | -------- |
 | identity | `(conv, root)`, `rootBy`, `confirmed`, `request` |
-| epochs `e → {EK, keys, D, H(D), bundleId, E_start, …}` | For each lane ℓ: the dense-prefix position, the processed position, the last valid row (for `prev`/`prevh`), and the rows seen. For the control lane: the position `(E_c, cnt_c)`, the evaluated rows and their e-validity (valid, not valid, undecided), the winning claim with its finality and processing state, and the sealed eras observed. Also the set of members who left in e, each with its kept source (§6.9): the stored time of the LEAVE row it comes from and, when e is that row's epoch, the row's position (NONE for a leave carried into e), kept in LEFT records (§7.3). |
-| current epoch | `removed` (the copy has **ended**: the final winning claim of its current epoch removed or dropped self; latched, §6.6 step 3), `left` (the copy's leave is current, §6.9), `frozen` (with its cause, for the warning text: own entry not opened, or `D'` invalid; §6.6 steps 4 and 6) |
+| epochs `e → {EK, keys, D, H(D), bundleId, E_start, …}` | For each lane ℓ: the dense-prefix position, the processed position, the last valid row (for `prev`/`prevh`), the rows seen, and the lane's latest BELL row (its member's bell, §11.13). For the control lane: the position `(E_c, cnt_c)`, the evaluated rows and their e-validity (valid, not valid, undecided), the winning claim with its finality and processing state, and the sealed eras observed. Also the set of members who left in e, each with its kept source (§6.9): the stored time of the LEAVE row it comes from and, when e is that row's epoch, the row's position (NONE for a leave carried into e), kept in LEFT records (§7.3). |
+| current epoch | `removed` (the copy has **ended**: the final winning claim of its current epoch removed or dropped self; latched, §6.6 step 3), `left` (the copy's leave is current, §6.9), `frozen` (with its cause, for the warning text: own entry not opened, or `D'` invalid; §6.6 steps 4 and 6), and the generation of the copy's bells (§4.1, §11.13) |
 | followed lanes | the lane of epoch c−1 of each member silent in c (below) |
 | messages | message list (each message with its reactions, and the REACTION rows that wait for their target, §11.12), `unread`, `lastTs` |
 
@@ -3632,10 +4047,10 @@ The client also keeps:
   - the next 2 control slots of every epoch whose winner is not yet final and processed;
 - the self-lane and inbox cursors, and the processed positions of every lane.
 
-### 11.3 Send (TEXT / IMAGE / FILE / REACTION / LEAVE / WELCOME)
+### 11.3 Send (TEXT / IMAGE / FILE / REACTION / BELL / LEAVE / WELCOME)
 
-Sends are serialized per conversation. The UI echo appears at once, with status `sending` (none for LEAVE, WELCOME
-and REACTION). A REACTION has no echo: wherever this section marks an echo `failed`, a REACTION's send fails with the
+Sends are serialized per conversation. The UI echo appears at once, with status `sending` (none for LEAVE, WELCOME,
+BELL and REACTION). A REACTION has no echo: wherever this section marks an echo `failed`, a REACTION's send fails with the
 same error instead, nothing keeps its body, and it is not retried (the user reacts again).
 
 1. Re-check the session. Probe the control lane of the current epoch e as §6.5 says (its next 2 slots, and slot 0 of
@@ -3729,8 +4144,10 @@ same error instead, nothing keeps its body, and it is not retried (the user reac
    does. The row counts as delivered only if the copy is then still in e, or in e+1 with no valid row of self in e+1
    (so the others still follow self's lane of e). Otherwise, or if the probe fails or the wait times out: a TEXT,
    IMAGE or FILE echo becomes `failed` with the same "not delivered" error, and its retry builds the message again in
-   the current epoch; a REACTION's send fails with that error; a LEAVE is put again in the current epoch by the rule of
-   §6.9 (its record for the late row stays, since that row exists); a WELCOME's uid stays pending (§6.12 step 4). A
+   the current epoch; a REACTION's send fails with that error; a BELL is done either way (its row exists, and §11.13
+   posts another in the current epoch when self's lane there has none); a LEAVE is put again in the current epoch by
+   the rule of §6.9 (its record for the late row stays, since that row exists); a WELCOME's uid stays pending (§6.12
+   step 4). A
    member that did see the late row then sees the message twice.
 
 **Retry of a failed echo.** "Try again" first runs steps 1–3. While the copy is still in the body's epoch, it re-puts
@@ -3851,7 +4268,10 @@ the device left off, and otherwise from the server alone, as below.
      records name (§7.3: per member the record with the least key), each decided by §6.8 with the record's time and
      position, as its LEAVE row would be, when a claim of that epoch or a later one is processed; a LEAVE found here is
      applied as a live one is (§6.9: it replaces the kept source only when its key is smaller), and the switch to a
-     later epoch carries the leaves over (§6.6 step 4). Rows applied during restore never count as unread.
+     later epoch carries the leaves over (§6.6 step 4). The bells of the HEADS epoch's members are those its BELLS
+     record gives (§7.3), taken as if read at the entry's lane positions, and so is the generation of the account's
+     own bell; a BELL row processed from those positions on replaces them (§11.13). An epoch without a HEADS entry
+     starts with no bell known, and its lanes' BELL rows tell them. Rows applied during restore never count as unread.
    - **Frozen copies** re-derive their freeze from the control lane and the bundle (§6.6). The freeze itself posts
      nothing (LEAVEs that §6.9 repeats are still put).
    - **Unfinished deliveries** (§6.11), and LEAVEs that §6.9 repeats.
@@ -3886,8 +4306,8 @@ the device left off, and otherwise from the server alone, as below.
    `Tlink` of each live link.
 10. If more than 200 self records were applied since the snapshot, or there is no snapshot in `max(E_now, regEra)`,
     write a snapshot (§7.4; nothing defers it). Write HEADS when positions advanced (§7.3).
-11. **Notifications.** If this device has notifications on, send its registration set, and write the notification
-    cache when its preview is not `none` (§11.13).
+11. **Notifications.** Post the BELL rows that §11.13 calls for. If this device has notifications on, send its
+    registration set, and write the notification cache when its preview is not `none` (§11.13).
 
 Requests are paced to `RL_READ`: on 429 the client waits for `retry-after` and continues where it stopped.
 
@@ -3944,24 +4364,35 @@ keys (8 `get` requests) plus at most 4 800 history rows (about 1.4 MB at class 0
 and no `blob/meta` request when no epoch changed since HEADS, no request has moved past its root epoch (its later epochs
 are re-derived on every restore, above), a TREG, REQUEST or EPOCH_PENDING names every copy's bundle, and every copy that
 has ended has its ENDED record, as from the first snapshot written after the upgrade on (before it, one per copy joined
-by an earlier version, up to 100 here, all to the single BlobRegDO, on each restore until that snapshot, normally only
+by an earlier version, up to 100 here, each to its id's registry shard, on each restore until that snapshot, normally only
 the first one, whose step 10 writes it). With ENDED records an ended copy costs its lanes' probe keys, and one claim row
 when its history is loaded; a copy that ended before the upgrade from the first release costs the claim once more, on
 each restore until a HEADS row or snapshot holds its ENDED record, normally only the first.
 
 ### 11.5 Inbox poll and requests
 
-The client polls every `max(inboxSlot, 2)` seconds while the page is visible, on reconnect, and after unlock.
+A **poll** is one read of the inbox, below. The client polls on an INBOX notice for a bucket it watches, after the
+random delay of §10.8, at every catch-up (§11.6: on reconnect, then every 300 s while the realtime socket is up and
+every 10 s while it is down), and after unlock (§11.4 step 7). Nothing polls at the slot cadence: a notice follows a
+post within `2·Δin + SKEW + 1` s (the row's slot with its jitter, then the notice, §9.3) and the poll follows the
+notice within `max(0, Δin − SKEW − 2)` s (29 s in all in production), near what polling every Δin gave, at one
+read per notice instead of one per slot per client, most of them served by the edge cache (§10.5).
 
 1. Let `(Ec, rc)` be the cursor. For each era E from `max(Ec, E_now − 3)` to `era(server now)` (from params or
-   `x-segv-now`): `GET …/inbox/{E}/0?after=a` until `more = 0`, with `a = rc` for `E = Ec` and `a = 0` for every later
-   era. A 410 moves the cursor to `(max(E_FIRST, E_now − 3), 0)`. Without a cursor (the self lane holds no HEADS
-   record), start at the registration cursor with `t_r = start(regEra)` (below).
-2. Trial-decrypt each row (§5.3), in chunks in a Web Worker, so the page stays responsive. A decapsulation that throws
-   means "not for me". A worker that fails (an `error` or `messageerror` event, as when its script does not load) or
-   leaves a chunk unanswered for 30 s is terminated. Its waiting chunks, and every later chunk of the session, are
-   then decrypted on the page's thread, yielding to the event loop between chunks, so a failed worker never stops a
-   poll. Process each J (§6.7). Joins found in one poll are processed one after the other, each after
+   `x-segv-now`): `GET …/inbox/{E}/{g_E}?after=a` until `more = 0`, with `g_E` the account's own bucket of E and
+   `a = rc` for `E = Ec` and `a = 0` for every later era. The account's buckets come from its own entry
+   (`GET /api/v2/dir/uid/{uid}`, §10.6: the lookup of §11.1 step 2 already gives them; it is made again when an
+   era's bucket is not known, once the era moved on); while a bucket stays unknown the poll
+   fails like a transient error (and the era's notice topic is not subscribed, §10.8). A bucket is a function of the
+   era and the handle, so the cursor needs no bucket. A 410 moves the cursor to `(max(E_FIRST, E_now − 3), 0)`.
+   Without a cursor (the self lane holds no HEADS record), start at the registration cursor with `t_r = start(regEra)`
+   (below).
+2. Trial-decrypt each row (§5.3, with the bucket it was read from), in chunks in a Web Worker, so the page stays
+   responsive. A decapsulation that throws means "not for me". A worker that fails (an `error` or `messageerror`
+   event, as when its script does not load) or leaves a chunk unanswered for 30 s is terminated. Its waiting chunks,
+   and every later chunk of the session, are then decrypted on the page's thread, yielding to the event loop between
+   chunks, so a failed worker never stops a poll. Process each J (§6.7). Joins found in one poll are processed one
+   after the other, each after
    the held copies of its conversation are caught up and settled (§6.7 step 4). A J of a conversation of which an
    earlier J of the same poll created a copy is parked, with the cursor before it, until the next poll, when that copy
    is held and settled (§6.7 step 4): so an honest sequence of re-adds, each after a removal
@@ -4069,6 +4500,9 @@ Rows on a slot in the expected map that fail decryption occupy the slot: the cli
 an undecryptable message" and advances.
 
 **On a NOTE frame** (§10.8) for `Tself`, the client applies the note (§11.16); it ignores one for any other topic.
+
+**On an INBOX frame** (§10.8) for a watched bucket, the client polls the inbox (§11.5) after the random delay of
+§10.8, one poll for the frames that come while it waits.
 
 **Catch-up** runs:
 
@@ -4333,9 +4767,9 @@ decrypts itself.
   native app deletes its push keys and gives up its token, with `unregisterForRemoteNotifications()` for APNs and
   `deleteToken()` for FCM, so that the push service refuses later pushes), then send the endpoint with an empty set, and
   delete the notification cache (below); `logout` also turns the setting off, so the next account that signs in on that
-  browser or app starts with notifications off. In this order, a tab closed between the two steps, or a deletion that a
-  restart of PushDO loses (§9.8), leaves registered only a subscription or token that has ended, which PushDO deletes at
-  its first push; in the other order it would leave a live one registered, and the next account on that browser or app
+  browser or app starts with notifications off. In this order, a tab closed between the two steps, or a deletion that
+  fails, leaves registered only a subscription or token that has ended, which the server deletes at its first push
+  (§9.8); in the other order it would leave a live one registered, and the next account on that browser or app
   would get the previous one's notifications for up to 30 days.
 - **A native app's push keys** stand for a Web Push subscription's: a P-256 key pair and 16 random bytes that the
   app makes on the device, registered as `p256dh` (the public key, uncompressed) and `auth` (§10.10), with which its
@@ -4348,43 +4782,70 @@ decrypts itself.
   becomes `none`.
 - **The registration set** of a device holds, for each copy that is not a request, has not ended, whose leave is not
   current (§6.9), whose `rootBy` is self or a contact (§7.3), and that the account has not muted (CONV_PREFS, §7.2; a
-  mute ends at its `until`, and the device then registers again), the bell `B_c(ℓ)` of self's lane ℓ in the copy's
-  current epoch c; frozen copies are included. It
-  holds no bell of an earlier epoch (senders ring those, below), none of a request, and none of another live copy whose
-  `rootBy` is neither self nor a contact (§11.5), so a conversation started by someone who is not a contact never rings
-  before the user accepts it or self sends a TEXT, IMAGE, FILE or REACTION in it (either makes `rootBy` a contact,
-  §11.5). When the set has more than `push.maxTokens` bells, it holds those of the copies with the newest `lastTs`.
+  mute ends at its `until`, and the device then registers again), the account's bell secret in the copy, `s(conv, g*)`
+  (§4.1), where `g*` is the generation of self's latest BELL row among the held epochs of the current generation
+  ("Bells", below) when there is one; else, while the current epoch started its generation, that of self's latest
+  BELL row among the held epochs of the previous generation when there is one (senders still ring that bell); else
+  the current generation. Frozen copies are included. It holds no secret of a request, and none of another live copy
+  whose `rootBy` is neither self nor a contact (§11.5), so a conversation started by someone who is not a contact never
+  rings before the user accepts it or self sends a TEXT, IMAGE, FILE or REACTION in it (either makes `rootBy` a
+  contact, §11.5). When the set has more than `push.maxTokens` secrets, it holds those of the copies with the newest
+  `lastTs`.
 - **Registering.** `POST /api/v2/push/sub` (§10.10) with the whole set, and with `quiet` = `Qself` (§4.1), replaces
   the endpoint's registration. A native app also sets `notes` when its preview is `name` or `message` and its handler
   can show nothing for a push: on iOS and macOS only with the notification filtering entitlement
   (`com.apple.developer.usernotifications.filtering`), on Android always, since a quiet push is a data message of normal
   priority. Its handler then gets the account's sync notes (§11.16) while the app is closed. A device sends it when the
-  set changes (an epoch switch, a join, an accepted request, a new contact, a leave, an ended copy, a mute, or a preview
-  change that turns `notes` on or off), at most once per Δ (changes within Δ go together); after each restore (§11.4
+  set changes (a new generation of a copy's bell, a join, an accepted request, a new contact, a leave, an ended copy,
+  a mute, or a preview change that turns `notes` on or off), at most once per Δ (changes within Δ go together); after each restore (§11.4
   step 11); and at least once per 24 hours while the session runs, so that a registration in use never reaches its
-  expiry, and one that a restart of PushDO lost or reverted (§9.8) comes back within a day. Each time, it first reads
+  expiry, and one that the server lost comes back within a day. Each time, it first reads
   `pushManager.getSubscription()`: when the endpoint differs from the one it last registered, it sends the old endpoint
   with an empty set before the new one; when the subscription is gone, or was made with another `applicationServerKey`
   than `push.vapid`, it sends the old endpoint with an empty set and subscribes again (or, where the browser needs a
   user gesture for that, shows the setting as off). A native app reads its current token instead, and when the token,
   and so the endpoint, changed, it sends the old endpoint with an empty set before the new one. A failed request is
-  retried with backoff (1 s, doubling to 10 minutes), never sooner than its `retry-after` (a minute after "push busy",
-  an hour after "push full"); a 404 means that the deployment no longer offers push: the device calls `unsubscribe()`
+  retried with backoff (1 s, doubling to 10 minutes), never sooner than its `retry-after`; a 404 means that the deployment no longer offers push: the device calls `unsubscribe()`
   (a native app gives up its token and deletes its push keys) and shows the setting as off.
 - **Ringing.** After each successful put of a TEXT, IMAGE or FILE row (§11.3 step 6: an OK with a verified receipt, a
-  CONFLICT with its own body, or a probe that finds its own body), also a late one (§11.3 step 8), the sender sends
-  one `POST /api/v2/ring` (§10.10) for the row's `(E, label)` with these bells, e being the send's epoch: `B_e(ℓ)` for
-  every lane `ℓ ≠ from` of `D_e`; and, when the copy holds e − 1, `B_{e−1}(ℓ′)` for each member of both `D_{e−1}` and
-  `D_e` other than self of whom the copy has seen no valid row in e (§11.2), ℓ′ being its index in `D_{e−1}`. With no
-  bell nothing is sent. The sender rings every such lane, whether or not its member turned notifications on, which the
-  sender does not know. It does not wait for the answer, and the send's outcome never depends on it; after a network
-  error, a timeout or a 5xx it sends the same request once more, within Δ, and never otherwise. Nothing else rings: no
-  WELCOME, CLAIM, LEAVE or REACTION row, no self row, no inbox invite and no link hello.
-- **Why the previous epoch.** A device that is closed while the epoch changes keeps the bell of the epoch it last
-  saw registered until it is opened and processes the change. Senders ring that bell while its member has posted
-  nothing in the new epoch, and stop once a device of that member has, or once the epoch changes again. A member
-  removed at the change knows the old bells and can watch them for as long as any continuing member stays silent,
-  learning when messages are sent and by which of the silent members (§13.4).
+  CONFLICT with its own body, or a probe that finds its own body), also a late one (§11.3 step 8), the sender sends one
+  `POST /api/v2/ring` (§10.10) for the row's `(E, label)` with these bells, e being the send's epoch: for each member of
+  `D_e` other than self, the bell of that member's latest BELL row among the held epochs of e's generation ("Bells",
+  below); or, when e started its generation, the device has loaded e − 1 and the member is in `D_{e−1}`, the bell of its
+  latest BELL row among the held epochs of e − 1's generation; a member with neither is not rung. With no bell nothing
+  is sent. The sender rings every such member, whether or not it turned notifications on, which the sender does not
+  know. It does not wait for the answer, and the send's outcome never depends on it; after a network error, a timeout or
+  a 5xx it sends the same request once more, within Δ, and never otherwise. Nothing else rings: no WELCOME, CLAIM, LEAVE
+  or REACTION row, no self row, no inbox invite and no link hello.
+- **Bells.** A member's bell in a conversation is what its latest BELL row says (§3.3, §4.1). The **generation** of an
+  epoch e of a copy is the latest epoch at or below e that **started a generation**: the copy's root epoch, and every
+  epoch whose `D` lacks a member of the previous epoch's (§4.1). An epoch whose previous epoch the device has not loaded
+  (one below the start of its restore, §11.4 step 5, until the history reads it, §11.10) also counts as a start: the
+  device cannot tell from it whether anyone was dropped, and a start it adds only gives a new bell, which no removed
+  member knows. The epochs of one generation form a run, and a member posts its bell once per epoch. A device posts a
+  BELL row on self's lane in the current epoch c of each copy that the registration set would hold if the device had
+  notifications on and the copy were not muted (above: a live copy that is not a request, has not ended, whose leave is
+  not current and whose `rootBy` is self or a contact; frozen copies included), when params carry `push` and self's lane
+  in c has no BELL row that the device has seen or put. The row carries `g` = c's generation and `bell(s(conv, g))`; it
+  is put as §11.3 says, after a random delay of up to `BELL_DELAY` = 60 s from when the device found the lane without
+  one (so that P cannot easily pair the members' rows with the claim, §13.1, and the members learn the moment the device
+  processed the epoch only to within about a minute, §13.4), with no echo, and counts toward nothing: no unread, no
+  `lastTs`, no system line, no ring. A put that fails is tried again at the next catch-up. Every device of the account
+  posts the same row, so a sibling's row on the lane counts as the device's own, and a device adopts the `g` of self's
+  latest BELL row even when it is not the one it would have posted. For every lane of every held epoch the device keeps
+  the lane's latest BELL row (the member's bell and `g`), replaced by a later row of the lane; a restore seeds those of
+  its HEADS epoch from the BELLS record (§7.3, §11.4 step 5). The row is posted whether or not the device has
+  notifications on, so the other members cannot tell from it whether it has.
+- **Why the previous generation.** A device that is closed while a member is removed keeps the old bell registered
+  until it is opened and posts the new one. Senders ring that bell while its member has posted no bell in the new
+  generation, and stop once a device of that member has, or once the epoch changes again. A member removed at the
+  change knows the old bells and can ring them meanwhile, which makes the silent members' devices show notifications,
+  at most one per device per `PUSH_WINDOW`, and tells it nothing: the answer to a ring is the same whatever it reaches
+  (§10.10), and the removed member is not in the new epoch's `D` (§13.4). Additions, renames and rotations that drop
+  nobody start no generation: the bell stays, so a device closed across them keeps being notified by the members that
+  hold its row. A member that joins holds no epoch below its join epoch, so it knows only the bells posted from then
+  on: a member whose devices have all stayed closed since the join is not rung by the joiner's messages until one of
+  them posts its BELL row, while the members that hold its earlier row keep ringing it.
 - **The notification cache.** While notifications are on, the preview is `name` or `message` and the device keeps its
   session, the client keeps a cache for the notification handler (below), sealed with AEAD under a device key that
   cannot be exported, and never sends it anywhere. A browser keeps it in the origin's storage, under a non-extractable
@@ -4392,7 +4853,7 @@ decrypts itself.
   app is closed (on iOS and macOS in the app group that the app shares with its extension, on Android in the app's own
   storage), under a device key that the system's key store holds (the Keychain, shared with the extension and
   readable once the device has been unlocked after a restart; the Android Keystore). For each
-  copy whose bell is in the registration set it holds that bell, the copy's `ref` (below), the name that the client
+  copy of the registration set it holds the copy's bell (`bell(s)` of its secret, §4.1), the copy's `ref` (below), the name that the client
   shows for it, its mute (CONV_PREFS, §7.2), whether the client counts it as unread (§11.8) and the time of its newest
   notification; and it holds `kN` (§11.16). With `message` it also holds the copy's current epoch c, `conv`, `mk_c`,
   `rk_c`, self's lane index, the `sigPk` of each member of `D_c` and the handle that the client shows for it, and for
@@ -4492,7 +4953,7 @@ decrypts itself.
   was stored recently enough to have rung (`t + Δ ≥ sec(now) − RING_FRESH`, §10.10): it sends `POST /api/v2/seen`
   (§10.10) with `qS` and the rows, gathering the rows of up to 1 s, at most 16 per request. It does not wait for the
   answer; after a network error, a timeout or a 5xx it sends the same request once more, after 1 s, and never otherwise.
-  PushDO then sends no push for those rows to any endpoint registered with `Qself`, the marking device's own included,
+  The server then sends no push for those rows to any endpoint registered with `Qself`, the marking device's own included,
   unless the push has already gone (each waits at least `PUSH_HOLD` = 5 s after its ring, §9.8). A device marks nothing
   else: no row while it is not in use, no row that it applies at a restore or finds older than that, and nothing at all
   while no row comes, so the server never learns when a device is in use apart from the moments at which rows reach it
@@ -4510,7 +4971,7 @@ decrypts itself.
 - **Apps without push.** A native app without a push transport (a desktop app on Windows or Linux, or one on macOS
   that does not use APNs, §11.14) registers no endpoint and gets no push. It MAY still notify while it runs, also with
   its window closed: for each TEXT, IMAGE or FILE row of another member that reaches it (§11.6) while it is not in use,
-  in a copy whose bell its registration set would hold, it shows the notification that the handler would show for that
+  in a copy that its registration set would hold, it shows the notification that the handler would show for that
   copy with the device's preview (step 2, with step 3's text when the preview is `message`), at most one per copy per
   `PUSH_WINDOW`. It sends nothing for this, and learns nothing of its account's marks, so it notifies also of rows that
   another device of the account shows (§0.4), and closes those notifications when a sync note says that the copy was
@@ -4767,7 +5228,7 @@ Stage 1 defines no client UI for them.
 
 ### 12.6 Not detected in stage 1 (see §13.2)
 
-The checkpoint chain commits to shard batch heads, inbox slots, blob registrations (hourly) and the directory log. But
+The checkpoint chain commits to shard batch heads, inbox slots, the registry's hourly value and the directory log. But
 clients verify **no inclusion proofs**, so:
 
 - O can omit rows from some clients;
@@ -4792,23 +5253,28 @@ are kept. Critical warnings are kept until sign-out.
 | linkage | P / P\* (public archive, public API) | O (operator, direct TLS) | M (member) | N (push service) |
 | ------- | ------------------------------------ | ------------------------ | ---------- | ---------------- |
 | message ↔ sender | None: no sender column, the signature is inside the AEAD, writes are anonymous. Only Δ-rounded `t` and the class. | The writer's IP for every put, which with an IP-to-account match (unlock, own-bundle lookup) gives the account. | Verifiable, not deniable. | — |
-| message ↔ recipients | None for rows. Inbox invite: one of all users (β = 0), even against a quantum P. | Exactly, through the socket's topic set and the labels each client fetches. | The member list. | — |
-| message ↔ message (same conversation) | No identifiers. Rows in the same Δ batch and rare classes are visible. With S = 1 and low traffic, timing correlation is strong. | Exactly: same topic, same IP. | Everything. | — |
+| message ↔ recipients | None for rows. Inbox invite: one of all users while an era has one bucket, even against a quantum P. With buckets (§9.3), one of the invite's bucket, about `N_E / 2^{β_E} ≥ K` users: the bucket is public, and so is every user's bucket of `E_now − 3 .. E_now + 1` in the directory's prefix pages (§10.6), so a P\* that reads the directory while the era is listed knows the users of each bucket. `kbucket_E` keeps that map out of the public archive (directory answers are `no-store`) and ends it with the key, nothing more. | Exactly, through the socket's topic set and the labels each client fetches; an invite's bucket, which O can compute from any handle anyway. | The member list. | — |
+| message ↔ message (same conversation) | No identifiers. Rows in the same Δ batch and rare classes are visible. With few shards and low traffic, timing correlation is strong. | Exactly: same topic, same IP. | Everything. | — |
 | user ↔ conversation | None. The directory reveals that the account exists and when it registered (the client's `ts`, and the minute through the dirlog head in checkpoints). | The topic set and fetch pattern per socket / IP, linked to the uid at unlock. | Co-members of shared conversations. | — |
 | user ↔ user | None. Global inbox counts per slot are public. | The whole social graph, including a p-bit prefix of every handle and co-member lookup (§13.2 item 10). | Co-members only. | — |
-| activity of a user | Directory events (registration, wrap additions); the size of the global inbox; self rows (one after each own creation, commit, join or leave, and at most one HEADS row per 30 minutes while active), which P cannot tell from other rows except by timing. Per-user send volume is not visible. | Per-IP read and write volume and times; online time; topic sets; with a `message` preview, when each such device receives a push, also while the app is closed (§13.4); from sync notes, when a device of the account changes its read state or a setting (§13.4). | Send times in shared conversations. | When each of its devices that turned notifications on is notified (§11.13), and when a native device that takes notes gets a quiet push, that is, when another device of its account changed its read state. |
-| activity of a conversation | Not directly: rows have uniform labels. | Exact per-topic volume and times. | Everything. After removal: only that a claim happened, its `rm` bits and its cuts; with push, also, through the old bells, when messages are sent in the new epoch and which of the members silent there sends them, until they all post there or the epoch changes again (§13.4). | — |
-| membership changes and creations | Both show the same row pattern: a class-1 self row, one class-1 row at least Δ+SKEW later (claim or decoy, which P cannot tell from a medium text), then J deliveries and one class-1 self row (DELIVERED, padded for any number of recipients, §6.12); at most hourly, that some blob was registered. Members who receive J by inbox add that many inbox rows within seconds, while a removal or rotation adds none, so P can tell "someone was invited by inbox" from "nobody was" (§13.2 item 12). Not the member count, not who. No self rows follow a claim observed by other members, and a freeze writes nothing. | Which IPs fetch the bundle blob, so the members. | The members of e+1 see D′. Every member of e, removed ones included, sees `rm` (who of the old members was dropped). | — |
+| activity of a user | Directory events (registration, wrap additions); the size of the global inbox; self rows (one after each own creation, commit, join or leave, and at most one HEADS row per 30 minutes while active), which P cannot tell from other rows except by timing. Per-user send volume is not visible. | Per-IP read and write volume and times; online time; topic sets; with a `message` preview, when each such device receives a push, also while the app is closed (§13.4); from sync notes, when a device of the account changes its read state or a setting (§13.4). | Send times in shared conversations. With push, from each member's BELL row, when that member's first device processed each epoch change, to within about `BELL_DELAY` + Δ (§11.13, §13.4). | When each of its devices that turned notifications on is notified (§11.13), and when a native device that takes notes gets a quiet push, that is, when another device of its account changed its read state. |
+| activity of a conversation | Not directly: rows have uniform labels. | Exact per-topic volume and times. | Everything. After removal: only that a claim happened, its `rm` bits and its cuts. With push it can still ring the bells of its last generation, which makes the devices of the members silent since the change show notifications until they post their new bells or the epoch changes again, and tells it nothing (§13.4). | — |
+| membership changes and creations | Both show the same row pattern: a class-1 self row, one class-1 row at least Δ+SKEW later (claim or decoy, which P cannot tell from a medium text), then J deliveries and one class-1 self row (DELIVERED, padded for any number of recipients, §6.12). Members who receive J by inbox add that many inbox rows within seconds, while a removal or rotation adds none, so P can tell "someone was invited by inbox" from "nobody was" (§13.2 item 12). Not the member count, not who. No self rows follow a claim observed by other members, and a freeze writes nothing. With push, each member whose device is open posts one class-0 row (its BELL row, §11.13) within a minute of the claim, so on a quiet server P can estimate how many members were online at the change. | Which IPs fetch the bundle blob, so the members. | The members of e+1 see D′. Every member of e, removed ones included, sees `rm` (who of the old members was dropped). With push, the members of e+1 see from each other's BELL rows when each member's first device processed the change (§13.4). | — |
 | content | The size class only (a reaction is a class-0 row, like a short text). Safe against a quantum P. | Same, plus blob uploads and fetches per IP with the blob's padded length (§3.2), which bounds the size of the image or file in it (fetches: image recipients, and the members who save a file, §8.3); with push, which puts are texts, images or files, since a ring follows them (§13.4). | Everything in epochs held. | Nothing: every push has the same length and fixed text, and the bells in it are encrypted to the device (§9.8). |
 | directory | handle ↔ uid ↔ keys, registration time, every wrap (credential ids, recovery ids). | The same, plus a p-bit prefix of every lookup, and the exact wrap id and own uid at every login. | — | — |
-| device ↔ notifications (§9.8, §11.13) | None: push data is not public. | At each `push/sub`: the IP ↔ the endpoint ↔ its bells. Stored: the endpoint ↔ keyed hashes of its bells ↔ the day of its last registration, also in the platform's 30-day storage history, in which PushDO writes a change only after its UTC day has ended, so it shows which endpoints' bells changed, and which were deleted, on which day, and on a quiet day those that changed together may be co-members (§13.4); the number of bells is about the number of conversations it is notified for. With a `message` preview, each push is followed by a `get` of the conversation's lanes from the device's IP, which links the endpoint to that IP and dates the push's arrival (§13.4). | — | That the device uses this server (the VAPID key), linked to its subscription and often to an account with the browser's vendor. |
-| message ↔ recipients' devices | None. | At each ring: the writer's IP ↔ the row ↔ the bells of the other lanes ↔ every endpoint registered under them, **offline devices included** (held in memory only, never stored). | — | When each device is notified (`PUSH_HOLD` plus up to `PUSH_JITTER` after the ring, up to `PUSH_TICK` more when no flush sends it, at most once per `PUSH_WINDOW`); comparing the times of its devices suggests which share a conversation. |
+| device ↔ notifications (§9.8, §11.13) | None: push data is not public. | At each `push/sub`: the IP ↔ the endpoint ↔ its bells. Stored: the endpoint ↔ keyed hashes of its bells ↔ the day of its last registration, in a store that keeps no history of earlier values (§13.4); the number of bells is about the number of conversations it is notified for. With a `message` preview, each push is followed by a `get` of the conversation's lanes from the device's IP, which links the endpoint to that IP and dates the push's arrival (§13.4). | — | That the device uses this server (the VAPID key), linked to its subscription and often to an account with the browser's vendor. |
+| message ↔ recipients' devices | None. | At each ring: the writer's IP ↔ the row ↔ the other members' bells ↔ every endpoint registered under them, **offline devices included** (held in memory only, never stored). | — | When each device is notified (`PUSH_HOLD` plus up to `PUSH_JITTER` after the ring, at most once per `PUSH_WINDOW`); comparing the times of its devices suggests which share a conversation. |
 | devices ↔ account | None. | The devices of one account register the same bells, so the stored registrations link them (not to the account). | — | — |
 
-Never stored anywhere: topics, WebSocket topic subscriptions, IPs, RESUME rings, rate-limit keys, arrival order
-inside a Δ batch, and inbox jitter. PushDO stores only what §9.8 lists, and never a uid, handle, conversation, topic,
-IP or sender (§0.1, §13.4). The N column applies only to devices that turned notifications on; N sees nothing of the
-others.
+Never stored anywhere: topics, WebSocket topic subscriptions (the ConnDOs' socket attachments and the FeedDOs' indexes
+live with the open sockets, §9.4), IPs, RESUME rings, rate-limit keys, arrival order inside a Δ batch, inbox jitter,
+and inbox notices (§9.3; a notice says only that a slot of a bucket holds rows, when the slot closes). The push store
+holds only what §9.8 lists, and never a uid, handle, conversation, topic, IP or sender (§0.1, §13.4). The N column
+applies only to devices that turned notifications on; N sees nothing of the others.
+
+The public data of a sealed era moves to R2 (§9.1 "Paging") and is served from there; `kroute_E` of a sealed era is
+published with it (§10.9), which links nothing: labels are independent PRF outputs and `v` is their keyed hash, so a
+public `kroute_E` only lets anyone recompute which shard and bucket a label they already know went to.
 
 ### 13.2 Properties of v1 that stage 1 weakens
 
@@ -4863,7 +5329,8 @@ Each item is a deliberate trade-off that stage 2 or 3 addresses. None is silent.
 6. **Latency.**
    - Every membership change and every creation waits at least `Δ + SKEW` (12 s in production) before it becomes
      visible to others, and the creator's first messages wait for it too.
-   - First contact by handle arrives within about `inboxSlot` plus the poll interval.
+   - First contact by handle arrives within about `2·Δin + SKEW + 1` s (the invite's slot with its jitter, then the
+     notice, §9.3): 23 s in production.
    - The first message after a leave waits for the rotation.
    - Every send costs one more `get` (the control-lane probe of §11.3 step 1), as v1's sync before every send did, and
      another when preparing the put (a slow proof of work, a frozen tab) or its answer takes long (§11.3 steps 6
@@ -4888,7 +5355,7 @@ Each item is a deliberate trade-off that stage 2 or 3 addresses. None is silent.
     anonymity set is about 64–128 accounts at honest `P` (all accounts while there are fewer than 64). The client
     bounds `p` by the public dirlog size (§10.6), so O can shrink the set only by inflating the audited dirlog.
 11. **A third party can delay first contact and inbox deliveries.** v1 had no global quota. Stage 1's inbox has one
-    global day cap (2 000, β = 0). Anyone who fills it with PoW-priced invites makes first contacts, and adds of
+    day cap per bucket (2 000; one bucket until `INBOX_MAP` raises it, §9.3). Anyone who fills it with PoW-priced invites makes first contacts, and adds of
     members without a 1:1, wait until the next day, and an attacker who refills the cap right after every day rollover
     (about 2.6·10^8 SHA-256 of PoW per day, spread over a few IPs) delays them for as long as it keeps doing so: honest
     retries back off up to 10 minutes and rarely land in the first seconds of a day. Committers retry (§6.12), and
@@ -4898,10 +5365,12 @@ Each item is a deliberate trade-off that stage 2 or 3 addresses. None is silent.
     the same `[4, 3×N]` shape, revealing N but nothing else. Stage 1 hides N, but invites by inbox are public rows: a
     change or creation followed within seconds by inbox rows probably invited someone without a 1:1, and one followed
     by none probably did not.
-13. **Capacity.** One ShardDO per era stores at most 10 GB (about 25 000 active users at the stage-1 estimate) and
-    handles about 1 000 requests/s, and one RealtimeDO and one current InboxDO take every client. When a shard fills,
-    writes fail with FULL until the next era (§9.1). These are stage-1 bounds, not protocol limits: S > 1 is a
-    parameter change because routing by `v` already exists.
+13. **Capacity.** A ShardDO stores at most 10 GB (about 25 000 active users at the stage-1 estimate) and handles
+    about 1 000 requests/s; an era has `S_E` of them (§9.1), chosen before it starts, so its capacity cannot grow
+    within the week, and one current InboxDO takes every client (the realtime path is spread over the `C` ConnDOs and
+    `F` FeedDOs of the deployment, §9.4). When every shard of an era fills, writes fail with FULL until the next era
+    (§9.1). Paging (§9.1) moves a sealed era's rows into R2 and empties its shards, so the objects hold about two eras
+    of rows at a time.
 14. **A wrong key entry freezes everyone, and a freeze with a removal stops messaging.** Two deliberate changes to v1's
     freezes (§6.6, §6.10):
     - v1 froze only the members whose invite was missing, and the others kept changing membership. Stage 1 derives
@@ -4999,32 +5468,28 @@ device of the account is in use, the rows it shows notify none of the account's 
   §10.10) and the keys its pushes are encrypted to, sealed under `PUSH_KEY`; keyed hashes of its bells
   and of its account's quiet tag, the latter twice for an endpoint that takes notes (`tk`); and the day of its last
   registration. Nothing about a ring, a mark or a note is stored: which endpoints a message reached, and which rows an
-  account marked seen, live in PushDO's memory only, for at most a few minutes (§9.8). Bells are PRF outputs under keys
-  that only members hold (§4.2), and their stored hashes are keyed under `PUSH_KEY`, so the stored data links no
-  conversation or account to another, except that the devices of one account hold the same bells and the same quiet tag,
-  and the number of an endpoint's bells tells about how many conversations it is notified for. Bells change at every
-  epoch change; the quiet tag never does, so its stored hash links the endpoints of one account also when they never
-  shared a bell (an old phone and its replacement, say) for as long as both are stored. The platform keeps a
-  point-in-time history of this storage for 30 days, so a registration, its changes and its deletion stay recoverable
-  from that history for up to 30 days. PushDO writes a change into the registrations only after the UTC day in which it
-  was made has ended (§9.8), so the history shows, per day, which endpoints were registered, which changed their bell
-  sets and which were deleted, and nothing finer than a day. That still tells something: an epoch change makes the open
-  devices of every member replace one bell, a creation, an accepted request, a leave or an ended copy adds or removes
-  one, and one ring can get several stale endpoints of members of one conversation deleted, so on a day with few
-  changes, endpoints whose sets changed, or that were deleted, that day may be co-members. Until then the day's changes
-  live in PushDO's memory and, sealed under `PUSH_KEY`, in its journal, whose rows have one length and are written once
-  a minute whatever has changed, so that a restart loses only the last minute's changes. Those rows date nothing in
-  the history for whoever does not hold `PUSH_KEY`; whoever does can read from them the minute of each change.
-- **O** (live, not stored) sees, at each `push/sub`, an IP with an endpoint and its bells, and at each ring the
-  writer's IP, the row, the other lanes' bells and every endpoint registered under them, devices that are offline
-  included. With the row's topic, which the put carries, that links each such device to the conversation. Topics
+  account marked seen, live in the memory of the account's QuietDO only, for at most a few minutes (§9.8). Bells are
+  hashes of secrets that only the account's devices hold, one per conversation and generation (§4.1), and their stored
+  hashes are keyed under `PUSH_KEY`, so the stored data links no conversation or account to another, except that the
+  devices of one account hold the same bells and the same quiet tag, and the number of an endpoint's bells tells about
+  how many conversations it is notified for. A bell changes only when a member leaves its conversation (§4.1), and the
+  quiet tag never does, so its stored hash links the endpoints of one account also when they never shared a bell (an
+  old phone and its replacement, say) for as long as both are stored. The store is a KV namespace,
+  which keeps no point-in-time history: a registration, a change and a deletion are written at once, and an earlier
+  value is gone once replaced, apart from the copies that the namespace's replication serves for up to a minute after a
+  write (§9.8). So the store shows the registrations as they are, with the day of each endpoint's last registration,
+  and not when its bells changed; whoever reads it over time can still watch changes as they happen, as O can at
+  `push/sub` anyway.
+- **O** (live, not stored) sees, at each `push/sub`, an IP with an endpoint and its bell secrets (with which it could
+  ring or register under the bells, which adds nothing to what it can do anyway), and at each ring the writer's IP, the
+  row, the other members' bells and every endpoint registered under them, devices that are offline included. With the row's topic, which the put carries, that links each such device to the conversation. Topics
   already give O the social graph of the sockets that are open (§13.2 item 1); endpoints add devices that are closed,
   under identifiers that stay the same across IP addresses. A put that a ring follows from the same IP is a TEXT, an
   IMAGE or a FILE, so O can tell those from the rows that never ring (reactions, LEAVEs, WELCOMEs, claims and self
   rows), which their class alone does not tell from texts. At each `seen`, O sees an IP with the account's quiet secret,
   and so its endpoints, and the rows marked (below).
-- **N** sees each push to its subscriptions: the time (the ring's, plus `PUSH_HOLD` and up to `PUSH_JITTER`, and up to
-  `PUSH_TICK` more when no `flush` sends it; at most once per `PUSH_WINDOW` except across a restart of PushDO) and the
+- **N** sees each push to its subscriptions: the time (the ring's, plus `PUSH_HOLD` and up to `PUSH_JITTER`; at most
+  once per `PUSH_WINDOW` except across a restart of its QuietDO) and the
   size, which is the same for every push. Pushes to the devices of one conversation follow the same rings, so N can
   guess from their times which of its subscriptions share a conversation; the jitter only blurs this. The bells in a
   push are encrypted to the device, and do not change its size. N sees no rings, so a push held back for a row marked
@@ -5035,23 +5500,23 @@ device of the account is in use, the rows it shows notify none of the account's 
   when the app's handler does not replace it, and a ciphertext of fixed length. The FCM message is a data message, so
   the text that an Android device shows never comes from Google.
 - **M** can ring the bells of its conversations with any fresh row (one ring per row and set of bells), which makes the
-  other members' devices show the notification at most once per `PUSH_WINDOW` (a restart of PushDO aside). It can
-  register its own endpoints under their bells: a bell's 8 places go to the endpoints that take them first (§9.8), so M
-  can keep a member's devices from registering under that bell, and so from that conversation's notifications, for as
-  long as M holds the places, and can take the new bells' places after each epoch change; and by registering its own
-  endpoints and ringing them it learns how many places other devices hold, and so whether that member has
-  notifications on. The places also give it a time: after an epoch change, which any member can cause, M can hold all
-  but one place of a member's new bell and probe the free place every few minutes (register an endpoint there, ring
-  it, delete it); the first probe left out dates, to within the probes' interval, when the member's first device
-  registered that bell, that is, when it was first open after the change. None of this lets M read anything new. M
-  cannot mark rows seen for another member (it cannot compute that account's `qS`, §10.10), and a mark cancels pushes
-  to its own account's endpoints only, never to M's endpoints under the same bells, so M learns nothing from its pushes
-  about whether another member is in use. A
-  member removed at an epoch change still knows that epoch's bells, and senders keep ringing the old bell of each
-  member silent in the new epoch (§11.13), so the removed member can register under or ring those bells for as long as
-  any such member stays silent, at most until the epoch changes again. It then learns when messages are sent in the
-  new epoch and, since a sender never rings its own bell, which of the silent members sends each and when each of them
-  first posts there; not what is sent.
+  other members' devices show the notification at most once per `PUSH_WINDOW` (a restart of its QuietDO aside). It
+  cannot register under another member's bell: registering needs the bell's secret, which only that member's devices
+  hold (§10.10), so M can neither keep a member's devices from registering, nor learn from the registrations whether a
+  member has notifications on; every member posts its BELL rows whether or not it has notifications on (§11.13). The
+  BELL rows themselves tell M when each other member's devices came online: a device posts one in every epoch,
+  additions and renames included, within `BELL_DELAY` = 60 s of first processing it, and the row's Δ-rounded `t` is on
+  a lane that M reads, so M learns, for every member and every epoch change, when the first device of that member
+  processed the change, to within about `BELL_DELAY` + Δ (70 s): soon after the change when a device of the member was
+  open, else when the member came back. None of this lets M read anything new. M cannot mark rows seen for
+  another member (it cannot compute that account's `qS`, §10.10), and a mark cancels pushes to its own account's
+  endpoints only, so M learns nothing from its pushes about whether another member is in use. A member removed at an
+  epoch change (or dropped after leaving) still knows the bells of the generations it was in, and senders keep ringing
+  the old bell of each member silent in the new generation (§11.13), so the removed member can ring those bells and
+  make each such member's devices show notifications, at most one per device per `PUSH_WINDOW`, until that member
+  posts its new bell or the epoch changes again. That is all it gains: it cannot register under the bells, which needs
+  their secrets (§4.1), the answer to its rings is the same whatever they reach (§10.10), and, not being in `D_{e+1}`,
+  it reads none of the new epoch's rows, its BELL rows included.
 - **Seen elsewhere** (§11.13). A device marks rows seen only while it is in use and its quiet setting is on, and only
   rows that it shows as they arrive. So O learns, per account, that one of its devices was in use at each moment at
   which a message reached it there, and from which IP; not when it is in use while no message comes, and not which of
@@ -5066,7 +5531,7 @@ device of the account is in use, the rows it shows notify none of the account's 
 - **Sync notes** (§11.16) pass through the server whether or not push is on. O sees at each `sync` an IP with the
   account's `qS` and `Tself`, which links that topic to the account's quiet tag and endpoints, and learns when a device
   of the account changed its read state or a setting, which is when its user read, marked or muted a conversation; not
-  which, since the note is sealed under `kN` and every note has the same length. A note stays in PushDO's memory for at
+  which, since the note is sealed under `kN` and every note has the same length. A note stays in its QuietDO's memory for at
   most `NOTE_TTL` and is never stored. A quiet push tells N the same moment, for each device that takes notes. O cannot
   forge a note, which would not open; it can withhold or delay notes, as it can any push. Whoever holds `AK` can send
   notes for the account, and can read its conversations anyway.
@@ -5085,12 +5550,10 @@ device of the account is in use, the rows it shows notify none of the account's 
   key beside the kept session. In a native app the handler reads the rows in the same way, while the app is closed; the
   cache, its device key and the push keys stay in the system's key store and the app's own storage (§11.13).
 - **Others.** A third party who reads a fresh row's `(E, label)` in the public feed knows no bell, so its rings reach
-  no device, and the dedup is keyed by the row and the bells together, so they never suppress the writer's ring
-  (§9.8). Anyone can fill PushDO's endpoint cap with registrations, or its cap of registrations changed in a day, or
-  keep more pushes due than the one PushDO sends (§0.4).
+  no device and change nothing (§9.8). Registrations are bounded by proof of work, `RL_WRITE` and their expiry only.
 - **Not affected.** The confidentiality of content (§0.3 item 1) apart from what previews show, the public data and what P learns (§0.3 item 2), and
   every other guarantee of §0.3. A deployment whose push is off (not configured, or configured invalidly, §9.8)
-  behaves as if this section did not exist, apart from the registrations that PushDO may still hold from before, until
+  behaves as if this section did not exist, apart from the registrations that the store may still hold from before, until
   they expire.
 
 ### 13.5 Native apps (optional)
@@ -5131,22 +5594,18 @@ A native app (§11.14) changes whom a user trusts for the client's code, and add
 
 **Storage and routing:**
 
-- paging sealed eras into R2 (`.idx`/`.dat`), `seal/{E}` objects, manifests, publishing `kroute_E` of sealed eras,
-  deleting old ShardDOs;
-- the public label-ordered page reads;
-- shard maps with S > 1 (routing by `v` is already in place) and emergency splitting (`MOVED`, frozen ranges);
-- R2 Range reads of bundle entries.
+- emergency splitting of a shard within an era (`MOVED`, frozen ranges);
+- R2 Range reads of bundle entries;
+- read replicas for the directory (the D1 Sessions API): the lookup of an account's own entry right after its
+  registration needs the primary, so replicas need a bookmark per client first.
 
 **Abuse control and transport:**
 
 - anonymous write tokens (VOPRF, NullDO) and refunds;
 - OHTTP (O1) and quiet mode (O2);
-- push beyond one PushDO (§9.8): bells sharded by prefix over several PushDOs, with the coalescing window kept
-  per endpoint by one shard that owns it; bells chosen by their owner (a secret whose hash the members learn through a
-  new record per epoch), so that members can no longer register under others' bells;
-- separate FeedDO / ConnDO / `segv-rt` Worker, and Bloom-filtered fan-out.
+- a separate `segv-rt` Worker for the realtime path, and Bloom-filtered fan-out from the FeedDOs.
 
-**Inbox:** β > 0 buckets aligned to handle prefixes, dynamic inbox pricing, and the link-only flag (`flags.bit0`).
+**Inbox:** dynamic inbox pricing, and the link-only flag (`flags.bit0`).
 
 **Groups:**
 
@@ -5198,9 +5657,9 @@ A native app (§11.14) changes whom a user trusts for the client's code, and add
 | Multi-device | own invite per epoch; counters by log scan | self lane (records + snapshots + trusted HEADS positions), CAS on shared counters, CONFLICT returns the occupant, resumable J delivery |
 | Re-add after a removal | the skip rule: the removed copy continues at the re-add's epoch | a separate copy, rooted at the re-add's descriptor, as a first contact; the removed copy has ended and keeps its history (§6.6 step 3, §6.7 step 6, §13.2 item 16) |
 | Reactions | none | REACTION rows (type 3) on the sender's lane, bound to the target row's label and body; per member and emoji the latest row decides, at most 8 emoji per member and message; no unread count, no `lastTs`, no line (§11.12) |
-| Notifications | none | optional push (Web Push, and APNs and FCM for native apps): devices register bells derived from the epoch key, a sender rings the other lanes' bells after a text, image or file, and one PushDO sends a contentless push, coalesced per device; it stores no uid, conversation or IP; a device may show a preview that it decrypts itself; a device in use marks the rows it shows seen, and the account's devices get no push for them (§9.8, §10.10, §11.13, §13.4) |
+| Notifications | none | optional push (Web Push, and APNs and FCM for native apps): devices register bells of their own (a secret per conversation, whose hash the members learn from BELL rows on its lane), a sender rings the other members' bells after a text, image or file, and the Worker sends a contentless push, coalesced per device; it stores no uid, conversation or IP; a device may show a preview that it decrypts itself; a device in use marks the rows it shows seen, and the account's devices get no push for them (§9.8, §10.10, §11.13, §13.4) |
 | Integrity | client-verified global chain (fatal on gaps); `head` in messages; local checkpoint | signed checkpoint chain (local persistence, range verification), `ck` in messages, `prevh`, immutability, receipts, public feed for auditors |
 | Abuse | PoW `register/wrap/append/blob`; RL write/blob/read | PoW `register/wrap/put/inbox/blob` (and `push`); RL write/inbox/blob/read (and ring) |
-| Blobs | `/api/blob`; D1 ledger (day precision, private) | `/api/v2/blob` + `meta`; BlobRegDO create-only with Δ-precise `t_reg`, readable by id only; its head enters checkpoints hourly |
+| Blobs | `/api/blob`; D1 ledger (day precision, private) | `/api/v2/blob` + `meta`; BlobRegDO shards, create-only with Δ-precise `t_reg`, readable by id only; one hourly value over their heads enters the checkpoints |
 | Time | `ts` = server ms floored to the second, in the chain | era (week) + `t = tpub` (Δ seconds) |
 | AK rotation | not supported | not supported (deferred) |

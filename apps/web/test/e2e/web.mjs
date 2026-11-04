@@ -199,12 +199,20 @@ export async function web({ base, browser, shots, P, Wire }) {
       check(r.ok, `${path}: ${r.status}`);
       return new Uint8Array(await r.arrayBuffer());
     };
-    /** Every closed batch of shard (E, 0), with each batch's root and the head chain verified (§9.1, §10.9). */
-    const feedOf = async (E) => {
+    /** S_E of era E (§9.1, §10.9). */
+    const shardsOf = async (E) => {
+      const r = await fetch(`${base}/api/v2/era/${E}`);
+      check(r.ok, `era ${E}: ${r.status}`);
+      const S = (await r.json()).shards;
+      check(Number.isInteger(S) && S >= 1 && (S & (S - 1)) === 0, `era ${E}: shards = ${S}`);
+      return S;
+    };
+    /** Every closed batch of shard (E, i), with each batch's root and the head chain verified (§9.1, §10.9). */
+    const feedOf = async (E, i) => {
       const batches = [];
       let head = P.ZERO32;
       for (let after = 0; ;) {
-        const page = Wire.decodeFeed(await getBytes(`/api/v2/feed/${E}/0?after=${after}`));
+        const page = Wire.decodeFeed(await getBytes(`/api/v2/feed/${E}/${i}?after=${after}`));
         for (const b of page.batches) {
           const leaves = [...b.rows]
             .sort((x, y) => Buffer.compare(Buffer.from(x.label), Buffer.from(y.label)))
@@ -217,7 +225,7 @@ export async function web({ base, browser, shots, P, Wire }) {
             P.equalBytes(P.mth(leaves), b.root),
             `feed ${E}: the root of batch ${b.t} does not verify`,
           );
-          head = P.nextHead(P.shardCid(E, 0), head, b.t, b.n, b.root);
+          head = P.nextHead(P.shardCid(E, i), head, b.t, b.n, b.root);
           check(P.equalBytes(head, b.head), `feed ${E}: the head chain breaks at batch ${b.t}`);
           batches.push(b);
           after = b.t;
@@ -226,14 +234,22 @@ export async function web({ base, browser, shots, P, Wire }) {
       }
       return batches;
     };
-    /** Every inbox row of era E (§10.5). */
+    /** Every inbox row of era E, over its buckets (§9.3, §10.5). */
     const inboxOf = async (E) => {
+      const r = await fetch(`${base}/api/v2/era/${E}`);
+      check(r.ok, `era ${E}: ${r.status}`);
+      const buckets = (await r.json()).inboxBuckets;
+      check(Number.isInteger(buckets) && buckets >= 1, `era ${E}: inboxBuckets = ${buckets}`);
       const rows = [];
-      for (let after = 0; ;) {
-        const page = Wire.decodeInboxRead(await getBytes(`/api/v2/inbox/${E}/0?after=${after}`));
-        rows.push(...page.rows);
-        if (!page.more) break;
-        after = page.rows.at(-1).rel;
+      for (let g = 0; g < buckets; g++) {
+        for (let after = 0; ;) {
+          const page = Wire.decodeInboxRead(
+            await getBytes(`/api/v2/inbox/${E}/${g}?after=${after}`),
+          );
+          rows.push(...page.rows);
+          if (!page.more) break;
+          after = page.rows.at(-1).rel;
+        }
       }
       return rows;
     };
@@ -245,31 +261,66 @@ export async function web({ base, browser, shots, P, Wire }) {
     const Enow = P.era(Date.now());
     // Shard feeds: roots, head chains, row sizes, no plaintext.
     let rows = 0;
-    for (let E = startEra; E <= Enow; E++)
-      for (const b of await feedOf(E))
-        for (const r of b.rows) {
-          rows++;
-          check(P.BODY_LENS.includes(r.body.length), `row size ${r.body.length}`);
-          clean(`a row of batch ${b.t}`, r.body);
-        }
+    for (let E = startEra; E <= Enow; E++) {
+      const S = await shardsOf(E);
+      for (let i = 0; i < S; i++)
+        for (const b of await feedOf(E, i))
+          for (const r of b.rows) {
+            rows++;
+            check(P.BODY_LENS.includes(r.body.length), `row size ${r.body.length}`);
+            clean(`a row of batch ${b.t}`, r.body);
+          }
+    }
     check(rows > 0, "the feed holds no rows");
-    // The deployment's checkpoints run: the latest one's head of this era's shard is in the feed's head chain (§9.5).
-    const cid = P.shardCid(Enow, 0);
+    // The deployment's checkpoints run: the latest one's head of every shard of this era is in that shard's head
+    // chain (§9.5); an empty shard's head is ZERO32.
+    const S = await shardsOf(Enow);
+    const cids = Array.from({ length: S }, (_, i) => P.shardCid(Enow, i));
     const t0 = Date.now();
     for (;;) {
       const r = await fetch(`${base}/api/v2/ckpt/latest`);
       const ck = r.ok ? await r.json() : null;
-      const h = ck?.heads?.find((x) => x.cid === cid)?.head;
-      if (h) {
-        const known = (await feedOf(Enow)).map((b) => P.b64u(b.head));
-        check(
-          known.includes(h),
-          `checkpoint ${ck.q}: the head of ${cid} is not in the feed's head chain`,
-        );
+      const got = cids.map((cid) => ck?.heads?.find((x) => x.cid === cid)?.head);
+      if (got.every((h) => h)) {
+        for (let i = 0; i < S; i++) {
+          const known = [P.b64u(P.ZERO32), ...(await feedOf(Enow, i)).map((b) => P.b64u(b.head))];
+          check(
+            known.includes(got[i]),
+            `checkpoint ${ck.q}: the head of ${cids[i]} is not in the feed's head chain`,
+          );
+        }
         break;
       }
-      check(Date.now() - t0 < 150_000, "no checkpoint covered the shard within 150 s");
+      check(Date.now() - t0 < 150_000, "no checkpoint covered every shard within 150 s");
       await new Promise((res) => setTimeout(res, 2000));
+    }
+    // Paging (§9.1): an open era's shards have no manifest; a sealed one with rows has one that verifies, names the
+    // era's kroute_E behind its kcommit, and whose head is the feed's last head.
+    const sealNow = await fetch(`${base}/api/v2/seal/${Enow}/0`);
+    check(sealNow.status === 404, `seal ${Enow}: ${sealNow.status}`);
+    for (let E = startEra; E < Enow; E++) {
+      const S = await shardsOf(E);
+      for (let i = 0; i < S; i++) {
+        const batches = await feedOf(E, i);
+        const r = await fetch(`${base}/api/v2/seal/${E}/${i}`);
+        if (batches.length === 0) {
+          check(r.status === 404, `seal ${E}/${i}: ${r.status} for an empty shard`);
+          continue;
+        }
+        if (r.status === 404) continue; // sealed, not paged yet
+        check(r.ok, `seal ${E}/${i}: ${r.status}`);
+        const m = await r.json();
+        const info = await (await fetch(`${base}/api/v2/era/${E}`)).json();
+        check(
+          P.b64u(P.kcommit(P.fromB64u(m.kroute))) === info.kcommit,
+          `seal ${E}/${i}: kroute does not match kcommit`,
+        );
+        check(
+          m.head === P.b64u(batches.at(-1).head),
+          `seal ${E}/${i}: the manifest's head is not the feed's`,
+        );
+        check(m.rows.n === batches.reduce((n, b) => n + b.n, 0), `seal ${E}/${i}: row count`);
+      }
     }
     // Inbox rows: the one size, no plaintext.
     let invites = 0;

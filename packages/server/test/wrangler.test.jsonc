@@ -5,6 +5,8 @@
   "main": "./entry.ts",
   "compatibility_date": "2026-10-20",
   "compatibility_flags": ["nodejs_compat"],
+  // The directory (§9.6): the log database and two user databases, so that the tests cover the placement of rows,
+  // merged lookups and the write-ahead log.
   "d1_databases": [
     {
       "binding": "DB",
@@ -12,16 +14,44 @@
       "database_id": "00000000-0000-0000-0000-000000000001",
       "migrations_dir": "../migrations",
     },
+    {
+      "binding": "DB1",
+      "database_name": "segv-test-1",
+      "database_id": "00000000-0000-0000-0000-000000000002",
+      "migrations_dir": "../migrations",
+    },
+    {
+      "binding": "DIRLOG",
+      "database_name": "segv-test-log",
+      "database_id": "00000000-0000-0000-0000-000000000003",
+      "migrations_dir": "../migrations",
+    },
   ],
   "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "segv-blobs-test" }],
+  "kv_namespaces": [{ "binding": "PUSH_KV", "id": "segv-push-test" }],
+  "queues": {
+    "producers": [{ "binding": "PUSH_QUEUE", "queue": "segv-push-test" }],
+    "consumers": [
+      {
+        "queue": "segv-push-test",
+        "max_batch_size": 100,
+        "max_batch_timeout": 1,
+        "max_retries": 3,
+      },
+    ],
+  },
+  "triggers": { "crons": ["17 3 * * *"] },
   "durable_objects": {
     "bindings": [
       { "name": "SHARD", "class_name": "ShardDO" },
       { "name": "BLOBREG", "class_name": "BlobRegDO" },
+      { "name": "DIRSEQ", "class_name": "DirSeqDO" },
+      { "name": "KEYS", "class_name": "KeyDO" },
       { "name": "INBOX", "class_name": "InboxDO" },
-      { "name": "RT", "class_name": "RealtimeDO" },
+      { "name": "CONN", "class_name": "ConnDO" },
+      { "name": "FEED", "class_name": "FeedDO" },
       { "name": "CKPT", "class_name": "CheckpointDO" },
-      { "name": "PUSH", "class_name": "PushDO" },
+      { "name": "QUIET", "class_name": "QuietDO" },
     ],
   },
   "migrations": [
@@ -30,6 +60,13 @@
       "new_sqlite_classes": ["ShardDO", "BlobRegDO", "InboxDO", "RealtimeDO", "CheckpointDO"],
     },
     { "tag": "v2", "new_sqlite_classes": ["PushDO"] },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["ConnDO", "FeedDO", "QuietDO"],
+      "deleted_classes": ["RealtimeDO", "PushDO"],
+    },
+    { "tag": "v4", "new_sqlite_classes": ["DirSeqDO"] },
+    { "tag": "v5", "new_sqlite_classes": ["KeyDO"] },
   ],
   "ratelimits": [
     { "name": "RL_WRITE", "namespace_id": "1001", "simple": { "limit": 60, "period": 60 } },
@@ -54,6 +91,17 @@
     "SKEW_S": "0",
     "INBOX_SLOT_S": "1",
     "E_FIRST": "1",
+    // Two ConnDOs and two FeedDOs, so that the tests cover the routing of clients and topics (§9.4).
+    "RT_CONNS": "2",
+    "RT_FEEDS": "2",
+    // Two QuietDOs, so that the tests cover the routing of accounts (§9.8).
+    "PUSH_SHARDS": "2",
+    // Two blob registry shards, so that the tests cover the routing of blob ids (§9.2).
+    "BLOBREG_SHARDS": "2",
+    // Two user databases in the directory (§9.6).
+    "DIR_SHARDS": "2",
+    // Four inbox buckets in every era, so that the tests cover the bucket map, keys and routing (§9.3).
+    "INBOX_MAP": "0:4",
     // Fixed test secrets (never used outside tests).
     "ROUTE_KEY": "dGVzdC1yb3V0ZS1rZXktc2Vndi5zaC12Mi0wMDAwMDA",
     "SRV_KEY": "dGVzdC1zcnYta2V5LXNlZ3Yuc2gtdjItMDAwMDAwMDA",
@@ -63,7 +111,7 @@
     "APPLE_APP_IDS": "ABCDE12345.test.segv.desktop,ABCDE12345.test.segv.ios",
     "ANDROID_APPS": "test.segv.app@14:6D:E9:83:C5:73:06:50:D8:EE:B9:95:2F:34:FC:64:16:A0:83:42:E6:1D:BE:A8:8A:04:96:B2:3F:CF:44:E5",
     // Web Push on, with fixed test keys. Pushes only ever go to the *.push.test hosts below, which never
-    // resolve: the push tests replace PushDO's fetch.
+    // resolve: the push tests replace the Worker's push fetch.
     "VAPID_SK": "dGVzdC12YXBpZC1rZXktc2Vndi5zaC12Mi0wMDAwMDA",
     "PUSH_KEY": "dGVzdC1wdXNoLWtleS1zZWd2LnNoLXYyLTAwMDAwMDA",
     "VAPID_SUB": "mailto:push@segv.test",

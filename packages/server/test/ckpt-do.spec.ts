@@ -1,13 +1,14 @@
 /**
  * CheckpointDO (docs/PROTOCOL.md §9.5, §10.9): the C_q chain and its signatures, no new q for
  * unchanged heads, the previous era's sealed shard (once more, then dropped), failing components (and ones that
- * never answered, which are left out), the sec clamp, the hourly blob registry head, alarm arming and ensure().
+ * never answered, which are left out), the sec clamp, the hourly blob registry head, alarm arming and ensure(), the
+ * lists in R2 (and rows that still hold theirs), and the hourly paging sweep.
  *
  * The checkpoint object is one instance: each test moves its clock to a fresh era further in the future and drives
  * tick() by hand (the alarm it re-arms then never fires on its own). Components are reached through the real DOs;
  * the InboxDO may or may not answer yet, so assertions only look at the components a test controls.
  */
-import { evictDurableObject, runInDurableObject } from "cloudflare:test";
+import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import * as P from "@segv/protocol/proto";
@@ -15,6 +16,7 @@ import type { BlobRegDO } from "../src/blobreg-do";
 import type { CheckpointDO } from "../src/ckpt-do";
 import type { ShardDO } from "../src/shard-do";
 import { blobRegStub, ckptStub, shardStub, type CkptRecord } from "../src/types";
+import { spyNamespace } from "./helpers";
 
 const E_NOW = P.era(Date.now());
 let nextEra = E_NOW + 20;
@@ -26,8 +28,24 @@ const freshEras = (): [number, number] => {
 };
 const ck = () => ckptStub(env);
 const SRV_PK = P.sigPub(P.fromB64u((env as unknown as { SRV_KEY: string }).SRV_KEY));
+const BLOB_KEY = P.kblob(P.fromB64u((env as unknown as { ROUTE_KEY: string }).ROUTE_KEY));
+/** A random blob id that routes to registry shard j under the two shards of ../wrangler.test.jsonc (§4.4). */
+function blobIdFor(j: number): Uint8Array {
+  for (;;) {
+    const id = P.random(32);
+    if (P.blobShardOf(BLOB_KEY, id, 1) === j) return id;
+  }
+}
+const hourOf = (ms: number): number => Math.floor(ms / 3_600_000);
 
-type CkInternals = { clock: () => number; env: Env; sizeWarnBytes: number };
+type CkInternals = {
+  clock: () => number;
+  env: Env;
+  sizeWarnBytes: number;
+  shardsOf: (E: number) => number;
+  sweepShards: number;
+  latestHeads: unknown;
+};
 async function ckClock(ms: number): Promise<void> {
   await runInDurableObject(ck(), (inst: CheckpointDO) => {
     (inst as unknown as CkInternals).clock = () => ms;
@@ -47,12 +65,11 @@ async function shardClock(E: number, ms: number): Promise<void> {
     (inst as unknown as { clock: () => number }).clock = () => ms;
   });
 }
-const shardRow = () => ({
-  v: P.random(8),
-  label: P.random(16),
-  cls: 0,
-  body: P.random(P.BODY_LENS[0]),
-});
+const shardRow = () => {
+  const v = P.random(8);
+  v[0] &= 0x7f; // a routing value is below 2^63 (§4.4)
+  return { v, label: P.random(16), cls: 0, body: P.random(P.BODY_LENS[0]) };
+};
 /** Puts one row into shard E at `ms` and leaves the shard's clock 3 s later (the next head() closes the batch). */
 async function shardWrite(E: number, ms: number): Promise<void> {
   await shardClock(E, ms);
@@ -92,6 +109,53 @@ function checkRecord(r: CkptRecord, prevC: Uint8Array): void {
   expect(r.C).toEqual(P.ckptC(prevC, r.q, r.sec, r.hd));
   expect(P.verify(r.sig, P.ckptSigMsg(r.q, r.C), SRV_PK)).toBe(true);
 }
+
+/** A routing value whose top `bits` bits (below the clear top bit) name shard `i` (§4.4, bits ≤ 7). */
+function vFor(i: number, bits: number): Uint8Array {
+  const v = P.random(8);
+  v[0] = (v[0] & (0x7f >> bits)) | (i << (7 - bits));
+  return v;
+}
+
+describe("CheckpointDO shard map (§9.1, §9.5)", () => {
+  it("collects every shard of each era's count, under its own cid", async () => {
+    const [Pe, F] = freshEras();
+    const base = P.eraStart(F) + 10 * 60_000;
+    await ckClock(base);
+    await runInDurableObject(ck(), (inst: CheckpointDO) => {
+      (inst as unknown as CkInternals).shardsOf = (E) => (E === F ? 4 : E === Pe ? 2 : 1);
+    });
+    try {
+      const r1 = await tick();
+      for (let i = 0; i < 4; i++) expect(headOf(r1, P.shardCid(F, i))).toEqual(P.ZERO32);
+      expect(headOf(r1, P.shardCid(F, 4))).toBeUndefined();
+      for (let i = 0; i < 2; i++) expect(headOf(r1, P.shardCid(Pe, i))).toBeDefined();
+      expect(headOf(r1, P.shardCid(Pe, 2))).toBeUndefined();
+      // A row in shard 3 of F (its own deployment count is 4 here) moves that cid's head only.
+      const s3 = shardStub(env, F, 3);
+      await runInDurableObject(s3, (inst: ShardDO) => {
+        const x = inst as unknown as { clock: () => number; shardBits: number };
+        x.clock = () => base;
+        x.shardBits = 2;
+      });
+      expect((await s3.put(F, 3, [{ ...shardRow(), v: vFor(3, 2) }]))[0].s).toBe("ok");
+      await runInDurableObject(s3, (inst: ShardDO) => {
+        (inst as unknown as { clock: () => number }).clock = () => base + 3000;
+      });
+      await ckClock(base + 60_000);
+      const r2 = await tick();
+      expect(r2.q).toBe(r1.q + 1);
+      expect(headOf(r2, P.shardCid(F, 3))).toEqual((await s3.head(F, 3)).head);
+      expect(headOf(r2, P.shardCid(F, 3))).not.toEqual(P.ZERO32);
+      for (const i of [0, 1, 2]) expect(headOf(r2, P.shardCid(F, i))).toEqual(P.ZERO32);
+      checkRecord(r2, r1.C);
+    } finally {
+      await runInDurableObject(ck(), (inst: CheckpointDO) => {
+        (inst as unknown as CkInternals).shardsOf = () => 1;
+      });
+    }
+  });
+});
 
 describe("CheckpointDO", () => {
   it("chains C_q, makes no new q for unchanged heads, and signs under SRV_KEY", async () => {
@@ -201,7 +265,7 @@ describe("CheckpointDO", () => {
       });
       // The shard still fails while the dirlog moves: the new checkpoint carries the old shard head.
       await withEnv(
-        { SHARD: deadNs, DB: fakeDb(async () => ({ seq: 9, h: P.b64u(X) })) },
+        { SHARD: deadNs, DIRLOG: fakeDb(async () => ({ seq: 9, h: P.b64u(X) })) },
         async () => {
           const r = await tick();
           expect(r.q).toBe(r1.q + 1);
@@ -211,7 +275,11 @@ describe("CheckpointDO", () => {
       );
       // D1 fails: the dirlog keeps X.
       await withEnv(
-        { DB: fakeDb(async () => Promise.reject(new Error("D1_ERROR: network connection lost"))) },
+        {
+          DIRLOG: fakeDb(async () =>
+            Promise.reject(new Error("D1_ERROR: network connection lost")),
+          ),
+        },
         async () => {
           const r = await tick();
           expect(headOf(r, P.DIRLOG_CID)).toEqual(X);
@@ -222,10 +290,10 @@ describe("CheckpointDO", () => {
       const noTable = fakeDb(async () =>
         Promise.reject(new Error("D1_ERROR: no such table: dirlog: SQLITE_ERROR")),
       );
-      await withEnv({ DB: noTable }, async () => {
+      await withEnv({ DIRLOG: noTable }, async () => {
         expect(headOf(await tick(), P.DIRLOG_CID)).toEqual(P.ZERO32);
       });
-      await withEnv({ DB: fakeDb(async () => null) }, async () => {
+      await withEnv({ DIRLOG: fakeDb(async () => null) }, async () => {
         expect(headOf(await tick(), P.DIRLOG_CID)).toEqual(P.ZERO32);
       });
       expect(errors.mock.calls.some((c) => String(c[0]).includes("did not answer"))).toBe(true);
@@ -249,8 +317,9 @@ describe("CheckpointDO", () => {
       await withEnv({ SHARD: deadNs, INBOX: deadNs }, async () => {
         r1 = await tick();
       });
+      // Two shards (F and F − 1) and the four inbox buckets of each (INBOX_MAP "0:4").
       expect(errors.mock.calls.filter((c) => String(c[0]).includes("did not answer"))).toHaveLength(
-        4,
+        10,
       );
     } finally {
       errors.mockRestore();
@@ -279,42 +348,56 @@ describe("CheckpointDO", () => {
     expect(r3.sec).toBe(P.secOf(base + 60_000));
   });
 
-  it("takes the blob registry head at most once per UTC hour", async () => {
+  it("takes the blob registry once per UTC hour: one value over every shard's head that changes every hour", async () => {
     const [, F] = freshEras();
     const h0 = P.eraStart(F); // eras start on a whole UTC hour
     expect(h0 % 3_600_000).toBe(0);
+    const shard0 = blobRegStub(env, 0);
     const blobClock = (ms: number) =>
-      runInDurableObject(blobRegStub(env), (inst: BlobRegDO) => {
+      runInDurableObject(shard0, (inst: BlobRegDO) => {
         (inst as unknown as { clock: () => number }).clock = () => ms;
       });
+    /** The §9.5 value of the hour of `ms` over the two shards' current heads. */
+    const expected = async (ms: number): Promise<Uint8Array> =>
+      P.blobregAll(hourOf(ms), [
+        (await shard0.head()).head,
+        (await blobRegStub(env, 1).head()).head,
+      ]);
     await blobClock(h0);
     await ckClock(h0 + 30_000);
     const first = await tick();
     const b0 = headOf(first, P.BLOBREG_CID)!;
-    expect(b0).toEqual((await blobRegStub(env).head()).head);
+    expect(b0).toEqual(await expected(h0 + 30_000));
 
     const seen = new Set<string>([P.b64u(b0)]);
     for (const m of [1, 2, 3, 4, 5, 30, 58, 59]) {
       await blobClock(h0 + m * 60_000);
-      expect((await blobRegStub(env).register(P.random(32), 100)).created).toBe(true); // closes last minute's batch
+      expect((await shard0.register(blobIdFor(0), 100)).created).toBe(true); // closes last minute's batch
       await ckClock(h0 + m * 60_000 + 30_000);
       const r = await tick();
       expect(headOf(r, P.BLOBREG_CID)).toEqual(b0);
       seen.add(P.b64u(headOf(r, P.BLOBREG_CID)!));
     }
-    const moved = (await blobRegStub(env).head()).head;
-    expect(moved).not.toEqual(b0); // the registry did change during the hour
+    expect((await shard0.head()).head).not.toEqual(P.ZERO32); // the registry did change during the hour
 
-    await ckClock(h0 + 3_600_000 + 30_000);
+    const t1 = h0 + 3_600_000 + 30_000;
+    await ckClock(t1);
     const next = await tick();
-    expect(headOf(next, P.BLOBREG_CID)).toEqual(moved);
+    expect(headOf(next, P.BLOBREG_CID)).toEqual(await expected(t1));
     seen.add(P.b64u(headOf(next, P.BLOBREG_CID)!));
     expect(seen.size).toBe(2);
-    await ckClock(h0 + 3_600_000 + 90_000);
-    expect(headOf(await tick(), P.BLOBREG_CID)).toEqual(moved);
+    await ckClock(t1 + 60_000);
+    expect(headOf(await tick(), P.BLOBREG_CID)).toEqual(headOf(next, P.BLOBREG_CID));
+    // An hour in which nothing was registered still changes the value: the hour is mixed in.
+    const t2 = h0 + 2 * 3_600_000 + 30_000;
+    await ckClock(t2);
+    const third = await tick();
+    expect(headOf(third, P.BLOBREG_CID)).toEqual(await expected(t2));
+    seen.add(P.b64u(headOf(third, P.BLOBREG_CID)!));
+    expect(seen.size).toBe(3);
   });
 
-  it("logs a shard above 4 GiB", async () => {
+  it("logs a shard above 2 GiB", async () => {
     const [, F] = freshEras();
     await ckClock(P.eraStart(F) + 60_000);
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -323,11 +406,11 @@ describe("CheckpointDO", () => {
         (inst as unknown as CkInternals).sizeWarnBytes = 0;
       });
       await tick();
-      expect(errors.mock.calls.some((c) => String(c[0]).includes("above 4 GiB"))).toBe(true);
+      expect(errors.mock.calls.some((c) => String(c[0]).includes("above 2 GiB"))).toBe(true);
     } finally {
       errors.mockRestore();
       await runInDurableObject(ck(), (inst: CheckpointDO) => {
-        (inst as unknown as CkInternals).sizeWarnBytes = 4 * 2 ** 30;
+        (inst as unknown as CkInternals).sizeWarnBytes = 2 * 2 ** 30;
       });
     }
   });
@@ -371,5 +454,306 @@ describe("CheckpointDO", () => {
       // Park it far away so no tick runs on its own while the rest of the file runs.
       await state.storage.setAlarm(P.eraStart(E_NOW + 1000));
     });
+  });
+});
+
+describe("CheckpointDO sweep (§9.5)", () => {
+  it("wakes the shards of past eras once an hour, marks the eras found paged (or empty) and stops at one that is not", async () => {
+    const [Pe, F] = freshEras();
+    const base = P.eraStart(F) + 10 * 60_000;
+    await ckClock(base);
+    const meta = (k: string): Promise<SqlStorageValue | null> =>
+      runInDurableObject(
+        ck(),
+        (_inst: CheckpointDO, state) =>
+          state.storage.sql
+            .exec<{ v: SqlStorageValue }>("SELECT v FROM meta WHERE k = ?", k)
+            .toArray()[0]?.v ?? null,
+      );
+    await runInDurableObject(ck(), (_inst: CheckpointDO, state) => {
+      state.storage.sql.exec("INSERT OR REPLACE INTO meta (k, v) VALUES ('page:era', ?)", F - 4);
+      state.storage.sql.exec("DELETE FROM meta WHERE k IN ('page:hour', 'page:at')");
+    });
+    // F − 4 and F − 2 are empty and over; F − 3 holds a row and has not sealed yet: nobody called it since its era
+    // ended. Each runs on its own clock, past its era (the real clock has not reached these eras).
+    const s3 = shardStub(env, F - 3, 0);
+    await shardWrite(F - 3, P.eraStart(F - 3) + 5000);
+    for (const e of [F - 4, F - 3, F - 2]) await shardClock(e, P.eraEnd(e) + 1000);
+    const calls: string[] = [];
+    const names = () =>
+      calls.filter((c) => c.startsWith("getByName(")).map((c) => c.slice("getByName(".length, -1));
+    await withEnv({ SHARD: spyNamespace(env.SHARD, calls) }, async () => {
+      await tick();
+      const touched = names();
+      for (const e of [F - 4, F - 3, F - 2]) expect(touched).toContain(`shard/v2/${e}/0`);
+      expect(touched).not.toContain(`shard/v2/${F - 5}/0`);
+      // The same hour: no second sweep; only the two live eras are collected.
+      calls.length = 0;
+      await ckClock(base + 60_000);
+      await ck().tick();
+      expect(new Set(names())).toEqual(new Set([`shard/v2/${F}/0`, `shard/v2/${Pe}/0`]));
+    });
+    expect(await meta(`paged:${F - 4}`)).toBe(1);
+    expect(await meta(`paged:${F - 2}`)).toBe(1);
+    expect(await meta(`paged:${F - 3}`)).toBeNull();
+    expect(await meta("page:era")).toBe(F - 3);
+    // The wake sealed F − 3; its earliest pending alarm (the write's batch alarm) stays armed and runs the paging.
+    expect(await s3.head(F - 3, 0)).toMatchObject({ sealed: true, paged: false });
+    const armed = await runInDurableObject(s3, (_inst: ShardDO, state) => state.storage.getAlarm());
+    expect(armed).not.toBeNull();
+    expect(armed!).toBeLessThanOrEqual(P.eraEnd(F - 3) + 2000);
+    // Once it is paged, the next hour marks it and moves on.
+    const paged = () =>
+      runInDurableObject(s3, (_inst: ShardDO, state) => {
+        const v = state.storage.sql
+          .exec<{ v: SqlStorageValue }>("SELECT v FROM meta WHERE k = 'state'")
+          .toArray()[0]?.v;
+        return v === "paged";
+      });
+    for (let k = 0; !(await paged()); k++) {
+      expect(k, "paging alarms").toBeLessThan(40);
+      expect(await runDurableObjectAlarm(s3)).toBe(true);
+    }
+    await ckClock(base + 3_600_000);
+    await ck().tick();
+    expect(await meta(`paged:${F - 3}`)).toBe(1);
+    expect(await meta("page:era")).toBe(F - 1);
+  });
+});
+
+/** Reads one meta value of the checkpoint object. */
+const ckMeta = (k: string): Promise<SqlStorageValue | null> =>
+  runInDurableObject(
+    ck(),
+    (_inst: CheckpointDO, state) =>
+      state.storage.sql
+        .exec<{ v: SqlStorageValue }>("SELECT v FROM meta WHERE k = ?", k)
+        .toArray()[0]?.v ?? null,
+  );
+/** Sets the clock of shard (E, i). */
+const shardClockAt = (E: number, i: number, ms: number) =>
+  runInDurableObject(shardStub(env, E, i), (inst: ShardDO) => {
+    (inst as unknown as { clock: () => number }).clock = () => ms;
+  });
+/** Starts the sweep afresh from era `from` at the next hourly tick. */
+const sweepFrom = (from: number) =>
+  runInDurableObject(ck(), (_inst: CheckpointDO, state) => {
+    state.storage.sql.exec("INSERT OR REPLACE INTO meta (k, v) VALUES ('page:era', ?)", from);
+    state.storage.sql.exec("DELETE FROM meta WHERE k IN ('page:hour', 'page:at')");
+  });
+const setCk = (f: (x: CkInternals) => void) =>
+  runInDurableObject(ck(), (inst: CheckpointDO) => f(inst as unknown as CkInternals));
+
+describe("CheckpointDO sweep: one shard at a time (§9.5)", () => {
+  it("round-robins over the unpaged shards: a shard that never answers costs one call per round and never holds up a later era", async () => {
+    const [, F] = freshEras();
+    const A = F - 3; // its one shard never answers
+    const B = F - 2; // empty and over: answers paged
+    const base = P.eraStart(F) + 10 * 60_000;
+    await ckClock(base);
+    await sweepFrom(A);
+    await shardClockAt(B, 0, P.eraEnd(B) + 1000);
+    const dead = `shard/v2/${A}/0`;
+    const calls: string[] = [];
+    const SHARD = {
+      getByName: (n: string) => {
+        calls.push(n);
+        return n === dead ? deadNs.getByName() : env.SHARD.getByName(n);
+      },
+    };
+    const sweptAt = async (ms: number): Promise<string[]> => {
+      calls.length = 0;
+      await ckClock(ms);
+      await ck().tick();
+      return calls.filter((n) => n === dead || n === `shard/v2/${B}/0`);
+    };
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    await setCk((x) => {
+      x.sweepShards = 1;
+    });
+    try {
+      await withEnv({ SHARD }, async () => {
+        expect(await sweptAt(base)).toEqual([dead]);
+        expect(await sweptAt(base + 60_000)).toEqual([]); // the same hour: no sweep
+        expect(await sweptAt(base + 3_600_000)).toEqual([`shard/v2/${B}/0`]);
+        expect(await ckMeta(`paged:${B}`)).toBe(1);
+        expect(await ckMeta(`paged:${A}`)).toBeNull();
+        expect(await ckMeta("page:era")).toBe(A);
+        // B is marked: every later round is the one shard left.
+        expect(await sweptAt(base + 2 * 3_600_000)).toEqual([dead]);
+        expect(await sweptAt(base + 3 * 3_600_000)).toEqual([dead]);
+      });
+    } finally {
+      errors.mockRestore();
+      await setCk((x) => {
+        x.sweepShards = 16;
+      });
+    }
+  });
+
+  it("counts its budget in shards, not eras: an era of four shards takes two hours at two shards per hour", async () => {
+    const [, F] = freshEras();
+    const D = F - 2;
+    const base = P.eraStart(F) + 10 * 60_000;
+    await ckClock(base);
+    await sweepFrom(D);
+    for (let i = 0; i < 4; i++) await shardClockAt(D, i, P.eraEnd(D) + 1000);
+    const calls: string[] = [];
+    await setCk((x) => {
+      x.sweepShards = 2;
+      x.shardsOf = (E) => (E === D ? 4 : 1);
+    });
+    try {
+      await withEnv({ SHARD: spyNamespace(env.SHARD, calls) }, async () => {
+        const swept = async (ms: number): Promise<string[]> => {
+          calls.length = 0;
+          await ckClock(ms);
+          await ck().tick();
+          return calls
+            .filter((c) => c.startsWith(`getByName(shard/v2/${D}/`))
+            .map((c) => c.slice("getByName(".length, -1))
+            .sort();
+        };
+        expect(await swept(base)).toEqual([`shard/v2/${D}/0`, `shard/v2/${D}/1`]);
+        expect(await ckMeta(`paged:${D}:0`)).toBe(1);
+        expect(await ckMeta(`paged:${D}:1`)).toBe(1);
+        expect(await ckMeta(`paged:${D}`)).toBeNull();
+        expect(await swept(base + 3_600_000)).toEqual([`shard/v2/${D}/2`, `shard/v2/${D}/3`]);
+        // Every shard answered paged: the era is marked, its shard marks are gone, and the cursor moves on.
+        expect(await ckMeta(`paged:${D}`)).toBe(1);
+        for (let i = 0; i < 4; i++) expect(await ckMeta(`paged:${D}:${i}`)).toBeNull();
+        expect(await ckMeta("page:era")).toBe(F - 1);
+        expect(await swept(base + 2 * 3_600_000)).toEqual([]);
+      });
+    } finally {
+      await setCk((x) => {
+        x.sweepShards = 16;
+        x.shardsOf = () => 1;
+      });
+    }
+  });
+});
+
+describe("CheckpointDO lists in R2 (§9.5)", () => {
+  const cpHeadsLen = (q: number) =>
+    runInDurableObject(
+      ck(),
+      (_inst: CheckpointDO, state) =>
+        state.storage.sql
+          .exec<{ n: number }>("SELECT length(heads) AS n FROM cp WHERE q = ?", q)
+          .one().n,
+    );
+  const forgetLatest = () =>
+    setCk((x) => {
+      x.latestHeads = null;
+    });
+
+  it("writes each checkpoint's list to R2 under ckpt/v2/{q} and keeps its row without it; get and latest read it back", async () => {
+    const [, F] = freshEras();
+    const base = P.eraStart(F) + 10 * 60_000;
+    await ckClock(base);
+    await shardWrite(F, base);
+    const r = await tick();
+    const obj = await env.BLOBS.get(`ckpt/v2/${r.q}`);
+    expect(obj).not.toBeNull();
+    const bytes = new Uint8Array(await obj!.arrayBuffer());
+    expect(P.H(bytes)).toEqual(r.hd);
+    expect(bytes).toEqual(
+      P.enc("segv.sh/v2/ckpt/heads", ...r.heads.flatMap((h) => [h.cid, h.head])),
+    );
+    expect(await cpHeadsLen(r.q)).toBe(0);
+    // Without the copy in memory, both reads go to R2.
+    await forgetLatest();
+    expect(await ck().get(r.q)).toEqual(r);
+    await forgetLatest();
+    expect(await ck().latest()).toEqual(r);
+    // A list in R2 that does not hash to hd is never served.
+    await env.BLOBS.put(`ckpt/v2/${r.q}`, P.random(64));
+    try {
+      await forgetLatest();
+      await runInDurableObject(ck(), async (inst: CheckpointDO) => {
+        await expect(inst.get(r.q)).rejects.toThrow(/does not match hd/);
+      });
+    } finally {
+      await env.BLOBS.put(`ckpt/v2/${r.q}`, bytes);
+    }
+    expect(await ck().get(r.q)).toEqual(r);
+  });
+
+  it("commits no checkpoint (and no final mark) while the list cannot be written to R2, and builds it at the next tick", async () => {
+    const [Pe, F] = freshEras();
+    await ckClock(P.eraStart(F) + 5 * 60_000);
+    await shardWrite(Pe, P.eraStart(Pe) + 5000);
+    const r1 = await tick();
+    // Another row is open when the era ends; the next head() seals the shard: its final head is due in the next
+    // checkpoint.
+    await shardClock(Pe, P.eraStart(Pe) + 10_000);
+    expect((await shardStub(env, Pe, 0).put(Pe, 0, [shardRow()]))[0].s).toBe("ok");
+    await shardClock(Pe, P.eraEnd(Pe) + 1000);
+    const failing = {
+      put: () => Promise.reject(new Error("R2 unavailable")),
+      get: (k: string) => env.BLOBS.get(k),
+    };
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await withEnv({ BLOBS: failing }, async () => {
+        await ck().tick();
+      });
+      expect(errors.mock.calls.some((c) => String(c[0]).includes("did not reach R2"))).toBe(true);
+    } finally {
+      errors.mockRestore();
+    }
+    expect((await ck().latest())!.q).toBe(r1.q);
+    expect(await ckMeta(`final:${P.shardCid(Pe, 0)}`)).toBeNull();
+    const final = await shardStub(env, Pe, 0).head(Pe, 0);
+    expect(final.sealed).toBe(true);
+    const r2 = await tick();
+    expect(r2.q).toBe(r1.q + 1);
+    checkRecord(r2, r1.C);
+    expect(headOf(r2, P.shardCid(Pe, 0))).toEqual(final.head);
+    expect(await ckMeta(`final:${P.shardCid(Pe, 0)}`)).toBe(1);
+    expect(headOf(await tick(), P.shardCid(Pe, 0))).toBeUndefined();
+  });
+
+  it("serves a row written before the lists moved to R2 from its own heads column, and chains on from it", async () => {
+    const [, F] = freshEras();
+    const base = P.eraStart(F) + 10 * 60_000;
+    await ckClock(base);
+    const r1 = await tick();
+    // A row in the earlier format: the encoded list in `heads`, no R2 object.
+    const heads = [...r1.heads, { cid: "zz:legacy", head: P.random(32) }];
+    const enc = P.enc("segv.sh/v2/ckpt/heads", ...heads.flatMap((h) => [h.cid, h.head]));
+    const q = r1.q + 1;
+    const sec = r1.sec + 1;
+    const hd = P.H(enc);
+    const C = P.ckptC(r1.C, q, sec, hd);
+    const sig = P.sign(
+      P.ckptSigMsg(q, C),
+      P.fromB64u((env as unknown as { SRV_KEY: string }).SRV_KEY),
+    );
+    const ab = (b: Uint8Array) => b.slice().buffer;
+    await runInDurableObject(ck(), (_inst: CheckpointDO, state) => {
+      state.storage.sql.exec(
+        "INSERT INTO cp (q, sec, hd, heads, C, sig) VALUES (?, ?, ?, ?, ?, ?)",
+        q,
+        sec,
+        ab(hd),
+        ab(enc),
+        ab(C),
+        ab(sig),
+      );
+    });
+    expect(await env.BLOBS.head(`ckpt/v2/${q}`)).toBeNull();
+    const old = { q, sec, hd, C, sig, heads };
+    expect(await ck().get(q)).toEqual(old);
+    expect(await ck().latest()).toEqual(old);
+    checkRecord((await ck().get(q))!, r1.C);
+    // The next checkpoint drops the made-up cid (nothing answers for it) and goes to R2.
+    await ckClock(base + 60_000);
+    const r3 = await tick();
+    expect(r3.q).toBe(q + 1);
+    checkRecord(r3, C);
+    expect(headOf(r3, "zz:legacy")).toBeUndefined();
+    expect(await cpHeadsLen(r3.q)).toBe(0);
   });
 });

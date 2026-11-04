@@ -37,9 +37,15 @@ import {
   eraEnd,
   eraStart,
   fromB64u,
+  hpre,
+  inboxBucketOf,
+  inboxPrefixOf,
   kcommit,
   kroute,
+  random,
   receiptMsg,
+  routeV,
+  shardOf as shardIndex,
   sigPub,
   sign,
   utf8,
@@ -82,8 +88,8 @@ import {
   type Res,
   type WorldCtx,
 } from "./common";
-import { FakeDirectory } from "./dir";
-import { FakeInbox } from "./inbox";
+import { FakeDirectory, userJson } from "./dir";
+import { FakeInbox, type InboxRowResult } from "./inbox";
 import { FAKE_VAPID, FakePush } from "./push";
 import { FakeRealtime, FakeWebSocket, type RtHost } from "./rt";
 import { FakeShard } from "./shard";
@@ -155,6 +161,10 @@ export interface FakeWorldOptions {
   skew?: number;
   inboxSlot?: number;
   efirst?: number;
+  /** S_E for every era: a power of two in 1..65536 (§9.1); 1 by default */
+  shards?: number;
+  /** 2^β for every era: the inbox buckets, a power of two in 1..65536 (§9.3); 1 by default */
+  inboxBuckets?: number;
   /** offer Web Push: params `push` and `pow.push`, and the two endpoints of §10.10 (FakePush) */
   push?: boolean;
 }
@@ -277,6 +287,12 @@ const ckptJson = (e: CkptEntry) => ({
 
 // ───────────────────────── the world ─────────────────────────
 
+/** §10.5: a non-final inbox read expires with the slot it reports (whole seconds by the Worker's clock, 1..Δin). */
+function inboxCacheControl(closed: number, nowMs: number, inboxSlot: number): string {
+  const end = T0_MS + (closed + 1) * inboxSlot * 1000;
+  return `public, max-age=${Math.min(inboxSlot, Math.max(1, Math.floor((end - nowMs) / 1000)))}`;
+}
+
 export class FakeWorld implements WorldCtx, RtHost {
   // ── clocks and parameters ──
   /** Server time = Date.now() + offsetMs. */
@@ -326,11 +342,24 @@ export class FakeWorld implements WorldCtx, RtHost {
   private readonly routes: Route[];
 
   constructor(opts: FakeWorldOptions = {}) {
+    const shards = opts.shards ?? 1;
+    if (!Number.isInteger(shards) || shards < 1 || shards > 65536 || (shards & (shards - 1)) !== 0)
+      throw new RangeError("shards must be a power of two in 1..65536");
+    const inboxBuckets = opts.inboxBuckets ?? 1;
+    if (
+      !Number.isInteger(inboxBuckets) ||
+      inboxBuckets < 1 ||
+      inboxBuckets > 65536 ||
+      (inboxBuckets & (inboxBuckets - 1)) !== 0
+    )
+      throw new RangeError("inboxBuckets must be a power of two in 1..65536");
     this.params = {
       delta: opts.delta ?? 1,
       skew: opts.skew ?? 0,
       inboxSlot: opts.inboxSlot ?? 1,
       efirst: opts.efirst ?? 0,
+      shards,
+      inboxBuckets,
     };
     this.pushOn = opts.push ?? false;
     this.shard = new FakeShard(this);
@@ -342,8 +371,10 @@ export class FakeWorld implements WorldCtx, RtHost {
       {
         now: () => this.now(),
         efirst: () => this.params.efirst,
-        shardHead: (E) => this.shard.head(E),
-        inboxHead: (E) => this.inbox.head(E),
+        shards: () => this.params.shards,
+        shardHead: (E, i) => this.shard.head(E, i),
+        inboxBuckets: () => this.params.inboxBuckets,
+        inboxHead: (E, g) => this.inbox.head(E, g),
         blobregHead: () => this.blobreg.head().head,
         dirlogHead: () => this.dir.head().h,
       },
@@ -378,6 +409,7 @@ export class FakeWorld implements WorldCtx, RtHost {
   advance(ms: number, opts: { keepSockets?: boolean } = {}): void {
     this.offsetMs += ms;
     if (!opts.keepSockets) this.rt.closeAll(1001, "clock moved");
+    this.inbox.flushNotices();
   }
 
   /**
@@ -394,6 +426,7 @@ export class FakeWorld implements WorldCtx, RtHost {
     if (!Number.isFinite(ms) || ms < 0) throw new RangeError("tick: ms must be ≥ 0");
     this.offsetMs += ms;
     for (const c of this.clocks) c.advance(ms);
+    this.inbox.flushNotices();
   }
 
   /** Moves server time to the start of era `E_now + n`, plus 1 s; closes every FakeWebSocket. Returns the new era. */
@@ -401,6 +434,7 @@ export class FakeWorld implements WorldCtx, RtHost {
     const now = this.now();
     this.offsetMs += eraStart(era(now) + n) + 1000 - now;
     if (!opts.keepSockets) this.rt.closeAll(1001, "new era");
+    this.inbox.flushNotices();
     return this.era;
   }
 
@@ -458,9 +492,15 @@ export class FakeWorld implements WorldCtx, RtHost {
     return kcommit(kroute(this.routeKey, E));
   }
 
+  /** (internal) WorldCtx: shard(E, label) (§4.4) with s_E from `params.shards`. */
+  shardOf(E: number, label: Bytes): number {
+    return shardIndex(routeV(kroute(this.routeKey, E), label), 31 - Math.clz32(this.params.shards));
+  }
+
   /** Closes every socket (end of a test). */
   close(): void {
     this.rt.closeAll(1001, "world closed");
+    this.inbox.close();
   }
 
   // ───────────── transports ─────────────
@@ -488,13 +528,47 @@ export class FakeWorld implements WorldCtx, RtHost {
     this.writeCount++;
   }
 
-  /** (internal) WorldCtx: RealtimeDO.publish. */
+  /** (internal) WorldCtx: FeedDO.publish → ConnDO.deliver. */
   publish(rows: PublishRow[]): void {
     this.rt.publish(rows);
   }
 
+  /** (internal) WorldCtx: the InboxDO's notice (§9.3) on its way to the sockets. */
+  notice(E: number, g: number, rel: number): void {
+    this.rt.inbox(E, g, rel);
+  }
+
+  /** kbucket_E of the fake KeyDO (§9.3 "Buckets"): random per era, made on first use. */
+  private readonly bucketKeys = new Map<number, Bytes>();
+  private bucketKey(E: number): Bytes {
+    let k = this.bucketKeys.get(E);
+    if (!k) this.bucketKeys.set(E, (k = random(32)));
+    return k;
+  }
+
+  /** β of every era: log2 of the world's inbox bucket count. */
+  get inboxBits(): number {
+    return 31 - Math.clz32(this.params.inboxBuckets);
+  }
+
+  /** bucket(E, handle) of §9.3: the inbox bucket of a user's invites and reads in era E. */
+  bucketOf(E: number, handle: string): number {
+    const bits = this.inboxBits;
+    return bits === 0
+      ? 0
+      : inboxBucketOf(this.bucketKey(E), bits, inboxPrefixOf(hpre(handle), bits));
+  }
+
+  /** The `inbox` list of a directory entry (§10.6): the user's bucket of E_now − 3 .. E_now + 1. */
+  inboxOf(handle: string): { E: number; g: number }[] {
+    const En = this.era;
+    return [En - 3, En - 2, En - 1, En, En + 1]
+      .filter((E) => E >= this.params.efirst && E <= 0xfffe)
+      .map((E) => ({ E, g: this.bucketOf(E, handle) }));
+  }
+
   /**
-   * (internal) RtHost: the Worker's handling of `GET /api/v2/rt` with an upgrade. A 101 is the RealtimeDO's response
+   * (internal) RtHost: the Worker's handling of `GET /api/v2/rt` with an upgrade. A 101 is the ConnDO's response
    * passed on unchanged, so it carries none of the per-response headers (§9.7, §10.1: HELLO carries the time); a
    * refusal is an error response like any other: 404 for another path, 429 from RL_READ or the per-client cap, 503
    * at the global cap or while `wsEnabled` is false.
@@ -529,7 +603,7 @@ export class FakeWorld implements WorldCtx, RtHost {
     return fail === "after" ? { status: 0, headers: null } : out;
   }
 
-  /** The Worker's answer to a RealtimeDO refusal (the DO's status, error and `retry-after`); null for a 101. */
+  /** The Worker's answer to a ConnDO refusal (the DO's status, error and `retry-after`); null for a 101. */
   private admitRefusal(status: number): Res | null {
     if (status === 101) return null;
     const retry = { "retry-after": "60" };
@@ -770,10 +844,11 @@ export class FakeWorld implements WorldCtx, RtHost {
       delta: p.delta,
       skew: p.skew,
       inboxSlot: p.inboxSlot,
+      inboxBuckets: p.inboxBuckets,
       inboxRetention: 4,
       inboxDayCap: this.inbox.dayCap,
       inboxBatch: INBOX_MAX_ROWS,
-      shards: 1,
+      shards: this.params.shards,
       p: this.dir.P,
       efirst: p.efirst,
       kcommit: b64u(this.kcommitOf(E)),
@@ -800,6 +875,8 @@ export class FakeWorld implements WorldCtx, RtHost {
         return err(400, "bad push subscription");
       if (o.quiet !== undefined && (typeof o.quiet !== "string" || fromB64u(o.quiet).length !== 16))
         return err(400, "bad quiet tag");
+      // The quiet tag is required unless the registration is deleted (§10.10).
+      if (o.quiet === undefined && o.tokens.length > 0) return err(400, "quiet tag required");
       this.push.sub(o.endpoint, o.tokens as string[], (o.quiet as string | undefined) ?? null);
       return { status: 204 };
     });
@@ -858,7 +935,8 @@ export class FakeWorld implements WorldCtx, RtHost {
         start: eraStart(E),
         end: eraEnd(E),
         delta: this.params.delta,
-        shards: 1,
+        shards: this.params.shards,
+        inboxBuckets: this.params.inboxBuckets,
         kcommit: b64u(this.kcommitOf(E)),
         sealed,
       },
@@ -973,12 +1051,23 @@ export class FakeWorld implements WorldCtx, RtHost {
     } catch (e) {
       return err(400, `bad inbox post (${(e as Error).message})`);
     }
-    if (p.bucket !== 0) return err(400, "bad bucket");
+    if (p.rows.some((r) => r.bucket >= this.params.inboxBuckets)) return err(400, "unknown bucket");
     const { cur, lo, hi } = this.bounds();
     if (p.E < lo || p.E > hi) return err(409, "wrong era", { era: cur });
-    const out = this.inbox.accept(p.E, p.rows);
-    if (out.s === "wrong_era") return err(409, "wrong era", { era: out.era });
-    return json(200, { results: out.results });
+    // One InboxDO per bucket: each bucket's rows go together; a WRONG_ERA from any is the call's (§10.5).
+    const groups = new Map<number, number[]>();
+    p.rows.forEach((r, k) => groups.set(r.bucket, [...(groups.get(r.bucket) ?? []), k]));
+    const results: InboxRowResult[] = [];
+    for (const [g, idx] of groups) {
+      const out = this.inbox.accept(
+        p.E,
+        idx.map((k) => p.rows[k]),
+        g,
+      );
+      if (out.s === "wrong_era") return err(409, "wrong era", { era: out.era });
+      idx.forEach((k, i) => (results[k] = out.results[i]));
+    }
+    return json(200, { results });
   }
 
   /**
@@ -989,7 +1078,7 @@ export class FakeWorld implements WorldCtx, RtHost {
     const E = eraParam(eS);
     const bucket = decimal(bS);
     if (E === null || bucket === null) return err(400, "bad era or bucket");
-    if (bucket !== 0) return err(400, "unknown bucket");
+    if (bucket >= this.params.inboxBuckets) return err(400, "unknown bucket");
     const { cur, hi } = this.bounds();
     if (E > hi) return err(400, "era is in the future");
     if (E < cur - 3) return err(410, "inbox era no longer served");
@@ -999,8 +1088,11 @@ export class FakeWorld implements WorldCtx, RtHost {
     if (after === undefined || limit === undefined) return err(400, "bad after or limit");
     const key = `${req.url.origin}/api/v2/inbox/${E}/${bucket}?after=${after}&limit=${limit}`;
     return this.cachedRead(req, log, key, () => {
-      const r = this.inbox.read(E, after, limit);
-      const cache = r.ended && !r.more ? IMMUTABLE : `public, max-age=${this.params.inboxSlot}`;
+      const r = this.inbox.read(E, after, limit, bucket);
+      const cache =
+        r.ended && !r.more
+          ? IMMUTABLE
+          : inboxCacheControl(r.closed, this.now(), this.params.inboxSlot);
       return bin(encodeInboxRead({ closed: r.closed, more: r.more, rows: r.rows }), { cache });
     });
   }
@@ -1108,7 +1200,8 @@ export class FakeWorld implements WorldCtx, RtHost {
     const E = eraParam(eS);
     const i = decimal(iS);
     if (E === null || i === null || i > 0xffff) return err(400, "bad era or shard");
-    if (i !== 0 || E > this.bounds().hi || E < this.params.efirst) return err(404, "unknown shard");
+    if (i >= this.params.shards || E > this.bounds().hi || E < this.params.efirst)
+      return err(404, "unknown shard");
     const after = queryInt(req.url, "after", 0, 0, 0xffffffff);
     if (after === undefined) return err(400, "bad after");
     const key = `${req.url.origin}/api/v2/feed/${E}/${i}?after=${after}`;
@@ -1117,7 +1210,7 @@ export class FakeWorld implements WorldCtx, RtHost {
       log,
       key,
       () => {
-        const page = this.shard.feed(E, after);
+        const page = this.shard.feed(E, i, after);
         const bytes = encodeFeed({
           more: page.more,
           batches: page.batches.map((b) => ({
@@ -1164,18 +1257,7 @@ export class FakeWorld implements WorldCtx, RtHost {
   private getDirUid(uidS: string): Res {
     if (!b64Param(uidS, 16)) return err(400, "bad uid");
     const u = this.dir.byUid(uidS);
-    return u
-      ? json(200, {
-          user: {
-            uid: u.uid,
-            handle: u.handle,
-            bundle: u.bundle,
-            sig: u.sig,
-            regEra: u.regEra,
-            dirseq: u.dirseq,
-          },
-        })
-      : err(404, "unknown uid");
+    return u ? json(200, { user: userJson(u, this.inboxOf(u.handle)) }) : err(404, "unknown uid");
   }
 
   /** GET /api/v2/dir/wraps/{id}[?uid=]. */

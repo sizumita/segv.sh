@@ -58,6 +58,8 @@ export interface Params {
   inboxDayCap: number;
   inboxBatch: number;
   shards: number;
+  /** 2^β of the current era (§9.3); informational, like `shards` */
+  inboxBuckets: number;
   /** the directory's P (§9.6) */
   p: number;
   efirst: number;
@@ -119,7 +121,12 @@ export function checkParams(x: unknown): Params {
   if (!isInt(x.inboxSlot, 1, 3600)) bad("inboxSlot");
   if (!isInt(x.p, 0, 32)) bad("p");
   if (!isInt(x.efirst, 0, 0xfffe)) bad("efirst");
-  if (!isInt(x.shards, 1, 1) || !isInt(x.inboxBatch, 1, 32) || !isInt(x.inboxRetention, 0, 0xfffe))
+  if (
+    !isInt(x.shards, 1, 65536) ||
+    !isInt(x.inboxBuckets, 1, 65536) ||
+    !isInt(x.inboxBatch, 1, 32) ||
+    !isInt(x.inboxRetention, 0, 0xfffe)
+  )
     bad("layout");
   if (!isInt(x.inboxDayCap, 0, Number.MAX_SAFE_INTEGER)) bad("inboxDayCap");
   if (!isB64u(x.srvKey, 32) || typeof x.kcommit !== "string") bad("keys");
@@ -222,6 +229,8 @@ export interface UserJson {
   sig: string;
   regEra: number;
   dirseq: number;
+  /** the user's inbox bucket of each era the server lists (E_now − 3 .. E_now + 1, §9.3, §10.6) */
+  inbox: { E: number; g: number }[];
 }
 
 export interface WrapJson {
@@ -247,6 +256,8 @@ export interface DirUser {
   dirseq: number;
   /** pin(u) (§2.2) */
   pin: Bytes;
+  /** the user's inbox bucket per era, as the server listed them (§10.6) */
+  inbox: { E: number; g: number }[];
 }
 
 function isUserJson(x: unknown): x is UserJson {
@@ -257,9 +268,15 @@ function isUserJson(x: unknown): x is UserJson {
     typeof x.bundle === "string" &&
     typeof x.sig === "string" &&
     isInt(x.regEra, 0, 0xfffe) &&
-    isInt(x.dirseq, 0, Number.MAX_SAFE_INTEGER)
+    isInt(x.dirseq, 0, Number.MAX_SAFE_INTEGER) &&
+    Array.isArray(x.inbox) &&
+    x.inbox.every((b) => isObj(b) && isInt(b.E, 0, 0xfffe) && isInt(b.g, 0, 0xffffffff))
   );
 }
+
+/** The bucket of era E that a directory entry lists, or null when the entry does not cover E (§10.6). */
+export const bucketIn = (u: { inbox: { E: number; g: number }[] }, E: number): number | null =>
+  u.inbox.find((b) => b.E === E)?.g ?? null;
 
 /** Verifies a directory user; null when its bundle does not verify or does not match the row. */
 export function verifyUser(u: UserJson): DirUser | null {
@@ -277,6 +294,7 @@ export function verifyUser(u: UserJson): DirUser | null {
       sig: u.sig,
       regEra: u.regEra,
       dirseq: u.dirseq,
+      inbox: u.inbox,
       pin: P.pin(u.bundle, P.fromB64u(u.sig)),
     };
   } catch {
@@ -325,6 +343,10 @@ async function readError(res: Response): Promise<ApiError> {
   return new ApiError(res.status, msg, body, Number.isFinite(ra) && ra >= 0 ? ra : null);
 }
 
+/** The longest wait before a registration is sent again (s), whatever its `retry-after` (§2.5 step 8). */
+export const REGISTER_WAIT_MAX_S = 10;
+/** Sends of one registration: the first and the identical ones after a network error, a 429 or a 5xx. */
+export const REGISTER_SENDS = 5;
 const TIMEOUT = "timeout";
 
 /**
@@ -864,14 +886,15 @@ export class Api {
   // ── inbox (§10.5) ──
 
   /**
-   * Posts 1..32 invites of era E (one burst, §6.12). A 409 `wrong era` throws an ApiError whose body names `era`.
+   * Posts 1..32 invites of era E (one burst, §6.12), each in its recipient's bucket. A 409 `wrong era` throws an
+   * ApiError whose body names `era`.
    */
   async postInbox(
     E: number,
     rows: readonly W.InboxPostRow[],
     onProgress?: Progress,
   ): Promise<W.InboxPostResult[]> {
-    const body = W.encodeInboxPost({ E, bucket: 0, rows: [...rows] });
+    const body = W.encodeInboxPost({ E, rows: [...rows] });
     const res = await this.postPow(
       "/api/v2/inbox",
       "inbox",
@@ -887,11 +910,11 @@ export class Api {
   }
 
   /**
-   * One page of `GET /api/v2/inbox/{E}/0?after=` (§10.5). A malformed page (decreasing rel, or `more = 1` without a
-   * row above `after`) is a failed read.
+   * One page of `GET /api/v2/inbox/{E}/{g}?after=` (§10.5), g the account's bucket of E. A malformed page (decreasing
+   * rel, or `more = 1` without a row above `after`) is a failed read.
    */
-  async readInbox(E: number, after: number): Promise<W.InboxRead> {
-    const res = await this.request(`/api/v2/inbox/${E}/0?after=${after}`);
+  async readInbox(E: number, g: number, after: number): Promise<W.InboxRead> {
+    const res = await this.request(`/api/v2/inbox/${E}/${g}?after=${after}`);
     if (!res.ok) throw await readError(res);
     let page: W.InboxRead;
     try {
@@ -908,23 +931,58 @@ export class Api {
 
   /**
    * `POST /api/v2/register`. `now` is the response's `x-segv-now`: the server time of the registration, from which
-   * the first inbox cursor is computed (§11.1), or null when absent.
+   * the first inbox cursor is computed (§11.1), or null when absent. After a network error, a 429 or a 5xx the
+   * identical body is sent again (§2.5 step 8), after the answer's `retry-after` or a backoff from 1 s, whichever is
+   * longer, at most REGISTER_WAIT_MAX_S, up to REGISTER_SENDS sends: the directory answers a registration it already
+   * logged as it answered the first time, so a 200 means registered and a 409 that another account holds the handle.
+   * The proof of work is reused while its window is accepted (§10.2) and solved again otherwise; a 403 refreshes the
+   * params and solves it again, once. The last error is thrown.
    */
   async register(
     body: { bundle: string; sig: string; wraps: WrapJson[] },
     onProgress?: Progress,
   ): Promise<{ dirseq: number; now: number | null }> {
-    const res = await this.postPow(
-      "/api/v2/register",
-      "register",
-      P.utf8(JSON.stringify(body)),
-      "application/json",
-      onProgress,
-    );
-    const h = res.headers.get("x-segv-now");
-    const j = await this.json<{ dirseq: number }>(res);
-    const now = h !== null && /^\d{1,16}$/.test(h) ? Number(h) : null;
-    return { dirseq: j.dirseq, now: now !== null && Number.isSafeInteger(now) ? now : null };
+    const bytes = P.utf8(JSON.stringify(body));
+    const digest = P.H(bytes);
+    let pow: string | null = null;
+    let refreshed = false;
+    for (let send = 1; ; send++) {
+      // A proof is accepted while its window is the current or the previous one (§10.2).
+      if (
+        pow === null ||
+        Math.floor(this.serverNow() / P.POW_WINDOW_MS) - Number(pow.slice(0, pow.indexOf("."))) > 1
+      )
+        pow = await this.powHeader("register", digest, bytes.length, onProgress);
+      let err: ApiError;
+      try {
+        const res = await this.request("/api/v2/register", {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-segv-pow": pow },
+          body: bytes as BodyInit,
+        });
+        if (res.ok) {
+          const h = res.headers.get("x-segv-now");
+          const j = await this.json<{ dirseq: number }>(res);
+          const now = h !== null && /^\d{1,16}$/.test(h) ? Number(h) : null;
+          return { dirseq: j.dirseq, now: now !== null && Number.isSafeInteger(now) ? now : null };
+        }
+        err = await readError(res);
+      } catch (e) {
+        if (!(e instanceof ApiError)) throw e;
+        err = e;
+      }
+      if (err.status === 403 && !refreshed) {
+        refreshed = true;
+        await this.params(true);
+        pow = null;
+        send--;
+        continue;
+      }
+      if (!err.transient || send >= REGISTER_SENDS) throw err;
+      onProgress?.("the server did not answer; sending the registration again…");
+      const wait = Math.min(Math.max(err.retryAfter ?? 0, 2 ** (send - 1)), REGISTER_WAIT_MAX_S);
+      await new Promise<void>((resolve) => this.clock.setTimer(resolve, wait * 1000));
+    }
   }
 
   // ── Web Push (§10.10) ──

@@ -14,6 +14,7 @@
  */
 import {
   BLOBREG_CID,
+  blobregAll,
   DIRLOG_CID,
   H,
   ZERO32,
@@ -52,8 +53,12 @@ export interface CkptSources {
   now(): number;
   /** E_FIRST (the previous era's components are collected only when E_now − 1 ≥ max(E_FIRST, 0)) */
   efirst(): number;
-  shardHead(E: number): { head: Bytes; sealed: boolean };
-  inboxHead(E: number): { head: Bytes; ended: boolean };
+  /** S_E (§9.1) */
+  shards(E: number): number;
+  shardHead(E: number, i: number): { head: Bytes; sealed: boolean };
+  /** 2^β_E (§9.3) */
+  inboxBuckets(E: number): number;
+  inboxHead(E: number, g: number): { head: Bytes; ended: boolean };
   blobregHead(): Bytes;
   dirlogHead(): Bytes;
 }
@@ -146,20 +151,26 @@ export class FakeCheckpoints {
 
   private collect(now: number): CkptHead[] {
     const E = era(now);
-    const heads: CkptHead[] = [
-      { cid: shardCid(E, 0), head: this.src.shardHead(E).head },
-      { cid: inboxCid(E, 0), head: this.src.inboxHead(E).head },
-    ];
+    const heads: CkptHead[] = [];
+    for (let i = 0; i < this.src.shards(E); i++)
+      heads.push({ cid: shardCid(E, i), head: this.src.shardHead(E, i).head });
+    for (let g = 0; g < this.src.inboxBuckets(E); g++)
+      heads.push({ cid: inboxCid(E, g), head: this.src.inboxHead(E, g).head });
     if (E - 1 >= Math.max(this.src.efirst(), 0)) {
-      const sh = this.src.shardHead(E - 1);
-      this.previous(heads, shardCid(E - 1, 0), sh.head, sh.sealed);
-      const ib = this.src.inboxHead(E - 1);
-      this.previous(heads, inboxCid(E - 1, 0), ib.head, ib.ended);
+      for (let i = 0; i < this.src.shards(E - 1); i++) {
+        const sh = this.src.shardHead(E - 1, i);
+        this.previous(heads, shardCid(E - 1, i), sh.head, sh.sealed);
+      }
+      for (let g = 0; g < this.src.inboxBuckets(E - 1); g++) {
+        const ib = this.src.inboxHead(E - 1, g);
+        this.previous(heads, inboxCid(E - 1, g), ib.head, ib.ended);
+      }
     }
     const hour = Math.floor(now / 3_600_000);
     if (hour > this.blobHour) {
       this.blobHour = hour;
-      this.blobHead = this.src.blobregHead();
+      // One registry shard in the fake world: the hourly value over its head (§9.5).
+      this.blobHead = blobregAll(hour, [this.src.blobregHead()]);
     }
     heads.push({ cid: BLOBREG_CID, head: this.blobHead });
     heads.push({ cid: DIRLOG_CID, head: this.src.dirlogHead() });

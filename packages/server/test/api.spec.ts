@@ -3,11 +3,12 @@
  * Tests that need to observe or replace a binding call handleApi directly
  * (helpers.direct) with a spied or fake namespace.
  */
-import { runInDurableObject } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import * as P from "@segv/protocol/proto";
 import * as W from "@segv/protocol/wire";
+import { clientKey } from "../src/abuse";
 import {
   MAX_REGISTER_BODY,
   MAX_WRAP_BODY,
@@ -16,9 +17,10 @@ import {
   routeLabel,
 } from "../src/api";
 import type { CheckpointDO } from "../src/ckpt-do";
-import type { RealtimeDO, RtLimits } from "../src/realtime-do";
+import type { ConnDO, RtLimits } from "../src/conn-do";
+import type { BlobRegDO } from "../src/blobreg-do";
 import type { ShardDO } from "../src/shard-do";
-import { shardStub, type ShardPutRow } from "../src/types";
+import { blobRegStub, connName, keyStub, shardStub, type ShardPutRow } from "../src/types";
 import {
   DIFF2,
   E_FIRST,
@@ -150,6 +152,7 @@ describe("GET /api/v2/params", () => {
       "inboxDayCap",
       "inboxBatch",
       "shards",
+      "inboxBuckets",
       "p",
       "efirst",
       "kcommit",
@@ -274,7 +277,7 @@ describe("GET /api/v2/params", () => {
       bind: () => stmt,
       first: () => Promise.reject(new Error("D1_ERROR: Network connection lost.")),
     };
-    const DB = new Proxy(env.DB, {
+    const DIRLOG = new Proxy(env.DIRLOG, {
       get: (t, k) => (k === "prepare" ? () => (reads++, stmt) : Reflect.get(t, k)),
     });
     const CKPT = { getByName: () => ({ ensure: async () => {} }) };
@@ -283,7 +286,7 @@ describe("GET /api/v2/params", () => {
     console.error = (...a: unknown[]) => void logs.push(a);
     try {
       for (let i = 0; i < 5; i++) {
-        const res = await direct("/api/v2/params", {}, { DB, CKPT });
+        const res = await direct("/api/v2/params", {}, { DIRLOG, CKPT });
         expect(res.status).toBe(200);
         expect(((await res.json()) as { p: number }).p).toBe(0);
       }
@@ -312,6 +315,7 @@ describe("GET /api/v2/era/{E}", () => {
       "end",
       "delta",
       "shards",
+      "inboxBuckets",
       "kcommit",
       "sealed",
     ]);
@@ -321,6 +325,7 @@ describe("GET /api/v2/era/{E}", () => {
       end: P.eraEnd(E),
       delta: 1,
       shards: 1,
+      inboxBuckets: 4,
       kcommit: P.b64u(P.kcommit(testKroute(E))),
       sealed: false,
     });
@@ -342,6 +347,7 @@ describe("GET /api/v2/era/{E}", () => {
       "end",
       "delta",
       "shards",
+      "inboxBuckets",
       "kcommit",
       "sealed",
     ]);
@@ -351,6 +357,7 @@ describe("GET /api/v2/era/{E}", () => {
       end: P.eraEnd(E),
       delta: 1,
       shards: 1,
+      inboxBuckets: 4,
       kcommit: P.b64u(P.kcommit(testKroute(E))),
       sealed: true,
     });
@@ -872,16 +879,17 @@ describe("GET /api/v2/feed and /api/v2/ckpt", () => {
     const N = 2100; // one Δ batch of 2100 class-3 rows: 2100 × (17 + 16 424) B ≈ 34.5 MB on the wire
     const sent = new Map<string, ShardPutRow>();
     for (let k = 0; k < N; k += 300) {
-      const part = Array.from({ length: 300 }, () => ({
-        v: P.random(8),
-        label: randomLabel(),
-        cls: 3,
-        body: randomBody(3),
-      }));
+      const part = Array.from({ length: 300 }, () => {
+        const v = P.random(8);
+        v[0] &= 0x7f; // a routing value is below 2^63 (§4.4)
+        return { v, label: randomLabel(), cls: 3, body: randomBody(3) };
+      });
       for (const r of await shard.put(E, 0, part)) expect(r.s).toBe("ok");
       for (const r of part) sent.set(P.b64u(r.label), r);
     }
-    await shardClock(P.eraEnd(E) + 1000); // the next RPC seals the era, closing the batch
+    // Past the era's end: the next RPC seals it, closing the batch. Far past it, so that the paging alarm the seal
+    // arms (clock + 1 s, §9.1) lies in the real future and only runs when this test runs it.
+    await shardClock(P.eraStart(eraNow() + 500));
     const { batches, head } = await feedVerified(E, true);
     expect(batches).toHaveLength(1);
     const [b] = batches;
@@ -892,6 +900,29 @@ describe("GET /api/v2/feed and /api/v2/ckpt", () => {
     for (const r of b.rows) expect(eq(r.body, sent.get(P.b64u(r.label))!.body)).toBe(true);
     expect(new Set(b.rows.map((r) => P.b64u(r.label))).size).toBe(N);
     expect(eq(head, (await shard.head(E, 0)).head)).toBe(true);
+    // Paged into R2 (three parts of 16 MiB), the page is the same: streamed from one Range of `rows` (§10.9).
+    for (let k = 0; ; k++) {
+      const paged = await runInDurableObject(shard, (_inst: ShardDO, state) => {
+        const v = state.storage.sql
+          .exec<{ v: SqlStorageValue }>("SELECT v FROM meta WHERE k = 'state'")
+          .toArray()[0]?.v;
+        return v === "paged";
+      });
+      if (paged) break;
+      expect(k, "paging alarms").toBeLessThan(40);
+      expect(await runDurableObjectAlarm(shard)).toBe(true);
+    }
+    const again = await feedVerified(E, true);
+    expect(again.batches).toHaveLength(1);
+    expect(again.batches[0].n).toBe(N);
+    expect(eq(again.head, head)).toBe(true);
+    for (const r of again.batches[0].rows)
+      expect(eq(r.body, sent.get(P.b64u(r.label))!.body)).toBe(true);
+    const seal = (await (await api(`/api/v2/seal/${E}/0`)).json()) as {
+      rows: { n: number; sha256: string[] };
+    };
+    expect(seal.rows.n).toBe(N);
+    expect(seal.rows.sha256).toHaveLength(3);
   }, 120_000);
 
   it("ckpt: 404 for q = 0 and unknown q; 400 on bad range parameters", async () => {
@@ -934,7 +965,11 @@ describe("inbox", () => {
       expect(rel).toBeGreaterThanOrEqual(Math.floor(before / 1000) + 1); // rel > ⌊ms / D⌋
       expect(rel).toBeLessThanOrEqual(Math.floor(after / 1000) + 2);
     }
-    const r2 = await inboxPostOk([i1, { eid: i2.eid, body: bigRandom(P.INBOX_BODY_LEN) }, i3]);
+    const r2 = await inboxPostOk([
+      i1,
+      { bucket: 0, eid: i2.eid, body: bigRandom(P.INBOX_BODY_LEN) },
+      i3,
+    ]);
     expect(r2[0]).toEqual({ rel: rels[0] }); // same eid, same body: idempotent
     expect(r2[1]).toEqual({ error: "conflict" });
     expect(Object.keys(r2[2])).toEqual(["rel"]);
@@ -969,29 +1004,29 @@ describe("inbox", () => {
     if (read.rows.length > one.rows.length) expect(one.more).toBe(true);
   });
 
-  it("409 {error, era} for a post outside the current era; 400 for bucket ≠ 0, a bad count or length; 413 above 45 831 B", async () => {
+  it("409 {error, era} for a post outside the current era; 400 for a bucket past the era's, a bad count or length; 413 above 45 955 B", async () => {
     const E = eraNow();
     for (const e of [E + 1, E - 1]) {
-      const res = await inboxPostRaw({ E: e, bucket: 0, rows: [randomInvite()] });
+      const res = await inboxPostRaw({ E: e, rows: [randomInvite()] });
       expect(res.status, String(e)).toBe(409);
       expectApiHeaders(res);
       expect(await res.json()).toEqual({ error: "wrong era", era: E });
     }
-    const one = W.encodeInboxPost({ E, bucket: 0, rows: [randomInvite()] });
-    const bucket1 = one.slice();
-    bucket1[5] = 1;
-    const count0 = one.slice(0, 7);
-    count0[6] = 0;
+    const one = W.encodeInboxPost({ E, rows: [randomInvite()] });
+    // u16 E | u8 count | (u32 bucket | eid | body) × count: the test deployment has 4 buckets (INBOX_MAP "0:4").
+    const bucket4 = one.slice();
+    bucket4[6] = 4;
+    const count0 = one.slice(0, 3);
+    count0[2] = 0;
     const count33 = W.encodeInboxPost({
       E,
-      bucket: 0,
-      rows: Array.from({ length: 32 }, randomInvite),
-    }).slice(0, 7 + 31 * 1432);
-    count33[6] = 33;
+      rows: Array.from({ length: 32 }, () => randomInvite()),
+    }).slice(0, 3 + 31 * 1436);
+    count33[2] = 33;
     const count2 = one.slice();
-    count2[6] = 2;
+    count2[2] = 2;
     const cases: [string, Bytes][] = [
-      ["bucket 1", bucket1],
+      ["bucket 4", bucket4],
       ["count 0", count0],
       ["count 33", count33],
       ["count 2, one row", count2],
@@ -1004,31 +1039,30 @@ describe("inbox", () => {
       expect(res.status, name).toBe(400);
       expectApiHeaders(res);
     }
-    expect(W.INBOX_MAX_BYTES).toBe(45831);
+    expect(W.INBOX_MAX_BYTES).toBe(45955);
     const full = W.encodeInboxPost({
       E,
-      bucket: 0,
-      rows: Array.from({ length: 32 }, randomInvite),
+      rows: Array.from({ length: 32 }, () => randomInvite()),
     });
-    expect(full.length).toBe(45831);
+    expect(full.length).toBe(45955);
     const big = P.concat(full, Uint8Array.of(0));
     expect(
       (await api("/api/v2/inbox", { method: "POST", body: big, headers: { "x-segv-pow": "0.0" } }))
         .status,
     ).toBe(413);
-    // 32 invites are one request (and one PoW priced by its size).
-    const res = await inboxPostOk(Array.from({ length: 32 }, randomInvite));
+    // 32 invites are one request (and one PoW priced by its size), whatever their buckets.
+    const res = await inboxPostOk(Array.from({ length: 32 }, (_, k) => randomInvite(k % 4)));
     expect(res.every((r) => "rel" in r)).toBe(true);
   });
 
-  it("reads: 410 below E_now − 3, 400 for a future era or bucket ≠ 0 or bad parameters; an ended era is immutable", async () => {
+  it("reads: 410 below E_now − 3, 400 for a future era, a bucket past the era's or bad parameters; an ended era is immutable", async () => {
     const E = eraNow();
     const gone = await inboxReadRaw(E - 4);
     expect(gone.status).toBe(410);
     expectApiHeaders(gone);
     for (const [name, res] of [
       ["future", await inboxReadRaw(E + 1)],
-      ["bucket 1", await inboxReadRaw(E, "", 1)],
+      ["bucket 4", await inboxReadRaw(E, "", 4)],
       ["limit 0", await inboxReadRaw(E, "?limit=0")],
       ["limit 1025", await inboxReadRaw(E, "?limit=1025")],
       ["after -1", await inboxReadRaw(E, "?after=-1")],
@@ -1136,6 +1170,7 @@ describe("directory: POST /api/v2/register and /api/v2/wraps", () => {
     expect(u.headers.get("cache-control")).toBe("no-store");
     const { user } = (await u.json()) as { user: DirUserJson };
     expect(user).toEqual({
+      inbox: expect.any(Array), // the inbox buckets (§10.6), checked in "inbox buckets" below
       uid: a.uidB64,
       handle: a.handle,
       bundle: a.bundle,
@@ -1371,6 +1406,9 @@ describe("directory lookups", () => {
       sig: a.sig,
       regEra: eraNow(),
       dirseq,
+      // the inbox buckets the server lists (§10.6): the same in every lookup, checked in "inbox buckets" below
+      inbox: ((await (await api(`/api/v2/dir/uid/${a.uidB64}`)).json()) as { user: DirUserJson })
+        .user.inbox,
     };
     for (const p of [0, 1, Math.min(32, Pnow + 1)]) {
       expect(
@@ -1763,7 +1801,7 @@ interface PowTarget {
 
 async function powTargets(): Promise<PowTarget[]> {
   const put = W.encodePutRequest([makeRow()]);
-  const inbox = W.encodeInboxPost({ E: eraNow(), bucket: 0, rows: [randomInvite()] });
+  const inbox = W.encodeInboxPost({ E: eraNow(), rows: [randomInvite()] });
   const register = jsonBytes(registerBody(makeAccount()));
   const wrap = jsonBytes(makeAccount().passkey);
   const { blob, id } = P.encryptBlob(P.utf8("pow"));
@@ -1875,7 +1913,7 @@ describe("proof of work", () => {
     });
     expect(res.status).toBe(200);
     expect(W.decodePutResponse(await bytesOf(res))[0].s).toBe("ok");
-    const inbox = W.encodeInboxPost({ E: eraNow(), bucket: 0, rows: [randomInvite()] });
+    const inbox = W.encodeInboxPost({ E: eraNow(), rows: [randomInvite()] });
     const res2 = await api("/api/v2/inbox", {
       method: "POST",
       body: inbox,
@@ -1936,7 +1974,6 @@ describe("rate limiting", () => {
   it("RL_INBOX: 10 posts per minute per IP, one token per request", async () => {
     const body = W.encodeInboxPost({
       E: eraNow(),
-      bucket: 0,
       rows: Array.from({ length: 2 }, randomInvite),
     });
     const statuses = await inOneRateWindow(async () => {
@@ -2020,12 +2057,21 @@ async function subscribed(c: RtClient, topics: Bytes[]): Promise<void> {
   throw new Error("subscription never took effect");
 }
 
-/** Runs `fn` inside the production RealtimeDO instance ("rt/v2/0"), with its test-visible fields. */
+/** The ConnDO index of a client address: conn(ck) of its tag under the test ROUTE_KEY and RT_CONNS (§4.4). */
+const connIndexOf = (ip: string): number =>
+  P.connOf(
+    P.clientTagOf(
+      P.ktag(P.fromB64u(env.ROUTE_KEY)),
+      clientKey(new Request(ORIGIN, { headers: { "cf-connecting-ip": ip } })),
+    ),
+    Number(env.RT_CONNS),
+  );
+/** Runs `fn` inside the ConnDO that serves the client at `ip`, with its test-visible fields. */
 type RtInner = { clock: () => number; limits: RtLimits };
-const rtInside = (fn: (i: RtInner, state: DurableObjectState) => void) =>
+const connInside = (ip: string, fn: (i: RtInner, state: DurableObjectState) => void) =>
   runInDurableObject(
-    (env.RT as unknown as DurableObjectNamespace<RealtimeDO>).getByName("rt/v2/0"),
-    (inst: RealtimeDO, state) => fn(inst as unknown as RtInner, state),
+    (env.CONN as unknown as DurableObjectNamespace<ConnDO>).getByName(connName(connIndexOf(ip))),
+    (inst: ConnDO, state) => fn(inst as unknown as RtInner, state),
   );
 
 const expectClosedWith = async (c: RtClient, code: number) => {
@@ -2155,39 +2201,42 @@ describe("GET /api/v2/rt", () => {
   });
 
   it("relays the global socket cap as 503 with retry-after", async () => {
-    const keep = await openRt();
+    const ip = freshIp();
+    const keep = await openRt({ ip });
     try {
-      await rtInside(
+      await connInside(
+        ip,
         (i, state) =>
           void (i.limits.total = state
             .getWebSockets()
             .filter((w) => w.readyState === WebSocket.OPEN).length),
       );
-      const full = await rtUpgrade();
+      const full = await rtUpgrade({ ip });
       expect(full.status).toBe(503);
       expect(full.headers.get("retry-after")).toBe("60");
       expectApiHeaders(full);
       expect(typeof (await errorOf(full))).toBe("string");
     } finally {
-      await rtInside((i) => void (i.limits.total = 20_000));
+      await connInside(ip, (i) => void (i.limits.total = 20_000));
       keep.close();
     }
-    (await openRt()).close();
+    (await openRt({ ip })).close();
   });
 
   it("closes sockets older than 1 h with 4000 before delivering to them", async () => {
     const T = randomTopic();
-    const old = await openRt();
+    const ip = freshIp();
+    const old = await openRt({ ip });
     try {
       await subscribed(old, [T]);
       const later = Date.now() + 2 * 3_600_000;
-      await rtInside((i) => void (i.clock = () => later));
+      await connInside(ip, (i) => void (i.clock = () => later));
       const row = makeRow({ topic: T });
       await putOk([row]);
       await expectClosedWith(old, 4000);
       expect(old.rows().some((r) => eq(r.label, row.label))).toBe(false);
     } finally {
-      await rtInside((i) => void (i.clock = () => Date.now()));
+      await connInside(ip, (i) => void (i.clock = () => Date.now()));
       old.close();
     }
     // A fresh socket gets the next row.
@@ -2256,7 +2305,8 @@ describe("GET /api/v2/rt", () => {
 
   it("RESUME replays the rows of its topics published since `since`, then RESUMED; an unknown boot gets GAP", async () => {
     const T = randomTopic();
-    const first = await openRt();
+    const ip = freshIp(); // one client: its sockets all reach its ConnDO (§4.4), whose boot the RESUME names
+    const first = await openRt({ ip });
     const since = first.hello!.seq;
     const boot = first.hello!.boot;
     let row: W.PutRow;
@@ -2269,7 +2319,7 @@ describe("GET /api/v2/rt", () => {
     } finally {
       first.close();
     }
-    const second = await openRt();
+    const second = await openRt({ ip });
     try {
       second.send({ f: "resume", boot, since, topics: [T] });
       await second.until(() => second.frames.some((f) => f.f === "resumed"), "RESUMED");
@@ -2285,7 +2335,7 @@ describe("GET /api/v2/rt", () => {
     } finally {
       second.close();
     }
-    const third = await openRt();
+    const third = await openRt({ ip });
     try {
       const otherBoot = boot.slice();
       otherBoot[0] ^= 0xff;
@@ -2377,6 +2427,9 @@ describe("hosts, HSTS and server secrets", () => {
       { INBOX_SLOT_S: "0" },
       { E_FIRST: "65535" },
       { E_FIRST: "-1" },
+      { DIR_SHARDS: "3" }, // not a power of two
+      { DIR_SHARDS: "4" }, // the deployment binds DB and DB1 only (§9.6)
+      { DIRLOG: undefined }, // the log database must be bound
     ];
     for (const over of bad) {
       for (const [path, init] of [
@@ -2418,7 +2471,8 @@ describe("era bounds (§9.7): no Durable Object for out-of-range eras", () => {
     const spies = {
       SHARD: spyNamespace(env.SHARD, calls),
       INBOX: spyNamespace(env.INBOX, calls),
-      RT: spyNamespace(env.RT, calls),
+      CONN: spyNamespace(env.CONN, calls),
+      FEED: spyNamespace(env.FEED, calls),
     };
     const put = W.encodePutRequest([
       makeRow({ E: 65000, topic: randomTopic() }),
@@ -2432,7 +2486,7 @@ describe("era bounds (§9.7): no Durable Object for out-of-range eras", () => {
     ]);
     // Inbox posts: 409 {error: "wrong era", era} outside [era(now − SKEW), era(now + SKEW)] (SKEW = 0 here).
     for (const e of [65000, 0, E + 1, E - 1]) {
-      const post = W.encodeInboxPost({ E: e, bucket: 0, rows: [randomInvite()] });
+      const post = W.encodeInboxPost({ E: e, rows: [randomInvite()] });
       const r = await direct("/api/v2/inbox", await powInit("inbox", post), spies);
       expect(r.status, String(e)).toBe(409);
       expect(await r.json()).toEqual({ error: "wrong era", era: E });
@@ -2503,10 +2557,7 @@ describe("server time (x-segv-now) and cache before limits", () => {
         "409 inbox",
         await direct(
           "/api/v2/inbox",
-          await powInit(
-            "inbox",
-            W.encodeInboxPost({ E: 65000, bucket: 0, rows: [randomInvite()] }),
-          ),
+          await powInit("inbox", W.encodeInboxPost({ E: 65000, rows: [randomInvite()] })),
         ),
       ],
       ["400 dir", await api("/api/v2/dir/h/33/0")],
@@ -2535,14 +2586,14 @@ describe("server time (x-segv-now) and cache before limits", () => {
     }
   });
 
-  it("the 101 upgrade is returned exactly as the RealtimeDO built it: no x-segv-now, HSTS, nosniff or no-referrer", async () => {
+  it("the 101 upgrade is returned exactly as the ConnDO built it: no x-segv-now, HSTS, nosniff or no-referrer", async () => {
     const PER_RESPONSE = [
       "x-segv-now",
       "strict-transport-security",
       "x-content-type-options",
       "referrer-policy",
     ];
-    // Through the Worker entry and the real RealtimeDO: HELLO carries the server time instead.
+    // Through the Worker entry and the real ConnDO: HELLO carries the server time instead.
     const res = await rtUpgrade();
     expect(res.status).toBe(101);
     for (const h of PER_RESPONSE) expect(res.headers.get(h), h).toBeNull();
@@ -2553,11 +2604,10 @@ describe("server time (x-segv-now) and cache before limits", () => {
     } finally {
       c.close();
     }
-    // handleApi hands back the very Response object the RealtimeDO returned, its headers untouched.
+    // handleApi hands back the very Response object the ConnDO returned, its headers untouched.
     _resetApiForTests();
     let built: Response | undefined;
-    const RT = fakeNs({
-      wsTagKey: async () => new Uint8Array(32).fill(9),
+    const CONN = fakeNs({
       fetch: async () => {
         const pair = new WebSocketPair();
         pair[1].accept();
@@ -2573,7 +2623,7 @@ describe("server time (x-segv-now) and cache before limits", () => {
       const r = await direct(
         "/api/v2/rt",
         { headers: { upgrade: "websocket", origin: ORIGIN } },
-        { RT },
+        { CONN },
       );
       expect(r.status).toBe(101);
       expect(r).toBe(built);
@@ -2689,7 +2739,80 @@ function countingLimiter(left = Number.POSITIVE_INFINITY) {
 }
 
 describe("Worker logic (fake Durable Objects)", () => {
-  it("publishes OK rows that carry a topic in one publish call (one retry), never delaying or changing the response", async () => {
+  it("routes rows and keys by the era's shard count (SHARD_MAP, §9.1), reports it in params and era info, and refuses a malformed map", async () => {
+    const E = eraNow();
+    const map = `${E}:4`; // four shards from this era on, one before it
+    const prm = (await (await direct("/api/v2/params", {}, { SHARD_MAP: map })).json()) as {
+      shards: number;
+    };
+    expect(prm.shards).toBe(4);
+    const shardsOf = async (e: number) =>
+      (
+        (await (await direct(`/api/v2/era/${e}`, {}, { SHARD_MAP: map })).json()) as {
+          shards: number;
+        }
+      ).shards;
+    expect(await shardsOf(E)).toBe(4);
+    expect(await shardsOf(E - 1)).toBe(1);
+    // Every row and key goes to shard(E, label) under s_E = 2, one DO call per shard.
+    const kr = P.kroute(P.fromB64u((env as unknown as { ROUTE_KEY: string }).ROUTE_KEY), E);
+    const shardOfLabel = (label: Uint8Array) => P.shardOf(P.routeV(kr, label), 2);
+    const rows = Array.from({ length: 12 }, () => makeRow({ E }));
+    const names: string[] = [];
+    let routed = 0;
+    const SHARD = {
+      getByName: (n: string) => {
+        names.push(n);
+        const i = Number(n.split("/").pop());
+        const check = (ii: number, items: { label: Uint8Array }[]) => {
+          expect(ii).toBe(i);
+          for (const it of items) expect(shardOfLabel(it.label)).toBe(i);
+          routed += items.length;
+        };
+        return {
+          put: async (_E: number, ii: number, items: { label: Uint8Array }[]) => {
+            check(ii, items);
+            return items.map(() => ({ s: "ok", t: 1 }));
+          },
+          get: async (_E: number, ii: number, keys: { label: Uint8Array }[]) => {
+            check(ii, keys);
+            return keys.map(() => ({ s: "miss", sealed: false }));
+          },
+          feedBatches: async () => ({ batches: [], more: false, sealed: false }),
+        };
+      },
+    };
+    const bytes = W.encodePutRequest(rows);
+    const res = await direct("/api/v2/put", await powInit("put", bytes), { SHARD, SHARD_MAP: map });
+    expect(res.status, await res.clone().text()).toBe(200);
+    expect(W.decodePutResponse(await bytesOf(res)).every((r) => r.s === "ok")).toBe(true);
+    expect(routed).toBe(12);
+    expect(new Set(names).size).toBe(names.length);
+    expect(names.length).toBeGreaterThanOrEqual(2);
+    for (const n of names) expect(n).toMatch(new RegExp(`^shard/v2/${E}/[0-3]$`));
+    routed = 0;
+    const got = await direct(
+      "/api/v2/get",
+      {
+        method: "POST",
+        body: W.encodeGetRequest(rows.map((r) => ({ E, label: r.label, mode: 1 as const }))),
+      },
+      { SHARD, SHARD_MAP: map },
+    );
+    expect(got.status).toBe(200);
+    expect(routed).toBe(12);
+    // The feed of shard 3 exists; shard 4 does not.
+    expect(
+      (await direct(`/api/v2/feed/${E}/3?after=4294967295`, {}, { SHARD, SHARD_MAP: map })).status,
+    ).toBe(200);
+    expect((await direct(`/api/v2/feed/${E}/4`, {}, { SHARD, SHARD_MAP: map })).status).toBe(404);
+    // A malformed map is a misconfiguration: 503 before any work.
+    const bad = await direct("/api/v2/params", {}, { SHARD_MAP: "60:3" });
+    expect(bad.status).toBe(503);
+    expect(((await bad.json()) as { error: string }).error).toBe("server misconfigured");
+  });
+
+  it("publishes OK rows that carry a topic in one publish call per FeedDO (one retry), never delaying or changing the response", async () => {
     const shardRows: unknown[] = [];
     const SHARD = fakeNs({
       put: async (_E: number, _i: number, rows: { v: Bytes; label: Bytes }[]) => {
@@ -2702,13 +2825,17 @@ describe("Worker logic (fake Durable Objects)", () => {
       },
     });
     const published: unknown[][] = [];
+    const feedNames: string[] = [];
     let failures = 1;
-    const RT = fakeNs({
-      publish: async (rows: unknown[]) => {
-        published.push(rows);
-        if (failures-- > 0) throw new Error("rt down");
+    const FEED = fakeNs(
+      {
+        publish: async (rows: unknown[]) => {
+          published.push(rows);
+          if (failures-- > 0) throw new Error("feed down");
+        },
       },
-    });
+      feedNames,
+    );
     const E = eraNow();
     const T = randomTopic();
     const rows = [
@@ -2719,7 +2846,7 @@ describe("Worker logic (fake Durable Objects)", () => {
       makeRow({ E: E + 1, topic: T }),
     ];
     const bytes = W.encodePutRequest(rows);
-    const res = await direct("/api/v2/put", await powInit("put", bytes), { SHARD, RT });
+    const res = await direct("/api/v2/put", await powInit("put", bytes), { SHARD, FEED });
     expect(res.status).toBe(200);
     const out = W.decodePutResponse(await bytesOf(res));
     expect(out.map((r) => r.s)).toEqual(["ok", "ok", "ok", "conflict", "wrong_era"]);
@@ -2735,8 +2862,13 @@ describe("Worker logic (fake Durable Objects)", () => {
     expect(shardRows.map((r) => P.b64u((r as { v: Bytes }).v))).toEqual(
       rows.slice(0, 4).map((r) => P.b64u(P.routeV(testKroute(E), r.label))),
     );
-    // One publish of the two OK rows with a topic, retried once after a failure.
+    // One publish of the two OK rows with a topic to T's FeedDO (feed(T), §4.4), retried once after a failure.
     expect(published).toHaveLength(2);
+    const j = P.feedOf(
+      P.feedHash(P.kfeed(P.fromB64u(env.ROUTE_KEY)), T),
+      P.feedBits(Number(env.RT_FEEDS)),
+    );
+    expect(feedNames).toEqual([`feed/v2/${j}`, `feed/v2/${j}`]);
     const want = [1, 2].map((i) => ({
       topic: T,
       E,
@@ -2752,20 +2884,20 @@ describe("Worker logic (fake Durable Objects)", () => {
     failures = 5;
     published.length = 0;
     const b2 = W.encodePutRequest([makeRow({ topic: T })]);
-    const r2 = await direct("/api/v2/put", await powInit("put", b2), { SHARD, RT });
+    const r2 = await direct("/api/v2/put", await powInit("put", b2), { SHARD, FEED });
     expect(r2.status).toBe(200);
     expect(W.decodePutResponse(await bytesOf(r2))[0].s).toBe("ok");
     expect(published).toHaveLength(2);
 
-    // Only zero topics: RealtimeDO is not addressed at all.
-    const rtNames: string[] = [];
+    // Only zero topics: no FeedDO is addressed at all.
+    const quiet: string[] = [];
     const b3 = W.encodePutRequest([makeRow(), makeRow()]);
     const r3 = await direct("/api/v2/put", await powInit("put", b3), {
       SHARD,
-      RT: fakeNs({ publish: async () => {} }, rtNames),
+      FEED: fakeNs({ publish: async () => {} }, quiet),
     });
     expect(r3.status).toBe(200);
-    expect(rtNames).toEqual([]);
+    expect(quiet).toEqual([]);
   });
 
   it("passes FULL and BAD through; 503 when a shard fails", async () => {
@@ -2808,7 +2940,6 @@ describe("Worker logic (fake Durable Objects)", () => {
     );
     const body = W.encodeInboxPost({
       E,
-      bucket: 0,
       rows: [randomInvite(), randomInvite(), randomInvite()],
     });
     let res = await direct("/api/v2/inbox", await powInit("inbox", body), { INBOX });
@@ -3060,19 +3191,22 @@ describe("Worker logic (fake Durable Objects)", () => {
     }
   });
 
-  it("rt: forwards only the upgrade and an opaque client tag to the RealtimeDO, and relays its refusals", async () => {
+  it("rt: forwards only the upgrade and an opaque client tag to the client's ConnDO, and relays its refusals", async () => {
     _resetApiForTests();
     const seen: Request[] = [];
-    const RT = fakeNs({
-      wsTagKey: async () => new Uint8Array(32).fill(7),
-      fetch: async (url: string, init: RequestInit) => {
-        seen.push(new Request(url, init));
-        return new Response(JSON.stringify({ error: "too many sockets" }), {
-          status: 429,
-          headers: { "retry-after": "60" },
-        });
+    const connNames: string[] = [];
+    const CONN = fakeNs(
+      {
+        fetch: async (url: string, init: RequestInit) => {
+          seen.push(new Request(url, init));
+          return new Response(JSON.stringify({ error: "too many sockets" }), {
+            status: 429,
+            headers: { "retry-after": "60" },
+          });
+        },
       },
-    });
+      connNames,
+    );
     try {
       const ip = freshIp();
       const res = await direct(
@@ -3081,13 +3215,15 @@ describe("Worker logic (fake Durable Objects)", () => {
           ip,
           headers: { upgrade: "websocket", origin: ORIGIN, cookie: "x=1", "user-agent": "ua" },
         },
-        { RT },
+        { CONN },
       );
       expect(res.status).toBe(429);
       expect(res.headers.get("retry-after")).toBe("60");
       expect(await errorOf(res)).toBe("too many sockets");
-      await direct("/api/v2/rt", { ip, headers: { upgrade: "websocket" } }, { RT });
+      await direct("/api/v2/rt", { ip, headers: { upgrade: "websocket" } }, { CONN });
       expect(seen).toHaveLength(2);
+      // The ConnDO is conn(ck) of the tag (§4.4): the same one for both requests.
+      expect(connNames).toEqual([connName(connIndexOf(ip)), connName(connIndexOf(ip))]);
       const h = [...seen[0].headers.keys()].sort();
       expect(h).toEqual(["upgrade", "x-segv-client"]);
       const tag = seen[0].headers.get("x-segv-client")!;
@@ -3113,5 +3249,267 @@ describe("routeLabel", () => {
     expect(routeLabel(`/api/v2/dir/wraps/${id}`)).toBe("/api/v2/dir/wraps/:id");
     expect(routeLabel("/api/v2/put")).toBe("/api/v2/put");
     expect(routeLabel("/api/v2/whatever/secret")).toBe("/api/v2/*");
+  });
+});
+
+describe('paged shards (§9.1 "Paging", §10.4, §10.9)', () => {
+  it("answers get, feed and seal of a paged shard from R2, byte for byte as the shard did", async () => {
+    // A future era, so that nothing fires on its own: the shard runs on its own clock, and the Worker's clock is
+    // moved past the era's end for the duration of the test.
+    const E = eraNow() + 30;
+    const kr = testKroute(E);
+    const s = shardStub(env, E, 0);
+    const clock = (ms: number) =>
+      runInDurableObject(s, (inst: ShardDO) => {
+        (inst as unknown as { clock: () => number }).clock = () => ms;
+      });
+    const rows = [
+      makeRow({ E, cls: 0 }),
+      makeRow({ E, cls: 2 }),
+      makeRow({ E, cls: 1 }),
+      makeRow({ E, cls: 3 }),
+    ];
+    const toShard = (rs: W.PutRow[]): ShardPutRow[] =>
+      rs.map((r) => ({ v: P.routeV(kr, r.label), label: r.label, cls: r.cls, body: r.body }));
+    await clock(P.eraStart(E) + 1000);
+    for (const r of await s.put(E, 0, toShard(rows.slice(0, 3)))) expect(r.s).toBe("ok");
+    await clock(P.eraStart(E) + 2000);
+    for (const r of await s.put(E, 0, toShard(rows.slice(3)))) expect(r.s).toBe("ok");
+    const sealedAt = P.eraEnd(E) + 5000;
+    await clock(sealedAt);
+    const now = vi.spyOn(Date, "now").mockReturnValue(sealedAt);
+    try {
+      const keys: W.GetKey[] = [
+        ...rows.map((r) => ({ E, label: r.label, mode: 0 as const })),
+        { E, label: rows[1].label, mode: 1 },
+        { E, label: randomLabel(), mode: 0 },
+      ];
+      const getVia = async (
+        origin: string,
+        overrides: Record<string, unknown> = {},
+      ): Promise<W.GetStatus[]> => {
+        const res = await direct(
+          "/api/v2/get",
+          { method: "POST", body: W.encodeGetRequest(keys), origin },
+          overrides,
+        );
+        expect(res.status, res.status === 200 ? "" : await res.clone().text()).toBe(200);
+        return W.decodeGetResponse(
+          await bytesOf(res),
+          keys.map((k) => k.mode),
+        );
+      };
+      const feedVia = async (origin: string): Promise<Bytes[]> => {
+        const pages: Bytes[] = [];
+        for (let after = 0; ;) {
+          const res = await direct(`/api/v2/feed/${E}/0?after=${after}`, { origin });
+          expect(res.status, res.status === 200 ? "" : await res.clone().text()).toBe(200);
+          expect(res.headers.get("cache-control")).toBe(IMMUTABLE);
+          const b = await bytesOf(res);
+          pages.push(b);
+          const f = W.decodeFeed(b);
+          if (!f.more) return pages;
+          after = f.batches[f.batches.length - 1].t;
+        }
+      };
+      // From the shard: sealed, not paged yet (the Worker looked for a manifest and found none).
+      const got0 = await getVia("https://a.segv.test");
+      expect(got0.slice(0, 4).map((g) => g.s)).toEqual(["hit", "hit", "hit", "hit"]);
+      expect(got0[4]).toMatchObject({ s: "hit", cls: 2 });
+      expect(got0[5]).toEqual({ s: "miss", sealed: true });
+      const pages0 = await feedVia("https://a.segv.test");
+      expect(pages0).toHaveLength(1);
+      expect(
+        await errorOf(await direct(`/api/v2/seal/${E}/0`, { origin: "https://a.segv.test" })),
+      ).toBe("not paged");
+      // The shard pages itself.
+      const paged = () =>
+        runInDurableObject(s, (_inst: ShardDO, state) => {
+          const v = state.storage.sql
+            .exec<{ v: SqlStorageValue }>("SELECT v FROM meta WHERE k = 'state'")
+            .toArray()[0]?.v;
+          return v === "paged";
+        });
+      for (let k = 0; !(await paged()); k++) {
+        expect(k, "paging alarms").toBeLessThan(40);
+        expect(await runDurableObjectAlarm(s)).toBe(true);
+      }
+      // The Worker still remembers "no manifest": the shard answers "shard: paged", and R2 takes over, with the
+      // same answers and the same bytes (another origin, so that caches.default has no say).
+      expect(await getVia("https://b.segv.test")).toEqual(got0);
+      expect(await feedVia("https://b.segv.test")).toEqual(pages0);
+      // Once the manifest is known, the shard is not addressed at all.
+      const calls: string[] = [];
+      expect(
+        await getVia("https://c.segv.test", { SHARD: spyNamespace(env.SHARD, calls) }),
+      ).toEqual(got0);
+      expect(calls).toEqual([]);
+      // The manifest: immutable JSON naming this shard, with kroute_E behind the era's kcommit; other shards: 404.
+      const seal = await direct(`/api/v2/seal/${E}/0`, { origin: "https://b.segv.test" });
+      expect(seal.status).toBe(200);
+      expect(seal.headers.get("cache-control")).toBe(IMMUTABLE);
+      expect(seal.headers.get("content-type")).toBe("application/json; charset=utf-8");
+      const m = (await seal.json()) as {
+        era: number;
+        shard: number;
+        kroute: string;
+        rows: { n: number };
+      };
+      expect(m).toMatchObject({ era: E, shard: 0, kroute: P.b64u(kr) });
+      expect(m.rows.n).toBe(4);
+      const info = (await (
+        await direct(`/api/v2/era/${E}`, { origin: "https://b.segv.test" })
+      ).json()) as { kcommit: string };
+      expect(P.b64u(P.kcommit(P.fromB64u(m.kroute)))).toBe(info.kcommit);
+      expect(
+        await errorOf(await direct(`/api/v2/seal/${E}/1`, { origin: "https://b.segv.test" })),
+      ).toBe("no such shard");
+      expect(
+        await errorOf(await direct(`/api/v2/seal/${E + 1}/0`, { origin: "https://b.segv.test" })),
+      ).toBe("not paged");
+    } finally {
+      now.mockRestore();
+    }
+  }, 60_000);
+});
+describe("blob registry shards (§9.2, §10.7)", () => {
+  it("registers and looks a blob up in the shard of its id, and refuses a shard count that moved the id", async () => {
+    const blobKey = P.kblob(P.fromB64u((env as unknown as { ROUTE_KEY: string }).ROUTE_KEY));
+    /** Random content whose id routes to registry shard j under the two shards of the test deployment. */
+    const contentFor = (j: number): { bytes: Bytes; id: Bytes } => {
+      for (;;) {
+        const bytes = bigRandom(64);
+        const id = P.H(bytes);
+        if (P.blobShardOf(blobKey, id, 1) === j) return { bytes, id };
+      }
+    };
+    const upload = async ({ bytes, id }: { bytes: Bytes; id: Bytes }): Promise<string> => {
+      const idB = P.b64u(id);
+      const res = await api(`/api/v2/blob/${idB}`, {
+        method: "PUT",
+        headers: {
+          "content-type": "application/octet-stream",
+          "x-segv-pow": await powHeader("blob", id, { bytes: bytes.length }),
+        },
+        body: bytes,
+      });
+      expect(res.status, await res.clone().text()).toBe(201);
+      return idB;
+    };
+    const c0 = contentFor(0);
+    const c1 = contentFor(1);
+    const id0 = await upload(c0);
+    const id1 = await upload(c1);
+    for (const idB of [id0, id1]) expect((await api(`/api/v2/blob/${idB}/meta`)).status).toBe(200);
+    // Each id sits in its own shard, and the other shard would not even answer for it.
+    expect((await blobRegStub(env, 0).meta(c0.id)).hit).toBe(true);
+    expect((await blobRegStub(env, 1).meta(c1.id)).hit).toBe(true);
+    await runInDurableObject(blobRegStub(env, 0), (inst: BlobRegDO) =>
+      expect(() => inst.meta(c1.id)).toThrow(/another shard/),
+    );
+    await runInDurableObject(blobRegStub(env, 1), (inst: BlobRegDO) =>
+      expect(() => inst.meta(c0.id)).toThrow(/another shard/),
+    );
+    // A deployment whose BLOBREG_SHARDS changed routes id1 to shard 0, which pinned b = 1: 503, never a wrong answer.
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const res = await direct(`/api/v2/blob/${id1}/meta`, {}, { BLOBREG_SHARDS: "1" });
+      expect(res.status).toBe(503);
+      expect(await errorOf(res)).toBe("storage unavailable");
+      const putAgain = await direct(
+        `/api/v2/blob/${id1}`,
+        {
+          method: "PUT",
+          headers: {
+            "content-type": "application/octet-stream",
+            "content-length": String(c1.bytes.length), // handleApi is called directly: nothing sets it for us
+            "x-segv-pow": await powHeader("blob", c1.id, { bytes: c1.bytes.length }),
+          },
+          body: c1.bytes,
+        },
+        { BLOBREG_SHARDS: "1" },
+      );
+      expect(putAgain.status).toBe(503);
+    } finally {
+      errors.mockRestore();
+    }
+    expect((await direct(`/api/v2/blob/${id0}/meta`, {}, { BLOBREG_SHARDS: "1" })).status).toBe(
+      200,
+    ); // still shard 0
+  });
+});
+describe("inbox buckets (§9.3, §10.5, §10.6)", () => {
+  it("posts land in their bucket's object, reads are per bucket, and the directory lists each user's buckets", async () => {
+    const E = eraNow();
+    // The test deployment has four buckets in every era (INBOX_MAP "0:4").
+    expect((await fetchParams()).inboxBuckets).toBe(4);
+    const rows = [0, 1, 2, 3, 1].map((g) => randomInvite(g));
+    const res = await inboxPostOk(rows);
+    expect(res.every((r) => "rel" in r)).toBe(true);
+    for (let g = 0; g < 4; g++) {
+      const mine = rows.filter((r) => r.bucket === g).map((r) => P.b64u(r.eid));
+      await until(async () => {
+        const page = W.decodeInboxRead(await bytesOf(await inboxReadRaw(E, "?limit=1024", g)));
+        return mine.every((eid) => page.rows.some((r) => P.b64u(r.eid) === eid));
+      }, `bucket ${g} readable`);
+      const page = W.decodeInboxRead(await bytesOf(await inboxReadRaw(E, "?limit=1024", g)));
+      // Nothing of another bucket shows up here (other tests' rows of this bucket may).
+      const others = rows.filter((r) => r.bucket !== g).map((r) => P.b64u(r.eid));
+      for (const r of page.rows) expect(others).not.toContain(P.b64u(r.eid));
+    }
+    // Every directory entry lists bucket(E, handle) of E_now − 1 .. E_now + 1, from the KeyDO's key of each era.
+    const a = makeAccount();
+    await registerOk(a);
+    const bucketKey = (e: number) => keyStub(env).bucketKey(e);
+    const expected = async (e: number) =>
+      P.inboxBucketOf(
+        new Uint8Array((await bucketKey(e))!),
+        2,
+        P.inboxPrefixOf(P.hpre(a.handle), 2),
+      );
+    const want = []; // the eras a reader reads (E_now − 3 ..) and a sender posts into (.. E_now + 1), §10.6
+    for (const e of [E - 3, E - 2, E - 1, E, E + 1])
+      if (e >= E_FIRST) want.push({ E: e, g: await expected(e) });
+    const own = (await (await api(`/api/v2/dir/uid/${a.uidB64}`)).json()) as { user: DirUserJson };
+    expect(own.user.inbox).toEqual(want);
+    expect(Object.keys(own.user)).toEqual([
+      "uid",
+      "handle",
+      "bundle",
+      "sig",
+      "regEra",
+      "dirseq",
+      "inbox",
+    ]);
+    const listed = await prefixFind("h", 0, 0, a.uidB64);
+    expect(listed?.inbox).toEqual(want);
+    for (const b of want) expect(b.g).toBeLessThan(4);
+    // The same handle maps to the same bucket for everyone who asks, and the key stays with the KeyDO.
+    const again = (await (await api(`/api/v2/dir/uid/${a.uidB64}`)).json()) as {
+      user: DirUserJson;
+    };
+    expect(again.user.inbox).toEqual(want);
+  });
+
+  it("refuses a directory answer once INBOX_MAP changes the count of an era it already listed (503), one bucket included", async () => {
+    const E = eraNow();
+    const a = makeAccount();
+    await registerOk(a);
+    // Listing E_now − 3 .. E_now + 1 pins their β (2: the test deployment's "0:4") in the KeyDO.
+    expect((await api(`/api/v2/dir/uid/${a.uidB64}`)).status).toBe(200);
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // Raised from E_now on (E_now and E_now + 1 are listed already), or lowered to one bucket everywhere: the
+      // eras of one bucket are asked about as well.
+      for (const INBOX_MAP of [`0:4,${E}:8`, "0:1"]) {
+        const res = await direct(`/api/v2/dir/uid/${a.uidB64}`, {}, { INBOX_MAP });
+        expect(res.status, INBOX_MAP).toBe(503);
+        expect(await errorOf(res)).toBe("storage unavailable");
+        expect((await direct("/api/v2/dir/h/0/0", {}, { INBOX_MAP })).status, INBOX_MAP).toBe(503);
+      }
+    } finally {
+      errors.mockRestore();
+    }
+    expect((await api(`/api/v2/dir/uid/${a.uidB64}`)).status).toBe(200);
   });
 });

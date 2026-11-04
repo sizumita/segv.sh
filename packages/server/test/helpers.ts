@@ -271,6 +271,7 @@ export interface Params {
   inboxDayCap: number;
   inboxBatch: number;
   shards: number;
+  inboxBuckets: number;
   p: number;
   efirst: number;
   kcommit: string;
@@ -366,7 +367,8 @@ export async function getKeys(keys: readonly W.GetKey[]): Promise<W.GetStatus[]>
 
 // ───────────── inbox (§10.5) ─────────────
 
-export const randomInvite = (): W.InboxPostRow => ({
+export const randomInvite = (bucket = 0): W.InboxPostRow => ({
+  bucket,
   eid: P.random(16),
   body: bigRandom(P.INBOX_BODY_LEN),
 });
@@ -387,7 +389,7 @@ export async function inboxPostOk(
   rows: W.InboxPostRow[],
   E = eraNow(),
 ): Promise<W.InboxPostResult[]> {
-  const res = await inboxPostRaw({ E, bucket: 0, rows });
+  const res = await inboxPostRaw({ E, rows });
   expect(res.status, res.status === 200 ? "" : await res.clone().text()).toBe(200);
   return W.parseInboxPostResults(await res.json(), rows.length);
 }
@@ -530,6 +532,8 @@ export interface DirUserJson {
   sig: string;
   regEra: number;
   dirseq: number;
+  /** the user's inbox bucket of E_now − 1 .. E_now + 1 (§9.3, §10.6) */
+  inbox: { E: number; g: number }[];
 }
 
 export interface DirlogEntryJson {

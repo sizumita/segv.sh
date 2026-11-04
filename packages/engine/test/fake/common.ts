@@ -16,9 +16,13 @@ export interface FakeParams {
   inboxSlot: number;
   /** E_FIRST: reads of lower eras are "sealed" / 404 without touching a component. */
   efirst: number;
+  /** S_E, the shard count of every era of this world: a power of two in 1..65536 (§9.1). Tests: 1. */
+  shards: number;
+  /** 2^β, the inbox buckets of every era of this world: a power of two in 1..65536 (§9.3). Tests: 1. */
+  inboxBuckets: number;
 }
 
-/** A row the Worker hands to the RealtimeDO after a successful put (spec §10.3 step 6). */
+/** A row the Worker hands to the ConnDO after a successful put (spec §10.3 step 6). */
 export interface PublishRow {
   topic: Bytes;
   E: number;
@@ -30,6 +34,8 @@ export interface PublishRow {
 
 /** What a component needs from the world: the clocks, the parameters and a few cross-component calls. */
 export interface WorldCtx {
+  /** the `inbox` list of a directory entry (§10.6): the user's bucket of E_now − 3 .. E_now + 1 (§9.3) */
+  inboxOf(handle: string): { E: number; g: number }[];
   /** Server time of the Worker, BlobReg, Realtime and Checkpoint components: Date.now() + offsetMs. */
   now(): number;
   /** The ShardDO clock: now() − shardLagMs. */
@@ -41,8 +47,12 @@ export interface WorldCtx {
   readonly sealDelayMs: number;
   /** Counts every accepted write of any component (used by `settle`). */
   bumpWrites(): void;
-  /** RealtimeDO.publish (rows with a zero topic must not be passed). */
+  /** FeedDO.publish → ConnDO.deliver (rows with a zero topic must not be passed). */
   publish(rows: PublishRow[]): void;
+  /** InboxDO alarm → FeedDO.inbox → ConnDO.deliverInbox: an INBOX notice to every socket subscribed to Tinbox(E, g). */
+  notice(E: number, g: number, rel: number): void;
+  /** shard(E, label) (§4.4) under the world's ROUTE_KEY and `params.shards`. */
+  shardOf(E: number, label: Bytes): number;
 }
 
 /** A fake HTTP response before the world adds the common headers. */

@@ -169,7 +169,7 @@ describe("echoes", () => {
 describe("rows that §6.8 drops (§11.3 step 7)", () => {
   it("a removal that lands during the put leaves the bubble failed", async () => {
     const {
-      users: [alice, bob, carol],
+      users: [alice, , carol],
       engines: [A, B, C],
       id,
     } = await group(["alice", "bob", "carol"]);

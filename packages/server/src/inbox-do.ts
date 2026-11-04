@@ -1,6 +1,7 @@
 /**
- * InboxDO — one era of the global inbox of sealed invites (docs/PROTOCOL.md §9.3, §10.5).
- * Name "inbox/v2/{E}/{g}" (stage 1: g = 0, bucket 0); (E, g) come from ctx.id.name. SQLite-backed.
+ * InboxDO — one bucket of one era of the global inbox of sealed invites (docs/PROTOCOL.md §9.3, §10.5).
+ * Name "inbox/v2/{E}/{g}", 0 ≤ g < 2^β_E (INBOX_MAP; one bucket until it is raised); (E, g) come from ctx.id.name.
+ * The object is its bucket: a post or read names the same bucket. SQLite-backed.
  *
  *  - Slot clock: D = Δin·1000 and ms = now − T0. Readers see `closed = max(⌊ms/D⌋, closed_hw)`; a new row gets
  *    `rel = max(⌊(ms + j)/D⌋ + 1, closed_hw + 1)` with a per-row jitter j uniform in [0, D) that is never stored.
@@ -16,6 +17,10 @@
  *    first day, so an era holds at most 7 day caps.
  *  - Slot commitments: before read and head, every closed slot with rows gets a `slot` row
  *    (leaves = leafInbox ordered by eid, chained with t = rel under cid "inbox/{E}/{g}").
+ *  - Notices (§9.3): a post arms the alarm at T0 + rel·D + (SKEW + 1)·1000 of its smallest new rel. The alarm settles,
+ *    persists `noticed = closed` and tells the FeedDO of Tinbox(E, g) the newest closed slot with rows above the old
+ *    `noticed` (one call, made once more on failure), then re-arms for the next slot with rows. Once `ended`, closed
+ *    is final, so the seal alarm announces whatever is still pending. Nothing about a notice is stored but `noticed`.
  */
 import { DurableObject } from "cloudflare:workers";
 import {
@@ -27,15 +32,33 @@ import {
   era,
   eraEnd,
   eraStart,
+  feedBits,
+  feedHash,
+  feedOf,
   inboxCid,
   leafInbox,
   mth,
   nextHead,
   secOf,
+  topicInbox,
 } from "@segv/protocol/proto";
 import { INBOX_READ_MAX_LIMIT } from "@segv/protocol/wire";
-import { INBOX_BATCH, INBOX_DAY_CAP, v2Params } from "./env";
-import { parseEraName, type InboxHead, type InboxPostOut, type InboxReadOut, type InboxRowResult } from "./types";
+import { AlarmSlot } from "./batch";
+import { INBOX_BATCH, INBOX_DAY_CAP, serverKeys, v2Params } from "./env";
+import { logErr } from "./http";
+import {
+  feedStub,
+  parseEraName,
+  type InboxHead,
+  type InboxPostOut,
+  type InboxReadOut,
+  type InboxRowResult,
+} from "./types";
+
+/** What an InboxDO calls on the FeedDO of its notice topic (§9.3). */
+export interface InboxFeedLink {
+  inbox(E: number, g: number, rel: number): Promise<void>;
+}
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v BLOB NOT NULL) WITHOUT ROWID;
@@ -91,6 +114,13 @@ export class InboxDO extends DurableObject<Env> {
   protected inboxSlot: number;
   /** INBOX_DAY_CAP. An instance field so tests can lower it. */
   protected dayCap = INBOX_DAY_CAP;
+  /** The FeedDO call of a notice (§9.3); tests replace it to observe or fail the calls. */
+  protected feeds: (j: number) => InboxFeedLink = (j) => feedStub(this.env, j);
+  private readonly alarmSlot: AlarmSlot;
+  /** feed(Tinbox(E, g)) (§4.4); null when the server keys are missing, and then no notice is sent */
+  private readonly feedJ: number | null;
+  /** the largest slot announced (meta 'noticed'; closed_hw for an object that has no such key yet) */
+  private noticed: number;
   /** Δin pinned for this era (meta 'slot', seconds), null until the first write */
   private slotPin: number | null;
   /** a deployment Δin that differs from the pinned one has been logged */
@@ -129,15 +159,19 @@ export class InboxDO extends DurableObject<Env> {
     this.ended = meta.get("ended") === 1;
     this.lastSlot = sql.exec<{ m: number | null }>("SELECT max(rel) AS m FROM slot").one().m ?? 0;
     this.buckets = new Set(sql.exec<{ b: number }>("SELECT DISTINCT bucket AS b FROM cnt").toArray().map((r) => r.b));
+    const noticed = meta.get("noticed");
+    this.noticed = typeof noticed === "number" ? noticed : this.closedHw;
+    const keys = serverKeys(env);
+    this.feedJ = keys ? feedOf(feedHash(keys.feedKey, topicInbox(E, i)), feedBits(p.rtFeeds)) : null;
 
-    // §9 "Identity and alarms": arm the seal alarm unless the era has already ended (prepare() seals then).
-    const due = this.sealAt();
-    if (!this.ended && this.clock() < due) {
-      void ctx.blockConcurrencyWhile(async () => {
-        const cur = await ctx.storage.getAlarm();
-        if (cur === null || cur > due) await ctx.storage.setAlarm(due);
-      });
-    }
+    // §9 "Identity and alarms": arm the seal alarm unless the era has already ended (prepare() seals then). A notice
+    // alarm that a post armed before an eviction is earlier, and kept.
+    this.alarmSlot = new AlarmSlot(ctx.storage);
+    void ctx.blockConcurrencyWhile(async () => {
+      await this.alarmSlot.load();
+      const due = this.sealAt();
+      if (!this.ended && this.clock() < due) await this.alarmSlot.set(due);
+    });
   }
 
   private sealAt(): number {
@@ -175,11 +209,56 @@ export class InboxDO extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    this.alarmSlot.fired();
     const now = this.clock();
     this.prepare(now);
-    // Fired early (clock differences): try again at the seal time, but never sooner than 1 s from now (§9), so an
-    // alarm that fired a few ms early does not re-arm a time that has already passed and fire again at once.
-    if (!this.ended) await this.ctx.storage.setAlarm(Math.max(this.sealAt(), now + 1000));
+    await this.notify(now);
+    // Re-arm for the next slot with rows to announce, and for the seal while the era has not ended. Fired early
+    // (clock differences): never sooner than 1 s from now (§9), so an alarm that fired a few ms early does not re-arm a
+    // time that has already passed and fire again at once.
+    const next = this.nextNoticeAt();
+    if (next !== null) await this.alarmSlot.set(Math.max(next, now + 1000));
+    if (!this.ended) await this.alarmSlot.set(Math.max(this.sealAt(), now + 1000));
+  }
+
+  // ───────────── notices (§9.3) ─────────────
+
+  /** When slot `rel` is announced: T0 + rel·D + (SKEW + 1)·1000. */
+  private noticeAt(rel: number, D = this.slotS() * 1000): number {
+    return T0_MS + rel * D + this.skewMs + 1000;
+  }
+
+  /** The alarm time of the smallest slot with rows above `noticed`, or null when every slot with rows is announced. */
+  private nextNoticeAt(): number | null {
+    const m = this.ctx.storage.sql
+      .exec<{ m: number | null }>("SELECT min(rel) AS m FROM inv WHERE rel > ?", this.noticed)
+      .one().m;
+    return m === null ? null : this.noticeAt(m);
+  }
+
+  /**
+   * Settles (persisting closed_hw and committing the closed slots), persists `noticed = closed`, and announces the
+   * newest closed slot with rows above the old `noticed` to the FeedDO of Tinbox(E, g): one call, made once more
+   * when it fails, then given up (clients catch up, §11.6).
+   */
+  private async notify(now: number): Promise<void> {
+    const closed = this.settle(now);
+    if (closed <= this.noticed) return;
+    const sql = this.ctx.storage.sql;
+    const top = sql
+      .exec<{ m: number | null }>("SELECT max(rel) AS m FROM inv WHERE rel > ? AND rel <= ?", this.noticed, closed)
+      .one().m;
+    sql.exec("INSERT INTO meta (k, v) VALUES ('noticed', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", closed);
+    this.noticed = closed;
+    if (top === null || this.feedJ === null) return;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await this.feeds(this.feedJ).inbox(this.E, this.g, top);
+        return;
+      } catch (e) {
+        if (attempt === 1) console.error(JSON.stringify({ msg: "inbox notice failed", error: logErr(e) }));
+      }
+    }
   }
 
   /**
@@ -267,7 +346,7 @@ export class InboxDO extends DurableObject<Env> {
   /** §9.3 post: 1..32 invites, one result per row (no atomicity across rows). */
   post(E: number, g: number, bucket: number, rows: { eid: Uint8Array; body: Uint8Array }[]): InboxPostOut {
     this.checkId(E, g);
-    if (!isU32(bucket)) throw new TypeError("inbox post: bad bucket");
+    if (bucket !== g) throw new TypeError("inbox post: bucket is not this object's");
     const input = checkRows(rows);
     const now = this.clock();
     this.prepare(now);
@@ -281,6 +360,7 @@ export class InboxDO extends DurableObject<Env> {
     const day = Math.max(Math.floor(secOf(now) / DAY_S), Math.floor(secOf(eraStart(this.E)) / DAY_S));
     let inserted = false;
     let pinned = false;
+    let minRel = Infinity;
     const results = this.ctx.storage.transactionSync((): InboxRowResult[] => {
       const n0 = sql.exec<{ n: number }>("SELECT n FROM cnt WHERE bucket = ? AND day = ?", bucket, day).toArray()[0]?.n ?? 0;
       let n = n0;
@@ -301,6 +381,7 @@ export class InboxDO extends DurableObject<Env> {
         const rel = Math.max(Math.floor((ms + j) / D) + 1, this.closedHw + 1);
         sql.exec("INSERT INTO inv (bucket, rel, eid, body) VALUES (?, ?, ?, ?)", bucket, rel, ab(r.eid), ab(r.body));
         n++;
+        minRel = Math.min(minRel, rel);
         out.push({ rel });
       }
       if (n !== n0) {
@@ -315,7 +396,10 @@ export class InboxDO extends DurableObject<Env> {
       }
       return out;
     });
-    if (inserted) this.buckets.add(bucket);
+    if (inserted) {
+      this.buckets.add(bucket);
+      this.alarmSlot.arm(this.noticeAt(minRel, D)); // §9.3: announce the slot once it has closed
+    }
     if (pinned) this.slotPin = slot;
     return { s: "ok", results };
   }
@@ -326,7 +410,7 @@ export class InboxDO extends DurableObject<Env> {
    */
   read(E: number, g: number, bucket: number, after: number, limit: number): InboxReadOut {
     this.checkId(E, g);
-    if (!isU32(bucket)) throw new RangeError("inbox read: bad bucket");
+    if (bucket !== g) throw new RangeError("inbox read: bucket is not this object's");
     if (!isU32(after)) throw new RangeError("inbox read: bad after");
     if (!Number.isInteger(limit) || limit < 1 || limit > INBOX_READ_MAX_LIMIT) throw new RangeError("inbox read: bad limit");
     const now = this.clock();

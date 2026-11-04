@@ -137,7 +137,7 @@ function world(
     clock,
     params: () => params,
     deltaMs: () => 10_000,
-    bells: () => bells,
+    secrets: () => bells,
     onOff: () => offs++,
     random: () => 0.5,
   });

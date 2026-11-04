@@ -10,12 +10,22 @@ import {
   createQwikRouter,
   type PlatformCloudflarePages,
 } from "@qwik.dev/router/middleware/cloudflare-pages";
-import { handleApi, pinHost, stampResponse, wellKnown } from "@segv/server";
+import { handleApi, pinHost, pushCleanup, pushQueue, stampResponse, wellKnown } from "@segv/server";
 import render from "./entry.ssr";
 
 // Durable Object classes must be exported from the Worker's main module (docs/PROTOCOL.md §9): per-era
-// shards and inboxes, the blob registry, realtime WebSockets, checkpoints and Web Push.
-export { ShardDO, BlobRegDO, InboxDO, RealtimeDO, CheckpointDO, PushDO } from "@segv/server";
+// shards and inboxes, the blob registry, realtime WebSockets, checkpoints and the push object.
+export {
+  ShardDO,
+  BlobRegDO,
+  DirSeqDO,
+  KeyDO,
+  InboxDO,
+  ConnDO,
+  FeedDO,
+  CheckpointDO,
+  QuietDO,
+} from "@segv/server";
 
 export interface PlatformCloudflareWorkers extends PlatformCloudflarePages {
   env: Env;
@@ -46,5 +56,13 @@ export default {
     // Every endpoint is under /api/v2/; any other /api/* path is a 404 from the same router (§10.1).
     if (isApi) return handleApi(request, env, ctx, url);
     return qwikRouter(request, env as unknown as QwikEnv, ctx);
+  },
+  // Pushes due later than a Worker can wait (docs/PROTOCOL.md §9.8 "The Worker's part").
+  async queue(batch, env) {
+    await pushQueue(batch, env);
+  },
+  // The daily expiry of push registrations (§9.8 "Expiry").
+  async scheduled(_controller, env, ctx) {
+    ctx.waitUntil(pushCleanup(env));
   },
 } satisfies ExportedHandler<Env>;

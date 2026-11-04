@@ -1426,6 +1426,26 @@ describe("self lane labels (§4.1)", () => {
     expect(P.topicSelf(nS).length).toBe(16);
   });
 
+  it("Tinbox(E, g) = t16(H(enc(\"segv.sh/v2/topic/inbox\", u16 E, u32 g))) (§9.3), public and keyless", () => {
+    for (const [E, g] of [
+      [0, 0],
+      [3, 7],
+      [0xfffe, 0xffffffff],
+    ]) {
+      expect(toHex(P.topicInbox(E, g))).toBe(toHex(tr16(sha(refEnc("segv.sh/v2/topic/inbox", be16(E), be32(g))))));
+      expect(P.topicInbox(E, g).length).toBe(16);
+    }
+    expect(toHex(P.topicInbox(1, 0))).not.toBe(toHex(P.topicInbox(0, 1)));
+    for (const [E, g] of [
+      [-1, 0],
+      [0x10000, 0],
+      [0, 2 ** 32],
+      [1.5, 0],
+    ]) {
+      expect(() => P.topicInbox(E, g)).toThrow();
+    }
+  });
+
   it("rejects E and n outside u16 / u32 instead of aliasing", () => {
     for (const f of [P.Lself, P.Lsnap]) {
       expect(() => f(rS, 0x10000, 0)).toThrow();
@@ -1499,23 +1519,30 @@ describe("conversation epochs (§4.2)", () => {
     expect(toHex(P.topicConv(nk))).toBe(toHex(tr16(hmacN(nk, "segv.sh/v2/topic/conv"))));
   });
 
-  it("B_e(ℓ) follows the spec, differs per lane and epoch, and never equals T_e", () => {
+  it("bells are the account's, not the epoch's (§4.1): bS, s(conv, g) and bell(s) follow the spec", () => {
+    const AK = seqBytes(32, 0x40);
+    const bS = P.bellKey(AK);
+    expect(toHex(bS)).toBe(toHex(hkdfN(AK, "", "segv.sh/v2/self/bell")));
+    expect(toHex(bS)).not.toBe(toHex(P.quietSecret(AK)));
     const seen = new Set<string>();
-    for (const e of [0, 1]) {
-      const { nk } = P.epochKeys(EK, CONV, e);
-      seen.add(toHex(P.topicConv(nk)));
-      for (const l of [0, 1, 31, 0xffff]) {
-        const b = P.bell(nk, l);
+    for (const conv of [CONV, seqBytes(16, 0x70)]) {
+      for (const g of [0, 1, 7, 0xffffffff]) {
+        const sec = P.bellSecret(bS, conv, g);
+        expect(sec.length).toBe(16);
+        expect(toHex(sec)).toBe(toHex(tr16(hmacN(bS, refEnc("segv.sh/v2/bell/secret", conv, be32(g))))));
+        const b = P.bellOf(sec);
         expect(b.length).toBe(16);
-        expect(toHex(b)).toBe(toHex(tr16(hmacN(nk, refEnc("segv.sh/v2/bell", be16(l))))));
+        expect(toHex(b)).toBe(toHex(tr16(sha(refEnc("segv.sh/v2/bell", sec)))));
+        seen.add(toHex(sec));
         seen.add(toHex(b));
       }
     }
-    expect(seen.size).toBe(10);
-    // A fixed vector, so a change of the derivation is caught even if the reference helpers change with it.
-    const nk = new Uint8Array(32).fill(7);
-    expect(toHex(P.bell(nk, 2))).toBe(toHex(tr16(hmacN(nk, refEnc("segv.sh/v2/bell", be16(2))))));
-    expect(() => P.bell(nk, 0x10000)).toThrow();
+    expect(seen.size).toBe(16); // every secret and bell differs, per conversation and generation
+    // Nothing a member holds derives a bell: it is not a function of the epoch keys.
+    const { nk } = P.epochKeys(EK, CONV, 0);
+    expect(toHex(P.bellOf(P.bellSecret(bS, CONV, 0)))).not.toBe(toHex(P.topicConv(nk)));
+    expect(() => P.bellSecret(bS, CONV, 2 ** 32)).toThrow();
+    expect(() => P.bellSecret(bS, CONV, -1)).toThrow();
   });
 
   it("labels are distinct across lane, era, slot, epoch and label kind", () => {
@@ -1646,6 +1673,53 @@ describe("server routing (§4.4)", () => {
     const buf = cat(Uint8Array.of(0xff, 0xff), fromHex("4000000000000000"));
     expect(P.shardOf(buf.subarray(2), 1)).toBe(1);
     for (const s of [-1, 17, 1.5]) expect(() => P.shardOf(vs[1], s)).toThrow(/shard/);
+  });
+
+  it("ktag / tag / conn and kfeed / h / feed follow the spec (§4.4, §9.4)", () => {
+    const kt = P.ktag(ROUTE_KEY);
+    const kf = P.kfeed(ROUTE_KEY);
+    expect(toHex(kt)).toBe(toHex(hmacN(ROUTE_KEY, "segv.sh/v2/ws-tag")));
+    expect(toHex(kf)).toBe(toHex(hmacN(ROUTE_KEY, "segv.sh/v2/feed")));
+    expect(toHex(kt)).not.toBe(toHex(kf));
+    for (const n of [0, 31, 33]) {
+      expect(() => P.ktag(new Uint8Array(n))).toThrow(/ROUTE_KEY/);
+      expect(() => P.kfeed(new Uint8Array(n))).toThrow(/ROUTE_KEY/);
+    }
+    // The client tag and its ConnDO.
+    for (const ck of ["4:10.0.0.1", "6:2001:db8:77:1::/64", "x:unknown"]) {
+      const tag = P.clientTagOf(kt, ck);
+      expect(tag.length).toBe(16);
+      expect(toHex(tag)).toBe(toHex(hmacN(kt, `ws|${ck}`).subarray(0, 16)));
+      const u32 = ((tag[0] << 24) >>> 0) + (tag[1] << 16) + (tag[2] << 8) + tag[3];
+      for (const C of [1, 2, 3, 7, 4096]) expect(P.connOf(tag, C)).toBe(u32 % C);
+    }
+    for (const C of [0, 4097, 1.5]) expect(() => P.connOf(new Uint8Array(16), C)).toThrow(/conn/);
+    expect(() => P.connOf(new Uint8Array(3), 2)).toThrow(/4 bytes/);
+    // The feed hash and its FeedDO.
+    const r = prng(0xfeed);
+    for (let i = 0; i < 100; i++) {
+      const T = r.bytes(16);
+      const h = P.feedHash(kf, T);
+      expect(h.length).toBe(8);
+      expect(toHex(h)).toBe(toHex(hmacN(kf, T).subarray(0, 8)));
+      expect(P.feedOf(h, 0)).toBe(0);
+      for (const f of [1, 2, 6, 12]) expect(P.feedOf(h, f)).toBe(Number(beToBig(h) >> BigInt(64 - f)));
+    }
+    expect(P.feedOf(fromHex("ffffffffffffffff"), 12)).toBe(4095);
+    expect(P.feedOf(fromHex("8000000000000000"), 1)).toBe(1);
+    expect(P.feedOf(fromHex("7fffffffffffffff"), 1)).toBe(0);
+    for (const n of [0, 15, 17]) expect(() => P.feedHash(kf, new Uint8Array(n))).toThrow(/16 bytes/);
+    for (const f of [-1, 13, 1.5]) expect(() => P.feedOf(new Uint8Array(8), f)).toThrow(/feed/);
+    expect(() => P.feedOf(new Uint8Array(7), 1)).toThrow(/8 bytes/);
+    for (const [F, f] of [
+      [1, 0],
+      [2, 1],
+      [4, 2],
+      [64, 6],
+      [4096, 12],
+    ] as const)
+      expect(P.feedBits(F)).toBe(f);
+    for (const F of [0, 3, 6, 8192, 1.5]) expect(() => P.feedBits(F)).toThrow(/feed/);
   });
 });
 
@@ -2474,5 +2548,87 @@ describe("known-answer vectors", () => {
 
   it("PoW prefix", () => {
     expect(V.powPre).toBe(KAT.powPre);
+  });
+});
+
+describe("sealed shards (§9.1 \"Paging\")", () => {
+  it("sealBucketBits: about 1 024 rows per bucket, at most 2^16 buckets", () => {
+    expect([0, 1, 1024, 1025, 2048, 2049, 1024 * 2 ** 16, 1024 * 2 ** 16 + 1, 2 ** 40].map(P.sealBucketBits)).toEqual([
+      0, 0, 0, 1, 1, 2, 16, 16, 16,
+    ]);
+    expect(() => P.sealBucketBits(-1)).toThrow();
+  });
+
+  it("sealBucketOf takes the b bits of v below its shard bits", () => {
+    // v = 0x5ac3… : below the clear top bit the bits run 1011010 11000011 …
+    const v = new Uint8Array([0x5a, 0xc3, 0, 0, 0, 0, 0, 0]);
+    expect(P.sealBucketOf(v, 0, 0)).toBe(0);
+    expect(P.sealBucketOf(v, 0, 3)).toBe(0b101);
+    expect(P.shardOf(v, 3)).toBe(0b101);
+    expect(P.sealBucketOf(v, 3, 4)).toBe(0b1010);
+    expect(P.sealBucketOf(v, 7, 8)).toBe(0xc3);
+    expect(P.sealBucketOf(v, 16, 16)).toBe(0);
+    expect(() => P.sealBucketOf(v, 0, 17)).toThrow();
+    expect(() => P.sealBucketOf(new Uint8Array(7), 0, 1)).toThrow();
+  });
+
+  it("sealSigMsg lays the manifest's fields out as §9.1 writes them", () => {
+    const sha = (k: number) => P.H(P.u8(k));
+    const m = {
+      era: 41,
+      shard: 2,
+      sbits: 2,
+      kroute: P.H(P.utf8("kroute")),
+      head: P.H(P.utf8("head")),
+      tLast: 1234,
+      part: 16777216,
+      n: 3,
+      b: 1,
+      dir: P.concat(P.u32(0), P.u32(1), P.u32(3)),
+      nb: 2,
+      rows: { size: 1000, sha256: [sha(1), sha(2)] },
+      idx: { size: 84, sha256: [sha(3)] },
+      batches: { size: 160, sha256: [sha(4)] },
+    };
+    const f = P.dec(P.sealSigMsg(m), 18);
+    expect(P.fromUtf8(f[0])).toBe("segv.sh/v2/seal");
+    expect(f.slice(1, 4)).toEqual([P.u16(41), P.u16(2), P.u8(2)]);
+    expect(f[4]).toEqual(m.kroute);
+    expect(f[5]).toEqual(m.head);
+    expect(f.slice(6, 10)).toEqual([P.u32(1234), P.u32(16777216), P.u32(3), P.u8(1)]);
+    expect(f[10]).toEqual(P.H(m.dir));
+    expect(f[11]).toEqual(P.u32(2));
+    expect(f[12]).toEqual(P.u64(1000));
+    expect(f[13]).toEqual(P.H(P.concat(sha(1), sha(2))));
+    expect(f[14]).toEqual(P.u64(84));
+    expect(f[15]).toEqual(P.H(sha(3)));
+    expect(f[16]).toEqual(P.u64(160));
+    expect(f[17]).toEqual(P.H(sha(4)));
+  });
+});
+describe("blob registry routing and the hourly value (§4.4, §9.2, §9.5)", () => {
+  const ROUTE_KEY = seqBytes(32, 0xb0);
+
+  it("kblob and blobShard follow the spec", () => {
+    const k = P.kblob(ROUTE_KEY);
+    expect(toHex(k)).toBe(toHex(hmacN(ROUTE_KEY, new TextEncoder().encode("segv.sh/v2/blob"))));
+    const id = seqBytes(32, 0x10);
+    const h = hmacN(k, id);
+    const top = ((h[0] << 24) | (h[1] << 16) | (h[2] << 8) | h[3]) >>> 0;
+    expect(P.blobShardOf(k, id, 0)).toBe(0);
+    for (const b of [1, 3, 6, 12]) expect(P.blobShardOf(k, id, b)).toBe(top >>> (32 - b));
+    expect(() => P.blobShardOf(k, id, 13)).toThrow();
+    expect(() => P.blobShardOf(k, new Uint8Array(31), 1)).toThrow();
+    expect(() => P.kblob(new Uint8Array(31))).toThrow();
+  });
+
+  it("blobregAll mixes the hour into the shards' heads", () => {
+    const heads = [seqBytes(32, 1), seqBytes(32, 2)];
+    const v = P.blobregAll(500_000, heads);
+    expect(toHex(v)).toBe(toHex(sha(refEnc("segv.sh/v2/blobreg/all", be32(500_000), heads[0], heads[1]))));
+    expect(toHex(P.blobregAll(500_001, heads))).not.toBe(toHex(v));
+    expect(toHex(P.blobregAll(500_000, [heads[1], heads[0]]))).not.toBe(toHex(v));
+    expect(P.blobRegCid(3)).toBe("blobreg/3");
+    expect(P.BLOBREG_CID).toBe("blobreg");
   });
 });

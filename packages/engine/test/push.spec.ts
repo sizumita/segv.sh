@@ -1,5 +1,6 @@
-// Notifications (docs/PROTOCOL.md §11.13): the registration set, its re-sends, the rings after a TEXT, IMAGE or FILE, and
-// the device's subscription at logout, against FakeWorld's push endpoints and a fake browser per device.
+// Notifications (docs/PROTOCOL.md §11.13): the bells (BELL rows and generations), the registration set, its re-sends,
+// the rings after a TEXT, IMAGE or FILE, and the device's subscription at logout, against FakeWorld's push endpoints and
+// a fake browser per device.
 import { describe, expect, it } from "vite-plus/test";
 import {
   isBox,
@@ -16,6 +17,7 @@ import {
   I,
   P,
   chat,
+  conv,
   engineFor,
   epoch,
   freshWorldPerTest,
@@ -62,11 +64,24 @@ function notifyOf() {
   return { store, preview };
 }
 
-/** `u`'s bell in the current epoch of `id`, as engine `e` computes it. */
+/**
+ * `u`'s bell in `id` as engine `e` learned it from u's BELL rows (§11.13): the latest row of u's lane in the current
+ * epoch, else in the newest earlier held epoch; what `e` rings for u, and, for e's own user, what it registers.
+ */
 function bellOf(e: Engine, id: string, u: TestUser): string {
-  const ep = epoch(e, id);
-  return P.b64u(P.bell(ep.keys.nk, P.memberIndex(ep.D, u.uid)));
+  const c = conv(e, id);
+  for (let k = c.current; k >= c.rootE; k--) {
+    const ep = c.epochs.get(k);
+    const j = ep ? P.memberIndex(ep.D, u.uid) : -1;
+    const b = j >= 0 ? ep!.lanes[j].bell : null;
+    if (b) return P.b64u(b.bell);
+  }
+  throw new Error(`no bell of ${u.handle} known in ${id}`);
 }
+
+/** `u`'s own bell for generation `g` of the conversation, from its account key alone (§4.1). */
+const ownBell = (u: TestUser, convBytes: Uint8Array, g: number): string =>
+  P.b64u(P.bellOf(P.bellSecret(P.bellKey(u.AK), convBytes, g)));
 
 /** The bells last registered for the device's endpoint. */
 const registered = (d: FakePushDevice): string[] =>
@@ -120,6 +135,14 @@ describe("the registration set (§11.13)", () => {
     await registeredAs(bobDev, [bellOf(A, g, bob), bellOf(A, one, bob)]);
     expect(bellOf(B, g, bob)).toBe(bellOf(C, g, bob));
     expect(bellOf(B, one, bob)).toBe(bellOf(A, one, bob));
+    // Generation 0 (the root epoch) of each: a function of bob's account key and the conversation alone (§4.1).
+    expect(bellOf(A, g, bob)).toBe(ownBell(bob, conv(A, g).conv, 0));
+    expect(bellOf(A, one, bob)).toBe(ownBell(bob, conv(A, one).conv, 0));
+    expect(bellOf(A, g, bob)).not.toBe(bellOf(A, one, bob));
+    // The server holds the hashes of the secrets, never a secret: what bob registered hashes to what alice rings.
+    const sent = server().push.subsOf(bobDev.endpoint).at(-1)!.tokens;
+    expect(sent.map((t) => P.b64u(P.bellOf(P.fromB64u(t)))).sort()).toEqual(registered(bobDev));
+    expect(sent).not.toContain(bellOf(A, g, bob));
     // A copy whose leave is current is left out.
     await B.leave(g);
     await settle(A, B, C);
@@ -168,6 +191,7 @@ describe("re-sends and the subscription (§11.13)", () => {
     const id = await A.createConversation(["bob", "carol"], "g");
     await settle(A, B);
     await B.accept(id);
+    await settle(A, B); // bob's BELL row reaches alice
     await B.setNotifications(true);
     await registeredAs(bobDev, [bellOf(A, id, bob)]);
     const sends = () => server().push.subsOf(bobDev.endpoint).length;
@@ -179,9 +203,14 @@ describe("re-sends and the subscription (§11.13)", () => {
     const old = bellOf(A, id, bob);
     await A.addMembers(id, ["dave"]);
     await settle(A, B);
-    expect(bellOf(A, id, bob)).not.toBe(old);
+    expect(bellOf(A, id, bob)).toBe(old); // an addition starts no generation: the bell stays (§4.1)
+    await new Promise((r) => setTimeout(r, 1200));
+    expect(sends()).toBe(n0);
+    await A.removeMember(id, carol.uidB);
+    await settle(A, B);
+    expect(bellOf(A, id, bob)).not.toBe(old); // a removal starts one: bob posted and registered a new bell
+    expect(bellOf(A, id, bob)).toBe(ownBell(bob, conv(A, id).conv, epoch(A, id).e));
     await registeredAs(bobDev, [bellOf(A, id, bob)]);
-    void carol;
     void dave;
     // A restore on a new engine of the same browser sends the set again, unchanged.
     await B.logout().catch(() => {});
@@ -201,6 +230,7 @@ describe("re-sends and the subscription (§11.13)", () => {
     const id = await A.createConversation(["bob"]);
     await settle(A, B);
     await B.accept(id);
+    await settle(A, B);
     await B.setNotifications(true);
     await registeredAs(dev, [bellOf(A, id, bob)]);
     const ep = dev.endpoint;
@@ -282,26 +312,79 @@ describe("rings (§11.3 step 6, §11.13)", () => {
     expect([...rings[0].tokens]).toEqual([bellOf(A, id, bob)]);
   });
 
-  it("after an epoch change a TEXT also rings the old bells of the members silent in the new epoch", async () => {
-    const [alice, bob, carol, dave] = ["alice", "bob", "carol", "dave"].map((h) => makeUser(h));
-    const engines = [await engineFor(alice), await engineFor(bob), await engineFor(carol)];
-    const [A, B, C] = engines;
-    const id = await A.createConversation(["bob", "carol"], "g");
-    await settle(...engines);
-    for (const e of [B, C]) await e.accept(id);
-    await settle(...engines);
+  it("a removal starts a generation: a TEXT rings the new bells of the members who posted them and the old bell of one whose devices are closed; an addition changes no bell", async () => {
+    const [alice, bob, carol, dave, erin] = ["alice", "bob", "carol", "dave", "erin"].map((h) =>
+      makeUser(h),
+    );
+    const [A, B, C, D] = [
+      await engineFor(alice),
+      await engineFor(bob),
+      await engineFor(carol),
+      await engineFor(dave),
+    ];
+    const id = await A.createConversation(["bob", "carol", "dave"], "g");
+    await settle(A, B, C, D);
+    for (const e of [B, C, D]) await e.accept(id);
+    await settle(A, B, C, D);
     const oldBob = bellOf(A, id, bob);
     const oldCarol = bellOf(A, id, carol);
-    await A.addMembers(id, ["dave"]);
-    await settle(...engines);
-    const now = [bellOf(A, id, bob), bellOf(A, id, carol), bellOf(A, id, dave)];
-    let [r] = await ringsAfter(() => A.sendText(id, "one"), engines);
-    expect([...r.tokens].sort()).toEqual([...now, oldBob, oldCarol].sort());
-    // bob posts in the new epoch: his old bell is no longer rung
-    await B.sendText(id, "bob here");
-    await settle(...engines);
-    [r] = await ringsAfter(() => A.sendText(id, "two"), engines);
-    expect([...r.tokens].sort()).toEqual([...now, oldCarol].sort());
+    await C.logout(); // carol's only device is closed from now on
+    await A.removeMember(id, dave.uidB);
+    await settle(A, B);
+    const e1 = epoch(A, id).e;
+    const newBob = bellOf(A, id, bob);
+    expect(newBob).not.toBe(oldBob);
+    expect(newBob).toBe(ownBell(bob, conv(A, id).conv, e1)); // generation = the epoch of the removal
+    // carol's old bell, which the removed member knows, is rung while she has posted none in the new generation
+    let [r] = await ringsAfter(() => A.sendText(id, "one"), [A, B]);
+    expect([...r.tokens].sort()).toEqual([newBob, oldCarol].sort());
+    // carol opens a device: it posts her new bell, and the old one is rung no more
+    const C2 = await engineFor(carol);
+    await settle(A, B, C2);
+    const newCarol = bellOf(A, id, carol);
+    expect(newCarol).not.toBe(oldCarol);
+    expect(newCarol).toBe(bellOf(C2, id, carol));
+    [r] = await ringsAfter(() => A.sendText(id, "two"), [A, B, C2]);
+    expect([...r.tokens].sort()).toEqual([newBob, newCarol].sort());
+    // an addition changes nobody's bell, and the new member's bell joins the ring once she posted it
+    const E = await engineFor(erin);
+    await A.addMembers(id, ["erin"]);
+    await settle(A, B, C2, E);
+    await E.accept(id);
+    await settle(A, B, C2, E);
+    expect(epoch(A, id).e).toBe(e1 + 1);
+    expect(bellOf(A, id, bob)).toBe(newBob);
+    expect(bellOf(A, id, carol)).toBe(newCarol);
+    [r] = await ringsAfter(() => A.sendText(id, "three"), [A, B, C2, E]);
+    expect([...r.tokens].sort()).toEqual([newBob, newCarol, bellOf(A, id, erin)].sort());
+    expect(bellOf(A, id, erin)).toBe(ownBell(erin, conv(A, id).conv, e1 + 1)); // her generation: her root epoch
+  });
+
+  it("a restore keeps the bells it knew (BELLS beside HEADS, §7.3): the new device rings them without re-reading the rows", async () => {
+    const [alice, bob, carol] = ["alice", "bob", "carol"].map((h) => makeUser(h));
+    const [A, B, C] = [await engineFor(alice), await engineFor(bob), await engineFor(carol)];
+    const id = await A.createConversation(["bob", "carol"], "g");
+    await settle(A, B, C);
+    for (const e of [B, C]) await e.accept(id);
+    await settle(A, B, C);
+    const bells = [bellOf(A, id, bob), bellOf(A, id, carol)].sort();
+    // Many rows after the BELL rows, so that a restore's history never reaches them.
+    for (let i = 0; i < 40; i++) await B.sendText(id, `row ${i}`);
+    await settle(A, B, C);
+    await I(A).catchUp(); // a HEADS row with the BELLS record
+    await settle(A, B, C);
+    await A.logout();
+    const A2 = await engineFor(alice);
+    await settle(A2, B, C);
+    expect(chat(A2, id)).not.toContain("row 0");
+    expect([bellOf(A2, id, bob), bellOf(A2, id, carol)].sort()).toEqual(bells);
+    const [r] = await ringsAfter(() => A2.sendText(id, "after the restore"), [A2, B, C]);
+    expect([...r.tokens].sort()).toEqual(bells);
+    // Its own bell too: the restored device holds the generation it had posted (seeded from the record, so it posts
+    // no second row), and registers that bell.
+    const ep2 = epoch(A2, id);
+    expect(ep2.lanes[ep2.myIndex].bell).toMatchObject({ seeded: true });
+    expect(bellOf(A2, id, alice)).toBe(bellOf(B, id, alice));
   });
 
   it("end to end: bob's device gets a push for alice's TEXT, none for a REACTION, and none while his copy is a request", async () => {

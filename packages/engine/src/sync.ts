@@ -47,6 +47,8 @@ export interface SyncCtx {
   onWelcome(c: Copy, ep: Epoch, j: number, at: Slot, J: P.Join): void;
   /** a valid row of member j (corroboration and request acceptance, §6.7 step 6, §11.5) */
   onValidRow(c: Copy, ep: Epoch, j: number): void;
+  /** lane j's latest BELL row changed: its member's bell (§11.13) */
+  onBell?(c: Copy, ep: Epoch, j: number): void;
   /**
    * The local echo waiting for this row (rowKey) with exactly this stored body, if any: a sibling device's row in the
    * same slot is not this device's message.
@@ -380,6 +382,19 @@ export function applyLaneRow(
     });
     c.reactionsDirty = true;
     ctx.changed();
+    return;
+  }
+  if (m.type === P.MT.BELL) {
+    // The member's bell (§11.13): the lane's latest BELL row by position; a seeded bell is replaced from its position
+    // on (a row at the HEADS position was not read by the device that wrote the record). No view, no unread, no line.
+    c.order.set(key, order);
+    const at = { E: r.E, n: r.n };
+    const had = lane.bell;
+    const cmp = had ? P.posCmp(at, had.at) : 1;
+    if (!had || cmp > 0 || (had.seeded && cmp === 0)) {
+      lane.bell = { g: m.bell.g, bell: m.bell.bell, at, seeded: false };
+      ctx.onBell?.(c, ep, j);
+    }
     return;
   }
   if (m.type !== P.MT.TEXT && m.type !== P.MT.IMAGE && m.type !== P.MT.FILE) return;

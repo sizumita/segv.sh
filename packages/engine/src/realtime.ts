@@ -1,5 +1,6 @@
 // The realtime socket (docs/PROTOCOL.md §10.8, §11.6): SUB / UNSUB / RESUME by seq, HELLO (a clock sample),
-// ROWS, GAP and RESUMED; reconnect with back-off and jitter, at least 60 s after a 1008 or 1013.
+// ROWS, GAP, RESUMED and INBOX (an inbox notice, §9.3); reconnect with back-off and jitter, at least 60 s after a 1008
+// or 1013.
 // One socket of up to 256 topics (the session opens a second one for more than 256 topics, §10.8).
 // Liveness: a ping every 30 s, and a socket that answers nothing within 10 s of a ping is replaced at once (a socket
 // can die without a close event: a laptop that slept, a network that changed, a NAT that forgot it); an attempt that
@@ -23,6 +24,8 @@ export interface RealtimeHandlers {
   onSubscribed(topics: Bytes[]): void;
   /** a HELLO's server time, with the socket's upgrade-to-HELLO interval on the monotonic clock (§10.1) */
   onHello(s: number, sentMono: number, recvMono: number): void;
+  /** an INBOX notice (§10.8): slot `rel` of inbox bucket `g` of era `E` closed with rows in it */
+  onInbox(E: number, g: number, rel: number): void;
   onState(connected: boolean): void;
 }
 
@@ -42,6 +45,8 @@ export class Realtime {
   private stopped = true;
   private boot: Bytes | null = null;
   private seq = 0;
+  /** the seq of the open socket's HELLO */
+  private helloSeq = 0;
   /** topics wanted, by b64u */
   private readonly want = new Map<string, Bytes>();
   /** topics the server has for the open socket */
@@ -309,6 +314,7 @@ export class Realtime {
         const fresh = !this.boot || !P.equalBytes(this.boot, f.boot);
         this.h.onHello(f.now, this.openedAt, this.clock.mono());
         if (fresh) this.seq = f.seq;
+        this.helloSeq = f.seq;
         this.boot = f.boot;
         return;
       }
@@ -317,12 +323,17 @@ export class Realtime {
         this.h.onRows(f.rows);
         return;
       case "gap":
+        // The catch-up this GAP starts covers every row before it: the next RESUME may start at this socket's HELLO.
+        this.seq = this.helloSeq;
         this.h.onMissed();
         this.sync();
         return;
       case "resumed":
         this.resumed = true;
         this.sync();
+        return;
+      case "inbox":
+        this.h.onInbox(f.E, f.g, f.rel);
         return;
     }
   }

@@ -93,8 +93,8 @@ Not implemented yet:
 
 - self-lane snapshots ([PROTOCOL.md §7.4](docs/PROTOCOL.md#74-snapshots)). Without them a restore reads the account's
   whole self lane, so restoring takes longer as an account accumulates history;
-- the work planned for later stages, such as paging old eras into R2, anonymous write tokens, OHTTP, groups larger than
-  32 members and inclusion proofs ([PROTOCOL.md §14](docs/PROTOCOL.md#14-deferred-to-stage-2--3)).
+- the work planned for later stages, such as anonymous write tokens, OHTTP, groups larger than 32 members and
+  inclusion proofs ([PROTOCOL.md §14](docs/PROTOCOL.md#14-deferred-to-stage-2--3)).
 
 ## Security model
 
@@ -152,25 +152,25 @@ segv.sh does not protect against:
 ### Notifications
 
 Notifications are off unless the deployment configures them and the user turns them on, per device. A device that
-does registers a "bell" for each conversation it accepted: a value derived from that conversation's epoch key, which
-every member can compute and no one else can. After sending a text, an image or a file, a client asks the server to ring the
-other members' bells, and the server sends each registered device one contentless push, at most once a minute. The
+does registers, for each conversation it accepted, the secret of a "bell": a value the account derives from its own key
+for that conversation, whose hash it tells the other members in a small row on its lane. Any member can ring the bell;
+only the account's own devices can register under it. After sending a text, an image or a file, a client asks the
+server to ring the other members' bells, and the server sends each registered device one contentless push, at most once
+a minute. The
 push names, encrypted to the device, the bells that rang. By default the device shows the fixed text "new messages". A
 device that keeps its session can instead show the conversation's name, or its name and newest message: it looks the
 bell up in a cache sealed on the device and, for the message, fetches and decrypts the new rows itself.
 
 - The server stores, per device, its push endpoint and keys sealed under a server key, keyed hashes of its bells, and
-  the day of its last registration: no account, conversation, topic or address, and nothing about which devices a
-  message reached. It writes registration changes only once a day, because the platform keeps a 30-day history of the
-  storage; that history can still suggest, on a quiet day, which devices changed together. Until then it keeps them in
-  a sealed journal that gets one row of the same size every minute whether or not anything changed, so a restart of
-  the server loses at most the last minute's changes.
+  the day of its last registration, in a store that keeps no history of earlier values: no account, conversation, topic
+  or address, and nothing about which devices a message reached.
 - The browser's push service (Apple for every iPhone and iPad web app, Google, Mozilla or Microsoft) learns that the
   device uses segv.sh and when it is notified, and can guess from the timing which of its devices share a
   conversation.
 - The operator sees, at each ring, which devices a message is for, including devices that are offline.
-- A member can make other members' devices show the notification, at most once a minute, or hold the registration
-  places of their bells and so keep their devices from being notified.
+- A member can make other members' devices show the notification, at most once a minute. It cannot register under
+  another member's bell, since that needs the bell's secret; a member who was removed keeps the old bells until the
+  others have posted new ones, and can ring those meanwhile.
 - A preview hands the conversation's name, and with messages their text, to the device's notification system: it can
   show them on the lock screen and keep them in its notification history after the messages or the app are gone. With
   message previews the device fetches the new rows after each push, also while the app is closed, so the operator
@@ -187,17 +187,20 @@ weaker or stronger than v1; [docs/PROTOCOL.md](docs/PROTOCOL.md) §0.3–§0.4 a
 
 The app is a Qwik v2 site with a client engine that runs entirely in the browser, served by one Cloudflare Worker.
 
-| Component               | Role                                                                                                                                                                                              |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Worker                  | The binary and JSON API under `/api/v2/*` and the realtime WebSocket; host pinning, proof-of-work checks and per-IP rate limits (IP addresses are never stored); server-side rendering of the app |
-| `ShardDO` (one per era) | Stores rows: create-only, batched every Δ seconds into a hash chain, sealed when the era ends                                                                                                     |
-| `InboxDO` (one per era) | The global inbox for first-contact invites; clients read the last 4 eras                                                                                                                          |
-| `BlobRegDO`             | Registers uploads to R2 and their times, which membership changes depend on                                                                                                                       |
-| `RealtimeDO`            | Hibernatable WebSockets that push new rows to the topics each client subscribed to                                                                                                                |
-| `CheckpointDO`          | Every 60 seconds, signs the heads of the shard, inbox, upload registry and directory into a checkpoint chain                                                                                      |
-| `PushDO` (optional)     | The sealed notification registrations of the devices that turned notifications on, and the notifications; written once a day, with a sealed journal of fixed size written once a minute           |
-| D1                      | The directory (handle ↔ account id ↔ public keys, key wraps) and its public, hash-chained log                                                                                                     |
-| R2                      | Encrypted images, files and key bundles, content-addressed and immutable                                                                                                                          |
+| Component                          | Role                                                                                                                                                                                                                                          |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Worker                             | The binary and JSON API under `/api/v2/*` and the realtime WebSocket; host pinning, proof-of-work checks and per-IP rate limits (IP addresses are never stored); server-side rendering of the app                                             |
+| `ShardDO` (`S_E` per era)          | Stores rows: create-only, batched every Δ seconds into a hash chain, sealed when the era ends, then written out to R2 and emptied; the count per era is a deployment setting, raised for a future era when the previous one grows             |
+| `InboxDO` (one per era and bucket) | The global inbox for first-contact invites, split into buckets per era by a keyed hash of the recipient's handle prefix; clients read their own bucket of the last 4 eras, and are told over the realtime socket when a slot closes with rows |
+| `KeyDO`                            | The per-era secrets that map handle prefixes to inbox buckets, drawn at random and deleted after the retention                                                                                                                                |
+| `BlobRegDO` (B of them)            | Registers uploads to R2 and their times, which membership changes depend on; a keyed hash of the blob id picks the object                                                                                                                     |
+| `DirSeqDO`                         | The only writer of the directory: hands out the log's sequence numbers and chain, writes a round of registrations in one batch per database, and moves rows when `DIR_SHARDS` is raised                                                       |
+| `ConnDO` (C of them)               | Hibernatable WebSockets; all of a client's connections go to one of them                                                                                                                                                                      |
+| `FeedDO` (F of them)               | Keeps, per topic, which ConnDOs have a subscriber and forwards new rows to them; stores nothing                                                                                                                                               |
+| `CheckpointDO`                     | Every 60 seconds, signs the heads of the shards, inbox and directory, and an hourly value of the upload registry that changes whether or not anything was registered, into a checkpoint chain                                                 |
+| `QuietDO` (optional)               | Notifications: the sealed registrations live in a KV namespace, which this object writes for its accounts; it keeps, in memory, each account's coalescing window, hold and seen marks. The Worker reads the bells and sends the pushes        |
+| D1                                 | The directory: a log database (the public, hash-chained log and the user count) and `DIR_SHARDS` user databases (handle ↔ account id ↔ public keys, key wraps), placed by the top bits of the account id and merged on lookup                 |
+| R2                                 | Encrypted images, files and key bundles, content-addressed and immutable; the rows, index and manifest of every sealed era                                                                                                                    |
 
 The server keeps no sessions and no login state: signing in means unlocking keys in the browser. Writes are anonymous;
 abuse is limited by proof of work, which grows with the number of bytes stored, and by per-IP rate limits.

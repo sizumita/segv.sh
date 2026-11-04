@@ -189,3 +189,28 @@ export function joinStreams(parts: (Uint8Array | ReadableStream<Uint8Array>)[]):
     },
   });
 }
+
+/** `p`, or a rejection with "timed out" when it has not settled within `ms`. */
+export function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("timed out")), ms);
+  });
+  return Promise.race([p, late]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * A best-effort call between objects: made once more when it fails, then given up, logging `msg` with the last
+ * error (never an id). Resolves true when one attempt succeeded.
+ */
+export async function twice(call: () => Promise<unknown>, msg: string): Promise<boolean> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await call();
+      return true;
+    } catch (e) {
+      if (attempt === 1) console.error(JSON.stringify({ msg, error: logErr(e) }));
+    }
+  }
+  return false;
+}

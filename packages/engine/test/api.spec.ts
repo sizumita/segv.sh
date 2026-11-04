@@ -27,6 +27,7 @@ const PARAMS = {
   inboxRetention: 4,
   inboxDayCap: 2000,
   inboxBatch: 32,
+  inboxBuckets: 1,
   shards: 1,
   p: 0,
   efirst: 0,
@@ -353,7 +354,7 @@ describe("request deadlines (§10.1)", () => {
         })) as typeof fetch,
     });
     let err: unknown = null;
-    const run = api.readInbox(10, 0).catch((e: unknown) => (err = e));
+    const run = api.readInbox(10, 0, 0).catch((e: unknown) => (err = e));
     await flush();
     c.advance(REQUEST_TIMEOUT_MS);
     await run;

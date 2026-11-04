@@ -171,6 +171,44 @@ describe("protocol-3 / engine-3 / web-1: wraps filed under someone else's public
   });
 });
 
+/** One POST /api/v2/register as the engine sent it, and the status it got (0: no answer). */
+interface Send {
+  body: string;
+  pow: string | null;
+  status: number;
+  at: number;
+}
+
+/**
+ * Records every POST /api/v2/register (the fake directory answers a registration sent again as §9.6 step 2 says).
+ * `answer(n)` may replace the answer to send n (0 first) by an error with that status and `retry-after: 1`.
+ */
+function recordSends(w: FakeWorld, answer: (n: number) => number | null = () => null): Send[] {
+  const sends: Send[] = [];
+  const real = w.fetch.bind(w);
+  vi.spyOn(w, "fetch").mockImplementation(async (input, init, who) => {
+    if (new URL(String(input), "http://segv.test/").pathname !== "/api/v2/register")
+      return real(input, init, who);
+    const send: Send = {
+      body: new TextDecoder().decode(init?.body as Uint8Array),
+      pow: new Headers(init?.headers).get("x-segv-pow"),
+      status: 0,
+      at: performance.now(),
+    };
+    sends.push(send);
+    let res = await real(input, init, who);
+    const swap = answer(sends.length - 1);
+    if (swap !== null)
+      res = new Response(JSON.stringify({ error: "directory unavailable" }), {
+        status: swap,
+        headers: { "content-type": "application/json", "retry-after": "1" },
+      });
+    send.status = res.status;
+    return res;
+  });
+  return sends;
+}
+
 describe("engine-12: registration", () => {
   it("registers (handle checked by prefix), shows the recovery code once, and both factors unlock the account", async () => {
     const R = newEngine("newbie");
@@ -194,18 +232,23 @@ describe("engine-12: registration", () => {
     expect(viaPasskey.getState().me?.uid).toBe(uid);
   });
 
-  it("a register whose response is lost after the server committed still completes", async () => {
-    server().hooks.fail = (m, p) => (m === "POST" && p === "/api/v2/register" ? "after" : null);
+  it("a register whose response is lost after the server committed completes when it is sent again", async () => {
+    const w = server();
+    const sends = recordSends(w);
+    let lost = 0;
+    w.hooks.fail = (m, p) =>
+      m === "POST" && p === "/api/v2/register" && lost++ === 0 ? "after" : null;
     const R = newEngine();
     const { recoveryCode } = await R.register("lucky");
-    server().hooks.fail = undefined;
+    w.hooks.fail = undefined;
     expect(R.getState().phase).toBe("ready");
     expect(R.getState().me?.handle).toBe("lucky");
     expect(wa.forgotten).toHaveLength(0);
-    // The lost-response check is a fresh handle-prefix query after the failed POST (§2.5 step 8).
-    const paths = server().requests.map((r) => r.path);
-    const post = paths.indexOf("/api/v2/register");
-    expect(paths.slice(post + 1).some((p) => p.startsWith("/api/v2/dir/h/"))).toBe(true);
+    // The identical body went out twice, with the same proof of work; the second answered as the first would have.
+    expect(sends).toHaveLength(2);
+    expect(sends[1].body).toBe(sends[0].body);
+    expect(sends[1].pow).toBe(sends[0].pow);
+    expect(sends.map((x) => x.status)).toEqual([0, 200]);
     await settle(R);
     expect(R.getState().phase).toBe("ready"); // the account check found it in the directory
     const uid = R.getState().me!.uid;
@@ -215,10 +258,53 @@ describe("engine-12: registration", () => {
     expect(L.getState().me?.uid).toBe(uid);
   });
 
+  it("a register answered 503 while the directory's rows wait to land is sent again after the retry-after (§2.5 step 8)", async () => {
+    // The directory logged the registration, but its rows wait in the write-ahead log (§9.6): the first answer is 503
+    // with retry-after, and the identical body sent again answers 200.
+    const w = server();
+    const sends = recordSends(w, (n) => (n === 0 ? 503 : null));
+    const R = newEngine();
+    const { recoveryCode } = await R.register("patient");
+    expect(R.getState().phase).toBe("ready");
+    expect(R.getState().me?.handle).toBe("patient");
+    expect(recoveryCode).toMatch(/\S/);
+    expect(wa.forgotten).toHaveLength(0);
+    expect(sends.map((x) => x.status)).toEqual([503, 200]);
+    expect(sends[1].body).toBe(sends[0].body);
+    expect(sends[1].at - sends[0].at).toBeGreaterThanOrEqual(900); // after the retry-after
+    await settle(R);
+    expect(R.getState().phase).toBe("ready");
+  });
+
+  it("a register sent again that meets another account's handle forgets the new passkey", async () => {
+    const w = server();
+    const sends = recordSends(w);
+    let n = 0;
+    w.hooks.fail = (m, p) => {
+      if (m !== "POST" || p !== "/api/v2/register" || n++ > 0) return null;
+      makeUser("late"); // the first send never arrives, and someone else registers the handle meanwhile
+      return "before";
+    };
+    const R = newEngine();
+    await expect(R.register("late")).rejects.toThrow(/taken/);
+    expect(sends.map((x) => x.status)).toEqual([0, 409]);
+    expect(wa.forgotten).toHaveLength(1);
+    expect(R.getState().phase).toBe("signed-out");
+  });
+
   it("a register that never reached the server fails without pretending success", async () => {
     server().hooks.fail = (m, p) => (m === "POST" && p === "/api/v2/register" ? "before" : null);
     const R = newEngine();
-    await expect(R.register("unlucky")).rejects.toThrow();
+    const reg = R.register("unlucky");
+    let done = false;
+    void reg.catch(() => {}).finally(() => (done = true));
+    // Every send fails: the engine's waits between them pass on the engine clock.
+    while (!done) {
+      await sleep(5);
+      server().tick(10_000);
+    }
+    await expect(reg).rejects.toThrow();
+    expect(server().requests.filter((r) => r.path === "/api/v2/register")).toHaveLength(5);
     expect(R.getState().phase).toBe("signed-out");
     expect(server().dir.byHandleName("unlucky")).toBeNull();
     expect(wa.forgotten).toHaveLength(0); // nobody else holds the handle: the passkey may still be used

@@ -112,6 +112,8 @@ export class SelfFold {
   readonly leaves = new Map<string, P.LeaveRec[]>();
   /** LEFT per (copy, e, uid): the least (t, position) */
   readonly lefts = new Map<string, P.LeftRec>();
+  /** BELLS per copy key: the latest wins, used beside the HEADS entry it was written with (§7.3) */
+  readonly bells = new Map<string, P.BellsRec>();
   /** TREG per bundleId (b64u): the bundle's t_reg; the first wins */
   readonly tregs = new Map<string, number>();
   /** LINK per s: the first, with later flags OR-ed */
@@ -355,6 +357,9 @@ export class SelfFold {
         if (!this.ended.has(k)) this.ended.set(k, r);
         return;
       }
+      case P.RT.BELLS:
+        this.bells.set(copyKey(r), r);
+        return;
       case P.RT.LINK: {
         const k = P.b64u(r.s);
         const had = this.links.get(k);

@@ -817,6 +817,8 @@ export const Lself = (rS: Bytes, E: number, n: number): Bytes =>
 export const Lsnap = (rS: Bytes, E: number, j: number): Bytes =>
   t16(HMAC(rS, enc("segv.sh/v2/lab/snap", u16(E), u32(j))));
 export const topicSelf = (nS: Bytes): Bytes => t16(HMAC(nS, utf8("segv.sh/v2/topic/self")));
+/** Tinbox(E, g) = t16(H(enc("segv.sh/v2/topic/inbox", u16 E, u32 g))): the public notice topic of an inbox bucket (§9.3). */
+export const topicInbox = (E: number, g: number): Bytes => t16(H(enc("segv.sh/v2/topic/inbox", u16(E), u32(g))));
 /** qS: the account's quiet secret (§2.1). Only the account's devices know it; it marks rows seen (§10.10). */
 export const quietSecret = (AK: Bytes): Bytes => HKDF(AK, "", "segv.sh/v2/self/quiet", 16);
 /** Qself = t16(H(enc("segv.sh/v2/quiet", qS))): the quiet tag a device registers with its push subscription (§4.1). */
@@ -848,8 +850,16 @@ export const Lmsg = (rk: Bytes, lane: number, E: number, n: number): Bytes =>
 export const Lctl = (rk: Bytes, E: number, k: number): Bytes => t16(HMAC(rk, enc("segv.sh/v2/lab/ctl", u16(E), u32(k))));
 /** T_e: realtime topic of epoch e. */
 export const topicConv = (nk: Bytes): Bytes => t16(HMAC(nk, utf8("segv.sh/v2/topic/conv")));
-/** B_e(ℓ): the Web Push bell of lane ℓ in epoch e (§4.2, §11.13). Every member can compute it; outsiders cannot. */
-export const bell = (nk: Bytes, lane: number): Bytes => t16(HMAC(nk, enc("segv.sh/v2/bell", u16(lane))));
+/** bS: the account's bell secret key (§2.1), the root of its bell secrets (§4.1). Only the account's devices know it. */
+export const bellKey = (AK: Bytes): Bytes => HKDF(AK, "", "segv.sh/v2/self/bell", 32);
+/**
+ * s(conv, g): the account's bell secret in conversation `conv`, generation `g` (§4.1). It is what a device registers
+ * (§10.10); the server computes the bell from it, and so can whoever learns it, but no member of the conversation does.
+ */
+export const bellSecret = (bS: Bytes, conv: Bytes, g: number): Bytes =>
+  t16(HMAC(bS, enc("segv.sh/v2/bell/secret", conv, u32(g))));
+/** bell(s): the bell of a secret (§4.1): what the account's BELL rows tell the members, and what rings carry. */
+export const bellOf = (s: Bytes): Bytes => t16(H(enc("segv.sh/v2/bell", s)));
 
 // ───────────────────────── links (§4.3) ─────────────────────────
 
@@ -917,6 +927,57 @@ export function shardOf(v: Bytes, sE: number): number {
   return Number(x >> BigInt(63 - sE));
 }
 
+/** ktag = HMAC(ROUTE_KEY, "segv.sh/v2/ws-tag"): the key of the opaque client tag. Server only. */
+export function ktag(routeKey: Bytes): Bytes {
+  if (routeKey.length !== 32) throw new Error("ROUTE_KEY must be 32 bytes");
+  return HMAC(routeKey, utf8("segv.sh/v2/ws-tag"));
+}
+/** tag(ck) = HMAC(ktag, "ws|" ‖ ck)[0..16]: the opaque tag of the client whose rate-limit key is ck. */
+export const clientTagOf = (ktagKey: Bytes, ck: string): Bytes => HMAC(ktagKey, utf8(`ws|${ck}`)).slice(0, 16);
+/** conn(ck) = u32(tag(ck)[0..4]) mod C: the index of the client's ConnDO (§9.4). */
+export function connOf(tag: Bytes, C: number): number {
+  if (tag.length < 4) throw new Error("tag must be at least 4 bytes");
+  if (!Number.isInteger(C) || C < 1 || C > 4096) throw new Error("bad conn count");
+  return new DataView(tag.buffer, tag.byteOffset, 4).getUint32(0) % C;
+}
+/** kfeed = HMAC(ROUTE_KEY, "segv.sh/v2/feed"): the key of the feed hash. Server only. */
+export function kfeed(routeKey: Bytes): Bytes {
+  if (routeKey.length !== 32) throw new Error("ROUTE_KEY must be 32 bytes");
+  return HMAC(routeKey, utf8("segv.sh/v2/feed"));
+}
+/** kblob = HMAC(ROUTE_KEY, "segv.sh/v2/blob"): the key that routes blob ids to the registry shards (§9.2). Server only. */
+export function kblob(routeKey: Bytes): Bytes {
+  if (routeKey.length !== 32) throw new Error("ROUTE_KEY must be 32 bytes");
+  return HMAC(routeKey, utf8("segv.sh/v2/blob"));
+}
+/** blobShard(id) = u32(HMAC(kblob, id)[0..4]) >> (32 − b): the registry shard of a blob id, B = 2^b (b = 0 ⇒ 0). */
+export function blobShardOf(kblobKey: Bytes, id: Bytes, b: number): number {
+  if (id.length !== 32) throw new Error("blob id must be 32 bytes");
+  if (!Number.isInteger(b) || b < 0 || b > 12) throw new Error("bad registry shard bits");
+  if (b === 0) return 0;
+  const h = HMAC(kblobKey, id);
+  return new DataView(h.buffer, h.byteOffset, 4).getUint32(0) >>> (32 - b);
+}
+
+/** h(T) = HMAC(kfeed, T)[0..8]: the feed hash of a topic. */
+export function feedHash(kfeedKey: Bytes, topic: Bytes): Bytes {
+  if (topic.length !== 16) throw new Error("topic must be 16 bytes");
+  return HMAC(kfeedKey, topic).slice(0, 8);
+}
+/** The f of F = 2^f FeedDOs (F a power of two in 1..4096); throws for any other F. */
+export function feedBits(F: number): number {
+  if (!Number.isInteger(F) || F < 1 || F > 4096 || (F & (F - 1)) !== 0) throw new Error("bad feed count");
+  return 31 - Math.clz32(F);
+}
+/** feed(T) = u64(h(T)) >> (64 − f): the index of the topic's FeedDO (§9.4). f = 0 ⇒ 0. */
+export function feedOf(h: Bytes, f: number): number {
+  if (!Number.isInteger(f) || f < 0 || f > 12) throw new Error("bad feed bits");
+  if (h.length !== 8) throw new Error("feed hash must be 8 bytes");
+  if (f === 0) return 0;
+  const x = new DataView(h.buffer, h.byteOffset, 8).getBigUint64(0);
+  return Number(x >> BigInt(64 - f));
+}
+
 // ───────────────────────── commitments (§9, §9.5, §9.6, §10.3, §3.3) ─────────────────────────
 
 /** leaf(data) = H(0x00 ‖ data). */
@@ -953,7 +1014,16 @@ export const nextHead = (cid: string, head: Bytes, t: number, n: number, root: B
 
 export const shardCid = (E: number, i: number): string => `shard/${E}/${i}`;
 export const inboxCid = (E: number, g: number): string => `inbox/${E}/${g}`;
+/** The checkpoint item that stands for every registry shard (§9.5). */
 export const BLOBREG_CID = "blobreg";
+/** The cid of registry shard j (its own head chain, §9.2). */
+export const blobRegCid = (j: number): string => `blobreg/${j}`;
+/**
+ * The hourly registry value of the checkpoints: H(enc("segv.sh/v2/blobreg/all", u32 hour, head_0, …, head_{B−1})).
+ * The hour is mixed in so that the value changes every hour whether or not anything was registered (§9.5).
+ */
+export const blobregAll = (hour: number, heads: readonly Bytes[]): Bytes =>
+  H(enc("segv.sh/v2/blobreg/all", u32(hour), ...heads));
 export const DIRLOG_CID = "dirlog";
 
 /** hd = H(enc("segv.sh/v2/ckpt/heads", [cid_1, head_1, …])) over heads sorted by cid (byte order). */
@@ -966,6 +1036,83 @@ export function ckptHd(heads: readonly { cid: string; head: Bytes }[]): Bytes {
 export const ckptC = (prevC: Bytes, q: number, sec: number, hd: Bytes): Bytes =>
   H(enc("segv.sh/v2/ckpt", prevC, u32(q), u32(sec), hd));
 export const ckptSigMsg = (q: number, C: Bytes): Bytes => enc("segv.sh/v2/ckpt-sig", u32(q), C);
+
+// ───────────────────────── sealed shards in R2 (§9.1 "Paging") ─────────────────────────
+
+/** Bytes of one `idx` entry: label[16] | u32 t | u8 cls | u8 0 | u48 off. */
+export const SEAL_IDX_ENTRY = 28;
+/** Bytes of one `batches` entry: u32 t | u32 n | root[32] | head[32] | u64 off. */
+export const SEAL_BATCH_ENTRY = 80;
+
+/** b of a paged shard with n rows: 0 for n ≤ 1024, else min(16, ⌈log2(n / 1024)⌉) (about 1 024 rows per bucket). */
+export function sealBucketBits(n: number): number {
+  if (!Number.isSafeInteger(n) || n < 0) throw new Error("sealBucketBits: bad n");
+  if (n <= 1024) return 0;
+  let b = 0;
+  while (b < 16 && 1024 * 2 ** b < n) b++;
+  return b;
+}
+
+/** bucket(v) = (v >> (63 − s_E − b)) mod 2^b: the b bits of the routing value below the shard bits. */
+export function sealBucketOf(v: Bytes, sE: number, b: number): number {
+  if (v.length !== 8) throw new Error("sealBucketOf: v must be 8 bytes");
+  if (!Number.isInteger(sE) || sE < 0 || sE > 16 || !Number.isInteger(b) || b < 0 || b > 16) throw new Error("sealBucketOf: bad bits");
+  if (b === 0) return 0;
+  const x = new DataView(v.buffer, v.byteOffset, 8).getBigUint64(0);
+  return Number((x >> BigInt(63 - sE - b)) & BigInt(2 ** b - 1));
+}
+
+/** One file of a paged shard, as the manifest describes it: its size and the SHA-256 of each of its parts. */
+export interface SealFile {
+  size: number;
+  sha256: Bytes[];
+}
+
+/** What the manifest of a paged shard commits to (§9.1 "Paging"); `dir` is the big-endian u32 counts. */
+export interface SealSummary {
+  era: number;
+  shard: number;
+  sbits: number;
+  kroute: Bytes;
+  head: Bytes;
+  tLast: number;
+  part: number;
+  n: number;
+  b: number;
+  dir: Bytes;
+  nb: number;
+  rows: SealFile;
+  idx: SealFile;
+  batches: SealFile;
+}
+
+/**
+ * sig = Sign(SRV_SK, enc("segv.sh/v2/seal", u16 E, u16 i, u8 s_E, kroute_E, head, u32 closed_t, u32 part, u32 n, u8 b,
+ * H(dir), u32 nb, u64 size(rows), H(sha of rows), u64 size(idx), H(sha of idx), u64 size(batches), H(sha of batches))).
+ */
+export function sealSigMsg(m: SealSummary): Bytes {
+  const shas = (f: SealFile): Bytes => H(concat(...f.sha256));
+  return enc(
+    "segv.sh/v2/seal",
+    u16(m.era),
+    u16(m.shard),
+    u8(m.sbits),
+    m.kroute,
+    m.head,
+    u32(m.tLast),
+    u32(m.part),
+    u32(m.n),
+    u8(m.b),
+    H(m.dir),
+    u32(m.nb),
+    u64(m.rows.size),
+    shas(m.rows),
+    u64(m.idx.size),
+    shas(m.idx),
+    u64(m.batches.size),
+    shas(m.batches),
+  );
+}
 
 /** receipt = Sign(SRV_SK, enc("segv.sh/v2/receipt", u16 E, label, H(body), u32 t)) (§10.3). */
 export const receiptMsg = (E: number, label: Bytes, body: Bytes, t: number): Bytes =>
@@ -1024,6 +1171,24 @@ export function prefixRange(p: number, x: number): { lo: number; hi: number } {
 
 /** Top p bits of a u32 prefix value. */
 export const topBits = (pre: number, p: number): number => Math.floor(pre / 2 ** (32 - p));
+
+// ───────────────────────── inbox buckets (§9.3) ─────────────────────────
+
+/** The inbox prefix has this many bits more than β_E: about K / 32 users per prefix (§9.3 "Buckets"). */
+export const INBOX_PREFIX_EXTRA = 5;
+/** x = the top (β_E + 5) bits of hpre(handle), at most 32. */
+export const inboxPrefixOf = (hpreV: number, bits: number): number => topBits(hpreV, Math.min(32, bits + INBOX_PREFIX_EXTRA));
+/**
+ * bucket(E, handle) = u32(HMAC(kbucket_E, enc("segv.sh/v2/inbox/bucket", u16 β_E, u32 x))[0..4]) mod 2^β_E, with x the
+ * inbox prefix of the handle; β_E = 0 ⇒ 0 (no key needed). Server only: kbucket_E never leaves it.
+ */
+export function inboxBucketOf(kbucket: Bytes, bits: number, x: number): number {
+  if (!Number.isInteger(bits) || bits < 0 || bits > 16) throw new Error("bad inbox bucket bits");
+  if (bits === 0) return 0;
+  if (kbucket.length !== 32) throw new Error("kbucket must be 32 bytes");
+  const h = HMAC(kbucket, enc("segv.sh/v2/inbox/bucket", u16(bits), u32(x)));
+  return new DataView(h.buffer, h.byteOffset, 4).getUint32(0) % 2 ** bits;
+}
 
 /** Largest k ≥ 0 with b·2^k ≤ a, or −1 when a < b. Integer-exact. */
 function floorLog2Div(a: number, b: number): number {
@@ -1893,7 +2058,7 @@ export function acceptOldRow(row: WalkRow, epochs: readonly WalkEpoch[], selfRem
 export const M_VER = 2;
 export const M_HEADER_LEN = 62;
 /** The types of M (§3.3): every other value is invalid. */
-export const MT = { TEXT: 1, IMAGE: 2, REACTION: 3, FILE: 4, WELCOME: 8, CLAIM: 16, LEAVE: 17 } as const;
+export const MT = { TEXT: 1, IMAGE: 2, REACTION: 3, FILE: 4, BELL: 5, WELCOME: 8, CLAIM: 16, LEAVE: 17 } as const;
 export type MsgType = (typeof MT)[keyof typeof MT];
 const MSG_TYPES: readonly number[] = Object.values(MT);
 /** lane of a CLAIM. */
@@ -2087,12 +2252,34 @@ export interface MHeader {
   ck16: Bytes;
 }
 
+/** BELL content (§3.3): `u32 g | bell[16]`, the sender's bell in the conversation and its generation (§4.1, §11.13). */
+export interface BellRef {
+  g: number;
+  bell: Bytes;
+}
+export const BELL_LEN = 20;
+
+export function parseBell(b: Bytes): BellRef {
+  const r = new Rd(b, "bell");
+  const g = r.u32();
+  const bell = r.bytes(16);
+  r.end();
+  return { g, bell };
+}
+
+export function encodeBell(x: BellRef): Bytes {
+  const out = concat(u32(x.g), fixed(x.bell, 16, "bell"));
+  parseBell(out);
+  return out;
+}
+
 /** The type and typed content of M. */
 export type MBody =
   | { type: typeof MT.TEXT; text: string }
   | { type: typeof MT.IMAGE; image: ImageRef }
   | { type: typeof MT.REACTION; reaction: Reaction }
   | { type: typeof MT.FILE; file: FileRef }
+  | { type: typeof MT.BELL; bell: BellRef }
   | { type: typeof MT.WELCOME; join: Join }
   | { type: typeof MT.CLAIM; claim: Claim }
   | { type: typeof MT.LEAVE };
@@ -2111,6 +2298,8 @@ function encodeContent(m: MBody): Bytes {
       return encodeReaction(m.reaction);
     case MT.FILE:
       return encodeFile(m.file);
+    case MT.BELL:
+      return encodeBell(m.bell);
     case MT.WELCOME:
       return encodeJ(m.join);
     case MT.CLAIM:
@@ -2133,6 +2322,8 @@ function parseContent(type: number, c: Bytes): MBody {
       return { type: MT.REACTION, reaction: parseReaction(c) };
     case MT.FILE:
       return { type: MT.FILE, file: parseFile(c) };
+    case MT.BELL:
+      return { type: MT.BELL, bell: parseBell(c) };
     case MT.WELCOME:
       return { type: MT.WELCOME, join: parseJ(c) };
     case MT.CLAIM:
@@ -2430,6 +2621,7 @@ export const RT = {
   LEFT: 0x0e,
   TREG: 0x0f,
   ENDED: 0x12,
+  BELLS: 0x15,
   SNAP: 0x20,
 } as const;
 export type RType = (typeof RT)[keyof typeof RT];
@@ -2572,6 +2764,21 @@ export interface LeftRec extends CopyRef {
   row: Pos;
 }
 /**
+ * The bells of epoch e of a copy as the writing device knows them (§7.2, §11.13): `g`, the generation of the account's
+ * own bell as its registration set holds it (BELLS_NO_GEN while it has posted none in the current generation), and
+ * the other members' bells of the current generation, by lane of D_e. Written beside every HEADS entry of the copy, in
+ * the same row or snapshot (§7.3); the latest per copy wins.
+ */
+export interface BellsRec extends CopyRef {
+  rtype: typeof RT.BELLS;
+  e: number;
+  g: number;
+  /** by lane, ascending; self's lane never appears */
+  entries: { lane: number; bell: Bytes }[];
+}
+/** BELLS `g` while the account has posted no BELL row in the current generation. */
+export const BELLS_NO_GEN = 0xffffffff;
+/**
  * The registration time `t_reg` of a bundle (§7.2): written in the same row as the CONV_JOIN of an accepted join (and
  * kept by snapshots), so a restore reads E_start = era(t_reg) without `blob/meta`. Folded by bundleId; the first wins.
  */
@@ -2616,9 +2823,18 @@ export type SelfRecord =
   | LeftRec
   | TregRec
   | EndedRec
+  | BellsRec
   | SnapRec;
 
 const wrCopy = (x: CopyRef): Bytes => concat(fixed(x.conv, 16, "record conv"), fixed(x.root, 32, "record root"));
+/** BELLS entries: at most 32, by lane ascending and distinct, each below 32 (§7.2). */
+function checkBellsEntries(entries: readonly { lane: number; bell: Bytes }[], what: string): void {
+  if (entries.length > MAX_MEMBERS) bad(`${what}: too many entries`);
+  entries.forEach((b, i) => {
+    if (!Number.isInteger(b.lane) || b.lane < 0 || b.lane >= MAX_MEMBERS) bad(`${what}: bad lane`);
+    if (i > 0 && b.lane <= entries[i - 1].lane) bad(`${what}: lanes not ascending`);
+  });
+}
 const wrMaterial = (x: EpochMaterial): Bytes =>
   concat(u32(x.e), fixed(x.EK, 32, "record EK"), fixed(x.bundleId, 32, "record bundleId"), u32(x.bundleSize));
 const wrUids = (uids: readonly Bytes[]): Bytes =>
@@ -2689,6 +2905,15 @@ function recordContent(x: SelfRecord): Bytes {
     case RT.ENDED:
       if (isNone(x.claim)) bad("ENDED: the claim position is NONE");
       return concat(wrCopy(x), u32(x.e), wrPos(x.claim, "ENDED"));
+    case RT.BELLS:
+      checkBellsEntries(x.entries, "BELLS");
+      return concat(
+        wrCopy(x),
+        u32(x.e),
+        u32(x.g),
+        u8(x.entries.length),
+        ...x.entries.map((b) => concat(u8(b.lane), fixed(b.bell, 16, "BELLS bell"))),
+      );
     case RT.SNAP:
       return concat(
         fixed(x.blobId, 32, "SNAP blobId"),
@@ -2827,6 +3052,18 @@ export function parseRecord(rtype: number, c: Bytes): SelfRecord | null {
       x = { rtype, ...rdCopy(r), e: r.u32(), claim: rdPos(r, what) };
       if (isNone(x.claim)) bad(`${what}: the claim position is NONE`);
       break;
+    case RT.BELLS: {
+      const copy = rdCopy(r);
+      const e = r.u32();
+      const g = r.u32();
+      const k = r.u8();
+      if (k > MAX_MEMBERS) bad(`${what}: too many entries`);
+      const entries: { lane: number; bell: Bytes }[] = [];
+      for (let i = 0; i < k; i++) entries.push({ lane: r.u8(), bell: r.bytes(16) });
+      checkBellsEntries(entries, what);
+      x = { rtype, ...copy, e, g, entries };
+      break;
+    }
     case RT.SNAP:
       x = { rtype, blobId: r.bytes(32), key: r.bytes(32), size: r.u32(), pos: rdPos(r, what) };
       break;

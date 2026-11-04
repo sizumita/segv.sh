@@ -322,40 +322,43 @@ export function decodeGetResponse(b: Bytes, modes: readonly number[]): GetStatus
 // ───────────────────────── inbox (§10.5) ─────────────────────────
 
 export const INBOX_MAX_ROWS = 32;
+/** eid[16] | body[1416]: a stored row, as a read returns it (after its u32 rel) */
 export const INBOX_ROW_LEN = 16 + INBOX_BODY_LEN; // 1432
-/** 7 + 1432 · 32 = 45 831 */
-export const INBOX_MAX_BYTES = 7 + INBOX_MAX_ROWS * INBOX_ROW_LEN;
+/** u32 bucket | eid[16] | body[1416]: a row of a post */
+export const INBOX_POST_ROW_LEN = 4 + INBOX_ROW_LEN; // 1436
+/** 3 + 1436 · 32 = 45 955 */
+export const INBOX_MAX_BYTES = 3 + INBOX_MAX_ROWS * INBOX_POST_ROW_LEN;
 export const INBOX_READ_MAX_LIMIT = 1024;
 
+/** One invite of a post: the recipient's bucket of era E (§9.3 "Buckets"), the eid and the sealed body. */
 export interface InboxPostRow {
+  bucket: number;
   eid: Bytes;
   body: Bytes;
 }
 
 export interface InboxPost {
   E: number;
-  bucket: number;
   rows: InboxPostRow[];
 }
 
 export function encodeInboxPost(p: InboxPost): Bytes {
   if (p.rows.length < 1 || p.rows.length > INBOX_MAX_ROWS) fail("bad invite count");
-  const w = new Writer().u16(p.E).u32(p.bucket).u8(p.rows.length);
-  for (const x of p.rows) w.bytes(x.eid, 16).bytes(x.body, INBOX_BODY_LEN);
+  const w = new Writer().u16(p.E).u8(p.rows.length);
+  for (const x of p.rows) w.u32(x.bucket).bytes(x.eid, 16).bytes(x.body, INBOX_BODY_LEN);
   return w.done();
 }
 
 export function decodeInboxPost(b: Bytes): InboxPost {
   const r = new Reader(b);
   const E = r.u16();
-  const bucket = r.u32();
   const count = r.u8();
   if (count < 1 || count > INBOX_MAX_ROWS) fail("bad invite count");
-  if (b.length !== 7 + INBOX_ROW_LEN * count) fail("bad inbox post length");
+  if (b.length !== 3 + INBOX_POST_ROW_LEN * count) fail("bad inbox post length");
   const rows: InboxPostRow[] = [];
-  for (let i = 0; i < count; i++) rows.push({ eid: r.bytes(16), body: r.bytes(INBOX_BODY_LEN) });
+  for (let i = 0; i < count; i++) rows.push({ bucket: r.u32(), eid: r.bytes(16), body: r.bytes(INBOX_BODY_LEN) });
   r.end();
-  return { E, bucket, rows };
+  return { E, rows };
 }
 
 /** JSON results of a post, in request order. */
@@ -478,6 +481,8 @@ export const RT_HELLO = 0x80;
 export const RT_ROWS = 0x81;
 export const RT_GAP = 0x82;
 export const RT_RESUMED = 0x83;
+/** 0x84 is NOTE (§10.8), which no server sends yet. */
+export const RT_INBOX = 0x85;
 
 export type ClientFrame =
   | { f: "sub"; topics: Bytes[] }
@@ -532,7 +537,8 @@ export type ServerFrame =
   | { f: "hello"; boot: Bytes; now: number; seq: number }
   | { f: "rows"; rows: RtRow[] }
   | { f: "gap"; since: number }
-  | { f: "resumed" };
+  | { f: "resumed" }
+  | { f: "inbox"; E: number; g: number; rel: number };
 
 export function encodeServerFrame(x: ServerFrame): Bytes {
   const w = new Writer();
@@ -550,6 +556,8 @@ export function encodeServerFrame(x: ServerFrame): Bytes {
       return w.u8(RT_GAP).u64(x.since).done();
     case "resumed":
       return w.u8(RT_RESUMED).done();
+    case "inbox":
+      return w.u8(RT_INBOX).u16(x.E).u32(x.g).u32(x.rel).done();
     default:
       return fail("bad frame");
   }
@@ -576,6 +584,7 @@ export function decodeServerFrame(b: Bytes): ServerFrame {
     out = { f: "rows", rows };
   } else if (op === RT_GAP) out = { f: "gap", since: r.u64() };
   else if (op === RT_RESUMED) out = { f: "resumed" };
+  else if (op === RT_INBOX) out = { f: "inbox", E: r.u16(), g: r.u32(), rel: r.u32() };
   else return fail("bad frame type");
   r.end();
   return out;
