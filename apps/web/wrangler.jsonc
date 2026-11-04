@@ -44,7 +44,7 @@
   "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "segv-blobs" }],
   // The push store (docs/PROTOCOL.md §9.8): sealed registrations, written at once; a KV namespace keeps no history.
   // Create it with `wrangler kv namespace create segv-push` and put its id here (docs/DEPLOYMENT.md).
-  "kv_namespaces": [{ "binding": "PUSH_KV", "id": "REPLACE_WITH_THE_SEGV_PUSH_NAMESPACE_ID" }],
+  "kv_namespaces": [{ "binding": "PUSH_KV", "id": "b230903c4bec4e4e9e2641c61e253aa6" }],
   // Pushes due later than a Worker can wait (§9.8 "The Worker's part"): a message names the QuietDO to ask, nothing else.
   "queues": {
     "producers": [{ "binding": "PUSH_QUEUE", "queue": "segv-push" }],
