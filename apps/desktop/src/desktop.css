@@ -1,10 +1,11 @@
 /*
  * The desktop app's window, over @segv/ui's global.css. The window itself is Liquid Glass (macOS 26 and later; the
  * sidebar material before that: windowEffects in src-tauri/tauri.conf.json), or Mica on Windows 11, and the page
- * leaves it showing through its chrome: the title bar strip and the conversation list. The open conversation, dialogs
- * and the image viewer stay opaque, so that messages read as they do on the web app. On macOS the page fills the
- * window under the system's buttons, and its top strip is the title bar (chrome.ts); on Windows the system draws the
- * title bar above the page (the end of this file).
+ * leaves it showing through the conversation list. The open conversation with the status bar above it, dialogs and the
+ * image viewer stay opaque, so that messages read as they do on the web app. In a wide window the list runs the
+ * window's full height on the left and one rule splits it from the rest; in a narrow one the status bar runs across
+ * the top, on the glass too. On macOS the page fills the window under the system's buttons, and its top strip is the
+ * title bar (chrome.ts); on Windows the system draws the title bar above the page (the end of this file).
  */
 :root[data-shell="desktop"] {
   --titlebar: 44px;
@@ -79,10 +80,15 @@ html[data-shell="desktop"] body {
   border-right: 0;
   background: transparent;
 }
-[data-shell="desktop"] .left :is(.me, .newconv, .lists) {
+[data-shell="desktop"] .left :is(.newconv, .lists) {
   border-bottom-color: var(--rule);
 }
-[data-shell="desktop"] .left :is(button:not(.conv, .link), .btn, input[type="text"], textarea) {
+[data-shell="desktop"] .left .me {
+  border-top-color: var(--rule);
+}
+[data-shell="desktop"]
+  .left
+  :is(button:not(.conv, .link, .gear), .btn, input[type="text"], textarea) {
   background: var(--glass);
 }
 [data-shell="desktop"] .left :is(button:not(.conv, .link), .btn):hover:not(:disabled) {
@@ -95,17 +101,46 @@ html[data-shell="desktop"] body {
 [data-shell="desktop"] .conv.on:hover:not(:disabled) {
   background: var(--glass-sel);
 }
-/* The conversation is a sheet inset in the glass. */
 [data-shell="desktop"] .right {
-  margin: 0 8px 8px 0;
   background: var(--bg);
-  border: 1px solid var(--rule);
-  border-radius: var(--radius);
-  overflow: hidden;
 }
-@media (max-width: 720px) {
-  [data-shell="desktop"] .right {
-    margin-left: 8px;
+/* A wide window: the list is the sidebar, the window's full height under the system's buttons (whose strip still
+   moves the window: chrome.ts), and the status bar, the errors and the conversation are one opaque area right of
+   it. The rule between them is the list's resize handle (global.css: .sizer). */
+@media (min-width: 721px) {
+  [data-shell="desktop"] .chat {
+    display: grid;
+    grid-template-columns: min(var(--side, 300px), calc(100% - 360px)) minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(0, 1fr);
+  }
+  [data-shell="desktop"] .panes {
+    display: contents;
+  }
+  [data-shell="desktop"] .panes > :is(.left, .sizer) {
+    grid-area: 1 / 1 / -1 / 2;
+  }
+  [data-shell="desktop"] .left {
+    padding-top: var(--titlebar);
+    border-right: 1px solid var(--rule);
+  }
+  [data-shell="desktop"] .chat > .bar {
+    grid-area: 1 / 2;
+    padding-left: 14px;
+    background: var(--bg);
+    border-bottom: 1px solid var(--line);
+  }
+  [data-shell="desktop"] .chat > .bar button:not(.link) {
+    background: var(--surface);
+  }
+  [data-shell="desktop"] .chat > .errors {
+    grid-area: 2 / 2;
+    margin: 0;
+    border-width: 0 0 1px;
+    border-color: var(--line);
+    border-radius: 0;
+  }
+  [data-shell="desktop"] .panes > .right {
+    grid-area: 3 / 2;
   }
 }
 [data-shell="desktop"] .settings,
@@ -125,4 +160,8 @@ html[data-shell="desktop"] body {
 html[data-shell="desktop"][data-backdrop="none"],
 html[data-shell="desktop"][data-backdrop="none"] body {
   background: var(--bg);
+}
+/* No strip to keep clear for the system's buttons: the list starts at the top of the page. */
+[data-shell="desktop"][data-os="windows"] .left {
+  padding-top: 0;
 }

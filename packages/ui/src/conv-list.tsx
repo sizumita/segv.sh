@@ -9,6 +9,22 @@ const LISTS: { id: ListView; empty: string }[] = [
   { id: "archives", empty: "nothing archived." },
 ];
 
+/** A gear: the settings. */
+const GearIcon = () => (
+  <svg
+    class="icon"
+    viewBox="0 0 20 20"
+    aria-hidden="true"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.4"
+    stroke-linejoin="round"
+  >
+    <path d="M15.9 7.78L18.23 8.33L18.23 11.67L15.9 12.22L15.74 12.6L17 14.64L14.64 17L12.6 15.74L12.22 15.9L11.67 18.23L8.33 18.23L7.78 15.9L7.4 15.74L5.36 17L3 14.64L4.26 12.6L4.1 12.22L1.77 11.67L1.77 8.33L4.1 7.78L4.26 7.4L3 5.36L5.36 3L7.4 4.26L7.78 4.1L8.33 1.77L11.67 1.77L12.22 4.1L12.6 4.26L14.64 3L17 5.36L15.74 7.4Z" />
+    <circle cx="10" cy="10" r="2.6" />
+  </svg>
+);
+
 export const ConvList = component$(() => {
   const state = useContext(StateCtx);
   const ui = useContext(UiCtx);
@@ -55,20 +71,6 @@ export const ConvList = component$(() => {
 
   return (
     <aside class="left" aria-label="conversations">
-      {me && (
-        <div class="me">
-          <span class="handle strong">@{me.handle}</span>
-          <button
-            type="button"
-            class="link"
-            aria-haspopup="dialog"
-            onClick$={() => (ui.settings = true)}
-          >
-            settings
-          </button>
-        </div>
-      )}
-
       <div class="newconv">
         {!formOpen ? (
           <button type="button" class="link" onClick$={() => (showNew.value = true)}>
@@ -165,6 +167,25 @@ export const ConvList = component$(() => {
           <p class="dim small pad">{LISTS.find((l) => l.id === ui.list)?.empty}</p>
         )}
       </nav>
+      {/* The account, at the foot of the list: the handle, online or offline, and the settings. */}
+      {me && (
+        <div class="me">
+          <span class="handle strong">@{me.handle}</span>
+          <span class={state.connected ? "dim" : "strong"}>
+            {state.connected ? "online" : "offline"}
+          </span>
+          <button
+            type="button"
+            class="gear"
+            aria-label="settings"
+            title="settings"
+            aria-haspopup="dialog"
+            onClick$={() => (ui.settings = true)}
+          >
+            <GearIcon />
+          </button>
+        </div>
+      )}
     </aside>
   );
 });

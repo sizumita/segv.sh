@@ -336,27 +336,82 @@ textarea:focus {
   border-color: var(--line);
   border-radius: 0;
 }
+/* The list's width is the user's (--side, set by chat.tsx), but leaves the conversation at least 360px. */
 .panes {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(220px, 300px) 1fr;
+  grid-template-columns: min(var(--side, 300px), calc(100% - 360px)) minmax(0, 1fr);
+}
+.panes > .left,
+.panes > .sizer {
+  grid-area: 1 / 1;
+}
+.panes > .right {
+  grid-area: 1 / 2;
 }
 .left {
   border-right: 1px solid var(--line);
   display: flex;
   flex-direction: column;
+  min-width: 0;
   min-height: 0;
 }
-.me,
+/* The handle on the rule between the list and the conversation: a strip 4px either side of it, which shows a
+   thicker rule while hovered, dragged or focused. */
+.sizer {
+  justify-self: end;
+  position: relative;
+  z-index: 5;
+  width: 8px;
+  margin-right: -4px;
+  cursor: col-resize;
+  touch-action: none;
+}
+.sizer::after {
+  content: "";
+  position: absolute;
+  inset: 0 3px;
+  border-radius: var(--pill);
+  transition: background-color 0.12s;
+}
+.sizer:hover::after,
+.sizer.drag::after,
+.sizer:focus-visible::after {
+  background: var(--edge);
+}
+.sizer:focus-visible {
+  outline: 0;
+}
 .newconv {
   padding: 8px 12px;
   border-bottom: 1px solid var(--line);
 }
+/* The account row at the foot of the list. */
 .me {
   display: flex;
-  align-items: baseline;
-  gap: 12px;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 6px 6px 12px;
+  border-top: 1px solid var(--line);
+}
+.gear {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-s);
+  background: none;
+  color: var(--dim);
+}
+.gear:hover:not(:disabled),
+.gear[aria-expanded="true"] {
+  background: var(--hi);
+  color: var(--fg);
 }
 .me .handle {
   flex: 1;
@@ -1542,10 +1597,16 @@ button.edited:hover:not(:disabled) {
     padding-top: calc(24px + env(safe-area-inset-top));
   }
   .panes {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .panes > .right {
+    grid-area: 1 / 1;
   }
   .left {
     border-right: 0;
+  }
+  .sizer {
+    display: none;
   }
   .panes[data-pane="conv"] .left,
   .panes[data-pane="list"] .right {
