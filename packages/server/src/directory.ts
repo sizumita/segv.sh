@@ -19,10 +19,12 @@
 import {
   MAX_ID_LEN,
   ZERO32,
+  aliasHandleTry,
   checkUserKeys,
   era,
   fromB64u,
   hpre,
+  isAliasHandle,
   parseBundle,
   prefixRange,
   serverP,
@@ -187,16 +189,27 @@ function checkWrapId(id: unknown): string {
 // ───────────── writes ─────────────
 
 /**
- * POST /api/v2/register: body `{bundle, sig, wraps: [{record, sig}, …1..4]}` (§10.6). Checks the canonical
+ * POST /api/v2/register: body `{bundle, sig, wraps: [{record, sig}, …0..4]}` (§10.6). Checks the canonical
  * bundle, sizes, handle, bundleSig and checkUserKeys; for every record canonical form, sizes, uid = the
- * bundle's, recordSig under the bundle key, and distinct ids. Then writes the user, the wraps, their dirlog
- * entries (user first) and the dirmeta.users increment atomically. Returns the user's dirseq.
+ * bundle's, recordSig under the bundle key, and distinct ids. An alias (§2.6) registers with no wraps and the alias
+ * handle of its own uid and keys; every other account with 1..4 wraps and a handle that does not start with `_`.
+ * Then writes the user, the wraps, their dirlog entries (user first) and the dirmeta.users increment atomically.
+ * Returns the user's dirseq.
  */
 export async function dirRegister(env: Env, body: Record<string, unknown>, nowMs: number): Promise<{ dirseq: number }> {
   const o = exactKeys(body, ["bundle", "sig", "wraps"], "register");
   const user = checkBundleShape(o.bundle, o.sig);
   const wraps = o.wraps;
-  if (!Array.isArray(wraps) || wraps.length < 1 || wraps.length > MAX_WRAPS_PER_REGISTER) {
+  if (!Array.isArray(wraps) || wraps.length > MAX_WRAPS_PER_REGISTER) {
+    throw new HttpError(400, `wraps: expected 0..${MAX_WRAPS_PER_REGISTER} wrap records`);
+  }
+  // §2.6, §10.6: a handle that starts with `_` belongs to an alias, which has no wraps and whose handle is derived
+  // from its own uid and keys (so nobody chooses it); every other account has wraps.
+  if (isAliasHandle(user.handle)) {
+    if (wraps.length !== 0) throw new HttpError(400, "an alias registers without wraps");
+    if (aliasHandleTry(user.handle, fromB64u(user.uid), user.sigPk, user.kemPk) < 0)
+      throw new HttpError(400, "invalid handle (not the alias handle of these keys)");
+  } else if (wraps.length < 1) {
     throw new HttpError(400, `wraps: expected 1..${MAX_WRAPS_PER_REGISTER} wrap records`);
   }
   const ids = new Set<string>();
@@ -247,6 +260,10 @@ export async function dirAddWrap(env: Env, body: Record<string, unknown>): Promi
   const row = await d1("user read", () => userByUid(env, rec.uid));
   if (!row) throw new HttpError(404, "unknown uid");
   const owner = parseBundle(row.bundle, row.sig); // validated at registration
+  // An alias has no wraps: it is opened only through its owner (§2.6). An account registered before aliases may hold
+  // another handle that starts with `_`; only an alias handle of the account's own keys marks an alias.
+  if (aliasHandleTry(row.handle, fromB64u(row.uid), owner.sigPk, owner.kemPk) >= 0)
+    throw new HttpError(400, "an alias has no wraps");
   if (!(await verifyRecordSig(rec, owner.sigPk))) throw new HttpError(400, "bad wrap signature");
 
   const seqs = await dirWrite(env, { kind: "wrap", wrap: { uid: rec.uid, id: enc64(rec.id), record: rec.record, sig: rec.sig } });
