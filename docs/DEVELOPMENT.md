@@ -203,9 +203,11 @@ place. A newer version is downloaded in the background, and Tauri's updater inst
 under the channel's update key and names the version that the feed names. If the app's window is closed, it installs
 the update at once and starts again in the menu bar or the tray, without the window. Otherwise the tray's menu offers
 "Restart to Update", and the update is installed when the window is next closed or the app quits. On macOS the app
-replaces its own bundle; where that would ask for an administrator (an app that another user installed, or one run
-from its disk image), it waits for the menu. On Windows the installer runs without a window once the app has exited,
-and starts it again.
+replaces the `Contents` folder of its own bundle and keeps the bundle's folder, which macOS knows the app by: a new
+folder in its place would leave the app's tile in the Dock behind, and the updated app would get a second one. Where
+replacing would ask for an administrator (an app that another user installed, or one run from its disk image), it
+waits for the menu, and Tauri's updater then replaces the whole bundle. On Windows the installer runs without a window
+once the app has exited, and starts it again.
 
 Only builds made with `SEGV_UPDATES=1` have a feed. `desktop.yml` sets it; any other build never looks for updates.
 `UPDATES` in `apps/desktop/scripts/bundle.mjs` holds each channel's feed and the public half of its update key.
