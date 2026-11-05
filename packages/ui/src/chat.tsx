@@ -4,7 +4,6 @@ import { ConversationPane } from "./conversation";
 import { Errors } from "./errors";
 import { Settings } from "./settings";
 import { StateCtx, UiCtx } from "./state";
-import { Warnings } from "./warnings";
 
 /** The width of the conversation list, in CSS pixels, on this device (global.css: --side). */
 const SIDE_KEY = "segv.listWidth";
@@ -35,8 +34,8 @@ function saveSide(w: number): void {
 }
 
 /**
- * Signed-in screen: status bar (sync, checkpoint, security warnings), errors, then list | conversation. Online or
- * offline is at the top of the list (conv-list.tsx).
+ * Signed-in screen: errors, then list | conversation. The connection, the checkpoint and the security warnings are at
+ * the foot of the list (conv-list.tsx).
  */
 export const Chat = component$(() => {
   const state = useContext(StateCtx);
@@ -88,24 +87,6 @@ export const Chat = component$(() => {
 
   return (
     <div class="chat" ref={root}>
-      <header class="bar">
-        {state.syncing && <span>syncing…</span>}
-        {state.progress && (
-          <span class="grow" role="status">
-            {state.progress}
-          </span>
-        )}
-        <span
-          class="dim push"
-          title={
-            state.head.h ? `verified checkpoint ${state.head.h}` : "no checkpoint verified yet"
-          }
-        >
-          checkpoint #{state.head.seq}
-        </span>
-        <Warnings />
-      </header>
-
       <Errors />
 
       <div class="panes" data-pane={active ? "conv" : "list"}>

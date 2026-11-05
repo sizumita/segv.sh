@@ -2,6 +2,7 @@ import { $, component$, useContext, useSignal } from "@qwik.dev/core";
 import { showChat } from "./route";
 import { type ListView, StateCtx, UiCtx } from "./state";
 import { act, listOf, MAX_NAME, parseHandles, relTime } from "./util";
+import { Warnings } from "./warnings";
 
 const LISTS: { id: ListView; empty: string }[] = [
   { id: "chats", empty: "no conversations yet." },
@@ -167,13 +168,25 @@ export const ConvList = component$(() => {
           <p class="dim small pad">{LISTS.find((l) => l.id === ui.list)?.empty}</p>
         )}
       </nav>
-      {/* The account, at the foot of the list: the handle, online or offline, and the settings. */}
+      {/* The foot of the list: a running task's progress, then the account: the handle, the connection with the latest
+          verified checkpoint, the security warnings and the settings. */}
+      {state.progress && (
+        <p class="progress-line small" role="status">
+          {state.progress}
+        </p>
+      )}
       {me && (
         <div class="me">
           <span class="handle strong">@{me.handle}</span>
-          <span class={state.connected ? "dim" : "strong"}>
-            {state.connected ? "online" : "offline"}
+          <span
+            class={state.connected ? "dim" : "strong"}
+            title={
+              state.head.h ? `verified checkpoint ${state.head.h}` : "no checkpoint verified yet"
+            }
+          >
+            {!state.connected ? "offline" : state.syncing ? "syncing…" : "online"} #{state.head.seq}
           </span>
+          <Warnings />
           <button
             type="button"
             class="gear"

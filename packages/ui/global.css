@@ -257,28 +257,16 @@ textarea:focus {
   height: 100dvh;
   display: flex;
   flex-direction: column;
-  /* keeps the top bar, the composer and the list footer clear of a notch and the home indicator */
+  /* keeps the list, the composer and the list's foot clear of a notch and the home indicator */
   padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
     env(safe-area-inset-left);
 }
-.bar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 14px;
-  padding: 4px 12px;
-  border-bottom: 1px solid var(--line);
-}
-.bar .push {
-  margin-left: auto;
-}
-
-/* Security warnings: a chip at the end of the status bar; the list opens on hover, focus or a tap. */
+/* Security warnings: a chip in the list's foot; the list opens above it, on hover, focus or a tap. */
 .warn {
-  position: relative;
   display: flex;
   align-items: center;
 }
-.bar .warn-chip {
+.warn-chip {
   padding: 0 8px;
   min-height: 0;
   line-height: 1.6;
@@ -288,19 +276,20 @@ textarea:focus {
   border-radius: var(--pill);
   font-weight: bold;
 }
-.bar .warn-chip:hover:not(:disabled) {
+.warn-chip:hover:not(:disabled) {
   background: var(--fg);
   border-color: var(--fg);
   opacity: 0.85;
 }
-/* Its top padding bridges the gap to the chip, so the pointer can move onto the list without closing it. */
+/* Above the account row, from its left edge (it may run over the conversation). Its bottom padding reaches down to
+   the chip, so the pointer can move onto the list without closing it. */
 .warn-pop {
   display: none;
   position: absolute;
-  top: 100%;
-  right: 0;
+  bottom: calc(100% - 6px);
+  left: 6px;
   z-index: 30;
-  padding-top: 6px;
+  padding-bottom: 10px;
   width: min(26rem, calc(100vw - 24px));
 }
 .warn:hover .warn-pop,
@@ -387,8 +376,16 @@ textarea:focus {
   padding: 8px 12px;
   border-bottom: 1px solid var(--line);
 }
-/* The account row at the foot of the list. */
+/* The foot of the list: a running task's progress, then the account row. */
+.progress-line {
+  margin: 0;
+  padding: 6px 12px;
+  border-top: 1px solid var(--line);
+  color: var(--dim);
+  overflow-wrap: anywhere;
+}
 .me {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 10px;

@@ -1,6 +1,6 @@
 // The window's title bar on macOS: the page fills the whole window under the system's buttons (titleBarStyle
 // "Overlay"), and its top strip moves the window as a title bar would, and zooms it on a double click. Controls in
-// that strip (the status bar's buttons) keep working. On Windows the system draws the title bar above the page
+// that strip (the conversation header's) keep working. On Windows the system draws the title bar above the page
 // (src-tauri/tauri.windows.conf.json), which leaves the page nothing to do.
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
