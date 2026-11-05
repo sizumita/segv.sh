@@ -1085,6 +1085,8 @@ button.edited:hover:not(:disabled) {
   border-top: 1px solid var(--line);
   padding: 8px 12px;
   display: grid;
+  /* the column never grows past the composer: a long word in the box (which sizes to its text) wraps instead */
+  grid-template-columns: minmax(0, 1fr);
   gap: 6px;
 }
 .composer .hint {
