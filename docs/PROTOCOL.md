@@ -80,12 +80,12 @@ texts.
 
 ### 0.3 Guarantees in stage 1
 
-1. **Confidentiality.** Message text, images, files, reactions, replies, conversation names and member lists are confidential
-   against everyone who holds none of: a member's passkey PRF output, recovery code or AK, or the epoch key. This
-   holds against a quantum P: every key is delivered with X-Wing, and everything else is 256-bit symmetric. Pushes
-   carry none of them (§9.8). A device whose user chose a preview (§11.13) decrypts the conversation's name, or its name
-   and newest message, itself and shows them through the operating system's notifications, which this guarantee does
-   not cover (§13.4).
+1. **Confidentiality.** Message text, images, files, reactions, replies, edits, conversation names and member lists
+   are confidential against everyone who holds none of: a member's passkey PRF output, recovery code or AK, or the
+   epoch key. This holds against a quantum P: every key is delivered with X-Wing, and everything else is 256-bit
+   symmetric. Pushes carry none of them (§9.8). A device whose user chose a preview (§11.13) decrypts the
+   conversation's name, or its name and newest message, itself and shows them through the operating system's
+   notifications, which this guarantee does not cover (§13.4).
 2. **Unlinkability against P.** Rows carry no sender, recipient, conversation, epoch or counter. Labels are
    independent PRF outputs. P learns the era, `t` (Δ-rounded), the size class of each row, inbox counts per slot, the
    public directory, and, once per hour, whether any blob was registered (§9.5). §13.1 lists the timing patterns.
@@ -108,8 +108,8 @@ texts.
      and reaches the same verdict as the members whose entry failed (§5.4, §6.6): no member is ever left behind in an
      older epoch. v1 froze only the members whose invite was missing (§13.2 item 14);
    - messaging in the old epoch continues, as in v1, unless the freezing claim removed a member who had not left.
-     That member still holds the old epoch's keys, so stage 1 refuses texts, images, files and reactions there
-     (§11.3), where v1 let the frozen members keep writing to it.
+     That member still holds the old epoch's keys, so stage 1 refuses texts, images, files, reactions and edits
+     there (§11.3), where v1 let the frozen members keep writing to it.
 
    Validity never depends on the directory: every descriptor carries each member's signing key and a hash of its KEM
    key (§5.1).
@@ -136,7 +136,8 @@ These hold in stage 1. §13 has the full leakage table and the explicit list of 
   the directory), without clients being able to prove it in stage 1. There are no inclusion proofs and no witnesses
   (§12.6).
 - No forward secrecy if a passkey PRF output, recovery code or AK leaks. No post-compromise security within an epoch.
-- No deniability among members. No deletion: the archive is public. No censorship resistance.
+- No deniability among members. No deletion: the archive is public, and an edit (§11.18) removes nothing: the
+  original text stays stored and readable by every member who holds its epoch. No censorship resistance.
 - Not defended against: malicious served JavaScript (in a browser; a native app runs only the code of its signed
   package, §11.14); a malicious member who signs an unusable claim (freezing membership for the whole conversation,
   attributably, and messaging too when the claim removes someone) or spams; anyone who fills the global inbox day cap
@@ -154,7 +155,8 @@ These hold in stage 1. §13 has the full leakage table and the explicit list of 
     starts, ring although the user never accepted them.
   - A push names at most the `PUSH_BELLS` = 4 bells that rang its device last, and a push that the push service
     replaces with the next one loses its bells (§9.8), so a preview may leave a conversation out. A preview may also
-    miss rows, or show a row that the app later drops (§11.13).
+    miss rows, show a row that the app later drops, or show a message's text from before an edit: a notification
+    already shown is not updated, and the handler applies only the edits that its own read finds (§11.13, §11.18).
   - **Previews** (§11.13). On a device whose preview is `name` or `message`, conversation names, and with `message`
     handles and message text, pass to the operating system's notifications, which show them on the lock screen as its
     settings say, may keep them in a notification history after the messages, the app or its data are gone, and may
@@ -499,7 +501,7 @@ CLASSES   = [256, 1024, 4096, 16384]            cls = index 0..3; row body lengt
 
 | cls | plaintext | body | typical content |
 | --- | --------- | ---- | --------------- |
-| 0 | 256 | 296 | text ≤ 129 B, image reference, file reference with a name ≤ 60 B, reaction, leave, welcome, most self rows, snapshot pointers |
+| 0 | 256 | 296 | text ≤ 129 B, image reference, file reference with a name ≤ 60 B, reaction, edit with a text ≤ 101 B, leave, welcome, most self rows, snapshot pointers |
 | 1 | 1024 | 1064 | text ≤ 897 B, file reference with a longer name, claims, decoys, self rows with EPOCH_PENDING or DELIVERED |
 | 2 | 4096 | 4136 | text ≤ 3969 B, link hellos, large self rows |
 | 3 | 16384 | 16424 | text ≤ 12000 B (the client limit), very large self rows |
@@ -527,9 +529,9 @@ body = aeadSeal(mk_e, pad(M ‖ sig, CLASSES), aad = enc("segv.sh/v2/msg", u16 E
 
 | field | meaning |
 | ----- | ------- |
-| `type` | 1 TEXT, 2 IMAGE, 3 REACTION, 4 FILE, 5 BELL, 6 REPLY, 8 WELCOME, 16 CLAIM, 17 LEAVE. Every other value is invalid. |
+| `type` | 1 TEXT, 2 IMAGE, 3 REACTION, 4 FILE, 5 BELL, 6 REPLY, 7 EDIT, 8 WELCOME, 16 CLAIM, 17 LEAVE. Every other value is invalid. |
 | `from` | The sender's index in `D_e` (§5.1). |
-| `lane` | For lane rows (types 1, 2, 3, 4, 5, 6, 8, 17): equal to `from` (stage 1: one lane per member). For CLAIM: `0xFFFF`. |
+| `lane` | For lane rows (types 1, 2, 3, 4, 5, 6, 7, 8, 17): equal to `from` (stage 1: one lane per member). For CLAIM: `0xFFFF`. |
 | `n` | The slot within era `E`: the lane counter, or `k` for CLAIM. |
 | `Eprev, nprev, prevh` | Lane rows only: the position of the sender's previous **valid** row on this lane in this epoch, and `prevh = t16(H(enc("segv.sh/v2/prev", label_prev, body_prev)))`, where `body_prev` is that row's stored body. For the first row of the lane in the epoch, and for every CLAIM: NONE and `ZERO16`. |
 | `ts` | The sender's clock in ms (display only, §11.8). |
@@ -541,7 +543,7 @@ of these hold:
 
 1. `unpad` (§1.3) succeeds. The result x has `len(x) ≥ 62 + 64`; `M` = x without its last 64 bytes, and `sig` = the
    last 64 bytes.
-2. `ver = 2` and `type ∈ {1, 2, 3, 4, 5, 6, 8, 16, 17}`.
+2. `ver = 2` and `type ∈ {1, 2, 3, 4, 5, 6, 7, 8, 16, 17}`.
 3. `from < 32`.
 4. `type = 16` (CLAIM): `lane = 0xFFFF` and `(Eprev, nprev)` = NONE. Every other type: `lane = from`.
 5. `(Eprev, nprev)` obeys the position rule (§3.1).
@@ -590,6 +592,11 @@ Content rules:
   (the same HMAC under the same label), so that only a holder of that epoch can tell which public row a reply names.
   A reply is 29 B longer than its message: a text of at most 100 B, an image reference, or a file reference with a
   name of at most 31 B stays in class 0. Any other `kind` is malformed; the target fields have no parse rule.
+- **EDIT (7)**: `u32 te | u16 tl | u16 tE | u32 tn | th[16] | text` (28 B + text): a new `text`, which obeys the TEXT
+  content rule above, that the sender sends for its own message at `(tE, tn)` on lane `tl` of epoch `te` (its
+  **target**, §11.18), with `th` computed as a REACTION's is (the same HMAC under the same label), so that only a
+  holder of that epoch can tell which public row an edit names. An edit is 28 B longer than its text: a text of at
+  most 101 B stays in class 0. The target fields have no parse rule.
 - **WELCOME (8)**: a join payload `J` (§5.2), 90 B.
 - **CLAIM (16)**: see §6.2.
 - **LEAVE (17)**: `len = 0`.
@@ -1184,8 +1191,8 @@ of e, made by `by = D_e.members[from]`:
 6. **Frozen.** There is one frozen state; the two warnings above differ only in what X could see. A frozen member:
    - stays in epoch e, keeps receiving there, and applies the cut rule through `rm` (§6.8);
    - keeps sending there (`canSend = true`), unless `rm` of C has a bit for a member who had not left (by the current
-     leave state, step 5). That member was told it was removed but still holds e's keys, so texts, images and
-     reactions in e are refused (§11.3);
+     leave state, step 5). That member was told it was removed but still holds e's keys, so texts, images, files,
+     reactions and edits in e are refused (§11.3);
    - refuses its own membership changes with "the members of this conversation can no longer change; start a new
      conversation" (its control lane of e has a winner it cannot follow).
 
@@ -1440,17 +1447,16 @@ shown before it is decided. A receiver never accepts a row because it lacks `C_j
   follow self's lane of c − 1 (a restore cannot see self's rows before its HEADS positions); an unneeded repeat costs
   one row, and a duplicate LEAVE is harmless.
 - **Rotation after a leave.** A remaining member MUST commit an epoch without the leavers (§6.3) before sending a TEXT,
-  IMAGE or REACTION in an epoch that lists a member who has left, unless it is frozen in that epoch or the epoch is
-  `2^32 − 2` (§11.3). Clients MAY rotate proactively: the remaining member of rank r (by index among non-leavers) waits
-  `r × 30 s + random(0..10 s)` after seeing the leave, and aborts if a claim appears first. A member added by a commit
-  that raced the LEAVE (its committer built `D′` before the row reached it, so `D′` still lists the leaver) holds no
-  epoch of that row and does not see it. It records the leave only when the leaver's device repeats it in an epoch
-  the new member holds (above). Until then, a claim that drops the leaver (a member who saw the leave rotating) is a
-  removal to it: it shows "`who(by)` removed `who(x)`" where the members who saw the leave show "keys rotated after
-  `who(x)` left", and if that claim froze the conversation it refuses texts there while they may still send (§6.6
-  steps 5–6). Members that hold different rows can thus show different lines and gates. Its texts sent
-  before the leaver is dropped are readable with the leaver's keys, although the leaver's own client shows none of
-  them.
+  IMAGE, FILE, REPLY, REACTION or EDIT in an epoch that lists a member who has left, unless it is frozen in that epoch
+  or the epoch is `2^32 − 2` (§11.3). Clients MAY rotate proactively: the remaining member of rank r (by index among
+  non-leavers) waits `r × 30 s + random(0..10 s)` after seeing the leave, and aborts if a claim appears first. A member
+  added by a commit that raced the LEAVE (its committer built `D′` before the row reached it, so `D′` still lists the
+  leaver) holds no epoch of that row and does not see it. It records the leave only when the leaver's device repeats it
+  in an epoch the new member holds (above). Until then, a claim that drops the leaver (a member who saw the leave
+  rotating) is a removal to it: it shows "`who(by)` removed `who(x)`" where the members who saw the leave show "keys
+  rotated after `who(x)` left", and if that claim froze the conversation it refuses texts there while they may still
+  send (§6.6 steps 5–6). Members that hold different rows can thus show different lines and gates. Its texts sent before
+  the leaver is dropped are readable with the leaver's keys, although the leaver's own client shows none of them.
 - **Add.** An add commit drops every member who has left. Re-adding a leaver who is still listed takes two commits:
   first drop the leavers, then add.
 - **Remove.** A remove commit drops the removed member and every leaver. A member cannot remove itself (it must leave).
@@ -1779,8 +1785,8 @@ records are idempotent:
 | HEADS | per copy | the latest entry wins (an entry of a legacy copy belongs to the copy that §7.2 assigns its epoch to); `(Ein, relIn)` takes the maximum. A record may hold any subset of copies. A restore also keeps, per epoch of a copy, the furthest control position `(ctlE, ctlCnt)` of the entries it applied, the replaced ones included (§11.4 step 5). |
 
 **Contacts.** A CONTACT is written for every user that self resolves by handle (creation, add), and for `D.by` (the
-copy's `rootBy`) when the user accepts a live copy whose `rootBy` is neither self nor a contact: with the accept
-control (`accept`, §11.11), or by self's first TEXT, IMAGE, FILE, REPLY or REACTION in it (§11.5). An incoming join never
+copy's `rootBy`) when the user accepts a live copy whose `rootBy` is neither self nor a contact: with the accept control
+(`accept`, §11.11), or by self's first TEXT, IMAGE, FILE, REPLY, REACTION or EDIT in it (§11.5). An incoming join never
 creates a contact, and neither does a third member's row that accepts a request (§11.5), nor `markRead`, which only
 reports an open pane (§11.10): a user becomes a contact only by self's own act. (The first release also writes one when
 a third member's row accepts a request; such a record counts like any other, so that user's conversations ring, §13.4.)
@@ -4001,7 +4007,7 @@ than `regEra` (§7.3).
 | epochs `e → {EK, keys, D, H(D), bundleId, E_start, …}` | For each lane ℓ: the dense-prefix position, the processed position, the last valid row (for `prev`/`prevh`), the rows seen, and the lane's latest BELL row (its member's bell, §11.13). For the control lane: the position `(E_c, cnt_c)`, the evaluated rows and their e-validity (valid, not valid, undecided), the winning claim with its finality and processing state, and the sealed eras observed. Also the set of members who left in e, each with its kept source (§6.9): the stored time of the LEAVE row it comes from and, when e is that row's epoch, the row's position (NONE for a leave carried into e), kept in LEFT records (§7.3). |
 | current epoch | `removed` (the copy has **ended**: the final winning claim of its current epoch removed or dropped self; latched, §6.6 step 3), `left` (the copy's leave is current, §6.9), `frozen` (with its cause, for the warning text: own entry not opened, or `D'` invalid; §6.6 steps 4 and 6), and the generation of the copy's bells (§4.1, §11.13) |
 | followed lanes | the lane of epoch c−1 of each member silent in c (below) |
-| messages | message list (each message with its reactions, and the REACTION rows that wait for their target, §11.12), `unread`, `lastTs` |
+| messages | message list (each message with its reactions and edits, and the REACTION and EDIT rows that wait for their target, §11.12, §11.18), `unread`, `lastTs` |
 
 **Unknown members.** A member of a D whose uid has no directory bundle, whose bundle fails `checkUserKeys`, or whose
 bundle (or MEMBER record) disagrees with D is an **unknown member**: the bundle's `sigPk` differs from the `sigPk` in
@@ -4053,11 +4059,11 @@ The client also keeps:
   - the next 2 control slots of every epoch whose winner is not yet final and processed;
 - the self-lane and inbox cursors, and the processed positions of every lane.
 
-### 11.3 Send (TEXT / IMAGE / FILE / REPLY / REACTION / BELL / LEAVE / WELCOME)
+### 11.3 Send (TEXT / IMAGE / FILE / REPLY / REACTION / EDIT / BELL / LEAVE / WELCOME)
 
 Sends are serialized per conversation. The UI echo appears at once, with status `sending` (none for LEAVE, WELCOME,
-BELL and REACTION). A REACTION has no echo: wherever this section marks an echo `failed`, a REACTION's send fails with the
-same error instead, nothing keeps its body, and it is not retried (the user reacts again).
+BELL, REACTION and EDIT). A REACTION or an EDIT has no echo: wherever this section marks an echo `failed`, its send
+fails with the same error instead, nothing keeps its body, and it is not retried (the user reacts or edits again).
 
 1. Re-check the session. Probe the control lane of the current epoch e as §6.5 says (its next 2 slots, and slot 0 of
    every later era up to `E_now`), in one `get`, whatever the realtime state, and process what it finds (§6.4–§6.6);
@@ -4080,8 +4086,8 @@ same error instead, nothing keeps its body, and it is not retried (the user reac
    - if the wait timed out: fail with "the conversation is changing membership; try again in a moment" (the v1 text).
      Writing into e now could reach a member that the pending claim removes;
    - if self is frozen in e, the winning claim of e has an `rm` bit for a member who had not left (by the leave state
-     when this check runs, §6.6 step 5), and the type is TEXT, IMAGE, FILE, REPLY or REACTION: fail with "a removed member
-     could still read this conversation; start a new conversation" (§6.6 step 6);
+     when this check runs, §6.6 step 5), and the type is TEXT, IMAGE, FILE, REPLY, REACTION or EDIT: fail with "a
+     removed member could still read this conversation; start a new conversation" (§6.6 step 6);
    - if the type is WELCOME and the current epoch (the one the row would be built in) does not meet every condition of
      §6.12 step 1 (a copy that self left or was removed from never does): put nothing; the recipient gets an inbox
      invite instead (§6.12 steps 1–2). A WELCOME is thus never written in an epoch that lists anyone but self and its
@@ -4096,16 +4102,17 @@ same error instead, nothing keeps its body, and it is not retried (the user reac
    **The send's epoch.** The epoch this step last checked is the send's epoch e. Steps 4–8 build, put and judge the row
    in e, also when the copy has meanwhile switched to a later epoch through §11.6 or a catch-up; only a re-run of steps
    1–3 (step 6) sets a new e.
-3. If the epoch lists a member who has left (other than self) and the type is TEXT, IMAGE, FILE, REPLY or REACTION, commit a
-   rotation (§6.3), unless self is frozen in e or `e = 2^32 − 2`. On a conflict, follow the winner. Then restart at
-   step 1. If the commit fails with "can no longer change" (self is now frozen), restart at step 1 too: step 2 decides
-   whether e still takes the send.
+3. If the epoch lists a member who has left (other than self) and the type is TEXT, IMAGE, FILE, REPLY, REACTION or
+   EDIT, commit a rotation (§6.3), unless self is frozen in e or `e = 2^32 − 2`. On a conflict, follow the winner. Then
+   restart at step 1. If the commit fails with "can no longer change" (self is now frozen), restart at step 1 too: step
+   2 decides whether e still takes the send.
 4. Pick the slot:
    - `(E, n)`: let `E* = max(E_now, the era of the lane head)`, so a slot is never picked below the head's era (a clock
      estimate that steps back across an era boundary); if the lane head is in `E*`, then `n = head.n + 1`, otherwise
      `(E*, 0)`;
    - `prev` = the sender's last valid row on its lane in epoch e.
-5. Build M, sign it, pad it (a text over 12000 bytes fails with "message is too long"), and encrypt it.
+5. Build M, sign it, pad it (a text over 12000 bytes, an EDIT's included, fails with "message is too long"), and
+   encrypt it.
 6. Put with topic `T_e` and handle the result. Every attempt, WRONG_ERA included, counts against `SEND_ATTEMPTS`, except
    the junk skipping below.
    - **Fresh probe.** Immediately before each put attempt is sent (the first one, every one after a return to step 4,
@@ -4140,8 +4147,8 @@ same error instead, nothing keeps its body, and it is not retried (the user reac
      - If every probe fails: the echo becomes `failed` with the same error, and the client keeps the body.
    - Any other 4xx: the echo becomes `failed`, with the server's error.
 7. After success, if the cut rule (§6.8) drops this row because a final winning claim removed the sender, when it is
-   applied or later, mark the echo `failed`, with the same "not delivered" error (a dropped REACTION counts for
-   nothing, §11.12).
+   applied or later, mark the echo `failed`, with the same "not delivered" error (a dropped REACTION or EDIT counts
+   for nothing, §11.12, §11.18).
 8. **Late rows.** A row is *late* when the answer to its put (or to the probe that found its body) arrived `Δ + SKEW`
    seconds or more after its latest step-1 probe was sent, by the monotonic clock, the wall clock or the estimated
    server time (as in step 6), or
@@ -4149,12 +4156,11 @@ same error instead, nothing keeps its body, and it is not retried (the user reac
    it landed (§11.2). After a late row in epoch e, its echo stays `sending`, and step 1 runs again and waits as step 2
    does. The row counts as delivered only if the copy is then still in e, or in e+1 with no valid row of self in e+1
    (so the others still follow self's lane of e). Otherwise, or if the probe fails or the wait times out: a TEXT,
-   IMAGE, FILE or REPLY echo becomes `failed` with the same "not delivered" error, and its retry builds the message again in
-   the current epoch; a REACTION's send fails with that error; a BELL is done either way (its row exists, and §11.13
-   posts another in the current epoch when self's lane there has none); a LEAVE is put again in the current epoch by
-   the rule of §6.9 (its record for the late row stays, since that row exists); a WELCOME's uid stays pending (§6.12
-   step 4). A
-   member that did see the late row then sees the message twice.
+   IMAGE, FILE or REPLY echo becomes `failed` with the same "not delivered" error, and its retry builds the message
+   again in the current epoch; a REACTION's or an EDIT's send fails with that error; a BELL is done either way (its row
+   exists, and §11.13 posts another in the current epoch when self's lane there has none); a LEAVE is put again in the
+   current epoch by the rule of §6.9 (its record for the late row stays, since that row exists); a WELCOME's uid stays
+   pending (§6.12 step 4). A member that did see the late row then sees the message twice.
 
 **Retry of a failed echo.** "Try again" first runs steps 1–3. While the copy is still in the body's epoch, it re-puts
 the kept sealed body at its original slot (after the fresh-probe check of step 6): OK, or a CONFLICT with an identical
@@ -4295,13 +4301,14 @@ the device left off, and otherwise from the server alone, as below.
    it, §6.8). These rows are processed as §11.10 says for rows found by scrollback. The history of an ended copy that
    the restore holds by its ENDED record reads the claim that ended its last epoch at the record's position, and shows
    that claim's line (§6.6 step 3). Other copies load their history when they are opened (§11.10). Build the views,
-   ordered by §11.8. The slots and the "fewer than 30 rows" count every row, REACTION rows included (§11.12): the
-   initial history is a number of slots, so its cost never depends on what the rows hold, and a lane with many
-   reactions shows fewer of its messages until scrollback loads more. A REACTION whose target lies before the slots
-   loaded waits until scrollback loads it. **Unread rows**: for every copy whose read positions (§7.2 READ, §11.8) lie
-   before the slots that the restore loaded or processed, also fetch the rows from the read positions on, at most
-   `UNREAD_FETCH` = 256 per copy, in lane order from the earliest (body mode), so that its unread messages, and the
-   first of them, can be shown; a copy with more shows that it has at least that many, and scrollback loads the rest.
+   ordered by §11.8. The slots and the "fewer than 30 rows" count every row, REACTION and EDIT rows included (§11.12,
+   §11.18): the initial history is a number of slots, so its cost never depends on what the rows hold, and a lane with
+   many reactions or edits shows fewer of its messages until scrollback loads more. A REACTION or an EDIT whose target
+   lies before the slots loaded waits until scrollback loads it. **Unread rows**: for every copy whose read positions
+   (§7.2 READ, §11.8) lie before the slots that the restore loaded or processed, also fetch the rows from the read
+   positions on, at most `UNREAD_FETCH` = 256 per copy, in lane order from the earliest (body mode), so that its unread
+   messages, and the first of them, can be shown; a copy with more shows that it has at least that many, and scrollback
+   loads the rest.
 7. **Inbox.** Read from the HEADS cursor (§11.5). Steps 4–5 have applied the self delta and restored every copy,
    a sibling's re-add copies and the copies of legacy skip records included, and settled the control lanes of the
    accepted ones; a request's is settled by step 8's probe, or by §6.7 step 4 when a J of its conversation comes first.
@@ -4447,23 +4454,23 @@ The start without a cursor reads, beyond `(regEra, 0)`, the rows of `regEra − 
 - It becomes an accepted copy (a CONV_JOIN with `via = 5`, which copies the REQUEST's epoch key, plus CONTACT for `D.by`
   when the user's own act accepts it; the REQUEST keeps naming the bundle's `t_reg`, so the row holds no TREG, §7.3)
   when the user accepts it (`accept`, §11.11, from the accept control of the request's read-only preview, which itself
-  accepts nothing), when self sends a TEXT, IMAGE, FILE, REPLY or REACTION in it (§11.12), when `D.by` becomes a contact, or
-  when a valid row (of any type) from a member other than `rootBy` and self is seen (which also writes CONFIRMED, unless
-  the copy holds one: a request that a claim confirmed, §6.7 step 6, which accepts nothing, is still accepted by such a
-  row). A row accepts or confirms a copy only once the copy's control lane is settled (§6.7 step 4), so a restore, or a
-  catch-up, that meets a member's row from before the claim that removed self processes that claim first, and the ended
-  request is neither accepted nor confirmed. None of these accepts an ended request (below), nor a request whose ENDED
-  record the fold holds while its probe has not yet reached that epoch. On that transition the client processes every
-  lane from `E_start` in body mode, looks up the members that have no MEMBER record, then treats the copy like any
-  other.
+  accepts nothing), when self sends a TEXT, IMAGE, FILE, REPLY, REACTION or EDIT in it (§11.12, §11.18), when `D.by`
+  becomes a contact, or when a valid row (of any type) from a member other than `rootBy` and self is seen (which also
+  writes CONFIRMED, unless the copy holds one: a request that a claim confirmed, §6.7 step 6, which accepts nothing, is
+  still accepted by such a row). A row accepts or confirms a copy only once the copy's control lane is settled (§6.7
+  step 4), so a restore, or a catch-up, that meets a member's row from before the claim that removed self processes that
+  claim first, and the ended request is neither accepted nor confirmed. None of these accepts an ended request (below),
+  nor a request whose ENDED record the fold holds while its probe has not yet reached that epoch. On that transition the
+  client processes every lane from `E_start` in body mode, looks up the members that have no MEMBER record, then treats
+  the copy like any other.
 - **A live copy whose `rootBy` is neither self nor a contact**, other than a request (a request that a third member's
   row accepted, or a copy that a legacy skip record starts, which §7.2 reads as accepted when its legacy copy was), has
   not been accepted by the user, and does not ring (§11.13). Only an explicit act of the user writes the CONTACT for
-  its `rootBy`: self's TEXT, IMAGE, FILE, REPLY or REACTION in it, or `accept` (§11.11) from the accept control, which the UI
-  shows for such a copy, as for a request, for as long as its `rootBy` is neither self nor a contact. That CONTACT is
-  written at once, in a self row that also holds a HEADS record (§7.3), after `rootBy`'s MEMBER is looked up when it has
-  none (§11.11; a TEXT, IMAGE, FILE, REPLY or REACTION whose lookup fails fails before its put, with `accept`'s error).
-  `markRead`, which only reports an open pane (§11.10), writes no CONTACT for it.
+  its `rootBy`: self's TEXT, IMAGE, FILE, REPLY, REACTION or EDIT in it, or `accept` (§11.11) from the accept control,
+  which the UI shows for such a copy, as for a request, for as long as its `rootBy` is neither self nor a contact. That
+  CONTACT is written at once, in a self row that also holds a HEADS record (§7.3), after `rootBy`'s MEMBER is looked up
+  when it has none (§11.11; a TEXT, IMAGE, FILE, REPLY, REACTION or EDIT whose lookup fails fails before its put, with
+  `accept`'s error). `markRead`, which only reports an open pane (§11.10), writes no CONTACT for it.
 - **An ended request**. A request copy ends as any copy does, when the final winning claim of its current epoch k
   removes self (§6.6 step 3), and is then inert, for good: no trigger above accepts it, its rows confirm nothing (the
   claim that ended it confirms it when a member other than `rootBy` and self made it), and §6.7 step 6 counts it in the
@@ -4571,17 +4578,18 @@ not stay followed are swept to their heads first (§11.2). Then it polls the inb
     line sorts before every row of that epoch with the same clamped `ts`.
   - There is no server total order, so concurrent messages from different senders may appear in different orders on
     different devices.
-- **`lastTs`** is the maximum clamped `ts` of the copy's TEXT, IMAGE, FILE and REPLY rows and system lines. A REACTION row
-  never raises it (§11.12): `lastTs` ranks the copies whose history a restore loads (§11.4 step 6), and a reaction that
-  is later removed could not lower it again.
-- **`unread`** counts the copy's unread rows: the TEXT, IMAGE, FILE and REPLY rows of other members' lanes (and the epochs
-  committed by others) that lie at or after their lane's read position in the epoch that the copy's READ names (§7.2),
-  or in a later epoch; never a REACTION row, a row of self's lane (a sibling device's included), or a row later
-  dropped by §6.8. A row counts whether the client applied it live or at a restore, so the messages that arrived while
-  every device of the account was closed stay unread when one opens. A copy without a READ for an epoch that it holds
-  (one that only the first release read, say) counts, until its first READ, the rows applied after its restore
-  finished, while `live`, as the first release did, so its old history never turns unread. A copy whose READ carries
-  the mark (flag bit0) counts as unread, with `unread` at least 1, until it is shown.
+- **`lastTs`** is the maximum clamped `ts` of the copy's TEXT, IMAGE, FILE and REPLY rows and system lines. A
+  REACTION or EDIT row never raises it (§11.12, §11.18): `lastTs` ranks the copies whose history a restore loads
+  (§11.4 step 6), a reaction that is later removed could not lower it again, and an edit leaves its message where it
+  was.
+- **`unread`** counts the copy's unread rows: the TEXT, IMAGE, FILE and REPLY rows of other members' lanes (and the
+  epochs committed by others) that lie at or after their lane's read position in the epoch that the copy's READ names
+  (§7.2), or in a later epoch; never a REACTION or EDIT row, a row of self's lane (a sibling device's included), or a
+  row later dropped by §6.8. A row counts whether the client applied it live or at a restore, so the messages that
+  arrived while every device of the account was closed stay unread when one opens. A copy without a READ for an epoch
+  that it holds (one that only the first release read, say) counts, until its first READ, the rows applied after its
+  restore finished, while `live`, as the first release did, so its old history never turns unread. A copy whose READ
+  carries the mark (flag bit0) counts as unread, with `unread` at least 1, until it is shown.
 - **Read positions.** While a device in use (§11.13) shows a copy, it moves the copy's read positions in its current
   epoch to the end of what it shows (each lane's slot after the last row it holds) and clears the mark. The device
   writes the READ records of the copies whose positions or mark changed in one self row (§7.3): when it stops being in
@@ -4611,7 +4619,7 @@ These strings are kept from v1. `who(u)` is "you" for self and `@handle` otherwi
 | leave | "you left the conversation" (own, once, at the earliest own LEAVE row held; also one that §6.8 drops, §6.9) or "`@x` left" |
 
 The rename lines compare the names as displayed (§5.1): a name that fails the reader's `validName` counts as no name.
-A REACTION row shows no line (§11.12).
+A REACTION or EDIT row shows no line (§11.12, §11.18).
 
 Lines that depend on others' leaves are derived from the leave state (§6.9), not latched when an event is processed. A
 LEAVE row R of x in epoch k shows "`@x` left" while it is the kept source of x's leave in k, §6.8 accepts it, and x is
@@ -4637,8 +4645,8 @@ or scrollback reads the claim that ended it (§11.4 steps 5–6), while the copy
 When a conversation is opened (`markRead`, which the UI calls every time it opens a conversation pane, though not while
 the pane shows a read-only preview, a request's or that of another copy whose `byContact` is false, whose accept control
 calls `accept` instead; `markRead` accepts nothing and writes no CONTACT, §11.11), the client loads older rows until the
-view holds `VIEW_MESSAGES` messages (TEXT, IMAGE, FILE and REPLY rows; REACTION rows are not messages, §11.12) or the
-history is exhausted. This runs once per copy and session; later calls are no-ops.
+view holds `VIEW_MESSAGES` messages (TEXT, IMAGE, FILE and REPLY rows; REACTION and EDIT rows are not messages,
+§11.12, §11.18) or the history is exhausted. This runs once per copy and session; later calls are no-ops.
 
 - For each lane, probe `(E, n−32..n−1)`.
 - At `n = 0`, move to the previous era that has rows: follow `prev` of the oldest loaded valid row, and also probe the
@@ -4666,9 +4674,9 @@ Rows found by scrollback are processed like any other (a WELCOME that lies befor
 processed and is not applied twice: its J is ignored when a held copy holds its bundle, §6.7 step 3, and any other such
 J, whose copy the self lane does not hold, goes through §6.7 again without raising its warnings a second time; a LEAVE
 is applied as §6.9 says: it records a leave the local state lacks, and replaces the kept source only when its key is
-smaller; a REACTION applies to its target as §11.12 says, and one whose target is not loaded yet waits for it; in an epoch that a claim removed self from, a row
-stored after that claim is dropped, §6.8, as the live final sweep dropped it). Older rows are never
-counted as unread.
+smaller; a REACTION applies to its target as §11.12 says and an EDIT as §11.18 says, and either waits for a target that
+is not loaded yet; in an epoch that a claim removed self from, a row stored after that claim is dropped, §6.8, as the
+live final sweep dropped it). Older rows are never counted as unread.
 
 ### 11.11 Engine operations
 
@@ -4678,6 +4686,8 @@ counted as unread.
 | `createConversation(handles, name)` | §6.1, by handle. It resolves after step 5, with the new copy in `conversations`; steps 6–9 run in the background. |
 | `sendText` / `sendImage` / `sendFile` / `leave` | §11.3. An image or a file is uploaded first (§8.1, §8.3); the echo shows a local preview (a file's name and size). Given the message key of a TEXT, IMAGE, FILE or REPLY row that the copy holds and accepts, `sendText`, `sendImage` and `sendFile` send their message as a REPLY to that row (§11.17), and fail with "unknown message" for any other key. Each `MessageView` of a REPLY carries `reply: {key, state}` (§11.17). |
 | `react(convId, messageKey, emoji, on)` | §11.3 and §11.12: one REACTION row for the TEXT, IMAGE, FILE or REPLY row of that message, with `op` 1 for `on` and 0 otherwise. It resolves when the row counts as delivered (§11.3 step 8) and fails with §11.3's errors; there is no echo. Each `MessageView` carries `reactions: {emoji, count, mine}[]`. |
+| `editText(convId, messageKey, text)` | §11.3 and §11.18: one EDIT row with `text` for self's TEXT row, or REPLY row of `kind` 1, of that message, which the copy holds and accepts. It fails with "unknown message" for a key that names no message, with "this message cannot be edited" for another member's message, an image, a file or an echo not yet sent, with "an edit cannot be empty" for a text that is empty or only white space, and with "message is too long" for one over 12000 bytes; a text equal to the current one resolves at once without a row. It resolves when the row counts as delivered (§11.3 step 8) and fails with §11.3's errors; there is no echo. Each `MessageView` carries its current text as `text`, and `edited: {ts, count, sending}` while an EDIT row edits it or an edit of this device is being sent (§11.18 "Display"). |
+| `editHistory(convId, messageKey)` | §11.18 "Display": the versions of that message as `{text, ts}[]`, its own text and then that of each EDIT row that edits it, in lane order, each with its clamped `ts` (§11.8); empty for a message without edits and for an unknown key. It makes no request. |
 | the notification setting of the device | §11.13: turning it on subscribes the browser (a native app: gets its token and push keys) and registers the set; turning it off unsubscribes (a native app: gives up its token and deletes its push keys), then deletes the registration and the notification cache. The preview (`none`, `name`, `message`) decides what notifications show. The names of these calls are implementation-defined. |
 | `addMembers` | Drop leavers (a separate commit first if a requested user is a listed leaver), then §6.3 with the added uids. Resolves after the switch and the first delivery attempt. |
 | `removeMember` | §6.3 without that uid and without leavers. Removing self is refused ("use “leave” to leave a conversation"). |
@@ -4794,9 +4804,9 @@ decrypts itself.
   BELL row among the held epochs of the previous generation when there is one (senders still ring that bell); else
   the current generation. Frozen copies are included. It holds no secret of a request, and none of another live copy
   whose `rootBy` is neither self nor a contact (§11.5), so a conversation started by someone who is not a contact never
-  rings before the user accepts it or self sends a TEXT, IMAGE, FILE, REPLY or REACTION in it (either makes `rootBy` a
-  contact, §11.5). When the set has more than `push.maxTokens` secrets, it holds those of the copies with the newest
-  `lastTs`.
+  rings before the user accepts it or self sends a TEXT, IMAGE, FILE, REPLY, REACTION or EDIT in it (either makes
+  `rootBy` a contact, §11.5). When the set has more than `push.maxTokens` secrets, it holds those of the copies with the
+  newest `lastTs`.
 - **Registering.** `POST /api/v2/push/sub` (§10.10) with the whole set, and with `quiet` = `Qself` (§4.1), replaces
   the endpoint's registration. A native app also sets `notes` when its preview is `name` or `message` and its handler
   can show nothing for a push: on iOS and macOS only with the notification filtering entitlement
@@ -4821,8 +4831,8 @@ decrypts itself.
   latest BELL row among the held epochs of e − 1's generation; a member with neither is not rung. With no bell nothing
   is sent. The sender rings every such member, whether or not it turned notifications on, which the sender does not
   know. It does not wait for the answer, and the send's outcome never depends on it; after a network error, a timeout or
-  a 5xx it sends the same request once more, within Δ, and never otherwise. Nothing else rings: no WELCOME, CLAIM, LEAVE
-  or REACTION row, no self row, no inbox invite and no link hello.
+  a 5xx it sends the same request once more, within Δ, and never otherwise. Nothing else rings: no WELCOME, CLAIM,
+  LEAVE, REACTION or EDIT row, no self row, no inbox invite and no link hello.
 - **Bells.** A member's bell in a conversation is what its latest BELL row says (§3.3, §4.1). The **generation** of an
   epoch e of a copy is the latest epoch at or below e that **started a generation**: the copy's root epoch, and every
   epoch whose `D` lacks a member of the previous epoch's (§4.1). An epoch whose previous epoch the device has not loaded
@@ -4910,10 +4920,14 @@ decrypts itself.
      row in the slot before the next slot, which the client has already read (as it does when it is open while the push
      comes), only when it was stored in the last 5 minutes. A copy's notification is then that of step 2 with, as its
      body, the copy's newest such row by clamped `ts` (§11.8): `@handle: ` and its text, cut to 200 characters, or
-     `@handle sent an image` or `@handle sent a file` (a REPLY by its `kind`), followed by ` (+k)` when it found k more. A copy whose answer has
-     not come 8 s after the push event gets the notification of step 2, with its fixed body, and so does a copy without
-     such a row, unless every row found lies before its read positions: that copy gets none. Then it moves each lane's
-     next slot past the dense prefix it found from that slot on, keeping the later of the stored one and its own.
+     `@handle sent an image` or `@handle sent a file` (a REPLY by its `kind`), followed by ` (+k)` when it found k more.
+     An EDIT row found in that read that opens, parses, recomputes and verifies as above, and whose target (§11.18) is
+     a TEXT, or a REPLY of `kind` 1, kept there, in the cached epoch on the EDIT's own lane (`te = c`, `tl` its lane),
+     with `th` verifying under the cached `rk_c`, gives that row its text (that of the latest such EDIT by `(E, n)`);
+     the row keeps its clamped `ts`, and the EDIT adds nothing to k. A copy whose answer has not come 8 s after the push
+     event gets the notification of step 2, with its fixed body, and so does a copy without such a row, unless every row
+     found lies before its read positions: that copy gets none. Then it moves each lane's next slot past the dense
+     prefix it found from that slot on, keeping the later of the stored one and its own.
   4. When steps 2 and 3 leave no notification (every copy muted, or read according to the notes), the notification of
      step 1, or none from a handler whose endpoint takes notes.
 
@@ -4961,9 +4975,9 @@ decrypts itself.
   answer; after a network error, a timeout or a 5xx it sends the same request once more, after 1 s, and never otherwise.
   The server then sends no push for those rows to any endpoint registered with `Qself`, the marking device's own included,
   unless the push has already gone (each waits at least `PUSH_HOLD` = 5 s after its ring, §9.8). A device marks nothing
-  else: no row while it is not in use, no row that it applies at a restore or finds older than that, and nothing at all
-  while no row comes, so the server never learns when a device is in use apart from the moments at which rows reach it
-  (§13.4).
+  else: no row of another type (a REACTION or an EDIT never rings), no row while it is not in use, no row that it
+  applies at a restore or finds older than that, and nothing at all while no row comes, so the server never learns when
+  a device is in use apart from the moments at which rows reach it (§13.4).
 - **The quiet setting**, "quiet my other devices while I use this one", belongs to the device, is on by default and is never
   synced; the device keeps it in its own storage, beside the notification setting, or, where that storage cannot keep
   it, in the page's memory until the page closes. A client shows it whenever params
@@ -4979,7 +4993,9 @@ decrypts itself.
   its window closed: for each TEXT, IMAGE, FILE or REPLY row of another member that reaches it (§11.6) while it is not in use,
   in a copy that its registration set would hold, it shows the notification that the handler would show for that
   copy with the device's preview (step 2, with step 3's text when the preview is `message`), at most one per copy per
-  `PUSH_WINDOW`. It sends nothing for this, and learns nothing of its account's marks, so it notifies also of rows that
+  `PUSH_WINDOW`. It builds a notification when it shows it, from the current text of its message (§11.18), so an edit
+  that reaches the app while a notification waits for its window shows in it; a notification already shown is not
+  updated. It sends nothing for this, and learns nothing of its account's marks, so it notifies also of rows that
   another device of the account shows (§0.4), and closes those notifications when a sync note says that the copy was
   read (§11.16); its own marks while it is in use, and its rings, are those of any client.
 
@@ -5094,10 +5110,11 @@ rather than restoring from scratch:
 - **What it holds**: the fold of the self lane as the device applied it (§7.3) with the device's self position; for
   each copy its state of §11.2 (epochs, keys, descriptors, members, claims and cuts, lane positions, the followed lanes,
   read positions and settings) and its messages: at least those of the initial history (§11.4 step 6), every unread
-  one, and those the user has scrolled back to, up to an implementation-defined bound; the inbox cursor and parked
-  joins (§11.5); the receipts, checkpoint references and row memory that §12 keeps; and the notification cache's
-  inputs (§11.13). Images and files are not part of it: a device fetches an image again when it shows it (§8.1), and
-  a file when the user asks for it (§8.3), unless it chose to keep them, sealed like the rest.
+  one, and those the user has scrolled back to, up to an implementation-defined bound, with the REACTION and EDIT rows
+  that apply to them or wait for their target (§11.12, §11.18), which the restore below does not fetch again; the
+  inbox cursor and parked joins (§11.5); the receipts, checkpoint references and row memory that §12 keeps; and the
+  notification cache's inputs (§11.13). Images and files are not part of it: a device fetches an image again when it
+  shows it (§8.1), and a file when the user asks for it (§8.3), unless it chose to keep them, sealed like the rest.
 - **How**: sealed with AEAD under a device key that cannot be exported and that never leaves the device: in a browser
   a non-extractable WebCrypto key in the origin's storage; in a native app a key that the system's key store holds and,
   as far as the system can (§11.14), keeps out of backups and moves to another device, the state lying in the app's
@@ -5176,8 +5193,8 @@ notifications in §11.13), and a REACTION can react to it (§11.12). It writes n
 - **Display.** A reply shows its message as a message of its `kind` would, with a line above it that names its target
   (`MessageView.reply`, §11.11): `key`, the target's message key, and `state`, which is `shown` when the reply replies
   to T, and `waiting` or `none` otherwise (with `key` empty). For `shown`, the client shows T's sender and the start of
-  its text, or that it is an image, or its file's name; for `waiting`, that the original message is not loaded; for
-  `none`, that it is not available. A reply whose target is none is still shown: its own message is valid.
+  its current text (§11.18), or that it is an image, or its file's name; for `waiting`, that the original message is not
+  loaded; for `none`, that it is not available. A reply whose target is none is still shown: its own message is valid.
 - **Thread.** Informative: a client MAY show a message's thread from the rows it holds, without a request: the chain of
   targets above it, up to a message that is not a reply (or a target that is waiting or none), and the replies to it,
   recursively, in the order of §11.8.
@@ -5193,6 +5210,80 @@ notifications in §11.13), and a REACTION can react to it (§11.12). It writes n
   compares `prevh` with the stored body of the slot it names, which needs no parse (§12.2). On the two paths that
   §11.12 "Compatibility" describes for the first release and a REACTION row, the first release treats a REPLY row as it
   treats a REACTION row.
+
+### 11.18 Edits
+
+An EDIT row (type 7, §3.3) is a new text that a member sends for one of its own earlier messages: a TEXT, or a REPLY
+that carries a text. The message then shows the new text in place of its own, while every row stays as it was stored
+(§12.1). It is a lane row like any other: it is sent on the sender's own lane of the send's epoch by the rules of §11.3,
+as a REACTION is (no echo; refused wherever a text is refused; a rotation first when the epoch lists a member who has
+left), accepted by §3.3 and §6.8, and part of its lane's `prev` chain (§12.2). It writes no self record of its own.
+
+- **Target.** An EDIT row R of epoch e that the reader holds and accepts edits the row T at `(tE, tn)` on lane `tl` of
+  epoch `te` when all of these hold: the conditions of §11.12 "Target", which are `te ≤ e`, R's copy holds epoch `te`
+  (an edit never crosses copies), `tl < |D_te|`, the reader holds and accepts T (§3.3, §6.8), and `th` names T's label
+  and stored body; T is a TEXT row, or a REPLY row of `kind` 1; and T's sender is R's sender, by uid:
+  `D_te.members[tl].uid = D_e.members[from].uid` (a member's index can differ from one epoch to the next; the devices of
+  an account share its lane, §11.7, so any of them can edit its messages). While the reader holds no decided row at T's
+  position (its history has not loaded it yet, §11.4 step 6, §11.10, or §6.8 has not decided it), R waits, and it takes
+  effect once T is loaded and accepted. Otherwise R edits nothing and is ignored, without a warning. A target in an
+  epoch that the copy does not hold (one before its root: the copy of a member added later, or a re-add's copy) never
+  loads, so such an edit never takes effect there. An EDIT row is itself never the target of an edit, a reaction or a
+  reply (§11.12, §11.17): every edit of a message names the message's own row and carries the whole new text.
+- **State.** The **current text** of a target T is the text of the latest EDIT row that edits T, in lane order (by the
+  row's epoch, then by `(E, n)`; the sender's devices share the lane through CAS, §11.7, so every device sees the same
+  order), or T's own text while no EDIT row edits it. It never depends on `ts`. Only accepted rows count: an EDIT row
+  that §6.8 drops counts for nothing, and when a new final winner makes §6.8 drop a row it had accepted (§6.8), the
+  current text is computed again; a retracted target loses its edits. Edits have no limit: any number of EDIT rows may
+  edit a message, at any time.
+- **Agreement.** The current text depends only on the rows the reader holds and accepts, so devices that hold the same
+  rows show the same text. A device that holds fewer (after a reload, until the initial history or scrollback reaches
+  them) shows the text of the latest edit among the rows it holds, and that of a later one once it loads, as for
+  reactions (§11.12).
+- **Display.** A message shows its current text (`MessageView.text`, §11.11), also where another view names it (a
+  reply's line, §11.17). It carries `MessageView.edited` while an EDIT row edits it or an edit of this device is being
+  sent: `ts`, the clamped `ts` (§11.8) of its latest edit, or this device's clock for an edit still being sent; `count`,
+  the number of EDIT rows that edit it (0 while only an edit of this device is being sent); and `sending`, whether the
+  text shown is an edit that this device is still sending. A client SHOULD mark an edited message as edited, and MAY
+  show its versions: T's own text, then the text of each EDIT row that edits it, in lane order, each with its clamped
+  `ts`. An edited message keeps its place in the order (§11.8), its reactions and its replies, which name its own row,
+  whose stored body does not change; an edited REPLY keeps its target, whose fields are in that stored body (§11.17).
+- **Not a message.** An EDIT creates no `MessageView` and is not a message for `VIEW_MESSAGES` (§11.10); it never counts
+  toward `unread`, never raises `lastTs` (§11.8), shows no system line (§11.9), does not ring and gets no seen mark
+  (§11.13). It is a valid row of its member wherever a rule asks for one: the followed lanes and sweeps (§11.2), the
+  qualifying 1:1 of §6.12 step 1, confirmation (§6.7 step 6) and the acceptance of a request (§11.5: self's EDIT accepts
+  it as self's TEXT does, and writes the CONTACT for the `rootBy` of any live copy whose `rootBy` is neither self nor a
+  contact, while that of a member other than `rootBy` and self is a third member's row). The initial history counts it
+  as a row (§11.4 step 6), and an EDIT whose target lies before the slots loaded waits until scrollback loads it.
+- **Sending.** A client sends an EDIT only for self's TEXT row, or REPLY row of `kind` 1, that it holds and accepts in
+  the same copy, with the target fields of that row: `te` its epoch, `tl` its lane, `(tE, tn)` its slot, and `th` over
+  its label and stored body (§3.3). The EDIT is sent by §11.3 at the send's epoch, which may be later than `te`, as a
+  REACTION is: it is refused wherever a text is refused (step 2), a rotation comes first when the epoch lists a member
+  who has left (step 3), a text over 12000 bytes fails with "message is too long" (step 5), a dropped EDIT counts for
+  nothing (step 7), and a late EDIT that does not count as delivered fails with the "not delivered" error (step 8),
+  although its row, which exists, still edits the message wherever it is read, the sender's own view included. It
+  has no echo: where §11.3 marks an echo `failed`, the EDIT's send fails with the same error instead, nothing keeps its
+  body, and it is not retried. A client SHOULD NOT send an EDIT whose text equals the message's current text, and sends
+  none with an empty text, which §3.3 does not allow. Informative: a client MAY show the new text at once while the send
+  runs (`edited.sending`), and shows the current text again if the send fails.
+- **Notifications.** An EDIT never rings (§11.13), so no edit causes a push or a notification. A notification handler
+  applies the EDIT rows that its own read finds to the rows it keeps (§11.13 step 3), and an app without push builds a
+  notification when it shows it, from the message's current text (§11.13 "Apps without push"). A notification already
+  shown is not updated: nothing wakes a handler for an edit.
+- **Leakage.** P cannot tell an EDIT from other rows except by its class, which its 28 bytes and its text decide (§3.2).
+  No ring follows it, so with push O can tell it from a message as it tells a reaction (§13.4); unlike a reaction, an
+  EDIT of a text over 101 bytes is of class 1 or more, so O can also tell such a put from a reaction by its class. N
+  sees nothing of it. A member who holds both the target's epoch and the EDIT's learns every version of the message
+  and when each was sent: an edit never removes the original text, which stays stored and readable by every holder of
+  epoch `te` (§0.4, §12.1). A member of the EDIT's epoch that does not hold epoch `te` (one added later) can read the
+  new text, but not which message it edits.
+- **Compatibility.** A client without type 7 (every release before it) reads an EDIT row as invalid, so the row is junk
+  to it (§3.3): it occupies its slot and is not shown, the edited message shows its original text there, and a later
+  row's `prev` check compares `prevh` with the stored body of the slot it names, which needs no parse (§12.2). On the
+  two paths that §11.12 "Compatibility" describes for the first release and a REACTION row, such a client treats an EDIT
+  row as the first release treats a REACTION row: it stops at one on the `prev` chain of a realtime row beyond its
+  catch-up with the warning "the server is showing different messages from @x to different members", and its scrollback
+  does not move to an earlier era through one.
 
 ## 12. Integrity (replacing the v1 global hash chain)
 
@@ -5223,8 +5314,8 @@ Honest writers never leave holes in their own lane, so a validly signed lane row
 - **Every row.** When a valid lane row names `prev = (Eprev, nprev)`, the client checks that it holds the row there and
   that `prevh` matches, whatever the position of that slot relative to the known prefix (fetching it if needed, with
   the outcomes above).
-- **Every type.** Lane rows of every type are on the chain: a REACTION, a WELCOME or a LEAVE is a valid row of its
-  lane like a TEXT, names its `prev` and is named by the next row's (§11.12).
+- **Every type.** Lane rows of every type are on the chain: a REACTION, an EDIT, a WELCOME or a LEAVE is a valid row
+  of its lane like a TEXT, names its `prev` and is named by the next row's (§11.12, §11.18).
 
 The warnings are deduplicated per sender.
 
@@ -5307,7 +5398,7 @@ are kept. Critical warnings are kept until sign-out.
 | activity of a user | Directory events (registration, wrap additions); the size of the global inbox; self rows (one after each own creation, commit, join or leave, and at most one HEADS row per 30 minutes while active), which P cannot tell from other rows except by timing. Per-user send volume is not visible. | Per-IP read and write volume and times; online time; topic sets; with a `message` preview, when each such device receives a push, also while the app is closed (§13.4); from sync notes, when a device of the account changes its read state or a setting (§13.4). | Send times in shared conversations. With push, from each member's BELL row, when that member's first device processed each epoch change, to within about `BELL_DELAY` + Δ (§11.13, §13.4). | When each of its devices that turned notifications on is notified (§11.13), and when a native device that takes notes gets a quiet push, that is, when another device of its account changed its read state. |
 | activity of a conversation | Not directly: rows have uniform labels. | Exact per-topic volume and times. | Everything. After removal: only that a claim happened, its `rm` bits and its cuts. With push it can still ring the bells of its last generation, which makes the devices of the members silent since the change show notifications until they post their new bells or the epoch changes again, and tells it nothing (§13.4). | — |
 | membership changes and creations | Both show the same row pattern: a class-1 self row, one class-1 row at least Δ+SKEW later (claim or decoy, which P cannot tell from a medium text), then J deliveries and one class-1 self row (DELIVERED, padded for any number of recipients, §6.12). Members who receive J by inbox add that many inbox rows within seconds, while a removal or rotation adds none, so P can tell "someone was invited by inbox" from "nobody was" (§13.2 item 12). Not the member count, not who. No self rows follow a claim observed by other members, and a freeze writes nothing. With push, each member whose device is open posts one class-0 row (its BELL row, §11.13) within a minute of the claim, so on a quiet server P can estimate how many members were online at the change. | Which IPs fetch the bundle blob, so the members. | The members of e+1 see D′. Every member of e, removed ones included, sees `rm` (who of the old members was dropped). With push, the members of e+1 see from each other's BELL rows when each member's first device processed the change (§13.4). | — |
-| content | The size class only (a reaction is a class-0 row, like a short text). Safe against a quantum P. | Same, plus blob uploads and fetches per IP with the blob's padded length (§3.2), which bounds the size of the image or file in it (fetches: image recipients, and the members who save a file, §8.3); with push, which puts are texts, images or files, since a ring follows them (§13.4). | Everything in epochs held. | Nothing: every push has the same length and fixed text, and the bells in it are encrypted to the device (§9.8). |
+| content | The size class only (a reaction is a class-0 row, like a short text; an edit takes the class of a text 28 B longer). Safe against a quantum P. | Same, plus blob uploads and fetches per IP with the blob's padded length (§3.2), which bounds the size of the image or file in it (fetches: image recipients, and the members who save a file, §8.3); with push, which puts are texts, images or files, since a ring follows them (§13.4). | Everything in epochs held. | Nothing: every push has the same length and fixed text, and the bells in it are encrypted to the device (§9.8). |
 | directory | handle ↔ uid ↔ keys, registration time, every wrap (credential ids, recovery ids). | The same, plus a p-bit prefix of every lookup, and the exact wrap id and own uid at every login. | — | — |
 | device ↔ notifications (§9.8, §11.13) | None: push data is not public. | At each `push/sub`: the IP ↔ the endpoint ↔ its bells. Stored: the endpoint ↔ keyed hashes of its bells ↔ the day of its last registration, in a store that keeps no history of earlier values (§13.4); the number of bells is about the number of conversations it is notified for. With a `message` preview, each push is followed by a `get` of the conversation's lanes from the device's IP, which links the endpoint to that IP and dates the push's arrival (§13.4). | — | That the device uses this server (the VAPID key), linked to its subscription and often to an account with the browser's vendor. |
 | message ↔ recipients' devices | None. | At each ring: the writer's IP ↔ the row ↔ the other members' bells ↔ every endpoint registered under them, **offline devices included** (held in memory only, never stored). | — | When each device is notified (`PUSH_HOLD` plus up to `PUSH_JITTER` after the ring, at most once per `PUSH_WINDOW`); comparing the times of its devices suggests which share a conversation. |
@@ -5428,9 +5519,9 @@ Each item is a deliberate trade-off that stage 2 or 3 addresses. None is silent.
       because they take every continuing member's key from the previous bundle, not from the directory.
     - v1 let the members frozen by a claim that removed someone keep messaging in the old epoch, which the removed
       member could still read, and stage 1 would show them that member as removed. Stage 1 refuses texts, images,
-      files and reactions there (§11.3 step 2), so such a conversation becomes read-only; the members start a new one. A
-      member who signs an e-valid claim could already end everyone's messaging by removing them, so no attacker gains
-      power.
+      files, reactions and edits there (§11.3 step 2), so such a conversation becomes read-only; the members start a new
+      one. A member who signs an e-valid claim could already end everyone's messaging by removing them, so no attacker
+      gains power.
 15. **A row in an old epoch can be missed live.** v1 clients processed every row of the global log. Stage 1 clients
     follow the lanes of the current epoch and, for silent members, of the previous one (§11.2). A row that lands in an
     older epoch after every other member swept that lane is shown live by nobody, and restores from a later HEADS
@@ -5506,10 +5597,10 @@ Each item is a deliberate trade-off that stage 2 or 3 addresses. None is silent.
 Notifications add one observer (N, §0.2) and the only data the server stores that is not public (§0.1, §9.8). The
 user-facing rules are fixed: off by default, per device and never synced; pushes that carry no content, whose
 notifications show the same fixed text unless the user of the device chooses a preview that the device decrypts itself
-(§11.13); invites, requests and reactions never ring, and neither does a conversation that the user has not accepted (§11.13),
-with one exception: a contact that the first release recorded when a third member's row accepted a request counts
-(§7.3), so that conversation, and the later ones that user starts, ring although the user never accepted them. While a
-device of the account is in use, the rows it shows notify none of the account's devices (§11.13).
+(§11.13); invites, requests, reactions and edits never ring, and neither does a conversation that the user has not
+accepted (§11.13), with one exception: a contact that the first release recorded when a third member's row accepted a
+request counts (§7.3), so that conversation, and the later ones that user starts, ring although the user never accepted
+them. While a device of the account is in use, the rows it shows notify none of the account's devices (§11.13).
 
 - **Stored.** Per endpoint: the endpoint (a Web Push URL, or a native app's token with its APNs environment and app,
   §10.10) and the keys its pushes are encrypted to, sealed under `PUSH_KEY`; keyed hashes of its bells
@@ -5532,9 +5623,12 @@ device of the account is in use, the rows it shows notify none of the account's 
   row, the other members' bells and every endpoint registered under them, devices that are offline included. With the row's topic, which the put carries, that links each such device to the conversation. Topics
   already give O the social graph of the sockets that are open (§13.2 item 1); endpoints add devices that are closed,
   under identifiers that stay the same across IP addresses. A put that a ring follows from the same IP is a TEXT, an
-  IMAGE, a FILE or a REPLY, so O can tell those from the rows that never ring (reactions, LEAVEs, WELCOMEs, claims and self
-  rows), which their class alone does not tell from texts. At each `seen`, O sees an IP with the account's quiet secret,
-  and so its endpoints, and the rows marked (below).
+  IMAGE, a FILE or a REPLY, so O can tell those from the rows that never ring (reactions, edits, LEAVEs, WELCOMEs,
+  claims and self rows), which their class alone does not tell from texts. Apart from edits, every row on a
+  conversation's topic that never rings is of class 0, or of class 1 for a claim, while an edit of a text over 101
+  bytes is of class 1 or more (§11.18): O can tell such an edit from a reaction by its class, and one of class 2 or 3
+  from every other row that never rings. At each `seen`, O sees an IP with the account's quiet secret, and so its
+  endpoints, and the rows marked (below).
 - **N** sees each push to its subscriptions: the time (the ring's, plus `PUSH_HOLD` and up to `PUSH_JITTER`; at most
   once per `PUSH_WINDOW` except across a restart of its QuietDO) and the
   size, which is the same for every push. Pushes to the devices of one conversation follow the same rings, so N can
@@ -5705,6 +5799,7 @@ A native app (§11.14) changes whom a user trusts for the client's code, and add
 | Re-add after a removal | the skip rule: the removed copy continues at the re-add's epoch | a separate copy, rooted at the re-add's descriptor, as a first contact; the removed copy has ended and keeps its history (§6.6 step 3, §6.7 step 6, §13.2 item 16) |
 | Reactions | none | REACTION rows (type 3) on the sender's lane, bound to the target row's label and body; per member and emoji the latest row decides, at most 8 emoji per member and message; no unread count, no `lastTs`, no line (§11.12) |
 | Replies | none | REPLY rows (type 6): a text, image or file that names its target row as a reaction does; a reply shows a line naming its target, and a client may show a message's thread from the rows it holds (§11.17) |
+| Edits | none | EDIT rows (type 7): a new text for a member's own earlier text, naming it as a reaction does; the latest edit in lane order decides, with no limit on their number or time; the original row stays stored and readable, and a client may show every version; an "edited" mark; no unread count, no `lastTs`, no line, no ring (§11.18) |
 | Notifications | none | optional push (Web Push, and APNs and FCM for native apps): devices register bells of their own (a secret per conversation, whose hash the members learn from BELL rows on its lane), a sender rings the other members' bells after a text, image or file, and the Worker sends a contentless push, coalesced per device; it stores no uid, conversation or IP; a device may show a preview that it decrypts itself; a device in use marks the rows it shows seen, and the account's devices get no push for them (§9.8, §10.10, §11.13, §13.4) |
 | Integrity | client-verified global chain (fatal on gaps); `head` in messages; local checkpoint | signed checkpoint chain (local persistence, range verification), `ck` in messages, `prevh`, immutability, receipts, public feed for auditors |
 | Abuse | PoW `register/wrap/append/blob`; RL write/blob/read | PoW `register/wrap/put/inbox/blob` (and `push`); RL write/inbox/blob/read (and ring) |

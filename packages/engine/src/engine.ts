@@ -43,7 +43,14 @@ import { SelfLane } from "./selflane";
 import { readSnapshot } from "./snapshot";
 import { idbSessionStore, type SessionStore } from "./session";
 import type { ImageCache } from "./image-cache";
-import type { ConversationView, Engine, EngineState, FileRef, ImageRef } from "./types";
+import type {
+  ConversationView,
+  EditVersion,
+  Engine,
+  EngineState,
+  FileRef,
+  ImageRef,
+} from "./types";
 import { browserPasskeys } from "./webauthn";
 
 export { alarmClock, type AlarmClock, type AlarmClockOptions } from "./alarm-clock";
@@ -527,6 +534,17 @@ export class SegvEngine implements Engine {
   async react(convId: string, messageKey: string, emoji: string, on: boolean): Promise<void> {
     this.requireAccount();
     await this.action(() => this.messaging().react(convId, messageKey, emoji, on));
+  }
+
+  /** §11.18: one EDIT row with a new text for self's text message, without an echo; rejects with §11.3's errors. */
+  async editText(convId: string, messageKey: string, text: string): Promise<void> {
+    this.requireAccount();
+    await this.action(() => this.messaging().editText(convId, messageKey, text));
+  }
+
+  /** §11.18 "Display": the versions of an edited message, its own text first. */
+  editHistory(convId: string, messageKey: string): EditVersion[] {
+    return this.msg?.editHistory(convId, messageKey) ?? [];
   }
 
   /** The accept control (§11.5, §11.11): the user's acceptance of a copy whose inviter is not a contact yet. */

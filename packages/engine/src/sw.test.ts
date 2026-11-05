@@ -259,6 +259,142 @@ describe("the notifications of a push (§11.13)", () => {
     ]);
   });
 
+  describe("`message`: an edit read with its message (§11.18)", () => {
+    type Stored = ReturnType<ReturnType<typeof makeConv>["row"]>;
+    /** What an EDIT of the stored row `t` (on lane `tl`, at slot `tn` of era E) names. */
+    const toOf = (a: ReturnType<typeof makeConv>, t: Stored, tl: number, tn: number) => ({
+      te: 3,
+      tl,
+      tE: E,
+      tn,
+      th: P.reactTh(a.keys.rk, t.label, t.body),
+    });
+    const edit = (to: P.ReplyTo, text: string) => ({ type: P.MT.EDIT, to, text }) as const;
+    const setup = () => {
+      const a = makeConv();
+      const w = world({ v: 1, preview: "message", deltaS: 10, copies: [a.copy] });
+      return {
+        a,
+        w,
+        bodies: async () => (await notesFor(proposed([a.bell]), w.deps, later)).map((n) => n.body),
+      };
+    };
+
+    it("shows the edited text, keeps the row's own time, adds nothing to (+k), and moves past the edit", async () => {
+      const { a, w, bodies } = setup();
+      const t = a.row(1, 0, { type: P.MT.TEXT, text: "helo" }, { ts: NOW - 1000 });
+      w.put(t);
+      w.put(a.row(1, 1, edit(toOf(a, t, 1, 0), "**hello** ||there||"), { ts: NOW }));
+      w.put(a.row(2, 0, { type: P.MT.TEXT, text: "older" }, { ts: NOW - 5000 }));
+      expect(await bodies()).toEqual(["@bob: hello (spoiler) (+1)"]);
+      expect(w.moves[0][0].next).toEqual([
+        { E, n: 0 },
+        { E, n: 2 },
+        { E, n: 1 },
+      ]);
+      // An edit never makes an old message the newest.
+      const b = setup();
+      const old = b.a.row(1, 0, { type: P.MT.TEXT, text: "old" }, { ts: NOW - 5000 });
+      b.w.put(old);
+      b.w.put(b.a.row(1, 1, edit(toOf(b.a, old, 1, 0), "old, edited"), { ts: NOW }));
+      b.w.put(b.a.row(2, 0, { type: P.MT.TEXT, text: "newest" }, { ts: NOW - 1000 }));
+      expect(await b.bodies()).toEqual(["@carol: newest (+1)"]);
+    });
+
+    it("the latest edit by position wins, whatever its time", async () => {
+      const { a, w, bodies } = setup();
+      const t = a.row(1, 0, { type: P.MT.TEXT, text: "v1" }, { ts: NOW - 2000 });
+      w.put(t);
+      w.put(a.row(1, 1, edit(toOf(a, t, 1, 0), "v2"), { ts: NOW }));
+      w.put(a.row(1, 2, edit(toOf(a, t, 1, 0), "v3"), { ts: NOW - 1000 }));
+      expect(await bodies()).toEqual(["@bob: v3"]);
+    });
+
+    it("ignores an edit of another member's message", async () => {
+      const { a, w, bodies } = setup();
+      const t = a.row(2, 0, { type: P.MT.TEXT, text: "carol's" }, { ts: NOW - 1000 });
+      w.put(t);
+      w.put(a.row(1, 0, edit(toOf(a, t, 2, 0), "forged"), { ts: NOW }));
+      expect(await bodies()).toEqual(["@carol: carol's"]);
+    });
+
+    it("ignores an edit whose th or epoch does not name the row", async () => {
+      const { a, w, bodies } = setup();
+      const t = a.row(1, 0, { type: P.MT.TEXT, text: "original" }, { ts: NOW - 1000 });
+      w.put(t);
+      w.put(a.row(1, 1, edit({ ...toOf(a, t, 1, 0), th: P.random(16) }, "wrong th")));
+      w.put(a.row(1, 2, edit({ ...toOf(a, t, 1, 0), te: 2 }, "wrong epoch")));
+      expect(await bodies()).toEqual(["@bob: original"]);
+    });
+
+    it("ignores an edit whose th names the sender's own row but whose lane is another", async () => {
+      const { a, w, bodies } = setup();
+      const t = a.row(1, 0, { type: P.MT.TEXT, text: "v1" }, { ts: NOW - 1000 });
+      w.put(t);
+      w.put(a.row(2, 0, { type: P.MT.TEXT, text: "carol's" }, { ts: NOW - 5000 }));
+      // (tE, tn) and th name bob's own row at slot 0, but tl names carol's lane, then alice's: the row such an EDIT
+      // names is not bob's (its th does not verify there), so it edits nothing, as the engine reads it (§11.18).
+      w.put(a.row(1, 1, edit(toOf(a, t, 2, 0), "v2 by carol's lane"), { ts: NOW }));
+      w.put(a.row(1, 2, edit(toOf(a, t, 0, 0), "v2 by alice's lane"), { ts: NOW }));
+      expect(await bodies()).toEqual(["@bob: v1 (+1)"]);
+    });
+
+    it("applies to a reply carrying a text, never to one carrying a file", async () => {
+      const { a, w, bodies } = setup();
+      const target = { te: 3, tl: 2, tE: E, tn: 0, th: P.random(16) };
+      const t = a.row(1, 0, {
+        type: P.MT.REPLY,
+        to: target,
+        body: { type: P.MT.TEXT, text: "ramen?" },
+      });
+      w.put(t);
+      w.put(a.row(1, 1, edit(toOf(a, t, 1, 0), "**sushi?**")));
+      expect(await bodies()).toEqual(["@bob: sushi?"]);
+      const b = setup();
+      const file = { id: P.random(32), k: P.random(32), size: 10, name: "menu.pdf" };
+      const f = b.a.row(1, 0, { type: P.MT.REPLY, to: target, body: { type: P.MT.FILE, file } });
+      b.w.put(f);
+      b.w.put(b.a.row(1, 1, edit(toOf(b.a, f, 1, 0), "a secret")));
+      expect(await b.bodies()).toEqual(["@bob sent a file"]);
+    });
+
+    it("an edit whose message is not read shows nothing and adds nothing, but occupies its slot", async () => {
+      const { a, w, bodies } = setup();
+      a.copy.epoch!.next = [
+        { E, n: 0 },
+        { E, n: 2 },
+        { E, n: 0 },
+      ];
+      // read already, and not in the slots read
+      const t = a.row(1, 0, { type: P.MT.TEXT, text: "read" });
+      w.put(t);
+      w.put(a.row(1, 2, edit(toOf(a, t, 1, 0), "a secret")));
+      expect(await bodies()).toEqual(["new messages"]);
+      expect(w.moves[0][0].next[1]).toEqual({ E, n: 3 });
+      w.put(a.row(2, 0, { type: P.MT.TEXT, text: "hi" }));
+      expect(await bodies()).toEqual(["@carol: hi"]);
+    });
+
+    it("edits the row before the next slot only while that row counts (stored in the last 5 minutes)", async () => {
+      const { a, w, bodies } = setup();
+      a.copy.epoch!.next = [
+        { E, n: 0 },
+        { E, n: 1 },
+        { E, n: 0 },
+      ];
+      const t = a.row(1, 0, { type: P.MT.TEXT, text: "just rang" });
+      w.put(t);
+      w.put(a.row(1, 1, edit(toOf(a, t, 1, 0), "just edited")));
+      expect(await bodies()).toEqual(["@bob: just edited"]);
+      const b = setup();
+      b.a.copy.epoch!.next = a.copy.epoch!.next.map((s) => ({ ...s }));
+      const old = b.a.row(1, 0, { type: P.MT.TEXT, text: "long ago" });
+      b.w.put(old, tSec - 600);
+      b.w.put(b.a.row(1, 1, edit(toOf(b.a, old, 1, 0), "a secret")));
+      expect(await b.bodies()).toEqual(["new messages"]);
+    });
+  });
+
   it("keeps only rows that verify: a wrong signer, a reaction and junk occupy their slots but show nothing", async () => {
     const a = makeConv();
     const c: NotifyCache = { v: 1, preview: "message", deltaS: 10, copies: [a.copy] };

@@ -314,8 +314,8 @@ export const rowOrder = (ts: number, e: number, E: number, lane: number, n: numb
 
 /**
  * Processes one stored row of lane j at (E, n) (§3.3, §11.6): junk occupies its slot (an undecryptable row gives the
- * noise warning); a valid row updates the lane and is shown (TEXT, IMAGE, FILE, REPLY), joined (WELCOME), or recorded as
- * a leave (LEAVE).
+ * noise warning); a valid row updates the lane and is shown (TEXT, IMAGE, FILE, REPLY), joined (WELCOME), recorded as
+ * a leave (LEAVE), or kept for the message it names (REACTION, EDIT).
  */
 export function applyLaneRow(
   ctx: SyncCtx,
@@ -384,6 +384,26 @@ export function applyLaneRow(
     ctx.changed();
     return;
   }
+  if (m.type === P.MT.EDIT) {
+    // A valid row of its member (above), but not a message: no view, no unread, no lastTs; it changes the text that
+    // its target shows (§11.18).
+    c.order.set(key, order);
+    c.edits.set(key, {
+      e: ep.e,
+      j,
+      E: r.E,
+      n: r.n,
+      t: r.t,
+      ts,
+      uid: P.b64u(ep.D.members[j].uid),
+      shown: !c.left && acceptedOld(c, ep.e, j, { E: r.E, n: r.n }, r.t),
+      to: m.to,
+      text: m.text,
+    });
+    c.refsDirty = true;
+    ctx.changed();
+    return;
+  }
   if (m.type === P.MT.BELL) {
     // The member's bell (§11.13): the lane's latest BELL row by position; a seeded bell is replaced from its position
     // on (a row at the HEADS position was not read by the device that wrote the record). No view, no unread, no line.
@@ -404,10 +424,10 @@ export function applyLaneRow(
     m.type !== P.MT.REPLY
   )
     return;
-  // What a REACTION or REPLY to this row names: its label and stored body under the epoch's route key (§3.3).
+  // What a REACTION, REPLY or EDIT of this row names: its label and stored body under the epoch's route key (§3.3).
   const th = P.reactTh(ep.keys.rk, r.label, r.body);
-  // a waiting reaction's or reply's target may have come (§11.12, §11.17)
-  if (c.reactions.size || c.replies.size) c.refsDirty = true;
+  // a waiting reaction's, reply's or edit's target may have come (§11.12, §11.17, §11.18)
+  if (c.reactions.size || c.replies.size || c.edits.size) c.refsDirty = true;
   // A leaver processes its lanes for WELCOMEs only (§6.9); a row §6.8 drops is not shown, and an echo of it fails.
   const accepted = !c.left && acceptedOld(c, ep.e, j, { E: r.E, n: r.n }, r.t);
   if (!accepted) {

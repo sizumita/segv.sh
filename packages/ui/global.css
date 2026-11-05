@@ -579,9 +579,11 @@ textarea:focus {
 .m.mine {
   border-left-color: var(--edge);
 }
-/* The message the composer replies to. */
+/* The message the composer replies to, or edits. */
 .m.replying,
-.m.replying:hover {
+.m.replying:hover,
+.m.editing,
+.m.editing:hover {
   background: color-mix(in srgb, var(--sel) 70%, transparent);
   border-left-color: var(--dim);
 }
@@ -720,6 +722,29 @@ textarea:focus {
 }
 .spoiler.shown {
   background: var(--hi);
+}
+/* "(edited)" after an edited message's text (msg-text.tsx), at the end of its last paragraph or on a line of its own;
+   a click shows its versions (edit.tsx). "(saving…)" while self's edit is being sent. */
+.edited {
+  display: inline;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--dim);
+  white-space: nowrap;
+}
+button.edited:hover:not(:disabled) {
+  background: none;
+  color: var(--fg);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.edited-line {
+  line-height: 18px;
 }
 .sys {
   color: var(--dim);
@@ -1177,7 +1202,7 @@ textarea:focus {
 .pending li {
   overflow-wrap: anywhere;
 }
-/* "replying to …" above the message box. */
+/* "replying to …" above the message box, and "editing …" (.editbar) while it edits a message. */
 .replybar {
   display: flex;
   align-items: center;
@@ -1201,7 +1226,7 @@ textarea:focus {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* An × that stops or closes something: the "replying to" bar's, the reply pane's. */
+/* An × that stops or closes something: the "replying to" and "editing" bars', the reply pane's, the edit history's. */
 .xbtn {
   flex: none;
   padding: 0 8px;
@@ -1381,14 +1406,16 @@ textarea:focus {
 }
 /* ::backdrop does not inherit the custom properties in every browser: plain colours. */
 .settings::backdrop,
-.leave::backdrop {
+.leave::backdrop,
+.history::backdrop {
   background: rgb(239 239 236 / 0.7);
   -webkit-backdrop-filter: blur(3px);
   backdrop-filter: blur(3px);
 }
 @media (prefers-color-scheme: dark) {
   .settings::backdrop,
-  .leave::backdrop {
+  .leave::backdrop,
+  .history::backdrop {
     background: rgb(34 34 36 / 0.75);
   }
 }
@@ -1419,6 +1446,53 @@ textarea:focus {
 }
 .leave a.btn {
   text-decoration: none;
+}
+/* "edit history" (edit.tsx): an edited message's versions, oldest first, the current one last and marked. Centred on
+   phones too; a long history scrolls inside it. */
+.history {
+  width: min(32rem, calc(100% - 32px));
+  max-width: none;
+  max-height: calc(100% - 64px);
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-l);
+  box-shadow: var(--shadow);
+  background: var(--bg);
+  color: var(--fg);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.history .sheet {
+  padding: 8px 12px 16px 16px;
+  display: grid;
+  gap: 10px;
+}
+.history h2 {
+  font-weight: 700;
+}
+.history header .xbtn {
+  font-size: 18px;
+  line-height: 26px;
+}
+.versions {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.versions > li {
+  min-width: 0;
+  padding: 3px 8px 4px;
+  border-left: 2px solid var(--line);
+  border-radius: 0 var(--r-s) var(--r-s) 0;
+}
+.versions > li:last-child {
+  background: var(--hi);
+  border-left-color: var(--dim);
+}
+.vmeta {
+  font-size: 12px;
 }
 .settings .sheet {
   padding: 10px 16px 20px;

@@ -1,5 +1,6 @@
 import { $, component$, useContext, useSignal, useStore, useVisibleTask$ } from "@qwik.dev/core";
 import type { ConversationView, MessageView } from "@segv/engine/types";
+import { EditIcon } from "./edit";
 import { quickList } from "./emoji";
 import { EmojiPicker, type Anchor } from "./emoji-picker";
 import { MsgFile } from "./msg-file";
@@ -7,7 +8,7 @@ import { MsgImage } from "./msg-image";
 import { MsgText } from "./msg-text";
 import { keyed, ReplyIcon, ReplyQuote, targetIn } from "./reply";
 import { PaneCtx, UiCtx, type UiState } from "./state";
-import { act, clock, dayKey, dayLabel, fullTime } from "./util";
+import { act, clock, dayKey, dayLabel, editable, fullTime } from "./util";
 
 const GROUP_MS = 5 * 60_000;
 const NEAR_BOTTOM_PX = 48;
@@ -129,6 +130,14 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
     }
   });
 
+  // An edit of the last message (§11.18) can make it taller: the list stays at the bottom while it was there. It is not
+  // a new message, so it shows no "new messages".
+  useVisibleTask$(({ track }) => {
+    track(() => props.conv.messages[props.conv.messages.length - 1]?.text ?? "");
+    const el = box.value;
+    if (el && stick.value) el.scrollTop = el.scrollHeight;
+  });
+
   const onScroll = $((_: Event, el: HTMLElement) => {
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX;
     stick.value = atBottom;
@@ -142,19 +151,28 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
     newBelow.value = false;
   });
 
-  // One click handler for the list: "reply" makes the composer reply to its message, a reply's quote line opens its
-  // thread beside the list, a "copy text" button copies its message's text, an "add a reaction" button opens (or
-  // closes) the picker beside it, and on a touch screen a tap on a message shows its actions, or hides them.
+  // One click handler for the list: "reply" makes the composer reply to its message and "edit" makes it edit its
+  // message (one or the other), a reply's quote line opens its thread beside the list, "(edited)" shows the message's
+  // versions, a "copy text" button copies its message's text, an "add a reaction" button opens (or closes) the picker
+  // beside it, and on a touch screen a tap on a message shows its actions, or hides them.
   const onClick = $(async (ev: MouseEvent) => {
     const t = ev.target as Element;
     const reply = t.closest<HTMLElement>("[data-reply]");
-    if (reply) {
-      pane.reply = reply.dataset.reply ?? "";
+    const edit = t.closest<HTMLElement>("[data-edit]");
+    if (reply || edit) {
+      pane.reply = reply?.dataset.reply ?? "";
+      pane.edit = edit?.dataset.edit ?? "";
       active.value = "";
       box.value
         ?.closest(".thread")
         ?.querySelector<HTMLTextAreaElement>(".composer textarea")
         ?.focus();
+      return;
+    }
+    const history = t.closest<HTMLElement>("[data-history]");
+    if (history) {
+      pane.history = history.dataset.history ?? "";
+      active.value = "";
       return;
     }
     const thread = t.closest<HTMLElement>("[data-thread]");
@@ -244,8 +262,10 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
             prev.from !== m.from ||
             m.ts - prev.ts > GROUP_MS ||
             !!m.reply;
-          // A reply is a post as a reaction is: both need a sent message where self can post.
+          // A reply is a post as a reaction is: both need a sent message where self can post. So is an edit, of self's
+          // text (§11.18).
           const reactable = canReact && m.status === "sent";
+          const canEdit = reactable && editable(m);
           // Any text can be copied, even one that is still sending or failed (to send it again).
           const copyable = m.kind === "text" && !!m.text;
           const done = copied.value === m.key;
@@ -271,6 +291,7 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
                     head && "head",
                     (active.value === m.key || pk === m.key) && "active",
                     pane.reply === m.key && "replying",
+                    pane.edit === m.key && "editing",
                   ]}
                   title={fullTime(m.ts)}
                   data-key={m.key}
@@ -281,6 +302,11 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
                         {reactable && (
                           <button type="button" data-reply={m.key} aria-label="reply" title="reply">
                             <ReplyIcon />
+                          </button>
+                        )}
+                        {canEdit && (
+                          <button type="button" data-edit={m.key} aria-label="edit" title="edit">
+                            <EditIcon />
                           </button>
                         )}
                         {copyable && (
@@ -321,7 +347,7 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
                   ) : m.kind === "file" && m.file ? (
                     <MsgFile file={m.file} />
                   ) : (
-                    <MsgText text={m.text ?? ""} />
+                    <MsgText text={m.text ?? ""} edited={m.edited} msgKey={m.key} />
                   )}
                   {m.status === "sending" && <p class="st">sending…</p>}
                   {m.status === "failed" && <p class="st failed">failed — not delivered</p>}

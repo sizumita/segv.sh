@@ -2065,6 +2065,7 @@ export const MT = {
   FILE: 4,
   BELL: 5,
   REPLY: 6,
+  EDIT: 7,
   WELCOME: 8,
   CLAIM: 16,
   LEAVE: 17,
@@ -2302,6 +2303,40 @@ export function encodeReply(to: ReplyTo, body: ReplyBody): Bytes {
   return out;
 }
 
+/** EDIT content without its text: te, tl, tE, tn, th. */
+export const EDIT_FIXED = 28;
+
+/**
+ * EDIT content (§3.3, §11.18): `u32 te | u16 tl | u16 tE | u32 tn | th[16] | text`, a new text that the sender sends
+ * for its own message at `(tE, tn)` on lane `tl` of epoch `te` (its target), named by the same `th` as a REACTION's
+ * target (`reactTh`). `text` obeys the TEXT rule; the target fields have no parse rule.
+ */
+export function parseEdit(b: Bytes): { to: ReplyTo; text: string } {
+  if (b.length < EDIT_FIXED) bad("edit: short");
+  const r = new Rd(b.slice(0, EDIT_FIXED), "edit");
+  const te = r.u32();
+  const tl = r.u16();
+  const tE = r.u16();
+  const tn = r.u32();
+  const th = r.bytes(16);
+  r.end();
+  const body = parseContent(MT.TEXT, b.slice(EDIT_FIXED)) as { type: typeof MT.TEXT; text: string };
+  return { to: { te, tl, tE, tn, th }, text: body.text };
+}
+
+export function encodeEdit(to: ReplyTo, text: string): Bytes {
+  const out = concat(
+    u32(to.te),
+    u16(to.tl),
+    u16(to.tE),
+    u32(to.tn),
+    fixed(to.th, 16, "edit th"),
+    encodeContent({ type: MT.TEXT, text }),
+  );
+  parseEdit(out);
+  return out;
+}
+
 /** The header fields of M other than ver, type and len. */
 export interface MHeader {
   /** The sender's index in D_e. */
@@ -2350,6 +2385,7 @@ export type MBody =
   | { type: typeof MT.FILE; file: FileRef }
   | { type: typeof MT.BELL; bell: BellRef }
   | { type: typeof MT.REPLY; to: ReplyTo; body: ReplyBody }
+  | { type: typeof MT.EDIT; to: ReplyTo; text: string }
   | { type: typeof MT.WELCOME; join: Join }
   | { type: typeof MT.CLAIM; claim: Claim }
   | { type: typeof MT.LEAVE };
@@ -2372,6 +2408,8 @@ function encodeContent(m: MBody): Bytes {
       return encodeBell(m.bell);
     case MT.REPLY:
       return encodeReply(m.to, m.body);
+    case MT.EDIT:
+      return encodeEdit(m.to, m.text);
     case MT.WELCOME:
       return encodeJ(m.join);
     case MT.CLAIM:
@@ -2398,6 +2436,8 @@ function parseContent(type: number, c: Bytes): MBody {
       return { type: MT.BELL, bell: parseBell(c) };
     case MT.REPLY:
       return { type: MT.REPLY, ...parseReply(c) };
+    case MT.EDIT:
+      return { type: MT.EDIT, ...parseEdit(c) };
     case MT.WELCOME:
       return { type: MT.WELCOME, join: parseJ(c) };
     case MT.CLAIM:
@@ -2411,7 +2451,7 @@ function parseContent(type: number, c: Bytes): MBody {
 }
 
 /**
- * Parses M and checks every parse rule of §3.3 (none needs epoch context): ver, type ∈ {1, 2, 3, 4, 5, 6, 8, 16, 17}, content,
+ * Parses M and checks every parse rule of §3.3 (none needs epoch context): ver, type ∈ {1, 2, 3, 4, 5, 6, 7, 8, 16, 17}, content,
  * `lane = from` for lane rows and `lane = 0xFFFF` with NONE / ZERO16 prev fields for a CLAIM, `from < 32`, the
  * position rule, prevh = ZERO16 with NONE, ts ≤ 2^53 − 1, ck16 = ZERO16 with ckq = 0, len. `from < |D_e|`, the
  * label, a CLAIM's m = |D_e| and the signature are contextual (acceptRow).

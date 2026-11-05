@@ -273,7 +273,7 @@ describe("re-sends and the subscription (§11.13)", () => {
 });
 
 describe("rings (§11.3 step 6, §11.13)", () => {
-  it("a TEXT rings once with the other lanes' bells; a REACTION and a LEAVE never ring", async () => {
+  it("a TEXT rings once with the other lanes' bells; a REACTION, an EDIT and a LEAVE never ring", async () => {
     const [alice, bob, carol, dave] = ["alice", "bob", "carol", "dave"].map((h) => makeUser(h));
     const engines = [
       await engineFor(alice),
@@ -292,9 +292,15 @@ describe("rings (§11.3 step 6, §11.13)", () => {
       [bellOf(A, id, bob), bellOf(A, id, carol), bellOf(A, id, dave)].sort(),
     );
     expect(rings[0].E).toBe(server().era);
-    expect(
-      await ringsAfter(() => B.react(id, msgKey(B, id, "hello"), "👍", true), engines),
-    ).toEqual([]);
+    const hello = msgKey(B, id, "hello");
+    expect(await ringsAfter(() => B.react(id, hello, "👍", true), engines)).toEqual([]);
+    // An EDIT is no message (§11.18): it is stored and shown everywhere, and rings no bell.
+    expect(await ringsAfter(() => A.editText(id, hello, "hello, all"), engines)).toEqual([]);
+    for (const e of engines) {
+      const m = mustView(e, id).messages.find((x) => x.key === hello)!;
+      expect(m.text).toBe("hello, all");
+      expect(m.edited).toMatchObject({ count: 1, sending: false });
+    }
     expect(await ringsAfter(() => D.leave(id), engines)).toEqual([]);
   });
 

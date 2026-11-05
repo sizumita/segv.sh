@@ -63,6 +63,25 @@ export interface ReplyView {
   state: "shown" | "waiting" | "none";
 }
 
+/**
+ * A message's edits (EDIT rows, §11.18): when the latest was made, how many count, and whether the text shown is an
+ * edit this device is still sending.
+ */
+export interface EditedView {
+  /** ms: the clamped ts (§11.8) of the latest edit that counts, or this device's clock for an edit still being sent */
+  ts: number;
+  /** the EDIT rows that count for the message (0 while only an edit of this device is being sent) */
+  count: number;
+  /** the text shown is an edit this device is still sending */
+  sending: boolean;
+}
+
+/** One version of an edited message (§11.18 "Display"): its text, and when it was sent (clamped, §11.8). */
+export interface EditVersion {
+  text: string;
+  ts: number;
+}
+
 export interface MessageView {
   /** stable unique key (era and label hex for a row, `local:<n>` for a local echo) */
   key: string;
@@ -82,6 +101,11 @@ export interface MessageView {
   reactions: ReactionView[];
   /** what a REPLY replies to (§11.17), in its view and its echo; absent for every other message */
   reply?: ReplyView;
+  /**
+   * The message's edits (§11.18), absent while none counts and none of this device is being sent; `text` is then the
+   * current text (that of its latest edit, or of the edit being sent).
+   */
+  edited?: EditedView;
 }
 
 /**
@@ -207,6 +231,20 @@ export interface Engine {
    * change nothing resolves at once without a row.
    */
   react(convId: string, messageKey: string, emoji: string, on: boolean): Promise<void>;
+  /**
+   * Edits self's TEXT message, or self's REPLY carrying a text, `messageKey` (§11.18): one EDIT row with the new text,
+   * sent as a text is (§11.3) but without an echo. The message shows `text` at once (`edited.sending`), and its current
+   * text again if the send fails. Resolves when the row counts as delivered; rejects with "unknown message" for an
+   * unknown key, "this message cannot be edited" for any other member's message, an image or a file, or a message not
+   * sent yet, "an edit cannot be empty", or "message is too long"; a text equal to the current one resolves at once
+   * without a row.
+   */
+  editText(convId: string, messageKey: string, text: string): Promise<void>;
+  /**
+   * The versions of an edited message (§11.18 "Display"): its own text, then the text of each edit that counts, in
+   * lane order, each with its time. Empty for a message without edits, and for an unknown key.
+   */
+  editHistory(convId: string, messageKey: string): EditVersion[];
   /**
    * The user's acceptance from the accept control (§11.5, §11.11): for a live copy whose inviter is neither self nor
    * a contact, writes the request's acceptance and the inviter's CONTACT at once; does nothing for any other copy.

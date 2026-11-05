@@ -121,9 +121,15 @@ export const ReplyTree = component$<{ conv: ConversationView; canReply: boolean 
     atEnd.value = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_END_PX;
   });
 
-  // "reply" makes the pane's message box reply to its message; a quote line shows that reply's own chain and replies.
+  // "reply" makes the pane's message box reply to its message; a quote line shows that reply's own chain and replies;
+  // "(edited)" shows the message's versions (edit.tsx).
   const onClick = $((ev: MouseEvent) => {
     const el = ev.target as Element;
+    const h = el.closest<HTMLElement>("[data-history]");
+    if (h) {
+      pane.history = h.dataset.history ?? "";
+      return;
+    }
     const q = el.closest<HTMLElement>("[data-thread]");
     if (q) {
       pane.thread = q.dataset.thread ?? "";
@@ -202,7 +208,7 @@ export const ReplyTree = component$<{ conv: ConversationView; canReply: boolean 
                     ) : m.kind === "file" && m.file ? (
                       <MsgFile file={m.file} />
                     ) : (
-                      <MsgText text={m.text ?? ""} />
+                      <MsgText text={m.text ?? ""} edited={m.edited} msgKey={m.key} />
                     )}
                     {m.status === "sending" && <p class="st">sending…</p>}
                     {m.status === "failed" && <p class="st failed">failed — not delivered</p>}

@@ -167,6 +167,33 @@ export interface ReactionRow {
   reaction: P.Reaction;
 }
 
+/** An EDIT row the device applied (§11.18): its position and member, what it edits, and its text. */
+export interface EditRow {
+  /** the row's epoch, lane (its member's index there), slot and stored time */
+  e: number;
+  j: number;
+  E: number;
+  n: number;
+  t: number;
+  /** the sender's ts clamped to the row's stored time (§11.8): when the edit was made */
+  ts: number;
+  /** the member, by b64u uid */
+  uid: string;
+  /** the row passed §6.8 when applied (and the copy was not left then) */
+  shown: boolean;
+  to: P.ReplyTo;
+  text: string;
+}
+
+/** An edit this device is sending (§11.18 "Sending"): shown on its message until the send decides. */
+export interface LocalEdit {
+  /** tells this edit from a later one of the same message */
+  n: number;
+  text: string;
+  /** this device's clock when the edit was made (ms) */
+  ts: number;
+}
+
 export interface Epoch {
   e: number;
   EK: Bytes;
@@ -252,9 +279,15 @@ export interface Copy {
   reactions: Map<string, ReactionRow>;
   /** the REPLY rows applied as messages, by message key: their epoch and what they reply to (§11.17) */
   replies: Map<string, { e: number; to: P.ReplyTo }>;
+  /** the EDIT rows applied, by row key (§11.18) */
+  edits: Map<string, EditRow>;
+  /** the text a message was sent with, by message key, once an edit replaced it in the view (§11.18) */
+  originals: Map<string, string>;
+  /** the edits this device is sending, by the key of the message they edit (§11.18 "Sending") */
+  localEdits: Map<string, LocalEdit>;
   /**
-   * The reactions and the reply targets shown on the messages are to be computed again (a row, a target or a §6.8
-   * decision changed).
+   * The reactions, the reply targets and the edits shown on the messages are to be computed again (a row, a target or
+   * a §6.8 decision changed).
    */
   refsDirty: boolean;
 }

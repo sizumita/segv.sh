@@ -78,6 +78,10 @@ export interface PaneState {
   thread: string;
   /** the message the side pane's message box replies to ('' = the last message the pane shows) */
   threadTo: string;
+  /** the key of self's message that the composer edits ('' = none, §11.18); never set together with `reply` */
+  edit: string;
+  /** the message whose versions the "edit history" dialog shows ('' = closed, edit.tsx) */
+  history: string;
 }
 
 export const StateCtx = createContextId<EngineState>("segv.state");

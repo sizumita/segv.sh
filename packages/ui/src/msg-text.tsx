@@ -1,31 +1,74 @@
 import { $, component$, Slot, sync$, useContext, useSignal, type JSXOutput } from "@qwik.dev/core";
 import { parse, type Block, type Inline, type ListBlock } from "@segv/engine/markdown";
+import type { EditedView } from "@segv/engine/types";
 import { UiCtx } from "./state";
+import { fullTime } from "./util";
 
-/** The text of a message, with its Markdown (packages/engine/src/markdown.ts) as elements. */
-export const MsgText = component$<{ text: string }>((props) => (
-  <div class="body">{parse(props.text).map(block)}</div>
-));
+/** The blocks that are one paragraph, which a mark can end. */
+const PARAGRAPHS = new Set<Block["t"]>(["p", "h", "sub"]);
 
-function block(b: Block, k: number): JSXOutput {
+/**
+ * The text of a message, with its Markdown (packages/engine/src/markdown.ts) as elements. An edited message (§11.18)
+ * ends with "(edited)", at the end of its last paragraph when it ends with one, else on a line of its own: a click
+ * shows its versions (`data-history`, handled by the list that shows it); "(saving…)" while self's edit is being sent.
+ */
+export const MsgText = component$<{ text: string; edited?: EditedView; msgKey?: string }>(
+  (props) => {
+    const blocks = parse(props.text);
+    const e = props.edited;
+    if (!e) return <div class="body">{blocks.map((b, k) => block(b, k))}</div>;
+    const mark = e.sending ? (
+      <span class="edited">(saving…)</span>
+    ) : (
+      <button
+        type="button"
+        class="edited"
+        data-history={props.msgKey}
+        title={`edited ${fullTime(e.ts)}`}
+        aria-haspopup="dialog"
+      >
+        (edited)
+      </button>
+    );
+    const last = blocks.length - 1;
+    const inside = last >= 0 && PARAGRAPHS.has(blocks[last].t);
+    return (
+      <div class="body">
+        {blocks.map((b, k) => block(b, k, inside && k === last ? mark : undefined))}
+        {!inside && <p class="edited-line">{mark}</p>}
+      </div>
+    );
+  },
+);
+
+/** One block; `tail` ends a paragraph (after a space), and nothing else. */
+function block(b: Block, k: number, tail?: JSXOutput): JSXOutput {
+  const end = tail ? <> {tail}</> : null;
   switch (b.t) {
     case "p":
-      return <p key={k}>{b.c.map(inline)}</p>;
+      return (
+        <p key={k}>
+          {b.c.map(inline)}
+          {end}
+        </p>
+      );
     // Not <h1>..<h3>: a message's headings are not headings of the page.
     case "h":
       return (
         <p key={k} class={`md-h${b.level}`}>
           {b.c.map(inline)}
+          {end}
         </p>
       );
     case "sub":
       return (
         <p key={k} class="md-sub">
           {b.c.map(inline)}
+          {end}
         </p>
       );
     case "quote":
-      return <blockquote key={k}>{b.c.map(block)}</blockquote>;
+      return <blockquote key={k}>{b.c.map((x, j) => block(x, j))}</blockquote>;
     case "list":
       return list(b, k);
     case "pre":

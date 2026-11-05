@@ -96,6 +96,8 @@ const refLmsg = (rk: B, l: number, E: number, n: number): B =>
 const refLctl = (rk: B, E: number, k: number): B =>
   hmacN(rk, refEnc("segv.sh/v2/lab/ctl", be16(E), be32(k))).slice(0, 16);
 const refEkc = (conv: B, e: number, EK: B): B => sha(refEnc("segv.sh/v2/ekc", conv, be32(e), EK));
+/** §3.3 prevh = H(enc("segv.sh/v2/prev", label, body))[0:16], over a row's label and stored body. */
+const refPrevh = (label: B, body: B): B => sha(refEnc("segv.sh/v2/prev", label, body)).slice(0, 16);
 
 /** §3.3 M with explicit fields (any value, so malformed variants can be built). */
 interface RefM {
@@ -411,6 +413,16 @@ const claim3: P.Claim = {
 const reaction1: P.Reaction = { te: 5, tl: 2, tE: 9, tn: 300, th: fill(16, 0x55), op: 1, emoji: "👍" };
 const refReaction = (x: P.Reaction, emoji: B = s2b(x.emoji)): B =>
   cat(be32(x.te), be16(x.tl), be16(x.tE), be32(x.tn), x.th, be8(x.op), be8(emoji.length), emoji);
+const editTo: P.ReplyTo = { te: 5, tl: 2, tE: 9, tn: 300, th: fill(16, 0x55) };
+/** §3.3 EDIT content: u32 te | u16 tl | u16 tE | u32 tn | th[16] | text. */
+const refEdit = (to: P.ReplyTo, text: B | string): B =>
+  cat(be32(to.te), be16(to.tl), be16(to.tE), be32(to.tn), to.th, s2b(text));
+const editMsg = (text: string, o: Partial<P.MHeader> = {}, to: P.ReplyTo = editTo): P.Msg => ({
+  ...hdr(o),
+  type: P.MT.EDIT,
+  to,
+  text,
+});
 const claimMsg = (c: P.Claim = claim3, k = 0, from = 0): P.Msg => ({
   ...hdr({ from, lane: P.CTL_LANE, n: k }),
   type: P.MT.CLAIM,
@@ -496,6 +508,11 @@ describe("envelope M: layout", () => {
       { type: 5, content: cat(be32(7), fill(16, 0x55)) },
     ],
     [
+      "EDIT",
+      { ...hdr(), type: P.MT.EDIT, to: { te: 5, tl: 2, tE: 9, tn: 300, th: fill(16, 0x55) }, text: "ramen!" },
+      { type: 7, content: cat(be32(5), be16(2), be16(9), be32(300), fill(16, 0x55), s2b("ramen!")) },
+    ],
+    [
       "TEXT with prev and checkpoint",
       {
         ...hdr({ prev: { E: 3, n: 7 }, prevh: fill(16, 0x77), ckq: 9, ck16: fill(16, 0x99) }),
@@ -537,7 +554,7 @@ describe("envelope M: strict parsing", () => {
   const rejects: [string, Partial<RefM>][] = [
     ["ver 1", { ver: 1 }],
     ["ver 3", { ver: 3 }],
-    ...[0, 3, 4, 7, 9, 15, 18, 19, 20, 255].map((t): [string, Partial<RefM>] => [
+    ...[0, 3, 4, 9, 15, 18, 19, 20, 255].map((t): [string, Partial<RefM>] => [
       `type ${t}`,
       { type: t, content: new Uint8Array(0) },
     ]),
@@ -610,6 +627,10 @@ describe("envelope M: strict parsing", () => {
       { ...hdr(), type: 6 as typeof P.MT.LEAVE },
       { ...hdr(), type: P.MT.BELL, bell: { g: 7, bell: fill(15, 0x55) } },
       { ...hdr(), type: P.MT.BELL, bell: { g: 2 ** 32, bell: fill(16, 0x55) } },
+      editMsg(""),
+      editMsg("a".repeat(12001)),
+      editMsg("\ud800"),
+      editMsg("x", {}, { ...editTo, th: fill(15, 0x55) }),
     ];
     for (const m of bads) expect(throwsError(() => P.encodeM(m))).toBe(true);
     // A BELL's content is exactly 20 bytes (§3.3).
@@ -767,8 +788,6 @@ describe("safeFileName (§8.3)", () => {
 });
 
 describe("REACTION (§3.3, §11.12)", () => {
-  const refPrevh = (label: B, body: B): B =>
-    new Uint8Array(createHash("sha256").update(refEnc("segv.sh/v2/prev", label, body)).digest()).slice(0, 16);
   const withContent = (content: B, o: Partial<RefM> = {}) => baseRefM({ type: 3, content, ...o });
 
   it("is 30 + elen bytes, op 0 or 1, 1..32 bytes of strict UTF-8, with no rule on the target fields", () => {
@@ -807,7 +826,7 @@ describe("REACTION (§3.3, §11.12)", () => {
     const m: P.Msg = { ...hdr(), type: P.MT.REACTION, reaction: { ...reaction1, emoji: "👍".repeat(8) } };
     expect(P.encodeReaction(m.type === P.MT.REACTION ? m.reaction : reaction1).length).toBe(62);
     expect(P.buildRow(ctx0(), E, m).cls).toBe(0);
-    for (const type of [0, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 18])
+    for (const type of [0, 9, 10, 11, 12, 13, 14, 15, 18])
       expect(throwsError(() => P.parseM(baseRefM({ type, content: new Uint8Array(0) })))).toBe(true);
   });
 
@@ -834,6 +853,102 @@ describe("REACTION (§3.3, §11.12)", () => {
     const th = P.reactTh(rk, label, body);
     expect(toHex(th)).toBe(toHex(hmacN(rk, refEnc("segv.sh/v2/react", label, body)).slice(0, 16)));
     expect(toHex(th)).not.toBe(toHex(P.reactTh(fill(32, 0x2d), label, body)));
+  });
+});
+
+describe("EDIT (§3.3, §11.18)", () => {
+  const withContent = (content: B, o: Partial<RefM> = {}) => baseRefM({ type: 7, content, ...o });
+
+  it("is 28 + text bytes, a TEXT's 1..12000 bytes of strict UTF-8, with no rule on the target fields", () => {
+    expect(P.EDIT_FIXED).toBe(28);
+    expect(toHex(P.encodeEdit(editTo, "ramen!"))).toBe(toHex(refEdit(editTo, "ramen!")));
+    expect(refEdit(editTo, "ramen!").length).toBe(28 + 6);
+    const any: P.ReplyTo = { te: 0xffffffff, tl: 0xffff, tE: 0xffff, tn: 0xffffffff, th: fill(16, 0) };
+    expect(P.parseEdit(P.encodeEdit(any, "x"))).toEqual({ to: any, text: "x" });
+    expect(P.parseEdit(P.encodeEdit(editTo, "﻿a")).text).toBe("﻿a"); // BOM kept
+    for (const text of ["\u0000nul", "日本語", "a".repeat(12000), "😀".repeat(3000)])
+      expect(P.parseEdit(P.encodeEdit(editTo, text))).toEqual({ to: editTo, text });
+    const m = P.parseM(withContent(refEdit(editTo, "ramen!")));
+    expect(m.type === P.MT.EDIT && [m.to, m.text]).toEqual([editTo, "ramen!"]);
+    // the target fields are a REACTION's and a REPLY's: the same 28 bytes at the start of the content
+    const head = toHex(P.encodeEdit(editTo, "x").slice(0, 28));
+    expect(toHex(P.encodeReaction({ ...editTo, op: 1, emoji: "x" }).slice(0, 28))).toBe(head);
+    expect(toHex(P.encodeReply(editTo, { type: P.MT.TEXT, text: "x" }).slice(0, 28))).toBe(head);
+  });
+
+  it("rejects a short content, an empty or too long text, bad UTF-8, and lane ≠ from", () => {
+    const ok = refEdit(editTo, "ramen!");
+    const bads: B[] = [
+      new Uint8Array(0),
+      ok.slice(0, 16),
+      ok.slice(0, 27),
+      ok.slice(0, 28), // an empty text
+      refEdit(editTo, fill(12001, 0x61)),
+      refEdit(editTo, Uint8Array.of(0xc0, 0xaf)), // an overlong form
+      refEdit(editTo, Uint8Array.of(0x61, 0xc0, 0x80)), // an overlong NUL
+      refEdit(editTo, Uint8Array.of(0xed, 0xa0, 0x80)), // a surrogate
+      refEdit(editTo, Uint8Array.of(0x61, 0xff)),
+    ];
+    for (const c of bads) {
+      expect(throwsError(() => P.parseEdit(c))).toBe(true);
+      expect(throwsError(() => P.parseM(withContent(c)))).toBe(true);
+    }
+    expect(throwsError(() => P.parseM(withContent(ok, { lane: 2 })))).toBe(true);
+    expect(throwsError(() => P.parseM(withContent(ok, { lane: 0xffff })))).toBe(true);
+    const unencodable: [P.ReplyTo, string][] = [
+      [editTo, ""],
+      [editTo, "a".repeat(12001)],
+      [editTo, "😀".repeat(3000) + "a"],
+      [editTo, "\ud800"],
+      [editTo, "a\udc00"],
+      [{ ...editTo, th: fill(15, 0x55) }, "x"],
+      [{ ...editTo, th: fill(17, 0x55) }, "x"],
+      [{ ...editTo, te: 2 ** 32 }, "x"],
+      [{ ...editTo, tl: 0x10000 }, "x"],
+      [{ ...editTo, tE: -1 }, "x"],
+      [{ ...editTo, tn: 1.5 }, "x"],
+    ];
+    for (const [to, text] of unencodable) expect(throwsError(() => P.encodeEdit(to, text))).toBe(true);
+  });
+
+  it("is class 0 with a text of at most 101 bytes, 1 to 869, 2 to 3941, 3 above, and round-trips as a row", () => {
+    for (const [len, cls] of [
+      [1, 0],
+      [101, 0],
+      [102, 1],
+      [869, 1],
+      [870, 2],
+      [3941, 2],
+      [3942, 3],
+      [12000, 3],
+    ] as const) {
+      const m = editMsg("a".repeat(len));
+      expect(P.encodeM(m).length).toBe(P.M_HEADER_LEN + P.EDIT_FIXED + len);
+      const r = P.buildRow(ctx0(), E, m);
+      expect([len, r.cls]).toEqual([len, cls]);
+      expect(r.body.length).toBe(CLASSES[cls] + 40);
+      const v = P.acceptRow(rowCtx0, E, r.label, r.body);
+      expect(v.ok && v.msg).toEqual(m);
+    }
+    expect(() => P.buildRow(ctx0(), E, editMsg("a".repeat(12001)))).toThrow();
+  });
+
+  it("is junk to the earlier type sets, and the next row's prevh over its stored body matches without a parse", () => {
+    const m = editMsg("ramen!", { n: 6 });
+    const row = P.buildRow(ctx0(), E, m);
+    const opened = P.openRow(keys0.mk, E, row.label, row.body);
+    expect(opened.M[1]).toBe(7);
+    const firstRelease = [1, 2, 8, 16, 17];
+    const beforeEdits = [1, 2, 3, 4, 5, 6, 8, 16, 17];
+    for (const types of [firstRelease, beforeEdits]) expect(types.includes(opened.M[1])).toBe(false); // "M: bad type"
+    const next: P.Msg = {
+      ...hdr({ n: 7, prev: { E, n: 6 }, prevh: P.prevh(row.label, row.body) }),
+      type: P.MT.TEXT,
+      text: "after",
+    };
+    const nextRow = P.buildRow(ctx0(), E, next);
+    const v = P.acceptRow(rowCtx0, E, nextRow.label, nextRow.body);
+    expect(v.ok && toHex(v.msg.prevh)).toBe(toHex(refPrevh(row.label, row.body)));
   });
 });
 
@@ -872,6 +987,7 @@ describe("conversation rows: seal, sign, open (§3.3)", () => {
       { ...hdr(), type: P.MT.WELCOME, join: join1 },
       { ...hdr(), type: P.MT.LEAVE },
       claimMsg(claim3, 2, 1),
+      editMsg("ramen!"),
     ];
     for (const m of msgs) {
       const r = P.buildRow(ctx0(), E, m);
@@ -926,7 +1042,7 @@ describe("conversation rows: seal, sign, open (§3.3)", () => {
       const body = P.sealRow(keys0.mk, E, label, M, P.signRow(bob.id.sigSk, conv, 0, E, label, M)).body;
       expect(P.acceptRow(rowCtx0, E, label, body)).toEqual({ ok: false, why: "malformed" });
     }
-    expect(Object.values(P.MT)).toEqual([1, 2, 3, 4, 5, 6, 8, 16, 17]);
+    expect(Object.values(P.MT)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 16, 17]);
   });
 
   it("flipping any byte of a body, or changing the label or E, makes the row fail to open", () => {
@@ -2511,6 +2627,8 @@ describe("fuzz: truncations, extensions and random bytes are rejected", () => {
         P.encodeM({ ...hdr(), type: P.MT.WELCOME, join: join1 }),
         P.encodeM(claimMsg()),
         P.encodeM({ ...hdr(), type: P.MT.LEAVE }),
+        // only through parseM: a cut or extended text tail can still be valid UTF-8, which only M's len catches
+        P.encodeM(editMsg("fuzz me")),
       ],
     ],
     ["parseD", P.parseD, [D0.bytes, D1.bytes]],
@@ -2648,6 +2766,7 @@ function computeKat() {
     ended: toHex(P.encodeRecord(record("ENDED"))),
     reactionM: toHex(P.encodeM({ ...hdr(), type: P.MT.REACTION, reaction: reaction1 })),
     reactTh: toHex(P.reactTh(fill(32, 0x2a), fill(16, 0x2b), fill(48, 0x2c))),
+    editM: toHex(P.encodeM(editMsg("ramen!"))),
   };
 }
 
@@ -2703,6 +2822,9 @@ const KAT = {
   reactionM:
     "02030001000100000005ffffffffffff000000000000000000000000000000000000019b93216d000000000000000000000000000000000000000000002200000005000200090000012c555555555555555555555555555555550104f09f918d",
   reactTh: "4a4d6976201f97cf0139c71d73f782bf",
+  // an EDIT M (type 7): hdr() | target (5, 2, 9, 300, th = 0x55…) | "ramen!"
+  editM:
+    "02070001000100000005ffffffffffff000000000000000000000000000000000000019b93216d000000000000000000000000000000000000000000002200000005000200090000012c5555555555555555555555555555555572616d656e21",
 };
 
 describe("known-answer vectors", () => {

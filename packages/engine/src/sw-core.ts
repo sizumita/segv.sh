@@ -1,9 +1,9 @@
 // The push Service Worker (docs/PROTOCOL.md §11.13), built to /sw.js from packages/engine/src/sw-main.ts. For every
 // push it shows at least one notification within 8 s: the payload's fixed text, or, with the device's preview, the name
 // of each conversation whose bell rang (from the notification cache), and with `message` its newest message, read with
-// one `get` and decrypted and verified here, and shown without its Markdown (no spoiler's content). The text never
-// comes from the payload, which the operator composes. It has no fetch handler and caches nothing, so it never serves
-// the app's pages or scripts.
+// one `get` and decrypted and verified here, as edited by an EDIT of that read, and shown without its Markdown (no
+// spoiler's content). The text never comes from the payload, which the operator composes. It has no fetch handler and
+// caches nothing, so it never serves the app's pages or scripts.
 import * as P from "@segv/protocol/proto";
 import * as W from "@segv/protocol/wire";
 import { plainText } from "./markdown";
@@ -149,7 +149,10 @@ interface Found {
   text: () => string;
 }
 
-/** The newest verified TEXT, IMAGE or FILE of each copy, and how far each lane's dense prefix reaches. */
+/**
+ * The verified TEXT, IMAGE and FILE rows of each copy (a TEXT with the text of its latest EDIT of the same read), and
+ * how far each lane's dense prefix reaches.
+ */
 async function readNewest(
   copies: { copy: CacheCopy; ep: CacheEpoch }[],
   d: SwDeps,
@@ -192,6 +195,12 @@ async function readNewest(
   const st = await d.get(keys);
   const reach = lanes.map((l) => ({ ...l.ep.next[l.j] }));
   const walking = lanes.map(() => true);
+  /** the kept TEXTs (and REPLYs carrying one), by lane and slot: what an EDIT of the same read may edit */
+  const editable = new Map<
+    string,
+    { label: Uint8Array; body: Uint8Array; who: string; f: Found }
+  >();
+  const edits: { lane: number; E: number; n: number; to: P.ReplyTo; text: string }[] = [];
   st.forEach((r, i) => {
     const a = at[i];
     const l = lanes[a.lane];
@@ -213,6 +222,13 @@ async function readNewest(
         r.body,
       );
       if (!v.ok || v.msg.from !== l.j) return;
+      // An EDIT is no message (§11.18): it may only change the text of a row of its own lane in the cached epoch.
+      if (v.msg.type === P.MT.EDIT) {
+        const { to, text } = v.msg;
+        if (to.te === l.ep.e && to.tl === l.j)
+          edits.push({ lane: a.lane, E: a.E, n: a.n, to, text });
+        return;
+      }
       const who = `@${l.ep.members[l.j]?.handle ?? "?"}`;
       // A REPLY shows as the message it carries (§11.17).
       const msg = v.msg.type === P.MT.REPLY ? v.msg.body : v.msg;
@@ -225,11 +241,24 @@ async function readNewest(
       const lo = P.T0_MS + r.t * 1000 - TS_SLACK_MS;
       const hi = P.T0_MS + (r.t + deltaS) * 1000 + TS_SLACK_MS;
       const ts = Math.min(Math.max(v.msg.ts, lo), hi);
+      const f: Found = { ts, text };
       const list = found.get(l.copy.bell) ?? [];
-      list.push({ ts, text });
+      list.push(f);
       found.set(l.copy.bell, list);
+      if (msg.type === P.MT.TEXT)
+        editable.set(`${a.lane}:${a.E}:${a.n}`, { label: keys[i].label, body: r.body, who, f });
     } else if (!a.seen && a.E === next.E) walking[a.lane] = false;
   });
+  // The EDITs of the same read, in lane order, so the latest one wins (§11.13 step 3): each replaces the text of the
+  // kept row whose label and stored body its th names. The row keeps its ts (an edit never makes an old message the
+  // newest), and the edit counts toward nothing.
+  edits.sort((x, y) => x.E - y.E || x.n - y.n);
+  for (const x of edits) {
+    const t = editable.get(`${x.lane}:${x.to.tE}:${x.to.tn}`);
+    const rk = keysOf.get(lanes[x.lane].copy)!.rk;
+    if (!t || !P.equalBytes(P.reactTh(rk, t.label, t.body), x.to.th)) continue;
+    t.f.text = () => `${t.who}: ${plainText(x.text)}`;
+  }
   const moves = new Map<string, Move>();
   lanes.forEach((l, li) => {
     const m = moves.get(l.copy.bell) ?? {
