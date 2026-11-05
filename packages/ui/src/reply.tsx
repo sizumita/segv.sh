@@ -1,6 +1,7 @@
 import { component$ } from "@qwik.dev/core";
 import { plainText } from "@segv/engine/markdown";
 import type { MessageView } from "@segv/engine/types";
+import { nameOf } from "./util";
 
 /** The longest gist a quote shows; CSS cuts it to its width. */
 const GIST_MAX = 160;
@@ -55,6 +56,7 @@ export const ReplyQuote = component$<{ m: MessageView; target: MessageView | und
     const r = props.m.reply;
     const t = props.target;
     if (!r) return null;
+    const who = t ? nameOf(t.fromHandle, t.fromNickname) || "unknown" : "";
     const what = t
       ? gist(t)
       : r.state === "none"
@@ -66,14 +68,12 @@ export const ReplyQuote = component$<{ m: MessageView; target: MessageView | und
         class={["rq", !t && "gone"]}
         data-thread={props.m.key}
         title="show the replies"
-        aria-label={
-          t ? `reply to ${t.fromHandle}: ${what}. show the replies` : `${what}. show the replies`
-        }
+        aria-label={t ? `reply to ${who}: ${what}. show the replies` : `${what}. show the replies`}
       >
         <span class="rq-line" aria-hidden="true" />
         {t && (
-          <b class="rq-who">
-            {t.fromHandle || "unknown"}
+          <b class="rq-who" title={t.fromNickname ? `@${t.fromHandle}` : undefined}>
+            {who}
             {t.mine && <span class="dim"> (you)</span>}
           </b>
         )}

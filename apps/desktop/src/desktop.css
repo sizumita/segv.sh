@@ -25,7 +25,18 @@ html[data-shell="desktop"] body {
 }
 /* Text that people read or write stays selectable. */
 [data-shell="desktop"]
-  :is(.msgs, .composer, input, textarea, .recovery .code, .fp, .settings, .errors, .warn-list) {
+  :is(
+    .msgs,
+    .composer,
+    input,
+    textarea,
+    .recovery .code,
+    .fp,
+    .settings,
+    .newchat,
+    .errors,
+    .warn-list
+  ) {
   -webkit-user-select: text;
   user-select: text;
 }
@@ -92,6 +103,12 @@ html[data-shell="desktop"] body {
   [data-shell="desktop"]:not([data-os="windows"]) .chat {
     padding-top: var(--titlebar);
   }
+  /* The new-conversation and settings dialogs fill a narrow window: their headings start below the system's buttons
+     too. */
+  [data-shell="desktop"]:not([data-os="windows"]) .nc-head,
+  [data-shell="desktop"]:not([data-os="windows"]) .settings .sheet {
+    padding-top: var(--titlebar);
+  }
 }
 /* A wide window: the list is the sidebar, the window's full height, and the errors and the conversation are one
    opaque area right of it. The rule between them is the list's resize handle (global.css: .sizer). On macOS the
@@ -131,6 +148,7 @@ html[data-shell="desktop"] body {
   }
 }
 [data-shell="desktop"] .settings,
+[data-shell="desktop"] .newchat,
 [data-shell="desktop"] .leave {
   border-radius: var(--radius);
 }

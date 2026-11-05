@@ -1,7 +1,8 @@
-import { component$, useContext, useSignal, useVisibleTask$ } from "@qwik.dev/core";
+import { $, component$, useContext, useSignal, useVisibleTask$ } from "@qwik.dev/core";
+import { MAX_LIVE_ALIASES, type IdentityView } from "@segv/engine/types";
 import { Errors } from "./errors";
 import { StateCtx, UiCtx } from "./state";
-import { act } from "./util";
+import { act, ALIAS_CAP, atAliasCap, identitiesOf, makeAlias } from "./util";
 
 type Preview = "none" | "name" | "message";
 
@@ -73,6 +74,8 @@ export const Settings = component$(() => {
           <p class="dim small">your safety number — compare it with your contacts in person:</p>
           <p class="fp">{me.fingerprint}</p>
         </section>
+
+        <Aliases />
 
         <section aria-labelledby="st-passkeys">
           <h3 id="st-passkeys">passkeys</h3>
@@ -208,5 +211,140 @@ export const Settings = component$(() => {
         </section>
       </div>
     </dialog>
+  );
+});
+
+/** What a temporary handle's state reads as (§2.6 "Running aliases"). */
+const STATUS: Record<IdentityView["status"], string> = {
+  starting: "starting…",
+  ready: "ready",
+  retired: "retired",
+  failed: "not registered correctly",
+  // valid, only not run on this device: retiring another one starts it
+  idle: `not run here: more than ${MAX_LIVE_ALIASES} are active`,
+};
+
+/**
+ * The temporary handles (§2.6): extra accounts with random handles, which nothing stored or sent relates to the user's
+ * own, each retired or brought back here, and a button that makes a new one.
+ */
+const Aliases = component$(() => {
+  const state = useContext(StateCtx);
+  const ui = useContext(UiCtx);
+  /** the handle being retired or brought back, and the one asked about ('' = none) */
+  const busy = useSignal("");
+  const confirm = useSignal("");
+  /** the handle just made ('' = none) */
+  const made = useSignal("");
+
+  const setRetired = $(async (uid: string, retired: boolean) => {
+    busy.value = uid;
+    confirm.value = "";
+    made.value = "";
+    await act(ui, (e) => e.setAliasRetired(uid, retired));
+    busy.value = "";
+  });
+
+  const all = identitiesOf(state);
+  const aliases = all.filter((i) => i.alias);
+  const fresh = made.value ? aliases.find((a) => a.uid === made.value) : undefined;
+  // no more can be made or brought back until one is retired (§2.6 MAX_LIVE_ALIASES)
+  const capped = atAliasCap(all);
+  return (
+    <section aria-labelledby="st-aliases">
+      <h3 id="st-aliases">temporary handles</h3>
+      <p class="dim small">
+        temporary handles are extra handles with random names. people you talk to as one see only
+        that handle, never yours or your other ones. retire one to stop it: its conversations are
+        hidden and it receives nothing until you bring it back.
+      </p>
+      <p class="dim small">
+        use a temporary handle from this device as you would a separate person: the times you are
+        active can still link them.
+      </p>
+      {aliases.length > 0 && (
+        <ul class="aliases">
+          {aliases.map((a) => {
+            const h = `@${a.handle || "…"}`;
+            const off = a.status === "retired";
+            return (
+              <li key={a.uid} class={{ off }}>
+                <div class="arow">
+                  <span class="ahandle" title={a.handle ? undefined : "its handle is being read"}>
+                    {h}
+                  </span>
+                  <span class={["astatus", a.status]}>{STATUS[a.status]}</span>
+                  {off ? (
+                    <button
+                      type="button"
+                      disabled={busy.value === a.uid || capped}
+                      title={capped ? ALIAS_CAP : undefined}
+                      aria-label={`bring back ${h}`}
+                      onClick$={() => setRetired(a.uid, false)}
+                    >
+                      {busy.value === a.uid ? "bringing back…" : "bring back"}
+                    </button>
+                  ) : (
+                    confirm.value !== a.uid && (
+                      <button
+                        type="button"
+                        class="link"
+                        disabled={busy.value === a.uid}
+                        aria-label={`retire ${h}`}
+                        onClick$={() => (confirm.value = a.uid)}
+                      >
+                        {busy.value === a.uid ? "retiring…" : "retire"}
+                      </button>
+                    )
+                  )}
+                </div>
+                {confirm.value === a.uid && (
+                  <p class="row confirm" role="group" aria-label={`retire ${h}`}>
+                    <span class="grow">retire {h}? its conversations will be hidden.</span>
+                    <button type="button" onClick$={() => setRetired(a.uid, true)}>
+                      retire
+                    </button>
+                    <button type="button" class="link" onClick$={() => (confirm.value = "")}>
+                      cancel
+                    </button>
+                  </p>
+                )}
+                {a.fingerprint && (
+                  <details class="afp">
+                    <summary class="small dim">safety number</summary>
+                    <p class="fp small">{a.fingerprint}</p>
+                  </details>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      <p class="row">
+        <button
+          type="button"
+          disabled={ui.makingAlias || capped}
+          aria-busy={ui.makingAlias}
+          aria-describedby="st-alias-note"
+          onClick$={async () => {
+            made.value = "";
+            made.value = (await makeAlias(ui)) ?? "";
+          }}
+        >
+          {ui.makingAlias ? "making a handle…" : "new temporary handle"}
+        </button>
+        {ui.makingAlias && state.progress && (
+          <span class="dim small" role="status">
+            {state.progress}
+          </span>
+        )}
+        {!ui.makingAlias && fresh && <span role="status">@{fresh.handle || "…"} is ready.</span>}
+      </p>
+      <p class="dim small" id="st-alias-note">
+        {capped
+          ? `${ALIAS_CAP}.`
+          : "when a handle is made is public: handles made close together, or soon after you signed up, can be linked by that time."}
+      </p>
+    </section>
   );
 });

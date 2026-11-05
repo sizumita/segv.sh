@@ -123,6 +123,8 @@ export const App = component$(() => {
             ui.members = false;
             ui.viewer = undefined;
             ui.settings = false;
+            ui.newChat = false;
+            ui.startAs = "";
             ui.leaving = "";
             ui.hiddenWarnings = [];
           }

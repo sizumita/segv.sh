@@ -10,6 +10,7 @@ const msg = (key: string, text: string): MessageView => ({
   seq: 1,
   from: "u",
   fromHandle: "bob",
+  fromNickname: "",
   mine: false,
   ts: 1,
   kind: "text",
@@ -20,9 +21,29 @@ const msg = (key: string, text: string): MessageView => ({
 
 const conv = (id: string, messages: MessageView[], unread = 0): ConversationView => ({
   id,
+  as: "u-me",
   ref: `ref-${id}`,
   name: `@${id}`,
-  members: [{ uid: "u", handle: "bob", fingerprint: "", left: false }],
+  members: [
+    {
+      uid: "u-me",
+      handle: "me",
+      nickname: "",
+      you: true,
+      own: false,
+      fingerprint: "",
+      left: false,
+    },
+    {
+      uid: "u",
+      handle: "bob",
+      nickname: "Bob B",
+      you: false,
+      own: false,
+      fingerprint: "",
+      left: false,
+    },
+  ],
   epoch: 0,
   canSend: true,
   blocked: "",
@@ -37,6 +58,18 @@ const conv = (id: string, messages: MessageView[], unread = 0): ConversationView
 const state = (conversations: ConversationView[], warnings: string[] = []): EngineState => ({
   ...initialEngineState(),
   phase: "ready",
+  identities: [
+    {
+      uid: "u-me",
+      handle: "me",
+      fingerprint: "",
+      alias: false,
+      index: -1,
+      retired: false,
+      status: "ready",
+    },
+  ],
+  people: [{ uid: "u", handle: "bob", nickname: "Bob B", contactOf: ["u-me"] }],
   conversations,
   warnings,
 });
@@ -52,6 +85,8 @@ describe("StateCopier", () => {
     expect(out.conversations[0].messages[0]).not.toBe(m);
     expect(out.conversations[0].members).not.toBe(s.conversations[0].members);
     expect(out.warnings).not.toBe(s.warnings);
+    expect(out.identities).not.toBe(s.identities);
+    expect(out.people).not.toBe(s.people);
   });
 
   it("gives the same state when nothing changed", () => {
@@ -71,6 +106,8 @@ describe("StateCopier", () => {
     const next = c.copy(state([conv("a", [m1, m3], 1), conv("b", [m2])], ["w"]));
     expect(next).not.toBe(first);
     expect(next.warnings).toBe(first.warnings);
+    expect(next.identities).toBe(first.identities);
+    expect(next.people).toBe(first.people);
     // b did not change
     expect(next.conversations[1]).toBe(first.conversations[1]);
     // a did: its members and its old message are the same copies

@@ -5,8 +5,8 @@ import { MsgImage } from "./msg-image";
 import { Composer } from "./composer";
 import { MsgText } from "./msg-text";
 import { gist, ReplyIcon, ReplyQuote } from "./reply";
-import { PaneCtx, UiCtx } from "./state";
-import { clock, dayKey, dayLabel, fullTime } from "./util";
+import { PaneCtx, StateCtx, UiCtx } from "./state";
+import { clock, dayKey, dayLabel, fullTime, identitiesOf, nameOf } from "./util";
 
 /** How the chain above the message ends. */
 type Top = "root" | "waiting" | "none" | "unloaded";
@@ -84,6 +84,7 @@ const NEAR_END_PX = 48;
  * replies to the last message it shows, or to the one whose "reply" was pressed (`PaneState.threadTo`) until it sends.
  */
 export const ReplyTree = component$<{ conv: ConversationView; canReply: boolean }>((props) => {
+  const state = useContext(StateCtx);
   const pane = useContext(PaneCtx);
   const ui = useContext(UiCtx);
   const box = useSignal<HTMLElement>();
@@ -146,6 +147,7 @@ export const ReplyTree = component$<{ conv: ConversationView; canReply: boolean 
   });
 
   const tree = threadOf(props.conv.messages, pane.thread);
+  const own = new Set(identitiesOf(state).map((i) => i.uid));
   // What the box replies to: the message whose "reply" was pressed, else the last one that was sent (not an echo).
   const sent = tree?.items.filter((x) => x.m.status === "sent").map((x) => x.m) ?? [];
   const chosen = pane.threadTo ? sent.find((m) => m.key === pane.threadTo) : undefined;
@@ -185,8 +187,11 @@ export const ReplyTree = component$<{ conv: ConversationView; canReply: boolean 
                   <div class="tb">
                     {quote && <ReplyQuote m={m} target={parent} />}
                     <p class="meta">
-                      <b>{m.fromHandle || "unknown"}</b>
+                      <b title={m.fromNickname ? `@${m.fromHandle}` : undefined}>
+                        {nameOf(m.fromHandle, m.fromNickname) || "unknown"}
+                      </b>
                       {m.mine && <span class="dim"> (you)</span>}
+                      {!m.mine && own.has(m.from) && <span class="dim"> (your other handle)</span>}
                       <span class="dim">
                         {newDay ? `${dayLabel(m.ts, ui.now)} ` : ""}
                         {clock(m.ts)}
@@ -196,7 +201,7 @@ export const ReplyTree = component$<{ conv: ConversationView; canReply: boolean 
                           type="button"
                           class="treply"
                           data-reply={m.key}
-                          aria-label={`reply to ${m.fromHandle || "this message"}`}
+                          aria-label={`reply to ${nameOf(m.fromHandle, m.fromNickname) || "this message"}`}
                           title="reply"
                         >
                           <ReplyIcon />
@@ -224,7 +229,7 @@ export const ReplyTree = component$<{ conv: ConversationView; canReply: boolean 
           convId={props.conv.id}
           blocked={props.conv.blocked}
           replyTo={target.key}
-          replyWho={target.fromHandle || "unknown"}
+          replyWho={nameOf(target.fromHandle, target.fromNickname) || "unknown"}
           replyGist={gist(target)}
           canStop={chosen !== undefined}
           setReply$={setTo}

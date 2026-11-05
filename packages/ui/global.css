@@ -373,8 +373,34 @@ textarea:focus {
   outline: 0;
 }
 .newconv {
-  padding: 8px 12px;
+  padding: 8px 10px;
   border-bottom: 1px solid var(--line);
+}
+/* "new conversation": opens its dialog (new-chat.tsx). */
+.newbtn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 12px;
+  border-radius: var(--r);
+}
+.newbtn .icon {
+  width: 16px;
+  height: 16px;
+  color: var(--dim);
+}
+/* The main action of a dialog or an empty pane. */
+.go {
+  padding: 5px 18px;
+  background: var(--fg);
+  border-color: var(--fg);
+  color: var(--bg);
+  font-weight: 700;
+}
+.go:hover:not(:disabled) {
+  background: var(--dim);
+  border-color: var(--dim);
 }
 /* The foot of the list: a running task's progress, then the account row. */
 .progress-line {
@@ -416,10 +442,6 @@ textarea:focus {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-.newconv form {
-  display: grid;
-  gap: 6px;
 }
 .fp {
   word-spacing: 0.2em;
@@ -464,11 +486,22 @@ textarea:focus {
 .conv.on:hover:not(:disabled) {
   background: var(--sel);
 }
-.conv .name {
+/* The name, and under it the temporary handle that holds the conversation, if one does (§2.6). */
+.cname {
   flex: 1;
+  min-width: 0;
+  display: grid;
+}
+.conv .name,
+.conv .as {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.conv .as {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--dim);
 }
 .conv.unread .name,
 .conv .badge {
@@ -479,7 +512,8 @@ textarea:focus {
   color: var(--dim);
 }
 .conv.on .when,
-.conv.on .dim {
+.conv.on .dim,
+.conv.on .as {
   color: inherit;
 }
 .right {
@@ -492,6 +526,22 @@ textarea:focus {
 .empty {
   padding: 16px 12px;
 }
+/* The conversation pane before there is any conversation. */
+.hello {
+  margin: auto;
+  max-width: 26rem;
+  padding: 24px 16px;
+  display: grid;
+  gap: 10px;
+  justify-items: center;
+  text-align: center;
+}
+.hello .strong {
+  font-size: 16px;
+}
+.hello .go {
+  margin-top: 6px;
+}
 .convhead {
   display: flex;
   align-items: baseline;
@@ -499,13 +549,34 @@ textarea:focus {
   padding: 6px 12px;
   border-bottom: 1px solid var(--line);
 }
-.convhead .title {
+.titlebox {
   flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.convhead .title {
   min-width: 0;
   font-weight: 700;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* "as @_k7m2_q9x4": the conversation is one of a temporary handle (§2.6). */
+.aspill {
+  flex: none;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0 8px;
+  font-size: 12px;
+  line-height: 20px;
+  color: var(--dim);
+  background: var(--surface);
+  border: 1px solid var(--edge);
+  border-radius: var(--pill);
 }
 .back {
   display: none;
@@ -1322,6 +1393,18 @@ button.edited:hover:not(:disabled) {
 .confirm {
   margin-top: 6px;
 }
+.mname {
+  overflow-wrap: anywhere;
+}
+.mname b + .dim {
+  font-size: 12px;
+}
+/* A member's nickname, being edited (members.tsx). */
+.nickform {
+  display: grid;
+  gap: 6px;
+  margin: 6px 0 4px;
+}
 .addm {
   display: flex;
   gap: 8px;
@@ -1460,6 +1543,7 @@ button.edited:hover:not(:disabled) {
 }
 /* ::backdrop does not inherit the custom properties in every browser: plain colours. */
 .settings::backdrop,
+.newchat::backdrop,
 .leave::backdrop,
 .history::backdrop {
   background: rgb(239 239 236 / 0.7);
@@ -1468,6 +1552,7 @@ button.edited:hover:not(:disabled) {
 }
 @media (prefers-color-scheme: dark) {
   .settings::backdrop,
+  .newchat::backdrop,
   .leave::backdrop,
   .history::backdrop {
     background: rgb(34 34 36 / 0.75);
@@ -1576,6 +1661,423 @@ button.edited:hover:not(:disabled) {
   padding: 0;
   margin-bottom: 4px;
 }
+/* The temporary handles (settings.tsx): one card each, a retired one drawn in dashes. */
+.aliases {
+  display: grid;
+  gap: 6px;
+  margin: 4px 0;
+}
+.aliases > li {
+  display: grid;
+  gap: 2px;
+  padding: 8px 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+}
+.aliases > li.off {
+  background: none;
+  border-style: dashed;
+  border-color: var(--edge);
+}
+.arow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+}
+.ahandle {
+  flex: 1;
+  min-width: 0;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+.off .ahandle {
+  color: var(--dim);
+}
+.astatus {
+  font-size: 12px;
+  color: var(--dim);
+}
+.astatus.ready::before,
+.astatus.starting::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 6px;
+  vertical-align: 1px;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+}
+.astatus.ready::before {
+  background: currentColor;
+}
+.astatus.failed {
+  color: var(--fg);
+  font-weight: 700;
+}
+.afp summary {
+  width: max-content;
+  cursor: pointer;
+}
+.afp .fp {
+  margin-top: 2px;
+}
+
+/* "new conversation" (new-chat.tsx): who starts it, with whom, and a group's name. Centred on wide screens, the whole
+   screen on phones (below); its head and foot stay put while the rest scrolls. */
+.newchat {
+  width: min(36rem, calc(100% - 32px));
+  max-width: none;
+  max-height: calc(100% - 64px);
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-l);
+  box-shadow: var(--shadow);
+  background: var(--bg);
+  color: var(--fg);
+  overflow: hidden;
+}
+.newchat[open] {
+  display: flex;
+  flex-direction: column;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .newchat[open] {
+    animation: nc-in 0.16s ease-out;
+  }
+}
+@keyframes nc-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.99);
+  }
+}
+.newchat .sheet {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.nc-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 12px 4px 20px;
+}
+.nc-head h2 {
+  flex: 1;
+  font-size: 16px;
+  font-weight: 700;
+}
+.nc-head .xbtn {
+  font-size: 18px;
+  line-height: 28px;
+}
+.nc-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: grid;
+  align-content: start;
+  gap: 20px;
+  padding: 8px 20px 20px;
+}
+.nc-label {
+  display: block;
+  padding: 0;
+  margin-bottom: 8px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--dim);
+}
+.nc-label .dim {
+  font-weight: 400;
+}
+/* "start as": the owner and its live temporary handles as cards, the chosen one ringed, and a card that makes a new
+   temporary handle. */
+.nc-as {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.idcards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 10rem), 1fr));
+  gap: 8px;
+}
+.idcard {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 9px 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  text-align: left;
+  white-space: normal;
+  cursor: pointer;
+  transition:
+    background-color 0.15s,
+    border-color 0.15s,
+    box-shadow 0.15s;
+}
+label.idcard:not(.on):hover {
+  border-color: var(--edge);
+}
+.idcard.on {
+  border-color: var(--dim);
+  box-shadow: 0 0 0 3px var(--ring);
+}
+.idcard:has(:focus-visible) {
+  outline: 2px solid var(--dim);
+  outline-offset: 2px;
+}
+.nc-as:disabled .idcard {
+  cursor: default;
+  opacity: 0.6;
+}
+.idmark {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  background: var(--bg);
+  border: 1.5px solid var(--edge);
+  border-radius: 50%;
+  transition:
+    background-color 0.15s,
+    border-color 0.15s;
+}
+.idcard.on .idmark {
+  background: var(--fg);
+  border-color: var(--fg);
+  box-shadow: inset 0 0 0 3px var(--surface);
+}
+.idtext {
+  display: grid;
+  min-width: 0;
+  line-height: 1.35;
+}
+.idhandle {
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.idtag {
+  font-size: 12px;
+  color: var(--dim);
+}
+/* A row of its own under the cards, its two lines as one. */
+.idnew {
+  width: 100%;
+  margin-top: 8px;
+  background: none;
+  border-style: dashed;
+  border-color: var(--edge);
+  color: var(--dim);
+}
+.idnew .idtext {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 10px;
+}
+.idnew:hover:not(:disabled) {
+  background: var(--hi);
+  border-color: var(--dim);
+  color: var(--fg);
+}
+.idnew:disabled {
+  opacity: 1;
+  cursor: progress;
+}
+.idplus {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  font-size: 18px;
+  line-height: 1;
+}
+/* While a temporary handle is being made: a ring that turns, in place of the "+". */
+.idnew[aria-busy="true"] .idplus {
+  color: transparent;
+  border: 1.5px solid var(--edge);
+  border-top-color: var(--fg);
+  border-radius: 50%;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .idnew[aria-busy="true"] .idplus {
+    animation: nc-turn 0.8s linear infinite;
+  }
+}
+@keyframes nc-turn {
+  to {
+    transform: rotate(1turn);
+  }
+}
+.nc-hint {
+  margin-top: 10px;
+  color: var(--dim);
+  overflow-wrap: anywhere;
+}
+.nc-hint b {
+  color: var(--fg);
+}
+.nc-note {
+  margin-top: 4px;
+  color: var(--dim);
+  opacity: 0.85;
+}
+/* "with": the people added, as chips, and a box to type the next one in, as one field. */
+.chipbox {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  padding: 5px 6px;
+  background: var(--surface);
+  border: 1px solid var(--edge);
+  border-radius: var(--r);
+  cursor: text;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
+}
+.chipbox:focus-within {
+  border-color: var(--dim);
+  box-shadow: 0 0 0 3px var(--ring);
+}
+.chipbox.off {
+  opacity: 0.6;
+}
+.chips {
+  display: contents;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 2px 2px 2px 10px;
+  line-height: 22px;
+  background: var(--sel);
+  border-radius: var(--pill);
+  cursor: default;
+}
+.chip > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chip .dim {
+  font-size: 12px;
+}
+.chipx {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: none;
+  font-size: 15px;
+  line-height: 22px;
+  color: var(--dim);
+}
+.chipx:hover:not(:disabled) {
+  background: var(--edge);
+  color: var(--fg);
+}
+.chipbox input[type="text"],
+.chipbox input[type="text"]:focus {
+  flex: 1 1 12ch;
+  width: auto;
+  min-width: 12ch;
+  padding: 4px 6px;
+  background: none;
+  border: 0;
+  box-shadow: none;
+}
+.suggest {
+  margin-top: 6px;
+  padding: 4px;
+  background: var(--surface);
+  border: 1px solid var(--edge);
+  border-radius: var(--r);
+  box-shadow: 0 4px 14px rgb(0 0 0 / 0.06);
+}
+.suggest[hidden] {
+  display: none;
+}
+.sopt {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  padding: 6px 10px;
+  border-radius: var(--r-s);
+  cursor: pointer;
+}
+.sopt b,
+.sopt .dim {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sopt .dim {
+  font-size: 12px;
+}
+.sopt:hover {
+  background: var(--hi);
+}
+.sopt.on {
+  background: var(--sel);
+}
+.stag {
+  flex: none;
+  margin-left: auto;
+  padding: 0 7px;
+  font-size: 11px;
+  line-height: 18px;
+  color: var(--dim);
+  border: 1px solid var(--line);
+  border-radius: var(--pill);
+}
+.nc-err {
+  margin-top: 6px;
+  font-weight: 700;
+}
+.nc-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+  padding: 12px 20px 16px;
+  border-top: 1px solid var(--line);
+}
+.nc-sum {
+  flex: 1 1 16rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.nc-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-left: auto;
+}
 
 @media (max-width: 1000px) {
   .members,
@@ -1625,6 +2127,26 @@ button.edited:hover:not(:disabled) {
   .settings .sheet {
     padding: calc(10px + env(safe-area-inset-top)) max(16px, env(safe-area-inset-right))
       calc(24px + env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  }
+  .newchat {
+    width: 100%;
+    height: 100%;
+    max-height: none;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+  }
+  .nc-head {
+    padding: calc(10px + env(safe-area-inset-top)) max(10px, env(safe-area-inset-right)) 4px
+      max(16px, env(safe-area-inset-left));
+  }
+  .nc-body {
+    padding-right: max(16px, env(safe-area-inset-right));
+    padding-left: max(16px, env(safe-area-inset-left));
+  }
+  .nc-foot {
+    padding: 10px max(16px, env(safe-area-inset-right)) calc(12px + env(safe-area-inset-bottom))
+      max(16px, env(safe-area-inset-left));
   }
   .picker {
     top: auto;

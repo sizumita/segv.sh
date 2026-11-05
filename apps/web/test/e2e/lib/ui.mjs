@@ -102,21 +102,32 @@ export async function closeImage(d) {
   await viewer.waitFor({ state: "hidden", timeout: T });
 }
 
-/** Fills the new-conversation form; `atForm` runs before it is sent. */
+/**
+ * Starts a conversation with `handles` ("bob" or "bob, carol") from the "new conversation" dialog, as the main handle:
+ * each handle typed into its "people" box and added with Enter, then the group name if given (groups only: the dialog
+ * has no name for a 1:1). `atForm` runs before "start" is pressed.
+ */
 export async function newConversation(d, handles, name, { atForm } = {}) {
-  const btn = d.page.getByRole("button", { name: "new conversation" });
-  if (await btn.isVisible()) await btn.click();
-  await d.page.getByLabel("handles").fill(handles);
-  if (name) await d.page.getByLabel("group name (optional)").fill(name);
+  const list = handles.split(/[\s,]+/).filter(Boolean);
+  if (name && list.length < 2)
+    throw new Error(`newConversation: the dialog names only groups, not a 1:1 with ${handles}`);
+  await d.page
+    .locator(".newconv")
+    .getByRole("button", { name: "new conversation", exact: true })
+    .click({ timeout: T });
+  const dialog = d.page.getByRole("dialog", { name: "new conversation" });
+  await dialog.waitFor({ timeout: T });
+  const people = dialog.getByRole("combobox", { name: "people" });
+  for (const h of list) {
+    await people.fill(h);
+    await people.press("Enter");
+    await dialog.getByRole("button", { name: `remove @${h}`, exact: true }).waitFor({ timeout: T });
+  }
+  if (name) await dialog.getByLabel("group name (optional)").fill(name);
   await atForm?.();
-  await d.page.getByRole("button", { name: "start" }).click();
-  const title =
-    name ??
-    handles
-      .split(/[\s,]+/)
-      .filter(Boolean)
-      .map((h) => `@${h}`)
-      .join(", ");
+  await dialog.getByRole("button", { name: "start", exact: true }).click();
+  await dialog.waitFor({ state: "hidden", timeout: T });
+  const title = name ?? list.map((h) => `@${h}`).join(", ");
   await d.page.locator(".convhead .title", { hasText: title }).waitFor({ timeout: T });
   await d.page.getByLabel("message", { exact: true }).waitFor({ timeout: T });
 }

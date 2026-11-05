@@ -1,7 +1,7 @@
-import { $, component$, useContext, useSignal } from "@qwik.dev/core";
+import { component$, useContext } from "@qwik.dev/core";
 import { showChat } from "./route";
 import { type ListView, StateCtx, UiCtx } from "./state";
-import { act, listOf, MAX_NAME, parseHandles, relTime } from "./util";
+import { identitiesOf, listOf, relTime } from "./util";
 import { Warnings } from "./warnings";
 
 const LISTS: { id: ListView; empty: string }[] = [
@@ -9,6 +9,23 @@ const LISTS: { id: ListView; empty: string }[] = [
   { id: "requests", empty: "no requests." },
   { id: "archives", empty: "nothing archived." },
 ];
+
+/** A pencil on a sheet: a new conversation. */
+const NewIcon = () => (
+  <svg
+    class="icon"
+    viewBox="0 0 20 20"
+    aria-hidden="true"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.5"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  >
+    <path d="M9 3.5H5.5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V11" />
+    <path d="M14.6 2.9a1.6 1.6 0 0 1 2.3 2.3L10.3 11.8l-3 .8.8-3z" />
+  </svg>
+);
 
 /** A gear: the settings. */
 const GearIcon = () => (
@@ -29,101 +46,32 @@ const GearIcon = () => (
 export const ConvList = component$(() => {
   const state = useContext(StateCtx);
   const ui = useContext(UiCtx);
-  const showNew = useSignal(false);
-  const handles = useSignal("");
-  const name = useSignal("");
-  const formError = useSignal("");
-  const creating = useSignal(false);
 
   const me = state.me;
-  const formOpen = showNew.value || state.conversations.length === 0;
   const counts: Record<ListView, number> = { chats: 0, requests: 0, archives: 0 };
   for (const c of state.conversations) counts[listOf(c)]++;
   const shown = state.conversations.filter((c) => listOf(c) === ui.list);
   // The switcher appears once there is something besides chats (or while another list is open).
   const lists = LISTS.filter((l) => l.id === "chats" || l.id === ui.list || counts[l.id] > 0);
-
-  const create = $(async () => {
-    if (creating.value) return;
-    const parsed = parseHandles(handles.value, state.me?.handle);
-    if (!parsed.ok) {
-      formError.value = parsed.error;
-      return;
-    }
-    const n = name.value.trim();
-    if ([...n].length > MAX_NAME) {
-      formError.value = `group name: at most ${MAX_NAME} characters`;
-      return;
-    }
-    formError.value = "";
-    creating.value = true;
-    const id = await act(ui, (e) => e.createConversation(parsed.handles, n || undefined));
-    creating.value = false;
-    if (id) {
-      handles.value = "";
-      name.value = "";
-      showNew.value = false;
-      ui.wanted = "";
-      ui.active = id;
-      ui.list = "chats";
-      ui.members = false;
-    }
-  });
+  // The temporary handle that holds a conversation (§2.6), for its row; none for the owner's.
+  const aliases = new Map(
+    identitiesOf(state)
+      .filter((i) => i.alias)
+      .map((i) => [i.uid, i.handle || "…"]),
+  );
 
   return (
     <aside class="left" aria-label="conversations">
       <div class="newconv">
-        {!formOpen ? (
-          <button type="button" class="link" onClick$={() => (showNew.value = true)}>
-            new conversation
-          </button>
-        ) : (
-          <form preventdefault:submit onSubmit$={create}>
-            <p class="small">new conversation</p>
-            <input
-              type="text"
-              aria-label="handles"
-              placeholder="handles: bob, carol"
-              autocapitalize="none"
-              autocomplete="off"
-              spellcheck={false}
-              bind:value={handles}
-              onInput$={() => (formError.value = "")}
-              disabled={creating.value}
-            />
-            <input
-              type="text"
-              aria-label="group name (optional)"
-              placeholder="group name (optional)"
-              autocomplete="off"
-              maxLength={MAX_NAME * 2}
-              bind:value={name}
-              disabled={creating.value}
-            />
-            {formError.value && (
-              <p class="small strong" role="alert">
-                {formError.value}
-              </p>
-            )}
-            <p class="row">
-              <button type="submit" disabled={creating.value || !handles.value.trim()}>
-                {creating.value ? "starting…" : "start"}
-              </button>
-              {state.conversations.length > 0 && (
-                <button
-                  type="button"
-                  class="link"
-                  onClick$={() => {
-                    showNew.value = false;
-                    formError.value = "";
-                  }}
-                >
-                  cancel
-                </button>
-              )}
-            </p>
-          </form>
-        )}
+        <button
+          type="button"
+          class="newbtn"
+          aria-haspopup="dialog"
+          onClick$={() => (ui.newChat = true)}
+        >
+          <NewIcon />
+          new conversation
+        </button>
       </div>
 
       {lists.length > 1 && (
@@ -154,7 +102,10 @@ export const ConvList = component$(() => {
             aria-current={c.id === ui.active ? "true" : undefined}
             onClick$={() => showChat(ui, c)}
           >
-            <span class="name">{c.name || "(no name)"}</span>
+            <span class="cname">
+              <span class="name">{c.name || "(no name)"}</span>
+              {aliases.has(c.as) && <span class="as">as @{aliases.get(c.as)}</span>}
+            </span>
             {ui.list === "archives" && <span class="dim small">{c.blocked}</span>}
             {c.unread > 0 && (
               <span class="badge" aria-label={`${c.unread} unread`}>
@@ -164,9 +115,22 @@ export const ConvList = component$(() => {
             <span class="when">{relTime(c.lastTs, ui.now)}</span>
           </button>
         ))}
-        {shown.length === 0 && (
-          <p class="dim small pad">{LISTS.find((l) => l.id === ui.list)?.empty}</p>
-        )}
+        {shown.length === 0 &&
+          (state.conversations.length === 0 ? (
+            <p class="dim small pad">
+              no conversations yet.{" "}
+              <button
+                type="button"
+                class="link"
+                aria-haspopup="dialog"
+                onClick$={() => (ui.newChat = true)}
+              >
+                start one
+              </button>
+            </p>
+          ) : (
+            <p class="dim small pad">{LISTS.find((l) => l.id === ui.list)?.empty}</p>
+          ))}
       </nav>
       {/* The foot of the list: a running task's progress, then the account: the handle, the connection with the latest
           verified checkpoint, the security warnings and the settings. */}
