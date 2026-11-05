@@ -38,6 +38,9 @@ tauri-plugin-updater = { version = "2.14.1", default-features = false, features 
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
+# flate2, tar and tempfile unpack an update into the app's bundle (src/update.rs): the versions that the updater
+# plugin uses.
+flate2 = "1.1.10"
 libc = "0.2.191"
 objc2 = "0.6.5"
 objc2-app-kit = "0.3.2"
@@ -45,6 +48,8 @@ objc2-authentication-services = "0.3.2"
 objc2-foundation = "0.3.2"
 objc2-user-notifications = "0.3.2"
 security-framework = { version = "3.7.0", features = ["OSX_10_15"] }
+tar = "0.4.46"
+tempfile = "3.27.0"
 
 [target.'cfg(windows)'.dependencies]
 sha2 = "0.10.9"

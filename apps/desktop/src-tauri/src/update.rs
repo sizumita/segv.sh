@@ -412,33 +412,161 @@ fn apply(app: &AppHandle<Wry>, after: After, asked: bool) {
     run();
 }
 
-/// macOS replaces the app's bundle, which `apply` then restarts; Windows runs the installer, which replaces the app
-/// after this process has exited and starts it again unless the app was quitting. `install` only returns on a failure
-/// there.
+/// macOS replaces what is in the app's bundle, which `apply` then restarts; Windows runs the installer, which replaces
+/// the app after this process has exited and starts it again unless the app was quitting. `install` only returns on a
+/// failure there.
 fn install(app: &AppHandle<Wry>, update: &Update, bytes: &[u8], after: After) -> Result<(), String> {
     mark_relaunch(app, after);
+    #[cfg(target_os = "macos")]
+    if let Some(bundle) = bundle()
+        && replaceable()
+    {
+        update.verify(bytes).map_err(|e| e.to_string())?;
+        match swap_contents(&bundle, bytes) {
+            Ok(()) => return Ok(()),
+            // Nothing has changed yet: the updater plugin replaces the whole bundle instead.
+            Err(e) => eprintln!("segv: could not install the update inside the bundle: {e}"),
+        }
+    }
     #[cfg(windows)]
     let update = &update.clone().restart_after_install(after != After::Quit);
     update.install(bytes).map_err(|e| e.to_string())
 }
 
+/// The running app's bundle: `<name>.app` of `<name>.app/Contents/MacOS/<binary>`.
+#[cfg(target_os = "macos")]
+fn bundle() -> Option<PathBuf> {
+    let exe = tauri::utils::platform::current_exe().ok()?;
+    let bundle = exe.ancestors().nth(3)?;
+    bundle
+        .extension()
+        .is_some_and(|e| e == "app")
+        .then(|| bundle.to_path_buf())
+}
+
 /// Whether this user may replace the app's bundle: write access to it and to the folder that holds it.
 #[cfg(target_os = "macos")]
 fn replaceable() -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(exe) = tauri::utils::platform::current_exe() else {
+    let Some(bundle) = bundle() else {
         return false;
     };
-    // <name>.app/Contents/MacOS/<binary>
-    let Some(bundle) = exe.ancestors().nth(3) else {
-        return false;
+    let writable = |p: &std::path::Path| c_path(p).is_ok_and(|c| unsafe { libc::access(c.as_ptr(), libc::W_OK) } == 0);
+    writable(&bundle) && bundle.parent().is_some_and(writable)
+}
+
+#[cfg(target_os = "macos")]
+fn c_path(path: &std::path::Path) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt as _;
+    Ok(std::ffi::CString::new(path.as_os_str().as_bytes())?)
+}
+
+/// Installs the update's package (verified) into `bundle` by exchanging the two `Contents` folders in one step, so
+/// that the bundle's own folder stays the same file. macOS remembers an app by that file, not by its path: the Dock's
+/// tile of an app kept in the Dock, for one. The updater plugin puts a new folder in the bundle's place, which leaves
+/// such a tile on a removed file, and the restarted app then gets a second tile. An error means that nothing has
+/// changed.
+#[cfg(target_os = "macos")]
+fn swap_contents(bundle: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Error;
+    use std::os::unix::fs::MetadataExt as _;
+
+    // The exchange is a rename, so the package is unpacked on the bundle's volume: in the temporary folder if it is
+    // there, else next to the app.
+    let volume = std::fs::symlink_metadata(bundle)?.dev();
+    let root = [Some(std::env::temp_dir()), bundle.parent().map(PathBuf::from)]
+        .into_iter()
+        .flatten()
+        .find(|dir| dir.metadata().is_ok_and(|m| m.dev() == volume))
+        .ok_or_else(|| Error::other("no folder for the package on the app's volume"))?;
+    // Removed on drop, with the previous version once it is in there.
+    let stage = tempfile::Builder::new().prefix("segv-update").tempdir_in(root)?;
+    // `unpack` keeps every entry inside `stage`. The package holds one folder, `<name>.app`.
+    tar::Archive::new(flate2::read::GzDecoder::new(bytes)).unpack(stage.path())?;
+    let mut apps = std::fs::read_dir(stage.path())?
+        .map(|entry| entry.map(|e| e.path()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "app"));
+    let (Some(new), None) = (apps.next(), apps.next()) else {
+        return Err(Error::other("the package does not hold one app"));
     };
-    if bundle.extension().is_none_or(|e| e != "app") {
-        return false;
+    let new = new.join("Contents");
+    if !new.join("Info.plist").is_file() {
+        return Err(Error::other("the package's app has no Info.plist"));
     }
-    let writable = |p: &std::path::Path| {
-        std::ffi::CString::new(p.as_os_str().as_bytes())
-            .is_ok_and(|c| unsafe { libc::access(c.as_ptr(), libc::W_OK) } == 0)
-    };
-    writable(bundle) && bundle.parent().is_some_and(writable)
+    let (from, to, at) = (c_path(&new)?, c_path(&bundle.join("Contents"))?, c_path(bundle)?);
+    // SAFETY: NUL-terminated paths that outlive the call.
+    if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_SWAP) } != 0 {
+        return Err(Error::last_os_error());
+    }
+    // The bundle ends up like the new folder that the updater plugin would have put in its place: without the
+    // quarantine of a download, which a version from the browser carries, and with a new date, which tells
+    // LaunchServices to read its Info.plist again.
+    // SAFETY: NUL-terminated strings that outlive the calls; a null `times` means now.
+    unsafe {
+        libc::removexattr(at.as_ptr(), c"com.apple.quarantine".as_ptr(), 0);
+        libc::utimes(at.as_ptr(), std::ptr::null());
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt as _;
+
+    /// A package like the one Tauri makes: `<name>.app/Contents/…`, gzipped.
+    fn package(app: &str, info: &str) -> Vec<u8> {
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut tar = tar::Builder::new(gz);
+        for (path, body) in [("Contents/Info.plist", info), ("Contents/MacOS/test", "#!/bin/sh\n")] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o755);
+            tar.append_data(&mut header, format!("{app}/{path}"), body.as_bytes())
+                .unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn installed() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("Test.app");
+        std::fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+        std::fs::write(bundle.join("Contents/Info.plist"), "old").unwrap();
+        (dir, bundle)
+    }
+
+    #[test]
+    fn an_update_keeps_the_bundles_folder() {
+        let (_dir, bundle) = installed();
+        let folder = std::fs::metadata(&bundle).unwrap().ino();
+        let contents = std::fs::metadata(bundle.join("Contents")).unwrap().ino();
+
+        swap_contents(&bundle, &package("Other Name.app", "new")).unwrap();
+
+        assert_eq!(std::fs::metadata(&bundle).unwrap().ino(), folder);
+        assert_ne!(std::fs::metadata(bundle.join("Contents")).unwrap().ino(), contents);
+        assert_eq!(
+            std::fs::read_to_string(bundle.join("Contents/Info.plist")).unwrap(),
+            "new"
+        );
+        let binary = std::fs::metadata(bundle.join("Contents/MacOS/test")).unwrap();
+        assert_eq!(binary.mode() & 0o777, 0o755);
+    }
+
+    #[test]
+    fn a_package_without_one_app_changes_nothing() {
+        let (_dir, bundle) = installed();
+        let contents = std::fs::metadata(bundle.join("Contents")).unwrap().ino();
+
+        assert!(swap_contents(&bundle, &package("Test", "new")).is_err());
+        assert!(swap_contents(&bundle, b"not a package").is_err());
+
+        assert_eq!(std::fs::metadata(bundle.join("Contents")).unwrap().ino(), contents);
+        assert_eq!(
+            std::fs::read_to_string(bundle.join("Contents/Info.plist")).unwrap(),
+            "old"
+        );
+    }
 }
