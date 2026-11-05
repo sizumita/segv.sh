@@ -51,6 +51,8 @@ export interface EngineDelays {
   headsJitter: number;
   /** a BELL row is posted after a random delay of up to this much (BELL_DELAY, §11.13) */
   bellDelay: number;
+  /** an alias repeats a LEAVE after a random delay of up to this much (§2.6, §6.9) */
+  aliasLeaveDelay: number;
   /** catch-up interval while the realtime socket is down (the inbox is read at each catch-up, and on notices, §11.5) */
   catchUpInterval: number;
 }
@@ -64,6 +66,7 @@ export const DEFAULT_DELAYS: EngineDelays = {
   headsInterval: 30 * 60_000,
   headsJitter: 5 * 60_000,
   bellDelay: 60_000,
+  aliasLeaveDelay: 12 * 3600_000,
   catchUpInterval: 10_000,
 };
 

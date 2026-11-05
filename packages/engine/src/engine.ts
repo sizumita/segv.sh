@@ -3,17 +3,24 @@
 // the view the UI renders. Browser only: the UI imports it dynamically (packages/ui/src/engine-loader.ts).
 //
 // The session's conversations live in Messaging (messaging.ts); this class owns accounts, the session lifecycle,
-// the generation guards, state emission and warnings.
+// the generation guards, state emission and warnings. It runs the owner's aliases (temporary handles, §2.6) as
+// accounts of their own, each with its own self lane and Messaging, and routes view ids to the account of the copy.
 import * as P from "@segv/protocol/proto";
 import {
+  ALIAS_CREATE_FAILED,
   addPasskeyTo,
+  aliasKeys,
+  isAliasEntry,
   loginWithCode,
   loginWithPasskey,
   registerAccount,
+  registerAlias,
+  type AliasKeys,
+  type AliasRegistration,
   type Passkeys,
   type Unlocked,
 } from "./accounts";
-import { Api, isTransient, pushParams } from "./api";
+import { Api, isTransient, pushParams, type Progress } from "./api";
 import { SessionEnded, UserError, message } from "./errors";
 import {
   DEFAULT_DELAYS,
@@ -22,9 +29,11 @@ import {
   type EngineDelays,
   type EngineOptions,
   type EngineTimer,
+  type WebSocketCtor,
 } from "./options";
 import { refKeyOf } from "./conv";
 import { cursorAt, type InboxCursor } from "./inbox";
+import { RealtimeHub } from "./hub";
 import { DEFAULT_WINDOW_MS, LocalNotify, localSettingStore } from "./local-notify";
 import { Messaging, type MessagingHost } from "./messaging";
 import {
@@ -49,7 +58,9 @@ import type {
   Engine,
   EngineState,
   FileRef,
+  IdentityView,
   ImageRef,
+  PersonView,
 } from "./types";
 import { browserPasskeys } from "./webauthn";
 
@@ -67,6 +78,37 @@ const MAX_NOISE = 5;
 export const ACCOUNT_MISSING = "your account was not found in the directory of this server";
 export const ACCOUNT_KEYS_MISMATCH =
   "the public keys registered for your account do not match your passkey's keys";
+/** §2.6 "Running aliases": an alias whose directory entry does not check is not run. */
+export const ALIAS_NOT_LISTED =
+  "the directory does not list one of your temporary handles as created; it is not used on this device";
+/** §11.19 "Rules". */
+export const NICK_INVALID = "a nickname: 1–64 characters, not starting with @";
+export const NICK_OWN = "you cannot give your own handles a nickname";
+/** §2.6 "Creating" step 1: creating or bringing one back beyond MAX_LIVE_ALIASES. */
+export const TOO_MANY_ALIASES = `at most ${P.MAX_LIVE_ALIASES} temporary handles can be active; retire one first`;
+/** A device that sees more live aliases than it runs (§2.6): it runs the newest. */
+export const ALIASES_NOT_RUN = `more than ${P.MAX_LIVE_ALIASES} temporary handles are active; only ${P.MAX_LIVE_ALIASES} run on this device`;
+const STILL_RESTORING = "still restoring; try again in a moment";
+
+/** Two alias tables are the same (§2.6). */
+const sameTable = (a: readonly P.AliasEntry[], b: readonly P.AliasEntry[]): boolean =>
+  P.equalBytes(P.encodeAliasTable(a), P.encodeAliasTable(b));
+
+/** The change of an alias table that sets fields of entry i (its `rest` bits kept, §7.1); none when it has none. */
+const setEntry =
+  (i: number, x: Partial<P.AliasEntry>) =>
+  (t: P.AliasEntry[]): P.AliasEntry[] =>
+    i < t.length ? t.map((y, k) => (k === i ? { ...y, ...x } : y)) : t;
+
+/** A promise and its resolver. */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => (resolve = r));
+  return { promise, resolve };
+}
+
+/** The view id prefix of an alias's copies (§11.11 "Accounts in the view"): copy keys never start with "@". */
+const aliasPrefix = (i: number): string => `@${i}/`;
 
 interface Account {
   uid: Uint8Array;
@@ -87,11 +129,35 @@ interface Registration {
   now: number | null;
 }
 
+/** An alias that this device runs as an account of its own (§2.6 "Running aliases"). */
+interface AliasRun {
+  i: number;
+  keys: AliasKeys;
+  acc: Account;
+  self: SelfLane;
+  msg: Messaging | null;
+  status: "starting" | "ready" | "failed";
+  /** its own work queue, so that its work never waits for the owner's (or another alias's) */
+  queue: Promise<unknown>;
+  /** retired, or the session ended: its pending work ends with SessionEnded */
+  stopped: boolean;
+  /**
+   * registered on this device, its own register request answered by a 200: the cursor of its first self row comes
+   * from that response (§2.6 "Creating" step 5, §11.1)
+   */
+  registered: Registration | null;
+  /** resolves once it runs; rejects when it fails or stops first */
+  running: Promise<void>;
+  settle: { ok(): void; fail(e: Error): void };
+}
+
 const emptyState = (): EngineState => ({
   phase: "boot",
   progress: "",
   error: "",
   me: null,
+  identities: [],
+  people: [],
   conversations: [],
   head: { seq: 0, h: "" },
   connected: false,
@@ -144,7 +210,51 @@ export class SegvEngine implements Engine {
   private self: SelfLane | null = null;
   /** the session's conversations, once restored */
   private msg: Messaging | null = null;
-  queue: Promise<unknown> = Promise.resolve();
+  /** the owner's work queue */
+  private ownerQueue: Promise<unknown> = Promise.resolve();
+  /** the aliases this device runs, live or failed, by index (§2.6) */
+  private readonly aliases = new Map<number, AliasRun>();
+  /**
+   * the owner's restore has applied its self delta (§11.4 step 4), so the fold holds the alias table, and the device's
+   * checkpoints were verified: from then on the live aliases run (§2.6 "Running aliases")
+   */
+  private tableKnown = false;
+  /** resolved then, or once the session ended */
+  private selfApplied = deferred();
+  private ownerDone = false;
+  /** the alias restores, one after the other, alongside the owner's §11.4 steps 5–11 (§2.6, §11.1 step 5) */
+  private aliasChain: Promise<void> = Promise.resolve();
+  /** this device's creations, by the index whose table entry they wrote: resolved once its registration ends (§2.6) */
+  private readonly creating = new Map<number, Promise<void>>();
+  /** the alias keys derived this session, by index */
+  private readonly aliasKeyCache = new Map<number, AliasKeys>();
+  /** alias uids by index (cheap, without the keys) */
+  private readonly aliasUids = new Map<number, string>();
+  /**
+   * aliases whose creation here got the 200 to its own register request, until their run takes it, by index (§2.6
+   * "Creating" step 5: the cursor of the registration HEADS)
+   */
+  private readonly justRegistered = new Map<number, Registration>();
+  /** the owner fold's NICK and alias-table versions last acted on */
+  private nickSeen = 0;
+  private aliasSeen = 0;
+  /**
+   * the uids of the owner (-1) and of every alias of its table (its index), retired ones included, at a version of
+   * the table
+   */
+  private ownUidMap: { v: number; map: Map<string, number> } | null = null;
+  /** each own account's sigPk and kh as D lists them (§2.6 "The owner's accounts"), by index (-1: the owner) */
+  private readonly ownMemberKeys = new Map<number, { sigPk: Uint8Array; kh: Uint8Array }>();
+  /** an alias's handle and fingerprint, by `${i}:${c}` */
+  private readonly aliasShown = new Map<string, { handle: string; fingerprint: string }>();
+  /** the device is in use (§11.13 "Seen elsewhere") */
+  private readonly inUse: () => boolean;
+  /** `createAlias` calls, one at a time (each takes the next index of the table, §2.6) */
+  private aliasCreation: Promise<unknown> = Promise.resolve();
+  /** the device's realtime sockets, for every account the session runs (§10.8) */
+  private hub: RealtimeHub | null = null;
+  /** the periodic catch-up of every account, in turn (§11.6) */
+  private periodicTimer: EngineTimer | null = null;
   readonly pending = new Map<string, string>();
   fatal = false;
   /** bumped on logout, so stale async work stops */
@@ -158,7 +268,10 @@ export class SegvEngine implements Engine {
   /** tracked background work per session generation (work of an ended session no longer counts) */
   private readonly tracked = new Map<number, number>();
   /** scheduled protocol timers (retries) with their monotonic due time; periodic timers are not here */
-  private readonly protocolTimers = new Map<EngineTimer, { due: number; release: () => void }>();
+  private readonly protocolTimers = new Map<
+    EngineTimer,
+    { due: number; release: () => void; run: AliasRun | null }
+  >();
   private live = false;
   private critical: string[] = [];
   private readonly noise = new Map<string, number>();
@@ -180,6 +293,7 @@ export class SegvEngine implements Engine {
     };
     this.api = this.newApi();
     const inUse = opts.quiet?.inUse ?? pageInUse();
+    this.inUse = inUse;
     this.push = new PushClient({
       transport: {
         pushSub: (b) => this.api.pushSub(b),
@@ -193,7 +307,9 @@ export class SegvEngine implements Engine {
         return p ? pushParams(p) : null;
       },
       deltaMs: () => (this.api.cachedParams?.delta ?? 10) * 1000,
-      secrets: () => this.msg?.pushSecrets() ?? [],
+      secrets: () => this.pushSecrets(),
+      // never a set of only some accounts' copies: sent once every running account has restored (§2.6, §11.13)
+      ready: () => this.live && !this.syncingNow(),
       quiet: () => this.quietKeys()?.Q ?? null,
       onOff: () => {
         void this.dropCache();
@@ -231,7 +347,10 @@ export class SegvEngine implements Engine {
         })
       : null;
     opts.onWake?.(() => {
-      if (this.live) this.msg?.wake();
+      if (!this.live) return;
+      this.hub?.wake();
+      this.msg?.wake();
+      for (const m of this.aliasMsgs()) m.wake();
     });
     if (typeof document !== "undefined")
       document.addEventListener("visibilitychange", () => {
@@ -292,7 +411,7 @@ export class SegvEngine implements Engine {
    */
   private scheduleCache(ms: number): void {
     // Only a push's notification handler reads the cache; an app without push keeps none.
-    if (this.local || !this.live || this.preview() === "none") return;
+    if (this.local || !this.live || this.syncingNow() || this.preview() === "none") return;
     const now = this.clock.mono();
     if (now + ms >= this.cacheDue) return;
     this.cacheTimer?.cancel();
@@ -321,15 +440,14 @@ export class SegvEngine implements Engine {
         // the preview made anywhere after this read voids the write.
         const gen = await cacheGen(store);
         const p = this.preview();
-        if (p === "none" || !this.msg || !this.live) return;
+        if (p === "none" || !this.msg || !this.live || this.syncingNow()) return;
+        // every account's copies: the owner's and those of every running alias (§11.13)
+        const copies = [this.msg, ...this.aliasMsgs()].flatMap((m) =>
+          m.notifyCopies(p === "message"),
+        );
         await writeCache(
           store,
-          {
-            v: 1,
-            preview: p,
-            deltaS: this.api.cachedParams?.delta ?? 10,
-            copies: this.msg.notifyCopies(p === "message"),
-          },
+          { v: 1, preview: p, deltaS: this.api.cachedParams?.delta ?? 10, copies },
           gen,
         );
       } catch (e) {
@@ -498,15 +616,20 @@ export class SegvEngine implements Engine {
     this.scheduleCache(0);
   }
 
-  async createConversation(handles: string[], name?: string): Promise<string> {
+  /** §6.1 as the account `as` (the owner when absent, §11.11); the id is that account's view id of the copy. */
+  async createConversation(handles: string[], name?: string, as?: string): Promise<string> {
     this.requireAccount();
-    return this.action(() => this.messaging().create(handles, name));
+    return this.action(async () => {
+      const t = this.accountFor(as);
+      return t.prefix + (await t.msg.create(handles, name));
+    });
   }
 
   async sendText(convId: string, text: string, replyTo?: string): Promise<void> {
     this.requireAccount();
     try {
-      await this.messaging().sendText(convId, text, replyTo);
+      const t = this.route(convId);
+      await t.msg.sendText(t.key, text, replyTo);
     } catch (e) {
       this.patch({ error: message(e) });
     }
@@ -515,7 +638,8 @@ export class SegvEngine implements Engine {
   async sendImage(convId: string, file: File, replyTo?: string): Promise<void> {
     this.requireAccount();
     try {
-      await this.messaging().sendImage(convId, file, replyTo);
+      const t = this.route(convId);
+      await t.msg.sendImage(t.key, file, replyTo);
     } catch (e) {
       this.patch({ error: message(e) });
     }
@@ -524,7 +648,8 @@ export class SegvEngine implements Engine {
   async sendFile(convId: string, file: File, replyTo?: string): Promise<void> {
     this.requireAccount();
     try {
-      await this.messaging().sendFile(convId, file, replyTo);
+      const t = this.route(convId);
+      await t.msg.sendFile(t.key, file, replyTo);
     } catch (e) {
       this.patch({ error: message(e) });
     }
@@ -533,39 +658,199 @@ export class SegvEngine implements Engine {
   /** §11.12: one emoji reaction to a TEXT, IMAGE, FILE or REPLY message, without an echo; rejects with §11.3's errors. */
   async react(convId: string, messageKey: string, emoji: string, on: boolean): Promise<void> {
     this.requireAccount();
-    await this.action(() => this.messaging().react(convId, messageKey, emoji, on));
+    await this.action(() => {
+      const t = this.route(convId);
+      return t.msg.react(t.key, messageKey, emoji, on);
+    });
   }
 
   /** §11.18: one EDIT row with a new text for self's text message, without an echo; rejects with §11.3's errors. */
   async editText(convId: string, messageKey: string, text: string): Promise<void> {
     this.requireAccount();
-    await this.action(() => this.messaging().editText(convId, messageKey, text));
+    await this.action(() => {
+      const t = this.route(convId);
+      return t.msg.editText(t.key, messageKey, text);
+    });
   }
 
   /** §11.18 "Display": the versions of an edited message, its own text first. */
   editHistory(convId: string, messageKey: string): EditVersion[] {
-    return this.msg?.editHistory(convId, messageKey) ?? [];
+    const t = this.tryRoute(convId);
+    return t ? t.msg.editHistory(t.key, messageKey) : [];
   }
 
   /** The accept control (§11.5, §11.11): the user's acceptance of a copy whose inviter is not a contact yet. */
   async accept(convId: string): Promise<void> {
     this.requireAccount();
-    await this.action(() => this.messaging().accept(convId));
+    await this.action(() => {
+      const t = this.route(convId);
+      return t.msg.accept(t.key);
+    });
   }
 
   async addMembers(convId: string, handles: string[]): Promise<void> {
     this.requireAccount();
-    await this.action(() => this.messaging().addMembers(convId, handles));
+    await this.action(() => {
+      const t = this.route(convId);
+      return t.msg.addMembers(t.key, handles);
+    });
   }
 
   async removeMember(convId: string, uid: string): Promise<void> {
     this.requireAccount();
-    await this.action(() => this.messaging().removeMember(convId, uid));
+    await this.action(() => {
+      const t = this.route(convId);
+      return t.msg.removeMember(t.key, uid);
+    });
   }
 
   async leave(convId: string): Promise<void> {
     this.requireAccount();
-    await this.action(() => this.messaging().leave(convId));
+    await this.action(() => {
+      const t = this.route(convId);
+      return t.msg.leave(t.key);
+    });
+  }
+
+  /**
+   * §2.6 "Creating": once the owner's restore has applied its self delta, the next index of the table is written into
+   * the table, then registered without wraps (a proof of work), then run; resolves with its uid once it runs. One
+   * creation at a time.
+   */
+  createAlias(): Promise<string> {
+    const acc = this.requireAccount();
+    const gen = this.generation;
+    const run = () =>
+      this.action(async () => {
+        try {
+          return await this.createAliasNow(acc, gen);
+        } catch (e) {
+          if (e instanceof SessionEnded || e instanceof UserError) throw e;
+          console.error("segv:", e);
+          throw new UserError(ALIAS_CREATE_FAILED);
+        }
+      });
+    const p = this.aliasCreation.then(run, run);
+    this.aliasCreation = p.catch(() => {});
+    return p;
+  }
+
+  private async createAliasNow(acc: Account, gen: number): Promise<string> {
+    this.progress("making a temporary handle…");
+    await this.selfApplied.promise;
+    this.assertSession(acc, gen);
+    // step 1: the owner's self lane caught up, so that the fold holds the table as written so far
+    await this.messaging().catchUpSelf();
+    this.assertSession(acc, gen);
+    if (this.table().filter((x) => !x.retired).length >= P.MAX_LIVE_ALIASES)
+      throw new UserError(TOO_MANY_ALIASES);
+    // step 2: the table names the alias before any request, so every device of the owner knows it whether or not this
+    // creation finishes. A sibling's row that takes the slot first (a CONFLICT) moves it to the next index. This
+    // device's run of it waits for the registration (`creating`).
+    let ended!: () => void;
+    const made = new Promise<void>((r) => (ended = r));
+    let i = -1;
+    let written = false;
+    try {
+      await this.writeTable(acc, gen, (cur) => {
+        if (this.creating.get(i) === made) this.creating.delete(i);
+        i = cur.length;
+        this.creating.set(i, made);
+        return [...cur, { c: 0, retired: false }];
+      });
+      written = true;
+      // steps 3–4: registered with the table's c, a 409 settled by an exact lookup
+      const r = await this.registerAliasAt(
+        acc,
+        gen,
+        i,
+        () => this.assertSession(acc, gen),
+        (ms) => this.wait(ms),
+        (m) => this.progress(m),
+      );
+      if (!r.exists) this.justRegistered.set(i, { now: r.regNow });
+    } catch (e) {
+      // no device runs an alias that may not be registered; bringing it back runs it, which registers it
+      if (written && !(e instanceof SessionEnded))
+        await this.writeTable(acc, gen, setEntry(i, { retired: true })).catch(() => {});
+      throw e;
+    } finally {
+      if (this.creating.get(i) === made) this.creating.delete(i);
+      ended();
+    }
+    // step 5: it runs; its first self row is the registration HEADS when this device's register request got the 200
+    this.progress("making a temporary handle…");
+    this.syncAliases(gen);
+    const a = this.aliases.get(i);
+    if (!a) throw new UserError(ALIAS_CREATE_FAILED);
+    await a.running;
+    return a.acc.uidB;
+  }
+
+  /**
+   * §2.6 "Creating" steps 3–4 for alias i, whose table entry exists: registered with the table's c, and on a 409 an
+   * exact lookup; a c that changes (the next one, or a sibling's) is written into the table.
+   */
+  private registerAliasAt(
+    acc: Account,
+    gen: number,
+    i: number,
+    check: () => void,
+    wait: (ms: number) => Promise<void>,
+    progress: Progress,
+  ): Promise<AliasRegistration> {
+    return registerAlias(this.api, this.aliasKeysOf(i), this.table()[i]?.c ?? 0, progress, {
+      wait,
+      check,
+      retryBase: this.delays.retryBase,
+      setC: (c) => this.writeTable(acc, gen, setEntry(i, { c })),
+    });
+  }
+
+  /** §2.6 "Retiring": the table written with the alias's retired bit set, or clear; the device stops or starts it. */
+  async setAliasRetired(uid: string, retired: boolean): Promise<void> {
+    const acc = this.requireAccount();
+    const gen = this.generation;
+    await this.action(async () => {
+      await this.selfApplied.promise;
+      this.assertSession(acc, gen);
+      const t = this.table();
+      const i = t.findIndex((_, k) => this.aliasUidOf(k) === uid);
+      if (i < 0) throw new UserError("unknown temporary handle");
+      if (t[i].retired === retired) return;
+      if (!retired && t.filter((x) => !x.retired).length >= P.MAX_LIVE_ALIASES)
+        throw new UserError(TOO_MANY_ALIASES);
+      await this.writeTable(acc, gen, setEntry(i, { retired }));
+      this.syncAliases(gen);
+    });
+  }
+
+  /** §11.19: a NICK record of the owner's self lane, written at once ("" removes the nickname). */
+  async setNickname(uid: string, nickname: string): Promise<void> {
+    const acc = this.requireAccount();
+    const gen = this.generation;
+    await this.action(async () => {
+      let uidBytes: Uint8Array;
+      try {
+        uidBytes = P.fromB64u(uid);
+      } catch {
+        throw new UserError("unknown user");
+      }
+      if (uidBytes.length !== 16) throw new UserError("unknown user");
+      if (this.ownUids().has(uid)) throw new UserError(NICK_OWN);
+      const name = nickname === "" ? "" : nickname.trim();
+      if (nickname !== "" && !P.validNickname(name)) throw new UserError(NICK_INVALID);
+      await this.selfApplied.promise;
+      this.assertSession(acc, gen);
+      const self = this.self!;
+      if ((self.fold.nicks.get(uid) ?? "") === name) return;
+      await this.enqueue(async () => {
+        this.assertSession(acc, gen);
+        await self.write([{ rtype: P.RT.NICK, uid: uidBytes, name }]);
+      });
+      this.assertSession(acc, gen);
+      this.ownerFoldChanged();
+    });
   }
 
   /**
@@ -582,6 +867,8 @@ export class SegvEngine implements Engine {
     return this.action(() => this.messaging().openLink(url));
   }
 
+  // images and files: every account's Messaging shares the owner's caches, so the owner's loads them all
+
   loadImage(img: ImageRef): Promise<string> {
     if (!this.msg) return Promise.reject(new UserError("not signed in"));
     return this.msg.loadImage(img);
@@ -596,10 +883,12 @@ export class SegvEngine implements Engine {
     return this.msg.loadFile(file);
   }
 
-  markRead(convId: string): void {
-    this.msg?.markRead(convId);
+  markRead(convId: string, opened = true): void {
+    const t = this.tryRoute(convId);
+    if (!t) return;
+    t.msg.markRead(t.key, opened);
     // Shown: its notifications close (§11.13 "Closing and the badge").
-    if (this.local && this.msg?.copies.has(convId)) this.local.shown(this.msg.refOfKey(convId));
+    if (this.local && t.msg.copies.has(t.key)) this.local.shown(t.msg.refOfKey(t.key));
   }
 
   clearError(): void {
@@ -607,8 +896,50 @@ export class SegvEngine implements Engine {
   }
 
   private messaging(): Messaging {
-    if (!this.msg) throw new UserError("still restoring; try again in a moment");
+    if (!this.msg) throw new UserError(STILL_RESTORING);
     return this.msg;
+  }
+
+  /** The Messaging of a view id and the copy key in it: an alias's ids carry its prefix (§11.11). */
+  private route(convId: string): { msg: Messaging; key: string } {
+    const m = /^@(\d+)\/(.+)$/.exec(convId);
+    if (!m) return { msg: this.messaging(), key: convId };
+    const run = this.aliases.get(Number(m[1]));
+    if (!run || run.stopped || !run.msg) throw new UserError("unknown conversation");
+    return { msg: run.msg, key: m[2] };
+  }
+
+  private tryRoute(convId: string): { msg: Messaging; key: string } | null {
+    try {
+      return this.route(convId);
+    } catch {
+      return null;
+    }
+  }
+
+  /** The Messaging of the account `as` (a b64u uid; the owner when absent) and its view id prefix. */
+  private accountFor(as: string | undefined): { msg: Messaging; prefix: string } {
+    const acc = this.requireAccount();
+    if (as === undefined || as === "" || as === acc.uidB)
+      return { msg: this.messaging(), prefix: "" };
+    for (const run of this.aliases.values())
+      if (run.acc.uidB === as && !run.stopped) {
+        if (run.status === "failed")
+          throw new UserError("this temporary handle is not used on this device");
+        if (run.status !== "ready" || !run.msg) throw new UserError(STILL_RESTORING);
+        return { msg: run.msg, prefix: aliasPrefix(run.i) };
+      }
+    if (this.table().some((x, i) => x.retired && this.aliasUidOf(i) === as))
+      throw new UserError("this temporary handle is retired");
+    throw new UserError("unknown account");
+  }
+
+  /** The Messaging of every alias that runs (its restore done), in index order. */
+  private aliasMsgs(): Messaging[] {
+    return [...this.aliases.values()]
+      .filter((r) => !r.stopped && r.status === "ready" && r.msg)
+      .sort((a, b) => a.i - b.i)
+      .map((r) => r.msg!);
   }
 
   // ───────────── white-box hooks (the test harness's I(e)) ─────────────
@@ -633,9 +964,22 @@ export class SegvEngine implements Engine {
     return this.msg?.fileCache ?? new Map();
   }
 
-  /** the per-conversation send chains */
+  /** the per-conversation send chains of every account, by view id */
   get sendChains(): Map<string, Promise<unknown>> {
-    return this.msg?.chains ?? new Map();
+    const out = new Map(this.msg?.chains ?? []);
+    for (const run of this.aliases.values())
+      for (const [k, p] of run.msg?.chains ?? []) out.set(aliasPrefix(run.i) + k, p);
+    return out;
+  }
+
+  /** every account's work queue: the owner's and each alias's */
+  get queue(): Promise<unknown> {
+    return Promise.all([this.ownerQueue, ...[...this.aliases.values()].map((r) => r.queue)]);
+  }
+
+  /** an alias run by index (white-box: tests) */
+  aliasRun(i: number): AliasRun | undefined {
+    return this.aliases.get(i);
   }
 
   /** Busy work: in-flight actions plus scheduled protocol timers (the harness's settle waits for 0). */
@@ -660,14 +1004,89 @@ export class SegvEngine implements Engine {
     return this.api.time.sample;
   }
 
-  /** One catch-up round (§11.6): the self lane, every copy's lanes, the inbox, HEADS. */
+  /** One catch-up round (§11.6) of every account: the self lane, every copy's lanes, the inbox, HEADS. */
   async catchUp(): Promise<void> {
     if (!this.msg || !this.live || this.fatal) return;
     await this.msg.catchUp();
+    for (const m of this.aliasMsgs()) await m.catchUp().catch(() => {});
   }
 
+  /** Every account's views, most recent first; an alias's ids carry its prefix (§11.11 "Accounts in the view"). */
   views(): ConversationView[] {
-    return this.msg?.views() ?? [];
+    const out = this.msg?.views() ?? [];
+    let more = false;
+    for (const run of [...this.aliases.values()].sort((a, b) => a.i - b.i)) {
+      if (run.stopped || !run.msg) continue;
+      const prefix = aliasPrefix(run.i);
+      for (const v of run.msg.views()) out.push({ ...v, id: prefix + v.id });
+      more = true;
+    }
+    return more ? out.sort((a, b) => b.lastTs - a.lastTs) : out;
+  }
+
+  /** §11.11 "Accounts in the view": the owner, then its aliases by index, with handles computed from the table. */
+  identities(): IdentityView[] {
+    const acc = this.account;
+    if (!acc) return [];
+    const out: IdentityView[] = [
+      {
+        uid: acc.uidB,
+        handle: acc.handle,
+        fingerprint: this.state.me?.fingerprint ?? "",
+        alias: false,
+        index: -1,
+        retired: false,
+        status: this.ownerDone ? "ready" : "starting",
+      },
+    ];
+    const t = this.table();
+    const runs = this.runnable(t);
+    t.forEach((x, i) => {
+      const run = this.aliases.get(i);
+      out.push({
+        uid: this.aliasUidOf(i),
+        ...this.aliasShownOf(i, x.c),
+        alias: true,
+        index: i,
+        retired: x.retired,
+        // a live alias beyond the ones this device runs is idle here (§2.6 "Running aliases")
+        status: x.retired
+          ? "retired"
+          : run && !run.stopped
+            ? run.status
+            : runs.has(i)
+              ? "starting"
+              : "idle",
+      });
+    });
+    return out;
+  }
+
+  /**
+   * The users that the running accounts know by a MEMBER record, with the owner's nicknames and the accounts they are
+   * contacts of (§11.19); never one of the user's own accounts.
+   */
+  people(): PersonView[] {
+    const acc = this.account;
+    if (!acc || !this.self) return [];
+    const accounts = [
+      { uidB: acc.uidB, fold: this.self.fold },
+      ...[...this.aliases.values()]
+        .filter((r) => !r.stopped && r.status !== "failed")
+        .sort((a, b) => a.i - b.i)
+        .map((r) => ({ uidB: r.acc.uidB, fold: r.self.fold })),
+    ];
+    const own = this.ownUids();
+    const by = new Map<string, PersonView>();
+    for (const { fold } of accounts)
+      for (const [u, m] of fold.members)
+        if (!own.has(u) && !by.has(u))
+          by.set(u, { uid: u, handle: m.handle, nickname: this.nickOf(u), contactOf: [] });
+    for (const { uidB, fold } of accounts)
+      for (const u of fold.contacts.keys()) by.get(u)?.contactOf.push(uidB);
+    return [...by.values()].sort((a, b) =>
+      a.handle < b.handle ? -1 : a.handle > b.handle ? 1 : 0,
+    );
   }
 
   // ───────────── unlock, account check and restore (§11.1, §11.4) ─────────────
@@ -688,11 +1107,21 @@ export class SegvEngine implements Engine {
     const uidB = P.b64u(uid);
     this.resetData();
     this.account = { uid, uidB, AK, id, handle, regEra: null, inbox: [] };
+    const WS =
+      this.opts.WebSocket ??
+      (typeof WebSocket === "undefined" ? null : (WebSocket as unknown as WebSocketCtor));
+    this.hub = new RealtimeHub(WS, {
+      clock: this.clock,
+      origin: this.api.origin,
+      onHello: (s, sent, recv) => this.api.time.add(s, sent, recv),
+      onState: (on) => this.patch({ connected: on }),
+    });
     this.self = new SelfLane(this.api, id, {
       warn: (t, critical) => this.warn(t, critical),
       applied: () => {
         this.version++;
         this.scheduleEmit();
+        this.ownerFoldChanged(); // a NICK record or the alias table, of this device or a sibling (§7.3, §11.7)
       },
     });
     this.patch({
@@ -715,20 +1144,7 @@ export class SegvEngine implements Engine {
       if (this.fatal) return;
       self.floorEra = acc.regEra!;
       // §11.4 steps 2–4: the latest snapshot, then the self delta from its position (or the lane from regEra).
-      await this.enqueue(async () => {
-        if (!self.snapshotRead) {
-          const snap = await readSnapshot(this.api, acc.id, acc.regEra!);
-          self.snapshotRead = true;
-          if (snap) {
-            self.fold.applySnapshot(snap.records, snap.ts);
-            self.snapshot = { E: snap.E, applied: self.fold.applied, pos: snap.pos };
-          }
-        }
-        const pos = self.snapshot?.pos;
-        await self.catchUp(
-          pos && !P.isNone(pos) ? { E: pos.E, n: pos.n } : { E: acc.regEra!, n: 0 },
-        );
-      });
+      await this.enqueue(() => this.readSelf(self, acc));
       this.assertSession(acc, gen);
       if (registered && !self.fold.cursor) {
         cursor ??= cursorAt(
@@ -742,22 +1158,107 @@ export class SegvEngine implements Engine {
         );
       }
       const msg = (this.msg ??= new Messaging(this.host(acc, gen)));
+      // §11.1 step 3 for every account of the device, before any restore: the aliases share the checkpoints (§2.6); a
+      // failure is retried at catch-up
+      await msg.ckpt.verify().catch(() => {});
+      this.assertSession(acc, gen);
+      if (!this.tableKnown) {
+        // The self delta is applied (§11.4 step 4), so the fold holds the alias table: the live aliases restore from
+        // now on, one after another, alongside the owner's steps 5–11 (§2.6 "Running aliases", §11.1 step 5).
+        this.tableKnown = true;
+        this.selfApplied.resolve();
+        this.syncAliases(gen);
+      }
       await this.enqueue(() => msg.restore()); // serialised with the work it starts (new copies, member lookups)
     });
     if (!ok || gen !== this.generation || this.fatal) return;
     if (this.state.error.startsWith("sync failed:")) this.patch({ error: "" });
     this.live = true;
+    this.ownerDone = true;
     this.msg!.start();
+    this.refreshHub();
+    this.startPeriodic(gen);
+    this.patch(this.notificationPatch());
+    this.updateSyncing();
+  }
+
+  /** `syncing` (§11.11): until the owner and every live alias that runs here have restored or failed. */
+  /**
+   * `syncing` follows the restores; once the owner and every alias that runs have restored (or failed), the
+   * registration set is sent and the notification cache written, with every account's copies (§2.6, §11.13).
+   */
+  private updateSyncing(): void {
+    const syncing = this.syncingNow();
+    if (syncing === this.state.syncing) return;
+    this.patch({ syncing });
+    if (syncing || !this.live) return;
     this.push.restored();
-    this.patch({ syncing: false, ...this.notificationPatch() });
     this.scheduleCache(0);
   }
 
-  /** What the session's Messaging calls back into. */
-  private host(acc: Account, gen: number): MessagingHost {
+  private syncingNow(): boolean {
+    if (!this.ownerDone) return true;
+    for (const r of this.aliases.values()) if (!r.stopped && r.status === "starting") return true;
+    return false;
+  }
+
+  /** The device's sockets serve the accounts that run: the owner, then its aliases by index (§10.8). */
+  private refreshHub(): void {
+    if (!this.hub || !this.msg || !this.live) return;
+    this.hub.setAccounts([this.msg, ...this.aliasMsgs()]);
+  }
+
+  /**
+   * The periodic catch-up (§11.6): one timer at the short interval for the device, which gives every account that runs
+   * its tick in turn (each catches up every 300 s while realtime is connected, else at each tick).
+   */
+  private startPeriodic(gen: number): void {
+    const tick = () => {
+      this.periodicTimer = null;
+      if (gen !== this.generation || this.fatal) return;
+      void (async () => {
+        for (const m of [this.msg, ...this.aliasMsgs()])
+          if (m && gen === this.generation) await m.periodic().catch(() => {});
+      })().finally(() => {
+        if (gen === this.generation && !this.fatal && !this.periodicTimer)
+          this.periodicTimer = this.clock.setTimer(tick, this.delays.catchUpInterval);
+      });
+    };
+    this.periodicTimer?.cancel();
+    this.periodicTimer = this.clock.setTimer(tick, this.delays.catchUpInterval);
+  }
+
+  /**
+   * §11.4 steps 2–4 for one account's self lane: the latest snapshot, then the self delta from its position (or the
+   * lane from regEra). Runs in the account's queue.
+   */
+  private async readSelf(self: SelfLane, acc: Account): Promise<void> {
+    if (!self.snapshotRead) {
+      const snap = await readSnapshot(this.api, acc.id, acc.regEra!);
+      self.snapshotRead = true;
+      if (snap) {
+        self.fold.applySnapshot(snap.records, snap.ts);
+        self.snapshot = { E: snap.E, applied: self.fold.applied, pos: snap.pos };
+      }
+    }
+    const pos = self.snapshot?.pos;
+    await self.catchUp(pos && !P.isNone(pos) ? { E: pos.E, n: pos.n } : { E: acc.regEra!, n: 0 });
+  }
+
+  /** What the Messaging of an account calls back into: the owner's (`run` null) or an alias's. */
+  private host(acc: Account, gen: number, run: AliasRun | null = null): MessagingHost {
+    const owner = this.msg;
+    const base = this.clock;
     return {
       api: this.api,
-      clock: this.clock,
+      // An alias's rows and descriptors carry the server time as their ts, never this device's clock (§2.6, §3.3).
+      clock: run
+        ? {
+            mono: () => base.mono(),
+            wall: () => this.api.serverNow(),
+            setTimer: (fn, ms) => base.setTimer(fn, ms),
+          }
+        : base,
       delays: this.delays,
       opts: this.opts,
       acc: {
@@ -772,8 +1273,8 @@ export class SegvEngine implements Engine {
         refKey: refKeyOf(acc.AK),
         bellKey: P.bellKey(acc.AK),
       },
-      self: this.self!,
-      check: () => this.assertSession(acc, gen),
+      self: run ? run.self : this.self!,
+      check: () => (run ? this.assertAlias(run, gen) : this.assertSession(acc, gen)),
       warn: (t, c) => this.warn(t, c),
       changed: () => {
         this.version++;
@@ -787,11 +1288,13 @@ export class SegvEngine implements Engine {
       emitNow: () => this.emitNow(),
       progress: (t) => this.progress(t),
       error: (t) => this.patch({ error: t }),
-      wait: (ms) => this.wait(ms),
-      enqueue: (fn) => this.enqueue(fn),
+      wait: (ms) => this.wait(ms, run),
+      enqueue: (fn) => (run ? this.enqueueRun(run, fn) : this.enqueue(fn)),
       track: (p) => this.track(p),
-      setConnected: (on) => this.patch({ connected: on }),
-      setHead: (q, C) => this.patch({ head: { seq: q, h: P.b64u(C) } }),
+      // `head` follows the checkpoints, the owner's (shared with its aliases)
+      setHead: (q, C) => {
+        if (!run) this.patch({ head: { seq: q, h: P.b64u(C) } });
+      },
       ring: (E, label, bells) => {
         if (gen === this.generation) this.push.ring(E, label, bells);
       },
@@ -803,6 +1306,14 @@ export class SegvEngine implements Engine {
             if (this.live && gen === this.generation) this.local?.arrived(a);
           }
         : undefined,
+      nick: (uidB) => this.nickOf(uidB),
+      ownAccounts: () => this.ownAccounts(),
+      shared: run && owner ? owner : undefined,
+      alias: run !== null,
+      isOwn: (m) => this.isOwnMember(m),
+      subscribe: () => this.hub?.subscribe(),
+      connected: () => this.hub?.connected ?? false,
+      inUse: () => this.inUse(),
     };
   }
 
@@ -839,45 +1350,443 @@ export class SegvEngine implements Engine {
 
   /**
    * Runs `fn` until it succeeds, retrying failures with back-off on protocol timers (so the session's `busy` count
-   * covers the wait). Resolves false when the session ended or went fatal.
+   * covers the wait). Resolves false when the session ended or went fatal, or the alias `run` stopped.
    */
-  private async retrying(gen: number, fn: () => Promise<void>): Promise<boolean> {
+  private async retrying(
+    gen: number,
+    fn: () => Promise<void>,
+    run: AliasRun | null = null,
+  ): Promise<boolean> {
+    const over = () => gen !== this.generation || this.fatal || !!run?.stopped;
     for (let attempt = 0; ; attempt++) {
-      if (gen !== this.generation || this.fatal) return false;
+      if (over()) return false;
       try {
         await fn();
-        return gen === this.generation && !this.fatal;
+        return !over();
       } catch (e) {
-        if (e instanceof SessionEnded || gen !== this.generation || this.fatal) return false;
+        if (e instanceof SessionEnded || over()) return false;
         if (!isTransient(e)) console.error("segv:", e);
         this.patch({ error: `sync failed: ${message(e)} (retrying)` });
-        await this.wait(Math.min(this.delays.retryMax, this.delays.retryBase * 2 ** attempt));
+        await this.wait(Math.min(this.delays.retryMax, this.delays.retryBase * 2 ** attempt), run);
       }
     }
   }
 
   /**
-   * Waits `ms` on a protocol timer (counted in `busy`). It resolves early when the session ends or goes fatal
-   * (`stopTimers`); the caller then sees the new generation or `fatal` and stops.
+   * Waits `ms` on a protocol timer (counted in `busy`). It resolves early when the session ends or goes fatal, or the
+   * alias `run` stops (`stopTimers`); the caller then sees the new generation, `fatal` or the stop, and stops.
    */
-  private wait(ms: number): Promise<void> {
+  private wait(ms: number, run: AliasRun | null = null): Promise<void> {
+    if (run?.stopped) return Promise.resolve();
     this.waiting++;
     return new Promise<void>((resolve) => {
       const t = this.clock.setTimer(() => {
         this.protocolTimers.delete(t);
         resolve();
       }, ms);
-      this.protocolTimers.set(t, { due: this.clock.mono() + ms, release: resolve });
+      this.protocolTimers.set(t, { due: this.clock.mono() + ms, release: resolve, run });
     }).finally(() => this.waiting--);
   }
 
-  private stopTimers(): void {
-    const timers = [...this.protocolTimers];
-    this.protocolTimers.clear();
+  /** Releases the protocol timers: every one, or those of one alias. */
+  private stopTimers(run?: AliasRun): void {
+    const timers = [...this.protocolTimers].filter(([, x]) => run === undefined || x.run === run);
     for (const [t, { release }] of timers) {
+      this.protocolTimers.delete(t);
       t.cancel();
       release();
     }
+  }
+
+  // ───────────── aliases (§2.6) ─────────────
+
+  /** The owner's alias table (PREFS key 1): one entry per index 0..n−1 (§2.6, §7.2). */
+  private table(): P.AliasEntry[] {
+    return this.self?.fold.aliasTable() ?? [];
+  }
+
+  /** The indices this device runs: the live ones, at most the newest MAX_LIVE_ALIASES (§2.6). */
+  private runnable(t: readonly P.AliasEntry[] = this.table()): Set<number> {
+    const live = t.flatMap((x, i) => (x.retired ? [] : [i]));
+    return new Set(live.slice(-P.MAX_LIVE_ALIASES));
+  }
+
+  /** The uid of alias i (b64u), from AK. */
+  private aliasUidOf(i: number): string {
+    let u = this.aliasUids.get(i);
+    if (u === undefined) {
+      u = this.aliasKeyCache.get(i)?.uidB ?? P.b64u(P.aliasUid(P.aliasKey(this.account!.AK, i)));
+      this.aliasUids.set(i, u);
+    }
+    return u;
+  }
+
+  /** Every key of alias i (§2.6 "Keys"). */
+  private aliasKeysOf(i: number): AliasKeys {
+    let k = this.aliasKeyCache.get(i);
+    if (!k) this.aliasKeyCache.set(i, (k = aliasKeys(this.account!.AK, i)));
+    return k;
+  }
+
+  /**
+   * The uids of the user's own accounts: the owner (-1) and every alias of the table (its index), retired ones
+   * included (§2.6).
+   */
+  private ownUids(): Map<string, number> {
+    const acc = this.account;
+    if (!acc) return new Map();
+    const v = this.self?.fold.aliasVersion ?? 0;
+    if (this.ownUidMap?.v !== v) {
+      const map = new Map<string, number>([[acc.uidB, -1]]);
+      this.table().forEach((_, i) => map.set(this.aliasUidOf(i), i));
+      this.ownUidMap = { v, map };
+    }
+    return this.ownUidMap.map;
+  }
+
+  /**
+   * A member of a descriptor is one of the user's own accounts: D lists that account's uid with its own derived sigPk
+   * and kh (§2.6 "The owner's accounts"). Any other slot with such a uid is an unknown member, rung, counted and
+   * notified like any other, so a committer learns nothing from a forged slot.
+   */
+  private isOwnMember(m: P.Member): boolean {
+    const i = this.ownUids().get(P.b64u(m.uid));
+    if (i === undefined) return false;
+    let k = this.ownMemberKeys.get(i);
+    if (!k) {
+      const id = i < 0 ? this.account!.id : this.aliasKeysOf(i).id;
+      this.ownMemberKeys.set(i, (k = { sigPk: id.sigPk, kh: P.kemHash(id.kemPk) }));
+    }
+    return P.equalBytes(m.sigPk, k.sigPk) && P.equalBytes(m.kh, k.kh);
+  }
+
+  /** The handle and fingerprint of alias i with handle counter c (§2.6), computed once. */
+  private aliasShownOf(i: number, c: number): { handle: string; fingerprint: string } {
+    let x = this.aliasShown.get(`${i}:${c}`);
+    if (!x) {
+      const k = this.aliasKeysOf(i);
+      x = {
+        handle: P.aliasHandle(k.uid, k.id.sigPk, k.id.kemPk, c),
+        fingerprint: P.fingerprint(k.uid, k.id.sigPk, k.id.kemPk),
+      };
+      this.aliasShown.set(`${i}:${c}`, x);
+    }
+    return x;
+  }
+
+  /**
+   * The user's accounts that a conversation of another never gets (§2.6): the owner and every alias of the table,
+   * retired ones included, each with its handle (an alias's computed from the table).
+   */
+  private ownAccounts(): { uidB: string; handle: string }[] {
+    const acc = this.account;
+    if (!acc) return [];
+    return [
+      { uidB: acc.uidB, handle: acc.handle },
+      ...this.table().map((x, i) => ({
+        uidB: this.aliasUidOf(i),
+        handle: this.aliasShownOf(i, x.c).handle,
+      })),
+    ];
+  }
+
+  /** The owner's nickname for a user (§11.19): shown only while it is a valid name, never for an own account. */
+  private nickOf(uidB: string): string {
+    const name = this.self?.fold.nicks.get(uidB);
+    return name && P.validNickname(name) && !this.ownUids().has(uidB) ? name : "";
+  }
+
+  /**
+   * The owner's fold changed: new nicknames are shown everywhere at once (§11.19), and the device starts or stops the
+   * aliases whose table entries changed (§2.6 "Running aliases").
+   */
+  private ownerFoldChanged(): void {
+    const f = this.self?.fold;
+    if (!f) return;
+    if (f.aliasVersion !== this.aliasSeen) {
+      this.aliasSeen = f.aliasVersion;
+      const gen = this.generation;
+      if (this.tableKnown) queueMicrotask(() => this.syncAliases(gen));
+      this.scheduleEmit(true);
+    }
+    if (f.nickVersion !== this.nickSeen) {
+      this.nickSeen = f.nickVersion;
+      this.msg?.nicknamesChanged();
+      for (const run of this.aliases.values()) if (!run.stopped) run.msg?.nicknamesChanged();
+      this.scheduleCache(0);
+      this.scheduleEmit(true);
+    }
+  }
+
+  /** Runs every live alias of the table (the newest MAX_LIVE_ALIASES) and stops every other one (§2.6). */
+  private syncAliases(gen: number): void {
+    if (!this.tableKnown || gen !== this.generation || this.fatal || !this.self) return;
+    const t = this.table();
+    const runs = this.runnable(t);
+    if (t.filter((x) => !x.retired).length > runs.size) this.warn(ALIASES_NOT_RUN);
+    for (const run of this.aliases.values()) if (!runs.has(run.i)) this.stopAlias(run);
+    for (const i of runs) if (!this.aliases.has(i)) this.startAlias(i, gen);
+  }
+
+  private startAlias(i: number, gen: number): void {
+    const keys = this.aliasKeysOf(i);
+    const acc: Account = {
+      uid: keys.uid,
+      uidB: keys.uidB,
+      AK: keys.AK,
+      id: keys.id,
+      handle: "",
+      regEra: null,
+      inbox: [],
+    };
+    let settle!: AliasRun["settle"];
+    const running = new Promise<void>((ok, fail) => (settle = { ok, fail }));
+    running.catch(() => {});
+    const self = new SelfLane(
+      this.api,
+      keys.id,
+      {
+        warn: (t, critical) => this.warn(t, critical),
+        applied: () => {
+          this.version++;
+          this.scheduleEmit();
+        },
+      },
+      false,
+    );
+    const run: AliasRun = {
+      i,
+      keys,
+      acc,
+      self,
+      msg: null,
+      status: "starting",
+      queue: Promise.resolve(),
+      stopped: false,
+      registered: null,
+      running,
+      settle,
+    };
+    this.aliases.set(i, run);
+    // one alias at a time, alongside the owner's §11.4 steps 5–11 (§2.6 "Running aliases", §11.1 step 5)
+    const next = this.aliasChain.then(() => this.runAlias(run, gen));
+    this.aliasChain = next.catch(() => {});
+    void this.track(next).catch(() => {});
+    this.updateSyncing();
+  }
+
+  /**
+   * §11.1 step 5 for one alias: its account check (`checkAlias`; a failure is not fatal, §2.6), its restore from its
+   * own self lane (with the registration HEADS when its register request got the 200 here), then its realtime and
+   * catch-up.
+   */
+  private async runAlias(run: AliasRun, gen: number): Promise<void> {
+    const { acc, self } = run;
+    // This device's creation of it registers it first (§2.6 "Creating"); a failed one retires it, which stops it.
+    const making = this.creating.get(run.i);
+    if (making) {
+      await making;
+      this.syncAliases(gen);
+    }
+    let cursor: InboxCursor | null = null;
+    const ok = await this.retrying(
+      gen,
+      async () => {
+        this.assertAlias(run, gen);
+        const mine = this.justRegistered.get(run.i);
+        if (mine) {
+          run.registered ??= mine;
+          this.justRegistered.delete(run.i);
+        }
+        const p = await this.api.params();
+        if (acc.regEra === null && !(await this.checkAlias(run, gen))) return;
+        self.floorEra = acc.regEra!;
+        await this.enqueueRun(run, () => this.readSelf(self, acc));
+        this.assertAlias(run, gen);
+        if (run.registered && !self.fold.cursor) {
+          cursor ??= cursorAt(
+            run.registered.now ?? P.eraStart(acc.regEra!),
+            p,
+            P.era(this.api.serverNow()),
+          );
+          const c = cursor;
+          await this.enqueueRun(run, () =>
+            self.write([{ rtype: P.RT.HEADS, Ein: c.E, relIn: c.rel, entries: [] }]),
+          );
+        }
+        const msg = (run.msg ??= new Messaging(this.host(acc, gen, run)));
+        await this.enqueueRun(run, () => msg.restore());
+      },
+      run,
+    );
+    if (run.status === "failed") {
+      run.settle.fail(new UserError(ALIAS_CREATE_FAILED));
+      this.updateSyncing();
+      return;
+    }
+    if (!ok || run.stopped || !run.msg) {
+      run.settle.fail(new SessionEnded());
+      return;
+    }
+    if (this.state.error.startsWith("sync failed:")) this.patch({ error: "" });
+    run.status = "ready";
+    run.msg.start();
+    this.refreshHub();
+    run.settle.ok();
+    if (this.live) {
+      this.push.changed();
+      this.scheduleCache(CACHE_DEBOUNCE_MS);
+    }
+    this.updateSyncing();
+  }
+
+  /**
+   * §11.1 step 2 for an alias (§2.6 "Running aliases"): an exact lookup of its uid. A 404 means that a creation stopped
+   * after writing the table, so this device registers it ("Creating" steps 3–4). A bundle with its derived keys and the
+   * handle of another c′ ≤ 3 than the table's gets c′ written into the table. Any other entry, or a registration that
+   * fails, and the device does not run it: status "failed" with the critical warning, and false. Transient failures
+   * throw (the restore retries them).
+   */
+  private async checkAlias(run: AliasRun, gen: number): Promise<boolean> {
+    const { acc, keys } = run;
+    const owner = this.account!;
+    const check = () => this.assertAlias(run, gen);
+    let u = await this.api.userByUid(acc.uid);
+    check();
+    if (!u) {
+      let r: AliasRegistration;
+      try {
+        r = await this.registerAliasAt(
+          owner,
+          gen,
+          run.i,
+          check,
+          (ms) => this.wait(ms, run),
+          () => {},
+        );
+      } catch (e) {
+        if (e instanceof UserError) return this.aliasFailed(run);
+        throw e;
+      }
+      // its first self row is the registration HEADS only when this device's own register request got the 200
+      if (!r.exists) run.registered ??= { now: r.regNow };
+      u = r.user ?? (await this.api.userByUid(acc.uid));
+      check();
+    }
+    const x = this.table()[run.i];
+    const c =
+      x && u && isAliasEntry(u, keys)
+        ? P.aliasHandleTry(u.handle, keys.uid, keys.id.sigPk, keys.id.kemPk)
+        : -1;
+    if (!x || !u || c < 0) return this.aliasFailed(run);
+    // a creation that stopped between registering with c′ and writing it
+    if (c !== x.c) await this.writeTable(owner, gen, setEntry(run.i, { c }));
+    check();
+    acc.handle = u.handle;
+    acc.regEra = u.regEra;
+    acc.inbox = u.inbox;
+    return true;
+  }
+
+  /** §2.6: an alias whose directory entry does not check, or that cannot be registered, is not run here. */
+  private aliasFailed(run: AliasRun): false {
+    run.status = "failed";
+    this.warn(ALIAS_NOT_LISTED, true);
+    return false;
+  }
+
+  /**
+   * Stops an alias (retired, beyond the ones that run, or the session ends) as a sign-out stops an account: nothing of
+   * it runs, its pending deliveries wait, its views go; the registration set and the cache are sent again (§2.6).
+   */
+  private stopAlias(run: AliasRun): void {
+    if (run.stopped) return;
+    run.stopped = true;
+    run.msg?.stop();
+    if (this.aliases.get(run.i) === run) this.aliases.delete(run.i);
+    if (run.msg) this.dropBlobs(run.msg);
+    this.stopTimers(run);
+    run.settle.fail(new SessionEnded());
+    this.refreshHub();
+    if (this.live) {
+      this.push.changed();
+      this.scheduleCache(CACHE_DEBOUNCE_MS);
+    }
+    this.updateSyncing();
+  }
+
+  /** Throws once the alias run stopped or the session changed. */
+  private assertAlias(run: AliasRun, gen: number): void {
+    if (this.generation !== gen || run.stopped || this.aliases.get(run.i) !== run)
+      throw new SessionEnded();
+  }
+
+  /** Serialises an alias's state-changing work in its own queue. */
+  private enqueueRun<T>(run: AliasRun, fn: () => Promise<T>): Promise<T> {
+    const p = run.queue.then(fn);
+    run.queue = p.catch(() => {});
+    return p;
+  }
+
+  /**
+   * §2.6 "Retiring": the device revokes the image and file URLs of a stopped alias. The caches are the device's, shared
+   * by its accounts, so a blob that the copies of the owner or of another running alias also show stays.
+   */
+  private dropBlobs(gone: Messaging): void {
+    const keys = gone.blobKeys();
+    if (keys.size === 0) return;
+    const others = [
+      this.msg,
+      ...[...this.aliases.values()].filter((r) => !r.stopped).map((r) => r.msg),
+    ];
+    for (const m of others) if (m && m !== gone) for (const k of m.blobKeys()) keys.delete(k);
+    for (const k of keys) {
+      gone.images.drop(k);
+      const f = gone.fileCache.get(k);
+      if (!f) continue;
+      gone.fileCache.delete(k);
+      f.then((x) => URL.revokeObjectURL(x.url)).catch(() => {});
+    }
+  }
+
+  /**
+   * Writes the alias table that `change` makes of the fold's (§2.6, §7.3): at once, in the owner's queue. On a CONFLICT
+   * the table is built again from the fold, with the occupant applied, and changed again, so a sibling's concurrent
+   * change is kept. Nothing is written when the change changes nothing.
+   */
+  private async writeTable(
+    acc: Account,
+    gen: number,
+    change: (t: P.AliasEntry[]) => P.AliasEntry[],
+  ): Promise<void> {
+    const self = this.self!;
+    const records = (): P.SelfRecord[] => {
+      const cur = self.fold.aliasTable();
+      const next = change(cur);
+      return sameTable(cur, next)
+        ? []
+        : [{ rtype: P.RT.PREFS, key: P.PREFS_ALIASES, value: P.encodeAliasTable(next) }];
+    };
+    await this.enqueue(async () => {
+      this.assertSession(acc, gen);
+      const first = records();
+      if (first.length) await self.write(first, async () => records());
+    });
+    this.assertSession(acc, gen);
+    this.ownerFoldChanged();
+  }
+
+  /** The registration set's secrets of every running account, ranked together by `lastTs` (§11.13). */
+  private pushSecrets(): Uint8Array[] {
+    const all = this.msg?.pushEntries() ?? [];
+    for (const m of this.aliasMsgs()) all.push(...m.pushEntries());
+    return all.sort((a, b) => b.lastTs - a.lastTs).map((x) => x.secret);
+  }
+
+  /** The badge (§11.13): the copies of every running account that count as unread. */
+  private unreadCount(): number {
+    if (!this.msg) return 0;
+    return [this.msg, ...this.aliasMsgs()].reduce((n, m) => n + m.unreadCount(), 0);
   }
 
   /** "Remember this device" is a convenience: failing to store the session must not fail the sign-in. */
@@ -894,13 +1803,39 @@ export class SegvEngine implements Engine {
   }
 
   private resetData(): void {
+    for (const run of this.aliases.values()) {
+      run.stopped = true;
+      run.msg?.stop();
+      run.settle.fail(new SessionEnded());
+    }
+    this.aliases.clear();
+    this.tableKnown = false;
+    // waiters see the session end (their check throws)
+    this.selfApplied.resolve();
+    this.selfApplied = deferred();
+    this.ownerDone = false;
+    this.aliasChain = Promise.resolve();
+    this.creating.clear();
+    this.hub?.stop();
+    this.hub = null;
+    this.periodicTimer?.cancel();
+    this.periodicTimer = null;
+    this.aliasKeyCache.clear();
+    this.aliasUids.clear();
+    this.justRegistered.clear();
+    this.nickSeen = 0;
+    this.aliasSeen = 0;
+    this.ownUidMap = null;
+    this.ownMemberKeys.clear();
+    this.aliasShown.clear();
+    this.aliasCreation = Promise.resolve();
     this.msg?.stop();
     this.msg = null;
     this.pending.clear();
     this.critical = [];
     this.noise.clear();
     this.live = false;
-    this.queue = Promise.resolve();
+    this.ownerQueue = Promise.resolve();
   }
 
   /** Throws if the user signed out (or another account signed in) since `acc` was captured. */
@@ -913,10 +1848,10 @@ export class SegvEngine implements Engine {
     return this.account;
   }
 
-  /** Serialises state-changing work. */
+  /** Serialises the owner's state-changing work. */
   private enqueue<T>(fn: () => Promise<T>): Promise<T> {
-    const p = this.queue.then(fn);
-    this.queue = p.catch(() => {});
+    const p = this.ownerQueue.then(fn);
+    this.ownerQueue = p.catch(() => {});
     return p;
   }
 
@@ -974,6 +1909,10 @@ export class SegvEngine implements Engine {
   /** Ends the session's work: the account check failed (§11.1, §12.7). */
   private die(text: string): void {
     this.fatal = true;
+    for (const run of this.aliases.values()) this.stopAlias(run);
+    this.selfApplied.resolve();
+    this.periodicTimer?.cancel();
+    this.periodicTimer = null;
     this.stopTimers();
     this.patch({ phase: "fatal", error: text, syncing: false, connected: false });
   }
@@ -998,8 +1937,14 @@ export class SegvEngine implements Engine {
   private emitNow(): void {
     if (this.emitTimer) clearTimeout(this.emitTimer);
     this.emitTimer = null;
-    if (this.account) this.state = { ...this.state, conversations: this.views() };
-    if (this.local) this.local.badge(this.account && this.msg ? this.msg.unreadCount() : 0);
+    if (this.account)
+      this.state = {
+        ...this.state,
+        conversations: this.views(),
+        identities: this.identities(),
+        people: this.people(),
+      };
+    if (this.local) this.local.badge(this.account ? this.unreadCount() : 0);
     for (const fn of this.listeners) {
       try {
         fn(this.state);

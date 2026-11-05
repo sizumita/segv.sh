@@ -38,8 +38,12 @@ export interface MembershipHost {
   live(): boolean;
   warn(text: string, critical?: boolean): void;
   changed(): void;
-  /** the displayed handle of member j of an epoch */
+  /** the displayed handle of member j of an epoch (warnings name members by it, §11.19) */
   handleOf(c: Copy, ep: Epoch, j: number): string;
+  /** member j as the system lines name it: its nickname, else `@handle` (§11.9, §11.19); never "you" */
+  nameOf(c: Copy, ep: Epoch, j: number): string;
+  /** member j is another of the user's accounts (§2.6): what it commits counts as unread no more than self's */
+  otherOwn(ep: Epoch, j: number): boolean;
   /** walks these lanes to their heads now (a sweep, §11.2) */
   sweep(targets: LaneTarget[]): Promise<void>;
   /** the copy now follows epoch `ep`: its topic, the subscriptions, HEADS (§6.6 step 4) */
@@ -68,8 +72,9 @@ export interface MembershipHost {
   leftAt(c: Copy, k: number): boolean;
 }
 
+/** who(u) of §11.9: "you" for self, else u's nickname or `@handle`. */
 const who = (h: MembershipHost, c: Copy, ep: Epoch, j: number): string =>
-  P.equalBytes(ep.D.members[j].uid, h.selfUid) ? "you" : "@" + h.handleOf(c, ep, j);
+  P.equalBytes(ep.D.members[j].uid, h.selfUid) ? "you" : h.nameOf(c, ep, j);
 
 // ───────────────────────── lines ─────────────────────────
 
@@ -154,7 +159,7 @@ export function deriveLines(h: MembershipHost, c: Copy): void {
       if (!h.leftAt(c, ep.e))
         want.set(`sys:${ep.e}:rmyou`, {
           order: claimOrder(h, ep, w, 0),
-          render: () => `@${h.handleOf(c, ep, w.from)} removed you`,
+          render: () => `${h.nameOf(c, ep, w.from)} removed you`,
         });
       continue;
     }
@@ -287,7 +292,7 @@ export async function processWinner(
   ep.endedAt = null;
   h.claimConfirms(c, ep, w);
   const i = ep.myIndex;
-  const byOthers = w.from !== i;
+  const byOthers = w.from !== i && !h.otherOwn(ep, w.from);
   if (i < 0) return;
   if (P.rmHas(claim.rm, i)) {
     // Removed, or dropped after a leave: the lanes are swept once more (WELCOMEs, §6.9), then the copy has ended

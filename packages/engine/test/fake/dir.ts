@@ -11,6 +11,7 @@
 import {
   MAX_ID_LEN,
   ZERO32,
+  aliasHandleTry,
   b64u,
   bundleSigMsg,
   checkUserKeys,
@@ -22,6 +23,10 @@ import {
   era,
   fromB64u,
   hpre,
+  isAliasHandle,
+  makeBundle,
+  deriveIdentity,
+  random,
   parseBundle,
   parseWrap,
   prefixRange,
@@ -129,14 +134,22 @@ export class FakeDirectory {
 
   // ───────────── writes ─────────────
 
-  /** POST /api/v2/register: `{bundle, sig, wraps: [{record, sig}, …1..4]}`. */
+  /**
+   * POST /api/v2/register: `{bundle, sig, wraps: [{record, sig}, …0..4]}`. An alias (§2.6) registers with no wraps and
+   * the alias handle of its own uid and keys; every other account with 1..4 wraps and a handle without a leading `_`.
+   */
   register(body: unknown): Res {
     const o = exactKeys(body, ["bundle", "sig", "wraps"], "register");
     if (typeof o === "string") return err(400, o);
     const u = this.checkBundle(o.bundle, o.sig);
     if (typeof u === "string") return err(400, u);
-    if (!Array.isArray(o.wraps) || o.wraps.length < 1 || o.wraps.length > 4)
-      return err(400, "wraps: expected 1..4 records");
+    if (!Array.isArray(o.wraps) || o.wraps.length > 4)
+      return err(400, "wraps: expected 0..4 records");
+    if (isAliasHandle(u.handle)) {
+      if (o.wraps.length !== 0) return err(400, "an alias registers without wraps");
+      if (aliasHandleTry(u.handle, fromB64u(u.uid), u.sigPk, u.kemPk) < 0)
+        return err(400, "invalid handle (not the alias handle of these keys)");
+    } else if (o.wraps.length < 1) return err(400, "wraps: expected 1..4 records");
     const recs: WrapRecord[] = [];
     for (const [i, x] of (o.wraps as unknown[]).entries()) {
       const r = this.checkRecord(x, `wraps[${i}]`);
@@ -190,6 +203,7 @@ export class FakeDirectory {
     if (typeof r === "string") return err(400, r);
     const owner = this.users.get(r.uid);
     if (!owner) return err(404, "unknown uid");
+    if (isAliasHandle(owner.handle)) return err(400, "an alias has no wraps");
     const ownerKey = parseBundle(owner.bundle, owner.sig).sigPk;
     if (!verify(fromB64u(r.sig), wrapSigMsg(r.record), ownerKey))
       return err(400, "bad wrap signature");
@@ -245,6 +259,33 @@ export class FakeDirectory {
       entries: this.log.filter((e) => e.seq > after).slice(0, limit),
       head: { seq: this.log.length, h: b64u(this.headH) },
     };
+  }
+
+  /**
+   * Registers another account under `handle` as it is, without the handle rules (a handle that an alias's
+   * `aliasHandle` collides with, §2.6 "Creating" step 3): a fresh uid and keys whose bundle names that handle.
+   */
+  squat(handle: string): DirUserRow {
+    const id = deriveIdentity(random(32));
+    const uidBytes = random(16);
+    const { bundle, sig } = makeBundle(uidBytes, handle, id, 0);
+    const uid = b64u(uidBytes);
+    const dirseq = this.append(DIRLOG_USER, dirlogRefUser(bundle, fromB64u(sig)));
+    const row: DirUserRow = {
+      uid,
+      upre: upre(uidBytes),
+      handle,
+      hpre: hpre(handle),
+      bundle,
+      sig,
+      regEra: era(this.w.now()),
+      dirseq,
+    };
+    this.users.set(uid, row);
+    this.byHandle.set(handle, uid);
+    this.userCount++;
+    this.w.bumpWrites();
+    return row;
   }
 
   // ───────────── failure knob ─────────────

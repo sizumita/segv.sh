@@ -15,7 +15,8 @@
 import { afterEach, beforeEach } from "vite-plus/test";
 import * as P from "@segv/protocol/proto";
 import * as W from "@segv/protocol/wire";
-import type { ConversationView, Engine } from "../src/types";
+import type { ConversationView, Engine, IdentityView, PersonView } from "../src/types";
+import type { Messaging } from "../src/messaging";
 import { SegvEngine, type EngineOptions } from "../src/engine";
 import type { EngineClock, EngineDelays, EngineTimer, WebSocketCtor } from "../src/options";
 import type { SelfLane } from "../src/selflane";
@@ -418,6 +419,7 @@ export const TEST_DELAYS: Partial<EngineDelays> = {
   headsInterval: 0,
   headsJitter: 0,
   bellDelay: 0,
+  aliasLeaveDelay: 300,
   catchUpInterval: 1000,
 };
 
@@ -437,6 +439,8 @@ export interface EngineI {
   queue: Promise<unknown>;
   sendChains: Map<string, Promise<unknown>>;
   images: { readonly size: number } | null;
+  /** decrypted files of the session, by `id.k` (shared by every account of the device) */
+  fileCache: Map<string, Promise<{ url: string; size: number }>>;
   pending: Map<string, string>;
   fatal: boolean;
   generation: number;
@@ -467,6 +471,21 @@ export interface EngineI {
   /** links (§5.5): internal engine operations in stage 1 */
   createLink(opts?: { oneShot?: boolean }): Promise<string>;
   openLink(url: string): Promise<string>;
+  /** the accounts the engine runs (§11.11 "Accounts in the view"), computed now */
+  identities(): IdentityView[];
+  /** the users the accounts know (§11.19), computed now */
+  people(): PersonView[];
+  /** alias i as this device runs it (§2.6), or undefined */
+  aliasRun(i: number):
+    | {
+        i: number;
+        status: "starting" | "ready" | "failed";
+        stopped: boolean;
+        acc: { uid: Uint8Array; uidB: string; handle: string; regEra: number | null };
+        self: SelfLane;
+        msg: Messaging | null;
+      }
+    | undefined;
 }
 
 /** White-box access to an engine's private state. */

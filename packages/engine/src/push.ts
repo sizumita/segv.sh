@@ -129,6 +129,8 @@ export interface PushClientOptions {
   secrets: () => Uint8Array[];
   /** the account's quiet tag Qself (§4.1), registered with the set; null without a session */
   quiet?: () => Uint8Array | null;
+  /** the set is complete (every account the device runs has restored, §2.6); a sync waits for `restored` until then */
+  ready?: () => boolean;
   /** told when the setting turns off by itself (push gone from the server, or a subscription that needs a click) */
   onOff?: () => void;
   random?: () => number;
@@ -406,6 +408,10 @@ export class PushClient {
       if (st.endpoint !== null && st.endpoint !== s.endpoint && st.endpoint !== deleted) {
         await this.o.transport.pushSub({ ...bodyOf(s, []), endpoint: st.endpoint });
         if (gone()) return this.abandon(s, false);
+      }
+      if (this.o.ready && !this.o.ready()) {
+        this.force ||= force;
+        return;
       }
       const seen = new Set<string>();
       const tokens: string[] = [];

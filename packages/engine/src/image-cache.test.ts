@@ -113,4 +113,31 @@ describe("ImageCache", () => {
     expect(revoked).toEqual(["blob:a", "blob:b"]);
     expect(c.size).toBe(0);
   });
+
+  it("drops one image whatever holds it, also one still being made, and leaves the others", async () => {
+    const { c, revoked, made, make } = cache();
+    await c.hold("a", make("a"));
+    c.put("s", "blob:s", 10);
+    await c.hold("k", make("k"));
+    c.drop("a"); // held: revoked all the same
+    c.drop("s"); // idle
+    c.drop("none"); // nothing cached: nothing to do
+    await tick();
+    expect(revoked).toEqual(["blob:a", "blob:s"]);
+    expect(c.size).toBe(1);
+    c.release("a"); // its holder lets go later: nothing more happens
+    await tick();
+    expect(revoked).toEqual(["blob:a", "blob:s"]);
+    // one being made is revoked once it is made, and the next hold makes it again
+    let finish!: (v: { url: string; size: number }) => void;
+    const pending = c.hold("b", () => new Promise((r) => (finish = r)));
+    c.drop("b");
+    finish({ url: "blob:b", size: 1 });
+    await pending;
+    await tick();
+    expect(revoked).toEqual(["blob:a", "blob:s", "blob:b"]);
+    expect(await c.hold("b", make("b"))).toBe("blob:b");
+    expect(made).toEqual(["a", "k", "b"]);
+    expect(await c.hold("k", make("k"))).toBe("blob:k");
+  });
 });

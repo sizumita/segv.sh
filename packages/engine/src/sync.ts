@@ -43,6 +43,13 @@ export interface SyncCtx {
   shown?(E: number, label: Bytes, t: number, c: Copy, view: MessageView): void;
   /** the displayed handle of member j of an epoch */
   handleOf(c: Copy, ep: Epoch, j: number): string;
+  /** the nickname shown for the sender of a message, b64u uid and displayed handle (§11.19); "" for none */
+  nickOf(uidB: string, handle: string): string;
+  /**
+   * a member is another of the user's accounts, by its uid and keys (§2.6): its rows count as unread no more than
+   * self's
+   */
+  otherOwn(m: P.Member): boolean;
   /** a WELCOME's J, found on lane j at `at` (§5.2: accepted whenever the row is processed) */
   onWelcome(c: Copy, ep: Epoch, j: number, at: Slot, J: P.Join): void;
   /** a valid row of member j (corroboration and request acceptance, §6.7 step 6, §11.5) */
@@ -439,11 +446,14 @@ export function applyLaneRow(
   }
   // A row that replaces its echo stays `sending` until its send has decided (§11.3 steps 6–8).
   const echo = ctx.takeEcho(key, r.body);
+  const from = P.b64u(ep.D.members[j].uid);
+  const fromHandle = ctx.handleOf(c, ep, j);
   const view: MessageView = {
     key,
     seq: ctx.seq(),
-    from: P.b64u(ep.D.members[j].uid),
-    fromHandle: ctx.handleOf(c, ep, j),
+    from,
+    fromHandle,
+    fromNickname: ctx.nickOf(from, fromHandle),
     mine,
     ts,
     status: echo ? "sending" : "sent",
@@ -458,7 +468,7 @@ export function applyLaneRow(
   }
   if (echo) removeMessage(echo.c, echo.echoKey);
   if (!insertMessage(c, view, order)) return;
-  const unread = !mine && !quiet && ctx.live();
+  const unread = !mine && !ctx.otherOwn(ep.D.members[j]) && !quiet && ctx.live();
   if (unread) c.unread++;
   ep.rows.set(key, { j, E: r.E, n: r.n, t: r.t, unread, shown: true, th });
   if (unread) ctx.shown?.(r.E, r.label, r.t, c, view);
@@ -495,12 +505,24 @@ function messageBody(m: P.ReplyBody): Pick<MessageView, "kind" | "text" | "image
   }
 }
 
-/** Re-labels the handles of applied messages (after a lookup resolved a member). */
-export function refreshHandles(c: Copy, handleOf: (uidB: string) => string | null): void {
+/**
+ * Re-labels the senders of applied messages (after a lookup resolved a member, or the nicknames changed): the handle
+ * that `handleOf` gives (null: unchanged), and the nickname that `nickOf` gives for it (§11.19). True if any changed.
+ */
+export function refreshHandles(
+  c: Copy,
+  handleOf: (uidB: string) => string | null,
+  nickOf: (uidB: string, handle: string) => string,
+): boolean {
+  let changed = false;
   for (let i = 0; i < c.messages.length; i++) {
     const m = c.messages[i];
     if (!m.from) continue;
-    const h = handleOf(m.from);
-    if (h !== null && h !== m.fromHandle) c.messages[i] = { ...m, fromHandle: h };
+    const fromHandle = handleOf(m.from) ?? m.fromHandle;
+    const fromNickname = nickOf(m.from, fromHandle);
+    if (fromHandle === m.fromHandle && fromNickname === m.fromNickname) continue;
+    c.messages[i] = { ...m, fromHandle, fromNickname };
+    changed = true;
   }
+  return changed;
 }

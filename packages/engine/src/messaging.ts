@@ -65,14 +65,8 @@ import {
   type NewCopy,
   type SettleOwn,
 } from "./join";
-import type {
-  EngineClock,
-  EngineDelays,
-  EngineOptions,
-  EngineTimer,
-  WebSocketCtor,
-} from "./options";
-import { Realtime } from "./realtime";
+import type { AccountTopics } from "./hub";
+import type { EngineClock, EngineDelays, EngineOptions, EngineTimer } from "./options";
 import { keysChangedWarning, leftKeyCmp, liveAt, type SelfLane } from "./selflane";
 import { SNAP_RECORDS, firstFreePointer, writeSnapshot } from "./snapshot";
 import { decidedText, editVersions, reactionSets, refreshRefs } from "./reactions";
@@ -105,9 +99,6 @@ import {
 import { MAX_REACTIONS, type ConversationView, type EditVersion, type MessageView } from "./types";
 
 type Bytes = Uint8Array;
-
-/** Topics per realtime socket (§10.8). */
-const RT_TOPICS = 256;
 
 /** Catch-up runs this often while realtime is connected (§11.6); otherwise every `delays.catchUpInterval`. */
 const CONNECTED_CATCH_UP_MS = 300_000;
@@ -188,7 +179,6 @@ export interface MessagingHost {
   enqueue<T>(fn: () => Promise<T>): Promise<T>;
   /** counts an in-flight action (settle waits for it) */
   track<T>(p: Promise<T>): Promise<T>;
-  setConnected(on: boolean): void;
   /** the latest verified checkpoint (EngineState.head, §12.3) */
   setHead(q: number, C: Bytes): void;
   /** a TEXT, IMAGE, FILE or REPLY was stored: ask the server to ring these bells (§11.13); never waits */
@@ -197,6 +187,29 @@ export interface MessagingHost {
   shown(E: number, label: Bytes, t: number): void;
   /** the same row, in a copy whose bell the registration set holds: an app without push may notify (§11.13) */
   arrived?(a: Arrival): void;
+  /** the owner's nickname for a user by b64u uid (§11.19): a valid name, "" for none and for the user's own accounts */
+  nick(uidB: string): string;
+  /** the user's accounts that this device runs, the owner and its aliases (§2.6): none is invited from another */
+  ownAccounts(): { uidB: string; handle: string }[];
+  /**
+   * An alias's Messaging: what it shares with the owner's, the checkpoint chain, the decrypted blobs and the inbox
+   * decrypter (§2.6, §11.1 step 5)
+   */
+  shared?: Pick<Messaging, "ckpt" | "images" | "fileCache" | "decrypter">;
+  /** the account is an alias (§2.6): its automatic rows wait for the user (BELL, LEAVE repeats) */
+  alias?: boolean;
+  /**
+   * A member of a descriptor is one of the user's own accounts, the owner or one of its aliases: D lists that
+   * account's uid with that account's own derived sigPk and kh (§2.6 "The owner's accounts"). A slot with such a uid
+   * and other keys is an unknown member like any other.
+   */
+  isOwn(m: P.Member): boolean;
+  /** the account's topics changed: the device's realtime sockets subscribe again (§10.8) */
+  subscribe(): void;
+  /** the device's first realtime socket is open (§11.6: catch-up every 300 s while it is) */
+  connected(): boolean;
+  /** the device is in use (§11.13 "Seen elsewhere") */
+  inUse(): boolean;
 }
 
 export class Messaging {
@@ -218,8 +231,6 @@ export class Messaging {
   private readonly sendChains = new Map<string, Promise<unknown>>();
   /** T_e of every held epoch, by b64u topic */
   private readonly topics = new Map<string, { c: Copy; ep: Epoch }>();
-  /** at most 2 realtime sockets of at most 256 topics each (§10.8) */
-  private readonly rts: Realtime[] = [];
   /** monotonic time of the last periodic catch-up */
   private lastPeriodic = -Infinity;
   /** the eras whose inbox notice topics are subscribed (§10.8) */
@@ -229,7 +240,6 @@ export class Messaging {
   private bucketsPending: Promise<void> | null = null;
   /** the poll Δin after a notice whose slot the read had not reached (§10.8); at most one pending */
   private inboxRetry: EngineTimer | null = null;
-  private WS: WebSocketCtor | null = null;
   private seqCounter = 0;
   private localCounter = 0;
   /** the inbox cursor of this session (never past a parked join) */
@@ -237,8 +247,11 @@ export class Messaging {
   private headsDue = false;
   private headsTimer = false;
   private lastHeads = "";
-  private readonly timers: EngineTimer[] = [];
   private stopped = false;
+  /** an alias's delayed LEAVE repeats (§2.6) */
+  private readonly leaveTimers = new Set<EngineTimer>();
+  /** an alias's copies the user opened before `start`: their opening BELL rows, posted once it runs (§2.6, §11.13) */
+  private readonly earlyOpens = new Set<string>();
   live = false;
   /** the J delivery queue (§6.11, §6.12) */
   private readonly deliveries: Deliveries;
@@ -247,9 +260,9 @@ export class Messaging {
   /** those whose creation or commit is still running: it delivers J itself, so no resume starts a job for them */
   private readonly ownRunning = new Set<string>();
   /** decrypted images by `id.k` (never by id alone, §8.1) */
-  readonly images = new ImageCache();
+  readonly images: ImageCache;
   /** decrypted files by `id.k` (never by id alone, §8.3): an object URL and the file's length */
-  readonly fileCache = new Map<string, Promise<{ url: string; size: number }>>();
+  readonly fileCache: Map<string, Promise<{ url: string; size: number }>>;
   /** copies with a scheduled re-evaluation of their control lane (an undecided row, or finality, §6.4–§6.5) */
   private readonly settleTimers = new Set<string>();
   /** LEAVE records being written, by copy key and epoch (one write per session, §6.9) */
@@ -282,19 +295,23 @@ export class Messaging {
 
   constructor(private readonly h: MessagingHost) {
     for (const b of h.acc.inbox) this.ownBuckets.set(b.E, b.g);
-    this.ckpt = new Checkpoints({
-      api: h.api,
-      storage: () => {
-        try {
-          return typeof localStorage === "undefined" ? null : localStorage;
-        } catch {
-          return null;
-        }
-      },
-      wall: () => h.clock.wall(),
-      critical: (t) => h.warn(t, true),
-      onHead: (q, C) => h.setHead(q, C),
-    });
+    this.images = h.shared?.images ?? new ImageCache();
+    this.fileCache = h.shared?.fileCache ?? new Map();
+    this.ckpt =
+      h.shared?.ckpt ??
+      new Checkpoints({
+        api: h.api,
+        storage: () => {
+          try {
+            return typeof localStorage === "undefined" ? null : localStorage;
+          } catch {
+            return null;
+          }
+        },
+        wall: () => h.clock.wall(),
+        critical: (t) => h.warn(t, true),
+        onHead: (q, C) => h.setHead(q, C),
+      });
     this.deliveries = new Deliveries({
       api: h.api,
       params: () => this.params(),
@@ -326,7 +343,7 @@ export class Messaging {
    */
   async restore(): Promise<void> {
     this.h.api.beginOperation(); // §10.6: directory answers fetched from now on are fresh for the restore
-    await this.ckpt.verify().catch(() => {}); // §11.1: checkpoints first; a failure is retried at catch-up
+    // The checkpoints (§11.1 step 3) are verified first, by the engine, once for every account of the device (§2.6).
     const f = this.h.self.fold;
     this.cursor = f.cursor;
     await this.materializeAll();
@@ -350,45 +367,54 @@ export class Messaging {
     this.repeatLeaves();
   }
 
-  /** Starts realtime and the periodic catch-up (§11.6); the inbox is read on notices and at catch-ups (§11.5). */
+  /**
+   * Starts the account's realtime topics (the device's sockets, §10.8) and its automatic work; the engine runs the
+   * periodic catch-up (`periodic`, §11.6). The inbox is read on notices and at catch-ups (§11.5).
+   */
   start(): void {
     this.live = true;
     this.lastPeriodic = this.h.clock.mono(); // the restore just synced everything; the connect runs its own catch-up
     // §11.4 step 10: a snapshot when the era has none or many records were applied since the latest one.
     void this.h.track(this.maybeSnapshot()).catch(() => {});
-    const WS =
-      this.h.opts.WebSocket ??
-      (typeof WebSocket === "undefined" ? null : (WebSocket as unknown as WebSocketCtor));
-    this.WS = WS;
     this.subscribe();
     this.ensureBells();
+    // an alias's copies opened during its restore: their BELL rows now, checked again (§11.13 "An alias's BELL row")
+    const opened = [...this.earlyOpens];
+    this.earlyOpens.clear();
+    for (const key of opened) {
+      const c = this.copies.get(key);
+      if (c) this.openBell(c);
+    }
     // The notice topics need the account's buckets (§10.8): subscribe again once they are known.
     void this.h
       .track(this.ensureBuckets(this.inboxErasNow()).then((changed) => changed && this.subscribe()))
       .catch(() => {});
-    // The loop ticks at the short interval, so a socket that drops gets the short cadence at once, not after the
-    // long wait that was scheduled while it was connected. Each tick also keeps the inbox notice topics on E_now.
-    this.every(
-      () => this.h.delays.catchUpInterval,
-      () => {
-        this.refreshInboxTopics();
-        const now = this.h.clock.mono();
-        if (this.rts[0]?.connected && now - this.lastPeriodic < CONNECTED_CATCH_UP_MS)
-          return Promise.resolve();
-        this.lastPeriodic = now;
-        return this.catchUp();
-      },
-    );
+  }
+
+  /**
+   * One tick of the periodic catch-up (§11.6), which the engine runs at the short interval for every account in turn:
+   * the inbox notice topics follow E_now, and a catch-up runs every 300 s while realtime is connected, else each tick.
+   */
+  periodic(): Promise<unknown> {
+    if (this.stopped || !this.live) return Promise.resolve();
+    this.refreshInboxTopics();
+    const now = this.h.clock.mono();
+    if (this.h.connected() && now - this.lastPeriodic < CONNECTED_CATCH_UP_MS)
+      return Promise.resolve();
+    this.lastPeriodic = now;
+    return this.catchUp();
   }
 
   stop(): void {
     this.stopped = true;
-    for (const rt of this.rts) rt.stop();
-    this.rts.length = 0;
-    for (const t of this.timers) t.cancel();
+    this.live = false;
     this.inboxRetry?.cancel();
     this.inboxRetry = null;
-    void this.inbox?.then((x) => x.worker?.terminate());
+    for (const t of this.leaveTimers) t.cancel();
+    this.leaveTimers.clear();
+    this.earlyOpens.clear();
+    // the inbox worker is the owner's, shared by its aliases: it ends with the owner's (at logout)
+    if (!this.h.shared) void this.inbox?.then((x) => x.worker?.terminate());
   }
 
   private inbox: Promise<{ worker: Worker | null; decrypt: Decrypt }> | null = null;
@@ -396,9 +422,10 @@ export class Messaging {
   /**
    * Trial decryption in the inbox Web Worker when one can be made (§11.5 step 2; EngineOptions.inboxWorker: absent
    * is the default factory, null is none), else on this thread. A worker that fails is dropped, and the session goes
-   * on with this thread, as when none can be made.
+   * on with this thread, as when none can be made. An alias uses the owner's (one worker per device).
    */
-  private async decrypter(): Promise<Decrypt> {
+  async decrypter(): Promise<Decrypt> {
+    if (this.h.shared) return this.h.shared.decrypter();
     const opt = this.h.opts.inboxWorker;
     if (opt === null) return sameThread;
     const make = opt ?? (() => import("./inbox-worker-url").then((m) => m.createInboxWorker()));
@@ -420,20 +447,6 @@ export class Messaging {
     return (await this.inbox).decrypt;
   }
 
-  private every(ms: () => number, fn: () => Promise<unknown>): void {
-    // The loop's one slot in `timers`, which each tick replaces: a session runs for days, a tick every few seconds.
-    const slot = this.timers.length;
-    const tick = () => {
-      if (this.stopped) return;
-      void fn()
-        .catch(() => {})
-        .finally(() => {
-          if (!this.stopped) this.timers[slot] = this.h.clock.setTimer(tick, ms());
-        });
-    };
-    this.timers.push(this.h.clock.setTimer(tick, ms()));
-  }
-
   private params(): Params {
     return this.h.api.cachedParams!;
   }
@@ -445,7 +458,7 @@ export class Messaging {
    * inbox, and a HEADS row when positions moved.
    */
   async catchUp(): Promise<void> {
-    await this.ckpt.verify().catch(() => {});
+    if (!this.h.shared) await this.ckpt.verify().catch(() => {}); // the owner's catch-up verifies for the device
     await this.h.enqueue(async () => {
       this.h.check();
       this.h.api.beginOperation();
@@ -773,6 +786,8 @@ export class Messaging {
         this.h.changed();
       },
       handleOf: (c, ep, j) => this.handleOf(c, ep, j),
+      nameOf: (c, ep, j) => this.nameOf(c, ep, j),
+      otherOwn: (ep, j) => this.otherOwn(ep.D.members[j]),
       sweep: (targets) => syncLanes(this.syncCtx(quiet), targets, quiet),
       onSwitch: (c, ep) => {
         if (c.probe) return;
@@ -827,17 +842,31 @@ export class Messaging {
     this.markHeads();
   }
 
+  /** The self lane caught up, and what siblings wrote there absorbed (§11.7): read first by `createAlias` (§2.6). */
+  catchUpSelf(): Promise<void> {
+    return this.h.enqueue(async () => {
+      this.h.check();
+      await this.h.self.catchUp({ E: this.h.acc.regEra, n: 0 });
+      await this.absorbFold();
+    });
+  }
+
   private catchUpSoon(): Promise<void> {
     return this.h.track(this.catchUp()).catch(() => {});
   }
 
+  /** Rows of the account's topics may have been missed (a GAP, a first connection, new topics): a catch-up. */
+  missed(): void {
+    if (!this.live || this.stopped) return;
+    void this.catchUpSoon();
+  }
+
   /**
-   * The system woke from sleep (§11.14 "Desktop"): an open socket that no longer answers is replaced at once, a closed
-   * one reconnects without waiting for its back-off, and the rows stored meanwhile are fetched.
+   * The system woke from sleep (§11.14 "Desktop"): the engine wakes the device's sockets, and each account fetches the
+   * rows stored meanwhile.
    */
   wake(): void {
     if (!this.live || this.stopped) return;
-    for (const rt of this.rts) rt.wake();
     void this.catchUpSoon();
   }
 
@@ -945,15 +974,17 @@ export class Messaging {
     // A join without a stored row of its own takes D.ts clamped to the §11.8 window around the bundle's t_reg, so a
     // far-future D.ts cannot pin the copy to the top of the list. It sorts before the epoch's rows.
     const ts = ep.tReg !== null ? clampTs(ep.D.ts, ep.tReg, this.params().delta) : ep.D.ts;
-    this.putJoinLine(c, ep.e, this.whoOf(c, ep, ep.D.by), ts);
+    this.putJoinLine(c, ep.e, () => this.whoOf(c, ep, ep.D.by), ts);
   }
 
-  private putJoinLine(c: Copy, e: number, by: string, ts: number): void {
-    const text = e === 0 ? `${by} started the conversation` : `${by} added you`;
+  /** The join line, rendered again when handles resolve or nicknames change (`relabel`). */
+  private putJoinLine(c: Copy, e: number, by: () => string, ts: number): void {
     const key = `sys:${e}:join`;
     if (c.order.has(key)) return;
+    const render = () => (e === 0 ? `${by()} started the conversation` : `${by()} added you`);
+    c.lines.set(key, render);
     c.order.set(key, [ts, e, -1, -1, -1]);
-    const m = systemLine(key, ts, text);
+    const m = systemLine(key, ts, render());
     let i = c.messages.length;
     while (i > 0 && (c.order.get(c.messages[i - 1].key)?.[0] ?? Infinity) > ts) i--;
     c.messages.splice(i, 0, m);
@@ -1272,9 +1303,11 @@ export class Messaging {
     // The root epoch's join line: D.ts is not held without its bundle, so the line takes t_reg's time (§11.8).
     const tReg = f.tregs.get(P.b64u(rec.bundleId)) ?? null;
     const uidB = P.b64u(rec.rootBy);
-    const by = P.equalBytes(rec.rootBy, this.h.acc.uid)
-      ? "you"
-      : "@" + (this.knownUser(uidB)?.handle ?? unknownHandle(uidB));
+    const by = () => {
+      if (P.equalBytes(rec.rootBy, this.h.acc.uid)) return "you";
+      const handle = this.knownUser(uidB)?.handle;
+      return handle === undefined ? "@" + unknownHandle(uidB) : this.h.nick(uidB) || "@" + handle;
+    };
     if (tReg !== null) this.putJoinLine(c, rec.e, by, P.T0_MS + tReg * 1000);
     this.ctlFrom(c, ep);
     this.register(c);
@@ -1455,11 +1488,55 @@ export class Messaging {
     return memberHandle(m, this.knownUser(uidB)).handle;
   }
 
-  /** "you" for self, else "@handle" (§11.9). */
+  /** Member j as system lines name it: its nickname unless it is unknown, else `@handle` (§11.9, §11.19). */
+  private nameOf(c: Copy, ep: Epoch, j: number): string {
+    const handle = this.handleOf(c, ep, j);
+    return this.nickOf(P.b64u(ep.D.members[j].uid), handle) || "@" + handle;
+  }
+
+  /** The nickname shown for a user shown by `handle` (§11.19): none for self and for an unknown (`?…`) member. */
+  private nickOf(uidB: string, handle: string): string {
+    return uidB === this.h.acc.uidB || handle.startsWith("?") ? "" : this.h.nick(uidB);
+  }
+
+  /**
+   * A member that is another of the user's accounts than this one, by its uid and keys (§2.6): treated as self for
+   * unread, rings and notifications.
+   */
+  private otherOwn(m: P.Member): boolean {
+    return !P.equalBytes(m.uid, this.h.acc.uid) && this.h.isOwn(m);
+  }
+
+  /** who(u) (§11.9): "you" for self, else u's nickname or `@handle`. */
   private whoOf(c: Copy, ep: Epoch, uid: Bytes): string {
     if (P.equalBytes(uid, this.h.acc.uid)) return "you";
     const j = P.memberIndex(ep.D, uid);
-    return "@" + (j >= 0 ? this.handleOf(c, ep, j) : unknownHandle(P.b64u(uid)));
+    return j >= 0 ? this.nameOf(c, ep, j) : "@" + unknownHandle(P.b64u(uid));
+  }
+
+  /**
+   * The nicknames changed (§11.19): every sender, member and system line is shown again with them, without reading
+   * any row again.
+   */
+  nicknamesChanged(): void {
+    for (const c of this.copies.values()) {
+      this.refreshSenders(c);
+      relabel(c);
+    }
+    this.h.changed();
+  }
+
+  /** The handles and nicknames of the senders of a copy's messages, again (true if any changed). */
+  private refreshSenders(c: Copy): boolean {
+    const ep = c.epochs.get(c.current);
+    return refreshHandles(
+      c,
+      (uidB) => {
+        const j = ep ? ep.D.members.findIndex((m) => P.b64u(m.uid) === uidB) : -1;
+        return j >= 0 ? this.handleOf(c, ep!, j) : null;
+      },
+      (uidB, handle) => this.nickOf(uidB, handle),
+    );
   }
 
   /** Records a verified directory user: its MEMBER rides in the next HEADS row unless the fold has one (§7.3). */
@@ -1529,12 +1606,7 @@ export class Messaging {
         if (r.mismatch)
           this.h.warn(keysChangedWarning(this.knownUser(P.b64u(m.uid))!.handle), true);
       }
-      const before = c.messages.map((m) => m.fromHandle).join();
-      refreshHandles(c, (uidB) => {
-        const j = ep.D.members.findIndex((m) => P.b64u(m.uid) === uidB);
-        return j >= 0 ? this.handleOf(c, ep, j) : null;
-      });
-      if (c.messages.map((m) => m.fromHandle).join() !== before) changed = true;
+      if (this.refreshSenders(c)) changed = true;
       if (relabel(c)) changed = true;
     }
     if (changed || want.size) this.h.changed();
@@ -1565,6 +1637,8 @@ export class Messaging {
         }
       },
       handleOf: (c, ep, j) => this.handleOf(c, ep, j),
+      nickOf: (uidB, handle) => this.nickOf(uidB, handle),
+      otherOwn: (m) => this.otherOwn(m),
       onWelcome: (c, ep, j, at, J) => {
         // Own WELCOMEs (this device's or a sibling's) carry J of copies the account already holds; a probe copy's
         // rows carry nothing until it is held.
@@ -1764,19 +1838,44 @@ export class Messaging {
     if (this.stopped || !this.live) return;
     for (const c of this.copies.values()) {
       const ep = c.epochs.get(c.current);
-      const latest = this.latestLeave(c);
-      if (!ep || c.removed || c.request || !latest || latest.e >= ep.e || ep.myIndex < 0) continue;
-      if (!this.leaveCurrent(c) || this.leaveWrites.has(`${copyKeyOf(c)}:${ep.e}:repeat`)) continue;
-      this.leaveWrites.set(`${copyKeyOf(c)}:${ep.e}:repeat`, Promise.resolve());
-      void this.chain(c.key, () => this.putLeave(c, true)).catch(() => {
-        this.leaveWrites.delete(`${copyKeyOf(c)}:${ep.e}:repeat`);
-      });
+      if (!ep || !this.leaveDue(c, ep)) continue;
+      const key = `${copyKeyOf(c)}:${ep.e}:repeat`;
+      if (this.leaveWrites.has(key)) continue;
+      this.leaveWrites.set(key, Promise.resolve());
+      const put = () =>
+        void this.chain(c.key, () => this.putLeave(c, true)).catch(() =>
+          this.leaveWrites.delete(key),
+        );
+      if (!this.h.alias) {
+        put();
+        continue;
+      }
+      // An alias repeats only after its own random delay (up to `aliasLeaveDelay`, 12 h), and if still due then (§2.6,
+      // §6.9): a member's commit does not make one device answer for several accounts at once. The draw is per session:
+      // this engine keeps no local state (§11.15), so a restart draws again.
+      const t = this.h.clock.setTimer(
+        () => {
+          this.leaveTimers.delete(t);
+          if (c.current === ep.e && this.leaveDue(c, ep)) put();
+          else this.leaveWrites.delete(key);
+        },
+        Math.floor(Math.random() * (this.h.delays.aliasLeaveDelay + 1)),
+      );
+      this.leaveTimers.add(t);
     }
+  }
+
+  /** §6.9: a LEAVE is to be repeated in the copy's current epoch `ep`. */
+  private leaveDue(c: Copy, ep: Epoch): boolean {
+    const latest = this.latestLeave(c);
+    return (
+      !this.stopped && !c.removed && !c.request && !!latest && latest.e < ep.e && ep.myIndex >= 0
+    );
   }
 
   /** Puts a LEAVE on self's lane (§11.3; no echo) and waits for its LEAVE record (written when the row applies). */
   private async putLeave(c: Copy, repeat: boolean): Promise<void> {
-    const row = await sendRow({ ...this.sendCtx(c, null), repeatLeave: repeat }, c, {
+    const row = await sendRow({ ...this.sendCtx(c, null, !repeat), repeatLeave: repeat }, c, {
       type: P.MT.LEAVE,
     });
     await (this.leaveWrites.get(`${copyKeyOf(c)}:${row.e}`) ?? Promise.resolve());
@@ -1904,7 +2003,8 @@ export class Messaging {
    * Realtime rows (§11.6): Tself catches the self lane up; a row on T_e that is the next slot of its lane is applied
    * at once, anything else (a later slot, a control row) makes that copy catch up.
    */
-  private onRows(rows: { topic: Bytes; E: number; label: Bytes; t: number; body: Bytes }[]): void {
+  onRows(rows: { topic: Bytes; E: number; label: Bytes; t: number; body: Bytes }[]): void {
+    if (!this.live || this.stopped) return;
     const tself = P.b64u(P.topicSelf(this.h.acc.id.nS));
     const stale = new Set<Copy>();
     const beyond: { c: Copy; ep: Epoch; j: number; row: FoundRow; msg: P.Msg }[] = [];
@@ -1977,64 +2077,42 @@ export class Messaging {
         .catch(() => {});
   }
 
-  private newSocket(WS: WebSocketCtor): Realtime {
-    const rt = new Realtime(
-      WS,
-      this.h.clock,
-      {
-        onRows: (rows) => this.onRows(rows),
-        onMissed: () => void this.catchUpSoon(),
-        onSubscribed: () => void this.catchUpSoon(),
-        onHello: (s, sent, recv) => this.h.api.time.add(s, sent, recv),
-        onInbox: (E, g, rel) => this.onInbox(E, g, rel),
-        onState: () => this.h.setConnected(this.rts.some((x) => x.connected)),
-      },
-      this.h.api.origin,
-    );
-    rt.start();
-    return rt;
+  /** The account's topics changed: the device's sockets subscribe again (§10.8). */
+  private subscribe(): void {
+    if (this.live && !this.stopped) this.h.subscribe();
   }
 
   /**
-   * The topics, in priority order (§10.8): Tself, the inbox notice topics (§9.3), the current epochs of accepted
-   * copies by recent activity, the old epochs with followed lanes (§11.2), then the live links' Tlink. Requests are
-   * never subscribed. At most 256 per socket and 2 sockets; the rest are covered by catch-up.
+   * The account's topics by priority class (§10.8): Tself, the inbox notice topics (§9.3), the current epochs of
+   * accepted copies with their activity, the old epochs with followed lanes (§11.2), then the live links' Tlink.
+   * Requests are never subscribed. The engine merges every account's and cuts them at the device's 2 × 256.
    */
-  private subscribe(): void {
-    if (!this.live || !this.WS) return;
-    const topics: Bytes[] = [P.topicSelf(this.h.acc.id.nS)];
+  topicSet(): AccountTopics | null {
+    if (!this.live || this.stopped) return null;
     this.inboxEras = this.inboxErasNow();
+    const inbox: Bytes[] = [];
     for (const E of this.inboxEras) {
       const g = this.ownBuckets.get(E);
-      if (g !== undefined) topics.push(P.topicInbox(E, g));
+      if (g !== undefined) inbox.push(P.topicInbox(E, g));
     }
     const accepted = [...this.copies.values()]
       .filter((c) => !c.request && !c.removed)
       .sort((a, b) => b.lastTs - a.lastTs);
+    const current: AccountTopics["current"] = [];
+    const old: AccountTopics["old"] = [];
     for (const c of accepted) {
       const ep = c.epochs.get(c.current);
-      if (ep) topics.push(ep.topic);
-    }
-    for (const c of accepted) {
-      const ep = c.epochs.get(c.current);
+      if (ep) current.push({ topic: ep.topic, lastTs: c.lastTs });
       const prev = ep ? c.epochs.get(ep.e - 1) : undefined;
-      if (prev?.lanes.some((l) => !l.swept)) topics.push(prev.topic);
+      if (prev?.lanes.some((l) => !l.swept)) old.push({ topic: prev.topic, lastTs: c.lastTs });
     }
     this.linkTopics.clear();
+    const links: Bytes[] = [];
     for (const link of this.liveLinks()) {
       this.linkTopics.set(P.b64u(link.topic), link);
-      topics.push(link.topic);
+      links.push(link.topic);
     }
-    const parts = [topics.slice(0, RT_TOPICS), topics.slice(RT_TOPICS, 2 * RT_TOPICS)];
-    parts.forEach((part, i) => {
-      if (part.length === 0) return;
-      this.rts[i] ??= this.newSocket(this.WS!);
-      this.rts[i].setTopics(part);
-    });
-    if (parts[1].length === 0 && this.rts[1]) {
-      this.rts[1].stop();
-      this.rts.length = 1;
-    }
+    return { self: P.topicSelf(this.h.acc.id.nS), inbox, current, old, links };
   }
 
   // ───────────────────────── inbox and joins (§6.7, §11.5) ─────────────────────────
@@ -2117,7 +2195,7 @@ export class Messaging {
    * the close, or an era this device does not read yet), poll once more after Δin. The catch-up every 300 s covers
    * whatever these miss.
    */
-  private onInbox(E: number, g: number, rel: number): void {
+  onInbox(E: number, g: number, rel: number): void {
     if (this.ownBuckets.get(E) !== g || !this.live || this.stopped) return;
     const waiting = this.inboxNotice;
     if (waiting) {
@@ -2409,7 +2487,9 @@ export class Messaging {
     this.users.set(P.b64u(x.rootBy), x.dby);
     if (x.member) this.pendingRecords.push(x.member);
     this.joinLine(c, x.epoch);
-    if (this.live && !x.ended && !P.equalBytes(x.rootBy, this.h.acc.uid)) c.unread++;
+    // rootBy as D lists it: one of the user's accounts (self included) only with that account's own keys (§2.6)
+    const by = P.memberIndex(x.epoch.D, x.rootBy);
+    if (this.live && !x.ended && !(by >= 0 && this.h.isOwn(x.epoch.D.members[by]))) c.unread++;
     if (x.second) this.h.warn(secondCopyWarning(x.dby.handle), true);
     this.register(c);
     if (x.ended) {
@@ -2583,13 +2663,19 @@ export class Messaging {
     await this.h.track(this.h.enqueue(() => this.writeAcceptance(c)));
   }
 
-  markRead(convId: string): void {
+  /**
+   * The pane of the copy is open (§11.11): its unread mark goes, and scrollback starts once. `opened` says that the
+   * user opened it (or its page became visible again), not that rows arrived in a pane already open: only an opening
+   * posts an alias's BELL row, so that no member's act decides when an alias writes (§2.6, §11.13).
+   */
+  markRead(convId: string, opened = true): void {
     const c = this.copies.get(convId);
     if (!c) return;
     if (c.unread !== 0) {
       c.unread = 0;
       this.h.changed();
     }
+    if (opened) this.openBell(c);
     // The pane is open: scrollback once per copy and session (§11.10), after the claim that ended a copy restored by
     // its ENDED record is read (its "@by removed you" line, §11.9). It accepts nothing (§11.11).
     if (!c.scrolled)
@@ -2611,12 +2697,29 @@ export class Messaging {
     const acc = this.h.acc;
     const names = parseHandleList(handles).filter((h) => h !== acc.handle);
     if (names.length === 0) throw new UserError("add at least one other person");
+    this.refuseOwn(names);
     cleanName(name); // a name that would look like a person is refused before any request (§5.1)
     this.h.progress("looking up handles…");
     this.h.api.beginOperation(); // a handle entered again is looked up fresh (§10.6)
     const others = await resolveHandles(this.h.api, names);
     this.h.check();
+    this.refuseOwn(others);
     return this.createWith(others, name, null);
+  }
+
+  /**
+   * A conversation of one of the user's accounts never gets another of them as a member (§2.6): checked by handle
+   * before any request, and by uid once resolved.
+   */
+  private refuseOwn(xs: readonly (string | DirUser)[]): void {
+    const own = this.h.ownAccounts().filter((a) => a.uidB !== this.h.acc.uidB);
+    for (const x of xs) {
+      const a = own.find((o) =>
+        typeof x === "string" ? o.handle !== "" && o.handle === x : o.uidB === x.uid,
+      );
+      if (a)
+        throw new UserError(`@${typeof x === "string" ? x : x.handle} is one of your own handles`);
+    }
   }
 
   /** §6.1 from step 1 for resolved users; `hello`: J goes to the single other member as a link hello (§5.5). */
@@ -2709,6 +2812,8 @@ export class Messaging {
     } finally {
       release();
     }
+    // An alias's own creation of a conversation is its first act there: its BELL row (§2.6, §11.13).
+    if (this.h.alias) void this.chain(c.key, () => this.bellFirst(c)).catch(() => {});
     // §6.1 steps 8–9: the first attempt for every recipient, then one DELIVERED row (also when nobody got J).
     const J: P.Join = {
       conv: c.conv,
@@ -3038,6 +3143,7 @@ export class Messaging {
       },
       pksOf: (c, ep) => this.epochPks(c, ep),
       ck: () => this.ckpt.ck(),
+      beforeClaim: this.h.alias ? (c) => this.bellFirst(c) : undefined,
       deliver: async (c, J, to) => {
         const job = this.deliveries.enqueue({
           key: jobKey(copyKeyOf(c), J.e, J.bundleId),
@@ -3090,10 +3196,12 @@ export class Messaging {
       try {
         const names = parseHandleList(handles).filter((h) => h !== this.h.acc.handle);
         if (names.length === 0) throw new UserError("enter at least one handle");
+        this.refuseOwn(names);
         this.h.progress("looking up handles…");
         this.h.api.beginOperation();
         const wanted = await resolveHandles(this.h.api, names);
         this.h.check();
+        this.refuseOwn(wanted);
         for (const u of wanted) this.learnUser(u, true);
         const listedLeaver = (cc: Copy, ep: Epoch) =>
           wanted.some((u) => P.memberIndex(ep.D, u.uidBytes) >= 0 && leftIn(cc, ep, u.uid));
@@ -3178,7 +3286,7 @@ export class Messaging {
         await this.acceptForPost(c);
         const mime = img.mime === "image/webp" ? 1 : 2;
         await sendRow(
-          this.sendCtx(c, echo.key),
+          this.sendCtx(c, echo.key, true),
           c,
           asReply(to, {
             type: P.MT.IMAGE,
@@ -3224,6 +3332,18 @@ export class Messaging {
     this.images.release(`${img.id}.${img.k}`);
   }
 
+  /**
+   * The `id.k` keys of every image and file that the account's copies show (REPLY rows included): what the device's
+   * caches may hold for this account (§2.6 "Retiring"). Echoes still being sent have none.
+   */
+  blobKeys(): Set<string> {
+    const out = new Set<string>();
+    for (const c of this.copies.values())
+      for (const m of c.messages)
+        for (const x of [m.image, m.file]) if (x?.id && x.k) out.add(`${x.id}.${x.k}`);
+    return out;
+  }
+
   // ───────────────────────── files (§8.3) ─────────────────────────
 
   /**
@@ -3251,7 +3371,7 @@ export class Messaging {
         this.fileCache.set(`${id}.${k}`, Promise.resolve({ url, size: bytes.length }));
         await this.acceptForPost(c);
         await sendRow(
-          this.sendCtx(c, echo.key),
+          this.sendCtx(c, echo.key, true),
           c,
           asReply(to, {
             type: P.MT.FILE,
@@ -3330,6 +3450,7 @@ export class Messaging {
       seq: 0,
       from: this.h.acc.uidB,
       fromHandle: this.h.acc.handle,
+      fromNickname: "",
       mine: true,
       ts: Math.floor(this.h.clock.wall()),
       kind,
@@ -3364,8 +3485,10 @@ export class Messaging {
     if (m && (status === "failed" || m.status === "sending")) this.markEcho(c, m.key, status);
   }
 
-  private sendCtx(c: Copy, echoKey: string | null): SendCtx {
+  /** `user`: a row of the user's (not BELL, WELCOME or a repeated LEAVE): an alias's BELL row goes first (§2.6). */
+  private sendCtx(c: Copy, echoKey: string | null, user = false): SendCtx {
     return {
+      beforeRow: user && this.h.alias ? (cc) => this.bellFirst(cc) : undefined,
       api: this.h.api,
       clock: this.h.clock,
       params: () => this.params(),
@@ -3439,7 +3562,8 @@ export class Messaging {
     const out: Bytes[] = [];
     const seen = new Set<string>();
     ep.D.members.forEach((m, l) => {
-      if (l === ep.myIndex) return;
+      // never self's, nor another of the user's accounts' (§2.6, §11.13 "Ringing")
+      if (l === ep.myIndex || this.h.isOwn(m)) return;
       const b = this.memberBell(c, ep, m.uid);
       if (!b || seen.has(P.b64u(b.bell))) return;
       seen.add(P.b64u(b.bell));
@@ -3454,7 +3578,8 @@ export class Messaging {
    * is tried again after the retry delay.
    */
   private ensureBells(): void {
-    if (this.stopped || !this.live) return;
+    // an alias posts one only with a row of the user's, or when the user opens the copy (§2.6, `bellFirst`)
+    if (this.stopped || !this.live || this.h.alias) return;
     const p = this.h.api.cachedParams;
     if (!p || pushParams(p) === null) return;
     const now = this.h.clock.mono();
@@ -3476,6 +3601,54 @@ export class Messaging {
     }
   }
 
+  /**
+   * Self's BELL row is due in the copy's current epoch (§11.13 "Bells"): params offer push and the lane has none. It
+   * does not wait for `start`: an alias's user may act in a copy shown while it restores (§2.6); the automatic rows
+   * have their own `live` check (`ensureBells`).
+   */
+  private bellDue(c: Copy): boolean {
+    const p = this.h.api.cachedParams;
+    if (this.stopped || !p || pushParams(p) === null) return false;
+    const ep = this.bellEpoch(c);
+    return !!ep && ep.lanesOn && !ep.lanes[ep.myIndex].bell;
+  }
+
+  /**
+   * An alias's BELL row in the copy's current epoch, put just before its first row of the user's there (or when the
+   * user opens the copy, §2.6); a failure leaves it for the next one and never fails that row. Runs in the copy's chain.
+   */
+  private async bellFirst(c: Copy): Promise<void> {
+    if (!this.h.alias || !this.bellDue(c)) return;
+    try {
+      await this.putBell(c, c.current);
+    } catch (e) {
+      if (e instanceof SessionEnded) throw e;
+    }
+  }
+
+  /**
+   * An alias's BELL row when the user opens the copy on a device in use (§11.13 "An alias's BELL row"), after the
+   * random delay of an automatic one. An opening during the alias's restore waits for `start`.
+   */
+  private openBell(c: Copy): void {
+    if (!this.h.alias || this.stopped || !this.h.inUse()) return;
+    if (!this.live) {
+      this.earlyOpens.add(c.key);
+      return;
+    }
+    if (!this.bellDue(c)) return;
+    const key = `${copyKeyOf(c)}:${c.current}`;
+    if (this.bellWrites.has(key)) return;
+    const delay = Math.floor(Math.random() * (this.h.delays.bellDelay + 1));
+    const run = this.h
+      .wait(delay)
+      .then(() => this.chain(c.key, () => this.bellFirst(c)))
+      .catch(() => {})
+      .finally(() => this.bellWrites.delete(key));
+    this.bellWrites.set(key, run);
+    void this.h.track(run);
+  }
+
   /** Puts self's BELL row in epoch e of the copy (§11.13), unless its lane there has one by now. */
   private async putBell(c: Copy, e: number): Promise<void> {
     const ep = c.epochs.get(c.current);
@@ -3493,6 +3666,11 @@ export class Messaging {
    */
   pushSecrets(): Bytes[] {
     return this.notifiable().map((x) => x.secret);
+  }
+
+  /** The registration set's secrets with their copies' `lastTs`, which ranks them among every account's (§11.13). */
+  pushEntries(): { secret: Bytes; lastTs: number }[] {
+    return this.notifiable().map((x) => ({ secret: x.secret, lastTs: x.c.lastTs }));
   }
 
   /** The copies of the registration set (§11.13) with their secrets and bells, newest `lastTs` first. */
@@ -3529,6 +3707,7 @@ export class Messaging {
       ref: v.ref,
       name: v.name,
       handle: m.fromHandle,
+      nick: m.fromNickname,
       kind: m.kind,
       text,
       // read when the notification is shown: an edit that reached the device meanwhile is shown instead (§11.18)
@@ -3565,12 +3744,19 @@ export class Messaging {
           mk: P.b64u(ep.keys.mk),
           rk: P.b64u(ep.keys.rk),
           self: ep.myIndex,
-          members: ep.D.members.map((m, j) => ({
-            sigPk: P.b64u(m.sigPk),
-            handle: v.members[j]?.handle ?? "?",
-          })),
+          members: ep.D.members.map((m, j) => {
+            const x = v.members[j];
+            return {
+              sigPk: P.b64u(m.sigPk),
+              handle: x?.handle ?? "?",
+              ...(x?.nickname ? { nick: x.nickname } : {}),
+            };
+          }),
           next: ep.lanes.map((l) => ({ E: l.next.E, n: l.next.n })),
         };
+      // the lanes of the user's other accounts, which notify no more than self's (§2.6, §11.13)
+      const own = ep.D.members.flatMap((m, j) => (this.otherOwn(m) ? [j] : []));
+      if (copy.epoch && own.length) copy.epoch.own = own;
       out.push(copy);
     }
     return out;
@@ -3589,7 +3775,11 @@ export class Messaging {
     const run = async () => {
       try {
         await this.acceptForPost(c);
-        await sendRow(this.sendCtx(c, echo.key), c, asReply(to, { type: P.MT.TEXT, text: body }));
+        await sendRow(
+          this.sendCtx(c, echo.key, true),
+          c,
+          asReply(to, { type: P.MT.TEXT, text: body }),
+        );
         this.endSend(c, echo.key, "sent");
       } catch (e) {
         this.endSend(c, echo.key, "failed");
@@ -3806,7 +3996,7 @@ export class Messaging {
       const mine = reactionSets(c).get(messageKey)?.get(this.h.acc.uidB) ?? new Set<string>();
       if (on ? mine.has(emoji) || mine.size >= MAX_REACTIONS : !mine.has(emoji)) return;
       await this.acceptForPost(c);
-      await sendRow(this.sendCtx(c, null), c, {
+      await sendRow(this.sendCtx(c, null, true), c, {
         type: P.MT.REACTION,
         reaction: {
           te: t.e,
@@ -3846,7 +4036,11 @@ export class Messaging {
         if (c.refsDirty) refreshRefs(c, this.h.acc.uidB);
         if (body === decidedText(c, messageKey)) return;
         await this.acceptForPost(c);
-        const row = await sendRow(this.sendCtx(c, null), c, { type: P.MT.EDIT, to, text: body });
+        const row = await sendRow(this.sendCtx(c, null, true), c, {
+          type: P.MT.EDIT,
+          to,
+          text: body,
+        });
         // A row that §6.8 drops counts for nothing (§11.3 step 7).
         if (!c.edits.get(rowKey(row.E, row.label))?.shown) throw new UserError(NOT_DELIVERED);
       } finally {
@@ -4094,6 +4288,9 @@ export class Messaging {
     }
     for (const l of f.links.values()) if (l.Eexpires >= Enow) out.push(l);
     for (const [key, value] of f.prefs) out.push({ rtype: P.RT.PREFS, key, value });
+    // an owner's nicknames (§7.4); its alias table is the PREFS of key 1 above
+    if (f.owner)
+      for (const [u, name] of f.nicks) out.push({ rtype: P.RT.NICK, uid: P.fromB64u(u), name });
     // every copy's HEADS entry with the LEFT records of its epoch, then the cursor, over records of at most 64 KiB
     const cursor = this.cursor ?? f.cursor ?? { E: Enow, rel: 0 };
     let entries: P.HeadsEntry[] = [];
@@ -4177,6 +4374,8 @@ export class Messaging {
       selfUid: this.h.acc.uid,
       selfHandle: this.h.acc.handle,
       user: (uidB: string) => this.knownUser(uidB),
+      nick: (uidB: string) => this.h.nick(uidB),
+      otherOwn: (m: P.Member) => this.otherOwn(m),
       contested: (c: Copy) =>
         this.copiesOf(c.convB).some((y) => y !== c && contest(c, y, (x) => this.endOf(x))),
       byContact: (c: Copy) => this.byContact(c),

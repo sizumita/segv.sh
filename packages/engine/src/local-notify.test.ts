@@ -112,6 +112,14 @@ describe("noteFor (§11.13 steps 1–3)", () => {
     expect(long.endsWith("…")).toBe(true);
   });
 
+  it("names the sender by the nickname the user gave it, without @ (§11.19)", () => {
+    expect(noteFor(arrival({ nick: "Bobby" }), "message").body).toBe("Bobby: hello");
+    expect(noteFor(arrival({ nick: "Bobby", kind: "image", text: "" }), "message").body).toBe(
+      "Bobby sent an image",
+    );
+    expect(noteFor(arrival({ nick: "" }), "message").body).toBe("@bob: hello");
+  });
+
   it("takes a text message's current text over the text it arrived with, never for an image or file", () => {
     expect(noteFor(arrival({ text: "helo", current: () => "hello" }), "message").body).toBe(
       "@bob: hello",

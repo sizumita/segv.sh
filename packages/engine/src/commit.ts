@@ -50,6 +50,8 @@ export interface CommitHost {
   deliver(c: Copy, J: P.Join, to: DirUser[]): Promise<void>;
   /** the `ck` fields of the claim: the latest verified checkpoint (§6.2, §12.4) */
   ck(): { ckq: number; ck16: Bytes };
+  /** before a claim is built on epoch `ep`: an alias's BELL row goes first (§2.6, §11.13) */
+  beforeClaim?: (c: Copy) => Promise<void>;
 }
 
 /** The refusals before a commit: removed, left, frozen, or the last epoch (§6.3, §6.6 step 6, §6.10). */
@@ -187,6 +189,11 @@ export async function commit(h: CommitHost, c: Copy, plan: Plan): Promise<boolea
     refuse(c, ep);
     const change = plan(c, ep, round);
     if (!change) return false;
+    if (h.beforeClaim) {
+      await h.beforeClaim(c);
+      h.check();
+      if (c.current !== ep.e) continue; // the copy moved on meanwhile: plan again on top of it
+    }
     const pks = ep.pks ?? (await h.pksOf(c, ep));
     h.check();
     const b = build(h, c, ep, change, pks);

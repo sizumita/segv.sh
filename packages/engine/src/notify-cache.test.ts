@@ -137,6 +137,26 @@ describe("notification cache", () => {
   it("parses only what this version writes", () => {
     const ok = cache([{ E: 1, n: 0 }]);
     expect(parseCache(JSON.stringify(ok))).toEqual(ok);
+    // a member's nickname and the lanes of the user's other accounts are optional (§11.19, §2.6)
+    const ep = ok.copies[0].epoch!;
+    const nicked = {
+      ...ok,
+      copies: [
+        {
+          ...ok.copies[0],
+          epoch: { ...ep, own: [0], members: ep.members.map((m) => ({ ...m, nick: "Bobby" })) },
+        },
+      ],
+    };
+    expect(parseCache(JSON.stringify(nicked))).toEqual(nicked);
+    for (const bad of [
+      { ...ep, own: [0.5] },
+      { ...ep, own: "0" },
+      { ...ep, members: ep.members.map((m) => ({ ...m, nick: 1 })) },
+    ])
+      expect(
+        parseCache(JSON.stringify({ ...ok, copies: [{ ...ok.copies[0], epoch: bad }] })),
+      ).toBeNull();
     for (const bad of [
       "x",
       "null",
