@@ -157,8 +157,8 @@ async function steps12(
 ): Promise<{ ep: Epoch; sent: Stamp; answered: Stamp }> {
   for (let rotations = 0; ;) {
     const { ep, sent, answered, timedOut } = await probeAndWait(ctx, c);
-    // texts, images, files, replies and reactions (§6.6 step 6, §11.3 steps 2–3, §11.12, §11.17)
-    const visible = visibleRow(type) || type === P.MT.REACTION;
+    // texts, images, files, replies, reactions and edits (§6.6 step 6, §11.3 steps 2–3, §11.12, §11.17, §11.18)
+    const visible = visibleRow(type) || type === P.MT.REACTION || type === P.MT.EDIT;
     if (ctx.welcomeTo) {
       if (timedOut) throw new UserError(CHANGING);
       if (!ctx.qualifies?.(c, ep, ctx.welcomeTo)) throw new WelcomeRefused();

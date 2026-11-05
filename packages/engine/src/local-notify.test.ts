@@ -111,6 +111,16 @@ describe("noteFor (§11.13 steps 1–3)", () => {
     expect(Array.from(long)).toHaveLength(200);
     expect(long.endsWith("…")).toBe(true);
   });
+
+  it("takes a text message's current text over the text it arrived with, never for an image or file", () => {
+    expect(noteFor(arrival({ text: "helo", current: () => "hello" }), "message").body).toBe(
+      "@bob: hello",
+    );
+    expect(noteFor(arrival({ text: "helo" }), "message").body).toBe("@bob: helo");
+    expect(noteFor(arrival({ kind: "image", text: "", current: () => "x" }), "message").body).toBe(
+      "@bob sent an image",
+    );
+  });
 });
 
 describe("LocalNotify", () => {
@@ -137,6 +147,20 @@ describe("LocalNotify", () => {
     clock.advance(DEFAULT_WINDOW_MS);
     expect(notifier.shown.map((x) => x.body)).toEqual(["@bob: one", "new messages"]);
     expect(notifier.shown.some((x) => x.body.includes("secret"))).toBe(false);
+  });
+
+  it("makes a waiting notification with the message's current text, so an edit that came meanwhile is shown (§11.18)", () => {
+    const { n, clock, notifier } = setup();
+    n.arrived(arrival({ text: "one" }));
+    let current = "two";
+    n.arrived(arrival({ text: "two", current: () => current, unread: 2 }));
+    current = "**two**, edited";
+    clock.advance(DEFAULT_WINDOW_MS);
+    expect(notifier.shown.map((x) => x.body)).toEqual(["@bob: one", "@bob: two, edited (+1)"]);
+    // without `current`, the arrival's own text
+    n.arrived(arrival({ text: "three", unread: 3 }));
+    clock.advance(DEFAULT_WINDOW_MS);
+    expect(notifier.shown.map((x) => x.body).at(-1)).toBe("@bob: three (+2)");
   });
 
   it("notifies nothing while the device is in use, or while notifications are off", () => {

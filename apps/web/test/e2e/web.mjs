@@ -41,9 +41,11 @@ export async function web({ base, browser, shots, P, Wire }) {
   const t4 = `carol here secret-4 ${sfx}`;
   const t5 = `after removal secret-5 ${sfx}`;
   const t6 = `from alice's second device secret-6 ${sfx}`;
+  // alice's edit of t1; it keeps t1 in it, so that later steps still find the message by t1
+  const t7 = `${t1} — edited secret-7`;
   const fileName = `minutes-${sfx}.txt`;
   const fileText = `議事録 secret-file ${sfx}\n`;
-  const secrets = [t1, t2, t3, t4, t5, t6, fileName, fileText];
+  const secrets = [t1, t2, t3, t4, t5, t6, t7, fileName, fileText];
   const screen = (d, title) => shots.screen(d.page, title);
   let codeAlice = "";
 
@@ -108,6 +110,46 @@ export async function web({ base, browser, shots, P, Wire }) {
       await openImage(A);
       await screen(A, "image");
       await closeImage(A);
+    },
+  );
+
+  await step(
+    "an edit: alice changes her message; both see the new text marked edited, with its reaction, and its versions",
+    async () => {
+      const mine = A.page.locator(".thread .m", { hasText: t1 }).first();
+      await mine.hover();
+      await mine
+        .getByRole("toolbar")
+        .getByRole("button", { name: "edit", exact: true })
+        .click({ timeout: T });
+      const box = A.page.getByLabel("edit message", { exact: true });
+      await box.waitFor({ timeout: T });
+      // the box holds the message's text before it is replaced
+      await A.page.waitForFunction(
+        (t) => document.querySelector('textarea[aria-label="edit message"]')?.value === t,
+        t1,
+        { timeout: T },
+      );
+      await box.fill(t7);
+      await box.press("Enter");
+      await A.page.getByLabel("message", { exact: true }).waitFor({ timeout: T });
+      for (const d of [A, B]) {
+        const m = d.page.locator(".thread .m", { hasText: t7 }).first();
+        await m.getByRole("button", { name: "(edited)" }).waitFor({ timeout: T });
+        await m.locator(".react", { hasText: "👍 1" }).waitFor({ timeout: T });
+      }
+      await screen(B, "edited message");
+      await B.page
+        .locator(".thread .m", { hasText: t7 })
+        .first()
+        .getByRole("button", { name: "(edited)" })
+        .click({ timeout: T });
+      const history = B.page.getByRole("dialog", { name: "edit history" });
+      await history.getByText("original").waitFor({ timeout: T });
+      await history.getByText(t7).first().waitFor({ timeout: T });
+      await screen(B, "edit history");
+      await history.getByRole("button", { name: "close" }).click({ timeout: T });
+      await history.waitFor({ state: "hidden", timeout: T });
     },
   );
 

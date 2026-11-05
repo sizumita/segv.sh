@@ -14,6 +14,7 @@
 
 import type {
   ConversationView,
+  EditVersion,
   Engine,
   EngineState,
   FileRef,
@@ -23,6 +24,8 @@ import type {
 } from "@segv/engine/types";
 
 const HANDLE_RE = /^[a-z0-9_]{3,20}$/;
+/** Mirror of MAX_TEXT_BYTES (packages/engine/src/conv.ts): the longest text, in UTF-8. */
+const MAX_TEXT_BYTES = 12_000;
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const MIN = 60_000;
 const HOUR = 60 * MIN;
@@ -122,6 +125,8 @@ class MockEngine implements Engine {
   private local = 0;
   private blobs = new Map<string, Blob>();
   private urls = new Map<string, string>();
+  /** the versions of each edited message (§11.18), by its key: its own text first, then each edit's */
+  private versions = new Map<string, EditVersion[]>();
 
   constructor(private opts: MockOpts) {
     void this.boot();
@@ -206,6 +211,30 @@ class MockEngine implements Engine {
       status: p.status ?? "sent",
       reactions: p.reactions ?? [],
       ...(p.reply ? { reply: p.reply } : {}),
+      ...(p.edited ? { edited: p.edited } : {}),
+    };
+  }
+  /** Replaces one message of a conversation with a new object (the UI's copies need one per change). */
+  private updateMsg(convId: string, key: string, fn: (m: MessageView) => MessageView) {
+    this.updateConv(convId, (c) => ({
+      ...c,
+      messages: c.messages.map((m) => (m.key === key ? fn(m) : m)),
+    }));
+  }
+  /**
+   * A message as its versions show it (§11.18): the latest text, and when it was made. One without edits shows `own`,
+   * its own text.
+   */
+  private asEdited(m: MessageView, own = m.text): MessageView {
+    const v = this.versions.get(m.key);
+    const out: MessageView = { ...m, text: own };
+    delete out.edited;
+    if (!v || v.length < 2) return out;
+    const last = v[v.length - 1];
+    return {
+      ...out,
+      text: last.text,
+      edited: { ts: last.ts, count: v.length - 1, sending: false },
     };
   }
   /** What a mock send replies to: a message of the conversation, as the engine checks it. */
@@ -229,6 +258,16 @@ class MockEngine implements Engine {
     });
     const now = Date.now();
     const m = (p: Partial<MessageView> & Pick<MessageView, "kind">) => this.msg(p);
+    this.versions.clear();
+    /** A message that was edited: `text` is its own, each of `edits` a later version (§11.18). */
+    const edited = (
+      p: Partial<MessageView> & Pick<MessageView, "kind">,
+      edits: EditVersion[],
+    ): MessageView => {
+      const x = this.msg(p);
+      this.versions.set(x.key, [{ text: x.text ?? "", ts: x.ts }, ...edits]);
+      return this.asEdited(x);
+    };
     const dm: ConversationView = {
       id: randomId(),
       ref: mockRef("dm"),
@@ -244,12 +283,10 @@ class MockEngine implements Engine {
       unread: 0,
       messages: [
         m({ kind: "system", text: `${handle} started a conversation with bob`, ts: now - 2 * DAY }),
-        m({
-          kind: "text",
-          fromHandle: "bob",
-          text: "hey, are you around?",
-          ts: now - 2 * DAY + MIN,
-        }),
+        edited({ kind: "text", fromHandle: "bob", text: "hey", ts: now - 2 * DAY + MIN }, [
+          { text: "hey, you around", ts: now - 2 * DAY + MIN + 20_000 },
+          { text: "hey, are you around?", ts: now - 2 * DAY + 2 * MIN },
+        ]),
         m({
           kind: "text",
           fromHandle: handle,
@@ -309,13 +346,17 @@ class MockEngine implements Engine {
       ts: now - 8 * MIN,
       ...to(ship),
     });
-    const thu = m({
-      kind: "text",
-      fromHandle: handle,
-      text: "could we do **thursday** instead?",
-      ts: now - 7 * MIN,
-      ...to(ship),
-    });
+    // edited (§11.18): its quote line above carol's reply shows the edited text
+    const thu = edited(
+      {
+        kind: "text",
+        fromHandle: handle,
+        text: "could we do thursday?",
+        ts: now - 7 * MIN,
+        ...to(ship),
+      },
+      [{ text: "could we do **thursday** instead?", ts: now - 7 * MIN + 40_000 }],
+    );
     const fri = m({
       kind: "text",
       fromHandle: "carol",
@@ -845,6 +886,47 @@ class MockEngine implements Engine {
       }),
     }));
   }
+  /**
+   * As the engine's (§11.18): self's sent text only; the new text shows at once (`edited.sending`), and the current
+   * text again when the send fails, which a text with the word "fail" in it does.
+   */
+  async editText(convId: string, messageKey: string, text: string): Promise<void> {
+    const c = this.conv(convId);
+    const body = text.replace(/\s+$/, "");
+    if (!body.trim()) this.fail("an edit cannot be empty");
+    if (new TextEncoder().encode(body).length > MAX_TEXT_BYTES) this.fail("message is too long");
+    const m = c.messages.find((x) => x.key === messageKey);
+    if (!m) this.fail("unknown message");
+    if (!m.mine || m.kind !== "text" || m.status !== "sent")
+      this.fail("this message cannot be edited");
+    if (!c.canSend) this.fail(blockedMessage(c));
+    const ts = Date.now();
+    this.updateMsg(convId, messageKey, (x) => ({
+      ...x,
+      text: body,
+      edited: { ts, count: x.edited?.count ?? 0, sending: true },
+    }));
+    await sleep(200);
+    // back to the current text: nothing changed, or the send failed
+    const current = (x: MessageView) => this.asEdited(x, m.text);
+    if (body === (this.versions.get(messageKey)?.at(-1)?.text ?? m.text)) {
+      this.updateMsg(convId, messageKey, current);
+      return;
+    }
+    if (/\bfail\b/i.test(body)) {
+      this.updateMsg(convId, messageKey, current);
+      this.fail("message was not delivered (membership changed or the request failed); try again");
+    }
+    const v = this.versions.get(messageKey) ?? [{ text: m.text ?? "", ts: m.ts }];
+    this.versions.set(messageKey, [...v, { text: body, ts }]);
+    this.updateMsg(convId, messageKey, (x) => this.asEdited(x));
+  }
+  editHistory(convId: string, messageKey: string): EditVersion[] {
+    const c = this.state.conversations.find((x) => x.id === convId);
+    if (!c?.messages.some((m) => m.key === messageKey)) return [];
+    const v = this.versions.get(messageKey) ?? [];
+    return v.length < 2 ? [] : v.map((x) => ({ ...x }));
+  }
   clearError(): void {
     if (this.state.error) this.set({ error: "" });
   }
@@ -856,6 +938,16 @@ class MockEngine implements Engine {
       this.msg({ kind: "text", fromHandle, text, mine: false, reply }),
       true,
     );
+  }
+  /** Another member's edit of their message `key` (§11.18). */
+  incomingEdit(convId: string, key: string, text: string) {
+    const m = this.state.conversations
+      .find((c) => c.id === convId)
+      ?.messages.find((x) => x.key === key);
+    if (!m || m.mine || m.kind !== "text") return;
+    const v = this.versions.get(key) ?? [{ text: m.text ?? "", ts: m.ts }];
+    this.versions.set(key, [...v, { text, ts: Date.now() }]);
+    this.updateMsg(convId, key, (x) => this.asEdited(x));
   }
   incomingAt(index: number, text: string) {
     const c = this.state.conversations[index];

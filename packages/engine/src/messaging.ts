@@ -18,6 +18,7 @@ import {
   HISTORY_COPIES,
   HISTORY_INITIAL,
   MAX_TEXT_BYTES,
+  NOT_DELIVERED,
   clampTs,
   cleanName,
   contest,
@@ -74,7 +75,7 @@ import type {
 import { Realtime } from "./realtime";
 import { keysChangedWarning, leftKeyCmp, liveAt, type SelfLane } from "./selflane";
 import { SNAP_RECORDS, firstFreePointer, writeSnapshot } from "./snapshot";
-import { reactionSets, refreshRefs } from "./reactions";
+import { decidedText, editVersions, reactionSets, refreshRefs } from "./reactions";
 import { lanesEnd, olderInitialHistory, scrollback } from "./history";
 import { prepareImage } from "./image";
 import { ImageCache } from "./image-cache";
@@ -101,7 +102,7 @@ import {
   type FoundRow,
   type SyncCtx,
 } from "./sync";
-import { MAX_REACTIONS, type ConversationView, type MessageView } from "./types";
+import { MAX_REACTIONS, type ConversationView, type EditVersion, type MessageView } from "./types";
 
 type Bytes = Uint8Array;
 
@@ -932,6 +933,9 @@ export class Messaging {
       probe: false,
       reactions: new Map(),
       replies: new Map(),
+      edits: new Map(),
+      originals: new Map(),
+      localEdits: new Map(),
       refsDirty: false,
     };
   }
@@ -1556,7 +1560,8 @@ export class Messaging {
         this.h.shown(E, label, t);
         if (this.h.arrived) {
           const a = this.arrival(c, m);
-          if (a) this.h.arrived(a);
+          // After the rest of this batch of rows: an EDIT of the row read with it is in its text then (§11.18).
+          if (a) queueMicrotask(() => this.h.arrived?.(a));
         }
       },
       handleOf: (c, ep, j) => this.handleOf(c, ep, j),
@@ -3519,12 +3524,18 @@ export class Messaging {
     if (m.kind !== "text" && m.kind !== "image" && m.kind !== "file") return null;
     const v = this.viewOfCopy(c);
     if (!v) return null;
+    const text = m.kind === "text" ? (m.text ?? "") : "";
     return {
       ref: v.ref,
       name: v.name,
       handle: m.fromHandle,
       kind: m.kind,
-      text: m.kind === "text" ? (m.text ?? "") : "",
+      text,
+      // read when the notification is shown: an edit that reached the device meanwhile is shown instead (§11.18)
+      current: () => {
+        if (c.refsDirty) refreshRefs(c, this.h.acc.uidB);
+        return c.messages.find((x) => x.key === m.key)?.text ?? text;
+      },
       unread: c.unread,
     };
   }
@@ -3808,6 +3819,69 @@ export class Messaging {
         },
       });
     });
+  }
+
+  // ───────────────────────── edits (§11.18) ─────────────────────────
+
+  /**
+   * §11.18: one EDIT row with a new text for self's TEXT message, or self's REPLY carrying a text, `messageKey`, sent
+   * as a text is (§11.3) but without an echo, after the user's acceptance that a post makes (§11.5). The message shows
+   * the new text while the send runs, and its current text again once the send has decided. A text equal to the one the
+   * held rows decide resolves without a row. Rejects with §11.3's errors.
+   */
+  editText(convId: string, messageKey: string, text: string): Promise<void> {
+    const c = this.copy(convId);
+    const body = text.replace(/\s+$/, "");
+    if (!body.trim()) return Promise.reject(new UserError("an edit cannot be empty"));
+    if (P.utf8(body).length > MAX_TEXT_BYTES)
+      return Promise.reject(new UserError("message is too long"));
+    const to = this.editTarget(c, messageKey);
+    if (to instanceof Error) return Promise.reject(to);
+    const n = ++this.localCounter;
+    c.localEdits.set(messageKey, { n, text: body, ts: Math.floor(this.h.clock.wall()) });
+    c.refsDirty = true;
+    this.h.changed();
+    return this.chain(convId, async () => {
+      try {
+        if (c.refsDirty) refreshRefs(c, this.h.acc.uidB);
+        if (body === decidedText(c, messageKey)) return;
+        await this.acceptForPost(c);
+        const row = await sendRow(this.sendCtx(c, null), c, { type: P.MT.EDIT, to, text: body });
+        // A row that §6.8 drops counts for nothing (§11.3 step 7).
+        if (!c.edits.get(rowKey(row.E, row.label))?.shown) throw new UserError(NOT_DELIVERED);
+      } finally {
+        if (c.localEdits.get(messageKey)?.n === n) c.localEdits.delete(messageKey);
+        c.refsDirty = true;
+        this.h.changed();
+      }
+    });
+  }
+
+  /**
+   * The target fields of an edit of the message `key` (§11.18 "Sending"): self's TEXT row, or self's REPLY row carrying
+   * a text, that the copy holds and accepts. "unknown message" for a key that names no message.
+   */
+  private editTarget(c: Copy, key: string): P.ReplyTo | UserError {
+    // a system line is no message
+    const m = c.messages.find(
+      (x) => x.key === key && (x.kind === "text" || x.kind === "image" || x.kind === "file"),
+    );
+    for (const ep of c.epochs.values()) {
+      const row = ep.rows.get(key);
+      if (!row) continue;
+      if (!row.shown || m?.kind !== "text" || P.b64u(ep.D.members[row.j].uid) !== this.h.acc.uidB)
+        break;
+      return { te: ep.e, tl: row.j, tE: row.E, tn: row.n, th: row.th };
+    }
+    return new UserError(m ? "this message cannot be edited" : "unknown message");
+  }
+
+  /** The versions of an edited message (§11.18 "Display"); empty for one without edits or an unknown key. */
+  editHistory(convId: string, messageKey: string): EditVersion[] {
+    const c = this.copies.get(convId);
+    if (!c) return [];
+    if (c.refsDirty) refreshRefs(c, this.h.acc.uidB);
+    return editVersions(c, messageKey);
   }
 
   /** The epoch at which a copy ended, for ⚠: processed, or named by its ENDED record (§6.7 step 6); else null. */

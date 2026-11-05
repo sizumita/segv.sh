@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as proto from "@segv/protocol/proto";
+import type { MessageView } from "@segv/engine/types";
 import {
   HANDLE_RE,
   MAX_EMOJI_BYTES,
@@ -7,9 +8,11 @@ import {
   MAX_MEMBERS,
   MAX_NAME,
   dayKey,
+  editable,
   fitBox,
   fmtBytes,
   inviterOf,
+  lastEditable,
   listOf,
   parseHandles,
   relTime,
@@ -119,5 +122,44 @@ describe("lists", () => {
     expect(inviterOf({ request: true, members: [alice, me, unknown] }, "u-me")).toBe("alice");
     expect(inviterOf({ request: true, members: [unknown, me] }, "u-me")).toBeUndefined();
     expect(inviterOf({ request: false, members: [alice, me] }, "u-me")).toBeUndefined();
+  });
+});
+
+describe("edits", () => {
+  const msg = (key: string, p: Partial<MessageView> = {}): MessageView => ({
+    key,
+    seq: 1,
+    from: "u-me",
+    fromHandle: "me",
+    mine: true,
+    ts: 1,
+    kind: "text",
+    text: "hi",
+    status: "sent",
+    reactions: [],
+    ...p,
+  });
+  it("edits only self's sent texts, a reply carrying a text included", () => {
+    expect(editable(msg("a"))).toBe(true);
+    expect(editable(msg("a", { reply: { key: "b", state: "shown" } }))).toBe(true);
+    expect(editable(msg("a", { edited: { ts: 2, count: 1, sending: false } }))).toBe(true);
+    expect(editable(msg("a", { mine: false }))).toBe(false);
+    expect(editable(msg("local:1", { status: "sending" }))).toBe(false);
+    expect(editable(msg("local:1", { status: "failed" }))).toBe(false);
+    expect(editable(msg("a", { kind: "image", text: undefined }))).toBe(false);
+    expect(editable(msg("a", { kind: "file", text: undefined }))).toBe(false);
+    expect(editable(msg("a", { kind: "system", text: "me added bob" }))).toBe(false);
+    expect(editable(msg("a", { kind: "leave", text: undefined }))).toBe(false);
+  });
+  it("ArrowUp edits self's last sent text, past later messages it cannot edit", () => {
+    const own = msg("own");
+    const later = [
+      msg("theirs", { mine: false }),
+      msg("img", { kind: "image", text: undefined }),
+      msg("local:2", { status: "failed" }),
+    ];
+    expect(lastEditable([msg("first"), own, ...later])?.key).toBe("own");
+    expect(lastEditable(later)).toBeUndefined();
+    expect(lastEditable([])).toBeUndefined();
   });
 });

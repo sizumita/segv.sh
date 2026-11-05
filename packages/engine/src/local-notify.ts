@@ -69,6 +69,11 @@ export interface Arrival {
   kind: "text" | "image" | "file";
   /** the TEXT's text; "" for an IMAGE or FILE */
   text: string;
+  /**
+   * the message's current text (§11.18), read when the notification is shown, so an edit that reached the device first
+   * is shown; `text` when absent
+   */
+  current?: () => string;
   unread: number;
 }
 
@@ -89,7 +94,7 @@ export function noteFor(a: Arrival, preview: Preview): LocalNotification {
       ? `${who} sent an image`
       : a.kind === "file"
         ? `${who} sent a file`
-        : `${who}: ${plainText(a.text)}`;
+        : `${who}: ${plainText(a.current?.() ?? a.text)}`;
   const chars = Array.from(text);
   const cut = chars.length > MAX_BODY ? `${chars.slice(0, MAX_BODY - 1).join("")}…` : text;
   const more = Math.max(0, a.unread - 1);
@@ -114,7 +119,8 @@ export class LocalNotify {
   /**
    * per conversation (its ref): when its last notification was shown (monotonic), and the row waiting for the window
    * to end. The row, not its notification, waits: the notification is made when it is shown, with the preview in
-   * effect then, so a preview turned down meanwhile never shows a message's text.
+   * effect then, so a preview turned down meanwhile never shows a message's text, and with the message's current text
+   * then, so an edit that came meanwhile is shown (§11.18).
    */
   private readonly convs = new Map<
     string,

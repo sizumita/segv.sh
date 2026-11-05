@@ -1,5 +1,5 @@
 // Plain helpers shared by the UI components (no Qwik APIs, no secrets).
-import type { ConversationView, Engine } from "@segv/engine/types";
+import type { ConversationView, Engine, MessageView } from "@segv/engine/types";
 import { loadEngine } from "./engine-loader";
 import type { ListView, UiState } from "./state";
 
@@ -120,6 +120,21 @@ export function inviterOf(
 
 export function textTooLong(text: string): boolean {
   return new TextEncoder().encode(JSON.stringify(text)).length > MAX_TEXT_JSON_BYTES;
+}
+
+// ---- edits ----
+
+/**
+ * Self can edit the message (§11.18 "Sending"): self's text, a reply carrying a text included, once it is sent (an echo
+ * names no row yet). Where self can post at all is the caller's check.
+ */
+export const editable = (m: MessageView): boolean =>
+  m.mine && m.kind === "text" && m.status === "sent" && !!m.text;
+
+/** The message that ArrowUp in the empty message box edits: self's last sent text in the conversation. */
+export function lastEditable(msgs: readonly MessageView[]): MessageView | undefined {
+  for (let i = msgs.length - 1; i >= 0; i--) if (editable(msgs[i])) return msgs[i];
+  return undefined;
 }
 
 // ---- time ----

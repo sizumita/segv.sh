@@ -23,6 +23,9 @@ The reference deployment runs at <https://segv.sh>.
 - Replies: a reply shows a small line naming the message it answers. Clicking that line opens a pane beside the
   conversation with the messages the reply answers and every reply below it, and a message box there replies to the
   last of them.
+- Edits: a member can edit their own text messages, as often and as late as they like. The message then shows the new
+  text with an "edited" mark, which opens its earlier versions. An edit deletes nothing: the original stays in the
+  history, where the other members can still read it.
 - Sign-in with a passkey. A recovery code, shown once at registration, unlocks the account without a passkey, and
   more passkeys can be added later.
 - Restore on any device: a passkey or the recovery code brings back every conversation and its history, including the
@@ -33,7 +36,7 @@ The reference deployment runs at <https://segv.sh>.
   members different views.
 - Optional notifications (Web Push), off by default and turned on per device. A notification says "new messages", or,
   if the user chooses so on that device, the conversation's name or its name and newest message, which the device
-  decrypts itself; invites, requests and reactions never notify.
+  decrypts itself; invites, requests, reactions and edits never notify.
 - A URL for each conversation (`/#c/…`) that opens it from a link, a reload or a notification. The part after `#`
   never reaches the server, and it is not the conversation's secret id.
 - Installable as an app (a web app manifest; on iPhone and iPad, "Add to Home Screen").

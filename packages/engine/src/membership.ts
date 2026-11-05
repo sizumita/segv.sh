@@ -189,8 +189,8 @@ export function deriveLines(h: MembershipHost, c: Copy): void {
  * `unread`; an own row's message is marked failed (§11.3 step 7).
  */
 export function retract(h: MembershipHost, c: Copy): void {
-  // reactions and reply targets are decided again with the rows (§11.12, §11.17)
-  if (c.reactions.size || c.replies.size) c.refsDirty = true;
+  // reactions, reply targets and edits are decided again with the rows (§11.12, §11.17, §11.18)
+  if (c.reactions.size || c.replies.size || c.edits.size) c.refsDirty = true;
   for (const ep of c.epochs.values())
     for (const [key, r] of ep.rows) {
       if (!r.shown || acceptedOld(c, ep.e, r.j, { E: r.E, n: r.n }, r.t)) continue;

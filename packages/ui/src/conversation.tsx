@@ -9,6 +9,7 @@ import {
 } from "@qwik.dev/core";
 import type { ConversationView } from "@segv/engine/types";
 import { Composer } from "./composer";
+import { EditHistory } from "./edit";
 import { loadEngine } from "./engine-loader";
 import { Members } from "./members";
 import { Messages } from "./messages";
@@ -16,12 +17,12 @@ import { gist } from "./reply";
 import { ReplyTree } from "./reply-tree";
 import { leaveChat } from "./route";
 import { PaneCtx, StateCtx, UiCtx, type PaneState } from "./state";
-import { errMsg, inviterOf, isGone } from "./util";
+import { editable, errMsg, inviterOf, isGone, lastEditable } from "./util";
 
 export const ConversationPane = component$<{ conv: ConversationView }>((props) => {
   const ui = useContext(UiCtx);
-  // chat.tsx keys this pane by conversation: the reply and the open thread start empty in each one
-  const pane = useStore<PaneState>({ reply: "", thread: "", threadTo: "" });
+  // chat.tsx keys this pane by conversation: the reply, the edit and the open thread start empty in each one
+  const pane = useStore<PaneState>({ reply: "", thread: "", threadTo: "", edit: "", history: "" });
   useContextProvider(PaneCtx, pane);
   const conv = props.conv;
   const active = conv.members.filter((m) => !m.left).length;
@@ -69,9 +70,22 @@ export const ConversationPane = component$<{ conv: ConversationView }>((props) =
     if (track(() => ui.members)) pane.thread = "";
   });
 
-  // A reply is a post (§11.17): not where nothing can be sent, nor in a read-only preview, which it would accept.
+  // Editing stops once the message leaves the view (§6.8 dropped it), can no longer be edited, or nothing can be sent.
+  useVisibleTask$(({ track }) => {
+    const key = track(() => pane.edit);
+    const ok = track(() => {
+      const c = props.conv;
+      return c.canSend && c.byContact && c.messages.some((m) => m.key === key && editable(m));
+    });
+    if (key && !ok) pane.edit = "";
+  });
+
+  // A reply is a post (§11.17): not where nothing can be sent, nor in a read-only preview, which it would accept. So is
+  // an edit (§11.18), of self's sent text.
   const canReply = conv.canSend && conv.byContact;
   const replyTo = pane.reply ? conv.messages.find((m) => m.key === pane.reply) : undefined;
+  const edited = canReply && pane.edit ? conv.messages.find((m) => m.key === pane.edit) : undefined;
+  const editOf = edited && editable(edited) ? edited : undefined;
 
   return (
     <>
@@ -111,12 +125,32 @@ export const ConversationPane = component$<{ conv: ConversationView }>((props) =
               setReply$={$((key: string) => {
                 pane.reply = key;
               })}
+              editKey={editOf ? editOf.key : ""}
+              editText={editOf?.text ?? ""}
+              editGist={editOf ? gist(editOf) : ""}
+              // an edit is never a reply
+              setEdit$={$((key: string) => {
+                const c = props.conv;
+                const ok =
+                  c.canSend && c.byContact && c.messages.some((m) => m.key === key && editable(m));
+                if (key && !ok) return false;
+                pane.edit = key;
+                if (key) pane.reply = "";
+                return true;
+              })}
+              editLast$={$(() => {
+                const m = lastEditable(props.conv.messages);
+                if (!m) return;
+                pane.edit = m.key;
+                pane.reply = "";
+              })}
             />
           )}
         </div>
         {ui.members && <Members conv={conv} />}
         {!ui.members && pane.thread && <ReplyTree conv={conv} canReply={canReply} />}
       </div>
+      {pane.history && <EditHistory key={pane.history} conv={conv} />}
     </>
   );
 });
