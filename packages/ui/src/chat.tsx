@@ -1,4 +1,4 @@
-import { $, component$, useContext, useSignal } from "@qwik.dev/core";
+import { $, component$, useContext, useSignal, useVisibleTask$ } from "@qwik.dev/core";
 import { ConvList } from "./conv-list";
 import { ConversationPane } from "./conversation";
 import { Errors } from "./errors";
@@ -71,6 +71,14 @@ export const Chat = component$(() => {
     drag.value = undefined;
     void setSide(dragged.value);
   });
+  // Through the element's style, not a style attribute: the page's CSP allows no inline styles (style-src 'self').
+  useVisibleTask$(
+    ({ track }) => {
+      const w = track(() => side.value);
+      root.value?.style.setProperty("--side", `${w}px`);
+    },
+    { strategy: "document-ready" },
+  );
   const onKey = $((e: KeyboardEvent) => {
     if (e.key === "ArrowLeft") void setSide(side.value - SIDE_STEP);
     else if (e.key === "ArrowRight") void setSide(side.value + SIDE_STEP);
@@ -79,7 +87,7 @@ export const Chat = component$(() => {
   });
 
   return (
-    <div class="chat" ref={root} style={`--side: ${side.value}px`}>
+    <div class="chat" ref={root}>
       <header class="bar">
         {state.syncing && <span>syncing…</span>}
         {state.progress && (
