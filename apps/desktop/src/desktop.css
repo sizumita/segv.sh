@@ -1,16 +1,13 @@
 /*
  * The desktop app's window, over @segv/ui's global.css. The window itself is Liquid Glass (macOS 26 and later; the
  * sidebar material before that: windowEffects in src-tauri/tauri.conf.json), or Mica on Windows 11, and the page
- * leaves it showing through its chrome: the title bar strip and the conversation list. The open conversation, dialogs
- * and the image viewer stay opaque, so that messages read as they do on the web app. On macOS the page fills the
- * window under the system's buttons, and its top strip is the title bar (chrome.ts); on Windows the system draws the
- * title bar above the page (the end of this file).
+ * leaves it showing through the conversation list. The open conversation, dialogs and the image viewer stay opaque, so
+ * that messages read as they do on the web app. In a wide window the list runs the window's full height on the left
+ * and one rule splits it from the rest. On macOS the page fills the window under the system's buttons, and its top
+ * strip is the title bar (chrome.ts); on Windows the system draws the title bar above the page (the end of this file).
  */
 :root[data-shell="desktop"] {
   --titlebar: 44px;
-  /* the system's window buttons, from the left edge (trafficLightPosition, plus the three buttons), centred in the
-     title bar */
-  --lights: 84px;
   --glass: color-mix(in srgb, var(--bg) 55%, transparent);
   --glass-hi: color-mix(in srgb, var(--fg) 8%, transparent);
   --glass-sel: color-mix(in srgb, var(--fg) 14%, transparent);
@@ -50,20 +47,6 @@ html[data-shell="desktop"] body {
 [data-shell="desktop"] .chat {
   padding: 0;
 }
-/* The status bar is the title bar: after the window buttons, on the glass. */
-[data-shell="desktop"] .bar {
-  min-height: var(--titlebar);
-  align-items: center;
-  padding: 0 14px 0 var(--lights);
-  border-bottom: 0;
-}
-[data-shell="desktop"] .bar button:not(.link) {
-  background: var(--glass);
-}
-[data-shell="desktop"] .bar .warn-chip,
-[data-shell="desktop"] .bar .warn-chip:hover {
-  background: var(--fg);
-}
 [data-shell="desktop"] .chat > .errors {
   margin: 0 8px 8px;
   background: var(--bg);
@@ -79,13 +62,18 @@ html[data-shell="desktop"] body {
   border-right: 0;
   background: transparent;
 }
-[data-shell="desktop"] .left :is(.me, .newconv, .lists) {
+[data-shell="desktop"] .left :is(.newconv, .lists) {
   border-bottom-color: var(--rule);
 }
-[data-shell="desktop"] .left :is(button:not(.conv, .link), .btn, input[type="text"], textarea) {
+[data-shell="desktop"] .left :is(.me, .progress-line) {
+  border-top-color: var(--rule);
+}
+[data-shell="desktop"]
+  .left
+  :is(button:not(.conv, .link, .gear, .warn-chip), .btn, input[type="text"], textarea) {
   background: var(--glass);
 }
-[data-shell="desktop"] .left :is(button:not(.conv, .link), .btn):hover:not(:disabled) {
+[data-shell="desktop"] .left :is(button:not(.conv, .link, .warn-chip), .btn):hover:not(:disabled) {
   background: var(--glass-hi);
 }
 [data-shell="desktop"] .conv:hover:not(:disabled) {
@@ -95,17 +83,51 @@ html[data-shell="desktop"] body {
 [data-shell="desktop"] .conv.on:hover:not(:disabled) {
   background: var(--glass-sel);
 }
-/* The conversation is a sheet inset in the glass. */
 [data-shell="desktop"] .right {
-  margin: 0 8px 8px 0;
   background: var(--bg);
-  border: 1px solid var(--rule);
-  border-radius: var(--radius);
-  overflow: hidden;
 }
+/* A narrow window on macOS: an empty strip on the glass across the top, for the system's buttons, which moves the
+   window (chrome.ts). */
 @media (max-width: 720px) {
-  [data-shell="desktop"] .right {
-    margin-left: 8px;
+  [data-shell="desktop"]:not([data-os="windows"]) .chat {
+    padding-top: var(--titlebar);
+  }
+}
+/* A wide window: the list is the sidebar, the window's full height, and the errors and the conversation are one
+   opaque area right of it. The rule between them is the list's resize handle (global.css: .sizer). On macOS the
+   list starts below the system's buttons, and the conversation's header is as tall as the strip that moves the
+   window. */
+@media (min-width: 721px) {
+  [data-shell="desktop"] .chat {
+    display: grid;
+    grid-template-columns: min(var(--side, 300px), calc(100% - 360px)) minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  [data-shell="desktop"] .panes {
+    display: contents;
+  }
+  [data-shell="desktop"] .panes > :is(.left, .sizer) {
+    grid-area: 1 / 1 / -1 / 2;
+  }
+  [data-shell="desktop"] .left {
+    border-right: 1px solid var(--rule);
+  }
+  [data-shell="desktop"] .chat > .errors {
+    grid-area: 1 / 2;
+    margin: 0;
+    border-width: 0 0 1px;
+    border-color: var(--line);
+    border-radius: 0;
+  }
+  [data-shell="desktop"] .panes > .right {
+    grid-area: 2 / 2;
+  }
+  [data-shell="desktop"]:not([data-os="windows"]) .left {
+    padding-top: var(--titlebar);
+  }
+  [data-shell="desktop"]:not([data-os="windows"]) .convhead {
+    min-height: var(--titlebar);
+    align-items: center;
   }
 }
 [data-shell="desktop"] .settings,
@@ -116,9 +138,6 @@ html[data-shell="desktop"] body {
 /* ---- Windows: the system's title bar is above the page, and the window is Mica on Windows 11
    (data-backdrop="mica") or opaque before it ("none"); chrome.ts sets both attributes from what
    src-tauri/src/lib.rs tells the page ---- */
-:root[data-shell="desktop"][data-os="windows"] {
-  --lights: 14px;
-}
 [data-shell="desktop"][data-os="windows"] :is(.boot, .page) {
   padding-top: 32px;
 }

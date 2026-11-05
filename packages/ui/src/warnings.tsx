@@ -5,8 +5,9 @@ import { StateCtx, UiCtx } from "./state";
 export const warningKey = (w: string): string => w.replace(/ \(×\d+\)$/, "");
 
 /**
- * Security warnings, as a chip in the status bar: the list opens on hover, on focus, or on a tap (which keeps it open
- * until a tap outside or Escape). Dismissing hides a warning on this page only; the engine keeps it (§12.7).
+ * Security warnings, as a chip at the foot of the conversation list: the list opens above it on hover, on focus, or
+ * on a tap (which keeps it open until a tap outside or Escape). Dismissing hides a warning on this page only; the
+ * engine keeps it (§12.7).
  */
 export const Warnings = component$(() => {
   const state = useContext(StateCtx);
