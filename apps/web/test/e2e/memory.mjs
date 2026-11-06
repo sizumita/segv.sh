@@ -2,7 +2,8 @@
 // `pnpm run test:e2e`): the production build under `wrangler dev`, as the end-to-end tests run it, with two devices in
 // headless Chromium. Bob sends messages and images to alice in several conversations, first while alice's page is
 // hidden (a closed desktop window), then while it shows them; each phase prints alice's live JS heap after a full GC,
-// the highest heap seen while the phase ran, and the script time the phase cost her page.
+// the highest heap seen while the phase ran, and the script time the phase cost her page. Each conversation is a
+// named group with carol too, whose device only registers: the "new conversation" dialog names only groups.
 //
 //   node test/e2e/memory.mjs [--no-build] [--convs N] [--messages N] [--images N] [--snapshot FILE]
 //
@@ -120,12 +121,17 @@ try {
   await cdp.send("Performance.enable");
   const alice = `alice_${sfx}`;
   const bob = `bob_${sfx}`;
+  const carol = `carol_${sfx}`;
   await register(A, alice);
   await register(B, bob);
+  // carol's account makes each room a group, which keeps its name; her device is not needed after that
+  const C = await device(browser, BASE, "carol");
+  await register(C, carol);
+  await C.ctx.close();
   const rooms = Array.from({ length: CONVS }, (_, i) => `room ${i} ${sfx}`);
   // The first conversation is a request for bob; once he accepts it, alice is his contact.
   for (const [i, room] of rooms.entries()) {
-    await newConversation(A, bob, room);
+    await newConversation(A, `${bob}, ${carol}`, room);
     await send(A, `hello ${room}`);
     if (i === 0) {
       await openRequest(B, room, `hello ${room}`);

@@ -2,6 +2,7 @@ import { $, component$, useContext, useSignal, useVisibleTask$ } from "@qwik.dev
 import { ConvList } from "./conv-list";
 import { ConversationPane } from "./conversation";
 import { Errors } from "./errors";
+import { NewChat } from "./new-chat";
 import { Settings } from "./settings";
 import { StateCtx, UiCtx } from "./state";
 
@@ -113,15 +114,40 @@ export const Chat = component$(() => {
         <section class="right" aria-label="conversation">
           {active ? (
             <ConversationPane key={active.id} conv={active} />
-          ) : (
+          ) : state.conversations.length ? (
             <p class="empty dim">
-              {state.conversations.length
-                ? "select a conversation."
-                : "start a conversation on the left."}
+              select a conversation, or{" "}
+              <button
+                type="button"
+                class="link"
+                aria-haspopup="dialog"
+                onClick$={() => (ui.newChat = true)}
+              >
+                start a new one
+              </button>
+              .
             </p>
+          ) : (
+            <div class="hello">
+              <p class="strong">no conversations yet</p>
+              <p class="dim">
+                start one with someone's handle, as yourself or as a temporary handle that does not
+                show your own.
+              </p>
+              <button
+                type="button"
+                class="go"
+                aria-haspopup="dialog"
+                onClick$={() => (ui.newChat = true)}
+              >
+                start a conversation
+              </button>
+            </div>
           )}
         </section>
       </div>
+      {/* At this level, not in the list: the desktop app styles what is inside the list as its sidebar. */}
+      {ui.newChat && <NewChat />}
       {ui.settings && <Settings />}
     </div>
   );

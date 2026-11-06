@@ -17,9 +17,19 @@ import { gist } from "./reply";
 import { ReplyTree } from "./reply-tree";
 import { leaveChat } from "./route";
 import { PaneCtx, StateCtx, UiCtx, type PaneState } from "./state";
-import { editable, errMsg, inviterOf, isGone, lastEditable } from "./util";
+import {
+  editable,
+  errMsg,
+  identitiesOf,
+  inviterOf,
+  isGone,
+  lastEditable,
+  nameOf,
+  nameWithHandle,
+} from "./util";
 
 export const ConversationPane = component$<{ conv: ConversationView }>((props) => {
+  const state = useContext(StateCtx);
   const ui = useContext(UiCtx);
   // chat.tsx keys this pane by conversation: the reply, the edit and the open thread start empty in each one
   const pane = useStore<PaneState>({ reply: "", thread: "", threadTo: "", edit: "", history: "" });
@@ -29,7 +39,8 @@ export const ConversationPane = component$<{ conv: ConversationView }>((props) =
 
   // Opening the pane is the engine's "pane is open" hint (§11.10–§11.11): it starts scrollback once, even when nothing
   // is unread (after a reload every conversation has unread = 0). It accepts nothing; still, no read-only preview
-  // calls it: a copy whose inviter is not a contact waits for the accept button (§11.11).
+  // calls it: a copy whose inviter is not a contact waits for the accept button (§11.11). This is the opening, and
+  // so is the page becoming visible again with the pane open: only it may post a temporary handle's BELL row (§11.13).
   useVisibleTask$(async ({ track }) => {
     const id = track(() => props.conv.id);
     const byContact = track(() => props.conv.byContact);
@@ -44,7 +55,8 @@ export const ConversationPane = component$<{ conv: ConversationView }>((props) =
   });
 
   // Mark read while the conversation is on screen and the tab is visible: when new messages arrive, and when the
-  // tab becomes visible again.
+  // tab becomes visible again. Not an opening (`false`): rows that arrive in a pane already open never make a
+  // temporary handle write, or a member could choose when it does (§2.6).
   useVisibleTask$(async ({ track }) => {
     const unread = track(() => props.conv.unread);
     const byContact = track(() => props.conv.byContact);
@@ -52,7 +64,7 @@ export const ConversationPane = component$<{ conv: ConversationView }>((props) =
     const id = props.conv.id;
     if (unread > 0 && byContact && visible && document.visibilityState === "visible") {
       try {
-        (await loadEngine()).markRead(id);
+        (await loadEngine()).markRead(id, false);
       } catch {
         // ignore: the badge simply stays
       }
@@ -86,6 +98,8 @@ export const ConversationPane = component$<{ conv: ConversationView }>((props) =
   const replyTo = pane.reply ? conv.messages.find((m) => m.key === pane.reply) : undefined;
   const edited = canReply && pane.edit ? conv.messages.find((m) => m.key === pane.edit) : undefined;
   const editOf = edited && editable(edited) ? edited : undefined;
+  // A conversation of a temporary handle says so, beside its name (§2.6).
+  const alias = identitiesOf(state).find((i) => i.alias && i.uid === conv.as);
 
   return (
     <>
@@ -93,9 +107,19 @@ export const ConversationPane = component$<{ conv: ConversationView }>((props) =
         <button type="button" class="link back" onClick$={() => leaveChat(ui)}>
           back
         </button>
-        <h2 class="title" title={conv.name}>
-          {conv.name || "(no name)"}
-        </h2>
+        <div class="titlebox">
+          <h2 class="title" title={conv.name}>
+            {conv.name || "(no name)"}
+          </h2>
+          {alias && (
+            <span
+              class="aspill"
+              title="you take part in this conversation as this temporary handle"
+            >
+              as @{alias.handle || "…"}
+            </span>
+          )}
+        </div>
         <span class="dim small">
           {active} member{active === 1 ? "" : "s"}
         </span>
@@ -119,7 +143,9 @@ export const ConversationPane = component$<{ conv: ConversationView }>((props) =
               blocked={conv.blocked}
               // a target that left the view (§6.8 dropped it) is not replied to
               replyTo={replyTo ? replyTo.key : ""}
-              replyWho={replyTo ? replyTo.fromHandle || "unknown" : ""}
+              replyWho={
+                replyTo ? nameOf(replyTo.fromHandle, replyTo.fromNickname) || "unknown" : ""
+              }
               replyGist={replyTo ? gist(replyTo) : ""}
               canStop={true}
               setReply$={$((key: string) => {
@@ -187,17 +213,21 @@ const RequestBar = component$<{ conv: ConversationView }>((props) => {
   });
 
   const conv = props.conv;
-  const who = inviterOf(conv, state.me?.uid ?? "");
+  const inviter = inviterOf(conv);
+  const who = inviter ? nameWithHandle(inviter.handle, inviter.nickname) : "";
+  // A temporary handle has contacts of its own (§2.6).
+  const alias = identitiesOf(state).find((i) => i.alias && i.uid === conv.as);
+  const contacts = alias ? `the contacts of @${alias.handle || "…"}` : "your contacts";
   return (
     <div class="composer request" role="region" aria-label="request">
       <p>
         <b>message request</b>{" "}
-        {who ? `from @${who}, who is not in your contacts.` : "from someone not in your contacts."}
+        {who ? `from ${who}, who is not in ${contacts}.` : `from someone not in ${contacts}.`}
       </p>
       <p class="dim small">
         you can read it here without accepting it; images and files load only when you open them.
-        accept to reply. accepting adds {who ? `@${who}` : "the sender"} to your contacts, so their
-        next conversations are not requests.
+        accept to reply. accepting adds {who || "the sender"} to {contacts}, so their next
+        conversations are not requests.
         {conv.members.length > 2 && " the other members' handles are looked up when you accept."}
       </p>
       <p class="row">

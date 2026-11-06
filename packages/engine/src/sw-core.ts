@@ -162,7 +162,8 @@ async function readNewest(
   const lanes: { copy: CacheCopy; ep: CacheEpoch; j: number }[] = [];
   for (const x of copies)
     x.ep.next.forEach((_, j) => {
-      if (j !== x.ep.self) lanes.push({ ...x, j });
+      // neither self's lane nor those of the user's other accounts (§2.6, §11.13 step 3)
+      if (j !== x.ep.self && !x.ep.own?.includes(j)) lanes.push({ ...x, j });
     });
   const found = new Map<string, Found[]>();
   if (lanes.length === 0) return { found, moves: [] };
@@ -229,7 +230,9 @@ async function readNewest(
           edits.push({ lane: a.lane, E: a.E, n: a.n, to, text });
         return;
       }
-      const who = `@${l.ep.members[l.j]?.handle ?? "?"}`;
+      // the sender's nickname when the cache holds one, else `@handle` (§11.13 step 3, §11.19)
+      const sender = l.ep.members[l.j];
+      const who = sender?.nick ? sender.nick : `@${sender?.handle ?? "?"}`;
       // A REPLY shows as the message it carries (§11.17).
       const msg = v.msg.type === P.MT.REPLY ? v.msg.body : v.msg;
       let text: () => string;

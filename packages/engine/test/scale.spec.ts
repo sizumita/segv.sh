@@ -443,8 +443,9 @@ describe("T6: restore at scale", () => {
       (r) => r.method === "GET" && /^\/api\/v2\/blob\/[^/]+$/.test(r.path),
     );
     expect(blobs.length).toBeLessThanOrEqual(1); // the snapshot's own blob only
+    // the own entry only: an account without aliases looks up no alias uid (§2.6, §11.1)
     const dir = restore.filter((r) => r.path.startsWith("/api/v2/dir"));
-    expect(dir.map((r) => r.path.split("/").slice(0, 5).join("/"))).toEqual(["/api/v2/dir/uid"]);
+    expect(dir.map((r) => r.path)).toEqual([`/api/v2/dir/uid/${alice.uidB}`]);
     const withHistory = ids.filter(
       (id) =>
         (I(A2)

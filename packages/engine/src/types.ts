@@ -15,10 +15,60 @@ export interface Me {
   fingerprint: string; // "12345 67890 ..." (6 groups of 5 digits)
 }
 
+/**
+ * One account that this device runs for the user (§2.6, §11.11 "Accounts in the view"): the owner (the account that
+ * signed in) or one of its aliases, the temporary handles. Listed owner first, then the aliases by index.
+ */
+export interface IdentityView {
+  /** b64u uid */
+  uid: string;
+  /** the handle; an alias's is computed on the device from its keys (§2.6), retired ones included */
+  handle: string;
+  fingerprint: string;
+  /** an alias (a temporary handle); false for the owner */
+  alias: boolean;
+  /** the alias's index (§2.6); -1 for the owner */
+  index: number;
+  /** a retired alias: not run, its conversations not shown (§2.6 "Retiring") */
+  retired: boolean;
+  /**
+   * `starting` while its restore runs (or waits for its turn), `ready` once it runs, `failed` when this device does not
+   * run it because its directory entry did not check (§2.6 "Running aliases"), `idle` when it is live but beyond the
+   * MAX_LIVE_ALIASES with the highest indices that this device runs, `retired` for a retired alias. The owner is
+   * `starting` or `ready`.
+   */
+  status: "starting" | "ready" | "failed" | "idle" | "retired";
+}
+
+/** At most this many aliases run at once (§2.6 `MAX_LIVE_ALIASES`); creating and bringing back fail beyond it. */
+export const MAX_LIVE_ALIASES = 16;
+
+/**
+ * A user that one of the device's accounts knows (a MEMBER record: verified in the directory, §7.3), for suggestions
+ * and nicknames. The owner and its aliases are never listed.
+ */
+export interface PersonView {
+  uid: string;
+  handle: string;
+  /** the nickname the user gave them (§11.19), "" for none */
+  nickname: string;
+  /** the uids of the device's accounts (owner and aliases) of which this user is a contact (§7.3) */
+  contactOf: string[];
+}
+
 export interface MemberView {
   uid: string;
   /** handle, or `?` + 8 uid characters for a member not (or not validly, or not yet) resolved in the directory (§11.2) */
   handle: string;
+  /** the nickname the user gave this member (§11.19); "" for none, and always "" for an unknown (`?…`) member */
+  nickname: string;
+  /** the member is the copy's own account (the owner or the alias that holds the copy, §2.6) */
+  you: boolean;
+  /**
+   * the member is another of the user's own accounts (the owner, or one of its aliases, §2.6), listed with that
+   * account's own keys (a slot with its uid and other keys is an unknown member): "your other handle"
+   */
+  own: boolean;
   fingerprint: string;
   /** recorded as left in the current epoch (its LEAVE row, or a LEFT record at restore) and not yet rotated out */
   left: boolean;
@@ -89,6 +139,8 @@ export interface MessageView {
   seq: number;
   from: string; // uid ('' for system lines)
   fromHandle: string;
+  /** the sender's nickname (§11.19), "" for none (and for self, system lines and unknown members) */
+  fromNickname: string;
   mine: boolean;
   /** ms; sender time clamped to the row's public time ± 5 min (§11.8) */
   ts: number;
@@ -119,15 +171,22 @@ export interface MessageView {
 export type Blocked = "" | "removed" | "left" | "pending" | "frozen";
 
 export interface ConversationView {
-  /** opaque copy key (`b64u(conv)`, or `b64u(conv)~i` for a later copy, §7.3); secret, only ever used locally */
+  /**
+   * opaque view id: the copy key (`b64u(conv)`, or `b64u(conv)~i` for a later copy, §7.3) for a copy of the owner, and
+   * a prefixed copy key for a copy of an alias, unique among the copies of every account on the device; secret, only
+   * ever used locally
+   */
   id: string;
+  /** the uid of the account that holds the copy: the owner's, or an alias's (§2.6, `EngineState.identities`) */
+  as: string;
   /**
    * The copy's name in the page URL (`/#c/<ref>`): 12 b64u characters, a keyed hash of `id` under a key derived from
    * the account key. Every device of the account computes the same ref, other accounts a different one, and it tells
    * nothing about `conv`. It sits in a URL fragment, which browsers never send to the server.
    */
   ref: string;
-  name: string; // explicit group name ("# name"), or the other members' handles joined by ", "
+  /** explicit group name ("# name"), or the other members' names (a nickname, else `@handle`, §11.19) joined by ", " */
+  name: string;
   members: MemberView[]; // current epoch, in descriptor order
   epoch: number;
   /**
@@ -157,12 +216,18 @@ export interface EngineState {
   phase: Phase;
   progress: string; // human-readable status ("waiting for passkey…", "solving proof of work…"), '' when idle
   error: string; // last user-facing error, '' when none
+  /** the owner: the account that signed in */
   me: Me | null;
-  conversations: ConversationView[]; // most recent activity first
+  /** every account this device runs for the user: the owner first, then its aliases by index (§2.6, §11.11) */
+  identities: IdentityView[];
+  /** users the device's accounts know, for suggestions and nicknames (§11.19); never the user's own accounts */
+  people: PersonView[];
+  conversations: ConversationView[]; // most recent activity first, every account's copies together
   /** latest verified checkpoint: {seq: q, h: b64u(C_q)}; `{seq: 0, h: ""}` until a checkpoint is verified */
   head: { seq: number; h: string };
   connected: boolean; // realtime socket (/api/v2/rt) is open
-  syncing: boolean; // restoring or catching up
+  /** restoring or catching up; true until the owner and every live alias have restored (or failed, §2.6) */
+  syncing: boolean;
   warnings: string[]; // security warnings (split view, signature failures, …)
   prfSupported: boolean | null; // getClientCapabilities()['extension:prf'] if known
   /**
@@ -206,11 +271,26 @@ export interface Engine {
   logout(): Promise<void>;
 
   /**
-   * Starts a conversation with the given handles (1 handle = 1:1). Resolves with the conversation id after the bundle
-   * upload and the first self row, with the conversation already in `conversations` (§6.1 step 5); the
-   * invitations finish in the background (at least Δ + SKEW later).
+   * Starts a conversation with the given handles (1 handle = 1:1), as the account `as` (the uid of the owner or of a
+   * live alias; the owner when absent, §11.11). Resolves with the conversation id after the bundle upload and the first
+   * self row, with the conversation already in `conversations` (§6.1 step 5); the invitations finish in the background
+   * (at least Δ + SKEW later). Rejects with "@x is one of your own handles" for a handle of another of the user's
+   * accounts (§2.6).
    */
-  createConversation(handles: string[], name?: string): Promise<string>;
+  createConversation(handles: string[], name?: string, as?: string): Promise<string>;
+  /**
+   * Creates a temporary handle (an alias, §2.6 "Creating"): registers it (a proof of work) and starts it. Resolves with
+   * its uid once it runs; rejects with "could not create a temporary handle; try again", or with "at most 16 temporary
+   * handles can be active; retire one first".
+   */
+  createAlias(): Promise<string>;
+  /** Retires an alias, or brings it back (§2.6 "Retiring"; bringing back fails like `createAlias` beyond the cap). */
+  setAliasRetired(uid: string, retired: boolean): Promise<void>;
+  /**
+   * Gives the user `uid` a nickname, or removes it with "" (§11.19). Rejects with "a nickname: 1–64 characters, not
+   * starting with @" or "you cannot give your own handles a nickname".
+   */
+  setNickname(uid: string, nickname: string): Promise<void>;
   /**
    * The send calls take an optional `replyTo`: the key of a TEXT, IMAGE, FILE or REPLY message of the conversation,
    * which the message then replies to (a REPLY row, §11.17). An unknown key rejects at once ("unknown message").
@@ -265,9 +345,11 @@ export interface Engine {
   loadFile(file: FileRef): Promise<string>;
   /**
    * Resets `unread` and starts scrollback once (§11.10–§11.11): the "conversation pane is open" hint, even when
-   * `unread` is 0. It accepts nothing.
+   * `unread` is 0. It accepts nothing. `opened` (default true): the user opened the pane, or its page became visible
+   * again; pass false when only rows arrived in a pane already open. Only an opening posts an alias's BELL row
+   * (§11.13), so that no member can choose when an alias writes (§2.6).
    */
-  markRead(convId: string): void;
+  markRead(convId: string, opened?: boolean): void;
   /**
    * Turns notifications on this device on or off (§11.13). Turning them on must be called from the user's click: it
    * may ask for permission.

@@ -66,6 +66,8 @@ export interface Arrival {
   ref: string;
   name: string;
   handle: string;
+  /** the sender's nickname (§11.19), shown in place of `@handle`; "" or absent for none */
+  nick?: string;
   kind: "text" | "image" | "file";
   /** the TEXT's text; "" for an IMAGE or FILE */
   text: string;
@@ -88,7 +90,7 @@ export function noteFor(a: Arrival, preview: Preview): LocalNotification {
   const open = `#c/${a.ref}`;
   if (preview === "name") return { tag: a.ref, title: a.name, body: FIXED.body, open };
   // As plain text: a notification can neither style nor hide, and a spoiler must not reach the lock screen.
-  const who = `@${a.handle}`;
+  const who = a.nick ? a.nick : `@${a.handle}`;
   const text =
     a.kind === "image"
       ? `${who} sent an image`

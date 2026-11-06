@@ -126,7 +126,8 @@ function checkWrite(w: unknown): asserts w is DirWrite {
   if (o.kind !== "user") bad();
   if (!isStr(o.uid) || !isStr(o.handle) || !isStr(o.bundle) || !isStr(o.sig)) bad();
   if (!Number.isInteger(o.upre) || !Number.isInteger(o.hpre) || !Number.isInteger(o.regEra)) bad();
-  if (!Array.isArray(o.wraps) || o.wraps.length < 1 || !o.wraps.every(wrapOk)) bad();
+  // An alias registers without wraps (§2.6); the Worker checked which registrations may (§10.6).
+  if (!Array.isArray(o.wraps) || !o.wraps.every(wrapOk)) bad();
 }
 
 /** The dirlog entries of a write, in order (§9.6: a user's entry, then its wraps'; a wrap's entry). */

@@ -7,8 +7,8 @@ import { MsgFile } from "./msg-file";
 import { MsgImage } from "./msg-image";
 import { MsgText } from "./msg-text";
 import { keyed, ReplyIcon, ReplyQuote, targetIn } from "./reply";
-import { PaneCtx, UiCtx, type UiState } from "./state";
-import { act, clock, dayKey, dayLabel, editable, fullTime } from "./util";
+import { PaneCtx, StateCtx, UiCtx, type UiState } from "./state";
+import { act, clock, dayKey, dayLabel, editable, fullTime, identitiesOf, nameOf } from "./util";
 
 const GROUP_MS = 5 * 60_000;
 const NEAR_BOTTOM_PX = 48;
@@ -93,6 +93,7 @@ const CopiedIcon = () => (
 const COPIED_MS = 1500;
 
 export const Messages = component$<{ conv: ConversationView }>((props) => {
+  const state = useContext(StateCtx);
   const ui = useContext(UiCtx);
   const pane = useContext(PaneCtx);
   const box = useSignal<HTMLElement>();
@@ -234,6 +235,8 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
   );
 
   const msgs = props.conv.messages;
+  // the user's other accounts (§2.6), which may be members here too
+  const own = new Set(identitiesOf(state).map((i) => i.uid));
   // A reaction is a post: not in a read-only preview (it would accept the copy) or where nothing can be sent.
   const canReact = props.conv.canSend && props.conv.byContact;
   const picked = pick.key ? msgs.find((m) => m.key === pick.key) : undefined;
@@ -279,7 +282,7 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
               {isLine(m) ? (
                 <p class="sys" title={fullTime(m.ts)}>
                   {m.kind === "leave"
-                    ? `${m.mine ? "you" : m.fromHandle || "someone"} left the conversation`
+                    ? `${m.mine ? "you" : nameOf(m.fromHandle, m.fromNickname) || "someone"} left the conversation`
                     : m.text}
                   <span class="t"> · {clock(m.ts)}</span>
                 </p>
@@ -337,8 +340,13 @@ export const Messages = component$<{ conv: ConversationView }>((props) => {
                   {m.reply && <ReplyQuote m={m} target={targetIn(byKey, m)} />}
                   {head && (
                     <p class="meta">
-                      <b>{m.fromHandle || "unknown"}</b>
-                      {m.mine && <span class="dim"> (you)</span>}{" "}
+                      <b title={m.fromNickname ? `@${m.fromHandle}` : undefined}>
+                        {nameOf(m.fromHandle, m.fromNickname) || "unknown"}
+                      </b>
+                      {m.mine && <span class="dim"> (you)</span>}
+                      {!m.mine && own.has(m.from) && (
+                        <span class="dim"> (your other handle)</span>
+                      )}{" "}
                       <span class="dim">{clock(m.ts)}</span>
                     </p>
                   )}

@@ -16,6 +16,11 @@ export interface CacheMember {
   sigPk: string;
   /** the handle the client shows for the member */
   handle: string;
+  /**
+   * the nickname the user gave the member (§11.19), which a notification shows in place of `@handle`; absent for none
+   * (and in caches written before nicknames, which a reader accepts as they are)
+   */
+  nick?: string;
 }
 
 /** The current epoch of a copy, for the `message` preview. Byte strings are b64u. */
@@ -26,6 +31,11 @@ export interface CacheEpoch {
   rk: string;
   /** self's lane index */
   self: number;
+  /**
+   * the lanes of the user's other accounts (the owner, or its aliases, §2.6), which notify no more than self's; absent
+   * for none (and in caches written before aliases)
+   */
+  own?: number[];
   members: CacheMember[];
   /** per lane: the slot after its head as the client last knew it */
   next: CacheSlot[];
@@ -111,8 +121,16 @@ function validEpoch(x: unknown): x is CacheEpoch {
     typeof e.mk === "string" &&
     typeof e.rk === "string" &&
     Number.isSafeInteger(e.self) &&
+    (e.own === undefined ||
+      (Array.isArray(e.own) && e.own.every((j) => Number.isSafeInteger(j)))) &&
     Array.isArray(e.members) &&
-    e.members.every((m) => m && typeof m.sigPk === "string" && typeof m.handle === "string") &&
+    e.members.every(
+      (m) =>
+        m &&
+        typeof m.sigPk === "string" &&
+        typeof m.handle === "string" &&
+        (m.nick === undefined || typeof m.nick === "string"),
+    ) &&
     Array.isArray(e.next) &&
     e.next.every(isSlot) &&
     e.next.length === e.members.length

@@ -23,6 +23,12 @@ export interface UiState {
   localError: string;
   /** settings dialog open */
   settings: boolean;
+  /** "new conversation" dialog open (new-chat.tsx) */
+  newChat: boolean;
+  /** the account the last new conversation was started as, for the next one (a uid; '' = the owner) */
+  startAs: string;
+  /** a temporary handle is being made (`createAlias`, a proof of work): one at a time */
+  makingAlias: boolean;
   /** document.visibilityState === 'visible' */
   visible: boolean;
   /** clock for relative times, refreshed every 30 s */
@@ -40,6 +46,8 @@ export const initialEngineState = (): EngineState => ({
   progress: "",
   error: "",
   me: null,
+  identities: [],
+  people: [],
   conversations: [],
   head: { seq: 0, h: "" },
   connected: false,
@@ -60,6 +68,9 @@ export const initialUiState = (): UiState => ({
   recovery: undefined,
   localError: "",
   settings: false,
+  newChat: false,
+  startAs: "",
+  makingAlias: false,
   visible: true,
   now: 0,
   viewer: undefined,

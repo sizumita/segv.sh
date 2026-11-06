@@ -10,23 +10,29 @@
 //                              ?mock=warn       -> adds security warnings + an error
 //                              ?mock=offline    -> connected = false, syncing = true
 //                              ?mock=push       -> notifications can be turned on and off
-// Tests can drive it through `window.__segvMock` (DEV only).
+// Signed in, alice has a temporary handle (`_k7m2_q9x4`, with a conversation of its own) and a retired one, and calls
+// bob "Bob B" (§2.6, §11.19). Tests can drive it through `window.__segvMock` (DEV only).
 
-import type {
-  ConversationView,
-  EditVersion,
-  Engine,
-  EngineState,
-  FileRef,
-  ImageRef,
-  MemberView,
-  MessageView,
+import {
+  MAX_LIVE_ALIASES,
+  type ConversationView,
+  type EditVersion,
+  type Engine,
+  type EngineState,
+  type FileRef,
+  type IdentityView,
+  type ImageRef,
+  type MemberView,
+  type MessageView,
+  type PersonView,
 } from "@segv/engine/types";
 
 const HANDLE_RE = /^[a-z0-9_]{3,20}$/;
 /** Mirror of MAX_TEXT_BYTES (packages/engine/src/conv.ts): the longest text, in UTF-8. */
 const MAX_TEXT_BYTES = 12_000;
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+/** The letters of a temporary handle (§2.6). */
+const ALIAS_CHARS = "0123456789abcdefghjkmnpqrstvwxyz";
 const MIN = 60_000;
 const HOUR = 60 * MIN;
 const DAY = 24 * HOUR;
@@ -72,12 +78,29 @@ function recoveryCode(): string {
   return chars.match(/.{4}/g)!.join("-");
 }
 
-const member = (handle: string, left = false): MemberView => ({
-  uid: `uid-${handle}`,
+/** A random temporary handle: `_k7m2_q9x4` (§2.6). */
+function aliasHandle(): string {
+  const b = crypto.getRandomValues(new Uint8Array(8));
+  const c = Array.from(b, (x) => ALIAS_CHARS[x & 31]).join("");
+  return `_${c.slice(0, 4)}_${c.slice(4)}`;
+}
+
+/** Another user's uid in the mock: their handle's. The user's own accounts have theirs (`MockEngine.uidOf`). */
+const userUid = (handle: string) => `uid-${handle}`;
+
+/** A member as a descriptor lists it; `dress` fills in `you` and the nickname. */
+const member = (handle: string, left = false, uid = userUid(handle)): MemberView => ({
+  uid,
   handle,
+  nickname: "",
+  you: false,
+  own: false,
   fingerprint: fakeFingerprint(handle),
   left,
 });
+
+/** Who a system line names (§11.9): "you" for the copy's own account, a nickname, or `@handle`. */
+type Who = (handle: string) => string;
 
 interface MockOpts {
   ready: boolean;
@@ -109,6 +132,8 @@ class MockEngine implements Engine {
     progress: "",
     error: "",
     me: null,
+    identities: [],
+    people: [],
     conversations: [],
     head: { seq: 0, h: "" },
     connected: false,
@@ -127,6 +152,16 @@ class MockEngine implements Engine {
   private urls = new Map<string, string>();
   /** the versions of each edited message (§11.18), by its key: its own text first, then each edit's */
   private versions = new Map<string, EditVersion[]>();
+  /** the nicknames the user gave (§11.19), by uid */
+  private nicks = new Map<string, string>();
+  /** the people the accounts know, without their nicknames (`state.people` has them) */
+  private known: Omit<PersonView, "nickname">[] = [];
+  /** each conversation's own name (§5.1), by id; none for one named after its members */
+  private titles = new Map<string, string>();
+  /** system lines, drawn again whenever a nickname changes (§11.9): by message key */
+  private lines = new Map<string, (who: Who) => string>();
+  /** the conversations of retired temporary handles, by the handle's uid: not shown (§2.6 "Retiring") */
+  private parked = new Map<string, ConversationView[]>();
 
   constructor(private opts: MockOpts) {
     void this.boot();
@@ -184,24 +219,99 @@ class MockEngine implements Engine {
     throw new Error(msg);
   }
   private updateConv(id: string, fn: (c: ConversationView) => ConversationView) {
-    const list = this.state.conversations.map((c) => (c.id === id ? fn(c) : c));
+    const list = this.state.conversations.map((c) => (c.id === id ? this.dress(fn(c)) : c));
     list.sort((a, b) => b.lastTs - a.lastTs);
     this.set({ conversations: list });
+  }
+  /** The user's account `uid` (the owner or a temporary handle). */
+  private identity(uid: string): IdentityView | undefined {
+    return this.state.identities.find((i) => i.uid === uid);
+  }
+  /** The account that holds a conversation (§2.6). */
+  private selfOf(c: ConversationView): IdentityView {
+    return this.identity(c.as) ?? this.state.identities[0];
+  }
+  /** A handle's uid: the user's own account's, or another user's. */
+  private uidOf(handle: string): string {
+    return this.state.identities.find((i) => i.handle === handle)?.uid ?? userUid(handle);
+  }
+  /** The nickname shown for `uid` (§11.19): never for the user's own accounts, nor for an unknown member. */
+  private nickOf(uid: string, handle: string): string {
+    if (handle.startsWith("?") || this.identity(uid)) return "";
+    return this.nicks.get(uid) ?? "";
+  }
+  /**
+   * A conversation as the engine shows it, from the view of the account that holds it (§11.19): `you`, the members'
+   * nicknames, the senders', its name and its system lines. Unchanged parts stay the same objects.
+   */
+  private dress(c: ConversationView): ConversationView {
+    const self = this.selfOf(c);
+    const members = c.members.map((m) => {
+      const you = m.uid === c.as;
+      const own = !you && !!this.identity(m.uid);
+      const nickname = you ? "" : this.nickOf(m.uid, m.handle);
+      return m.you === you && m.own === own && m.nickname === nickname
+        ? m
+        : { ...m, you, own, nickname };
+    });
+    const who: Who = (h) => {
+      if (h === self.handle) return "you";
+      return this.nickOf(this.uidOf(h), h) || `@${h}`;
+    };
+    const messages = c.messages.map((m) => {
+      const fromNickname = m.mine || !m.from ? "" : this.nickOf(m.from, m.fromHandle);
+      const line = this.lines.get(m.key);
+      const text = line ? line(who) : m.text;
+      return m.fromNickname === fromNickname && m.text === text ? m : { ...m, fromNickname, text };
+    });
+    const title = this.titles.get(c.id);
+    const others = members.filter((m) => !m.you).map((m) => m.nickname || `@${m.handle}`);
+    const name = title !== undefined ? `# ${title}` : others.join(", ") || "just you";
+    const same =
+      name === c.name &&
+      members.every((m, i) => m === c.members[i]) &&
+      messages.every((m, i) => m === c.messages[i]);
+    return same ? c : { ...c, name, members, messages };
+  }
+  /** The people with their nicknames (§11.19). */
+  private dressPeople(): PersonView[] {
+    return this.known.map((p) => ({ ...p, nickname: this.nicks.get(p.uid) ?? "" }));
+  }
+  /** The accounts of `as` now know these users (MEMBER records): they are its contacts from now on. */
+  private learn(as: string, handles: string[]) {
+    for (const h of handles) {
+      const uid = this.uidOf(h);
+      if (this.identity(uid)) continue;
+      const p = this.known.find((x) => x.uid === uid);
+      if (!p) this.known.push({ uid, handle: h, contactOf: [as] });
+      else if (!p.contactOf.includes(as)) p.contactOf = [...p.contactOf, as];
+    }
+    this.set({ people: this.dressPeople() });
   }
   private conv(id: string): ConversationView {
     const c = this.state.conversations.find((x) => x.id === id);
     if (!c) this.fail("unknown conversation");
     return c;
   }
-  private msg(p: Partial<MessageView> & Pick<MessageView, "kind">): MessageView {
-    const me = this.state.me!;
-    const mine = p.mine ?? p.fromHandle === me.handle;
+  /**
+   * A message of the account `self` (the owner unless given): its own when `fromHandle` is self's handle. A system
+   * line's `line` draws its text, again on every nickname change.
+   */
+  private msg(
+    p: Partial<MessageView> & Pick<MessageView, "kind"> & { line?: (who: Who) => string },
+    self: { uid: string; handle: string } = this.state.me!,
+  ): MessageView {
+    const mine = p.mine ?? p.fromHandle === self.handle;
     const seq = p.seq ?? ++this.seq;
+    const key = p.key ?? `tag-${seq}-${Math.random().toString(16).slice(2)}`;
+    if (p.line) this.lines.set(key, p.line);
+    const from = p.kind === "system" ? "" : mine ? self.uid : this.uidOf(p.fromHandle ?? "");
     return {
-      key: p.key ?? `tag-${seq}-${Math.random().toString(16).slice(2)}`,
+      key,
       seq,
-      from: p.kind === "system" ? "" : mine ? me.uid : `uid-${p.fromHandle}`,
-      fromHandle: p.kind === "system" ? "" : (p.fromHandle ?? me.handle),
+      from,
+      fromHandle: p.kind === "system" ? "" : (p.fromHandle ?? self.handle),
+      fromNickname: mine || !from ? "" : this.nickOf(from, p.fromHandle ?? ""),
       mine,
       ts: p.ts ?? Date.now(),
       kind: p.kind,
@@ -247,9 +357,43 @@ class MockEngine implements Engine {
 
   // ---- seed data ----
   private signIn(handle: string) {
-    const me = { uid: `uid-${handle}`, handle, fingerprint: fakeFingerprint(handle) };
+    const me = { uid: userUid(handle), handle, fingerprint: fakeFingerprint(handle) };
+    // the owner, a temporary handle with a conversation of its own, and a retired one (§2.6)
+    const alias = { uid: "uid-alias-0", handle: "_k7m2_q9x4" };
+    const retired = { uid: "uid-alias-1", handle: "_r3vd_8hcw" };
+    const identities: IdentityView[] = [
+      { ...me, alias: false, index: -1, retired: false, status: "ready" },
+      {
+        ...alias,
+        fingerprint: fakeFingerprint(alias.handle),
+        alias: true,
+        index: 0,
+        retired: false,
+        status: "ready",
+      },
+      {
+        ...retired,
+        fingerprint: fakeFingerprint(retired.handle),
+        alias: true,
+        index: 1,
+        retired: true,
+        status: "retired",
+      },
+    ];
+    this.nicks = new Map([[userUid("bob"), "Bob B"]]);
+    const contacts = (handles: string[], of: string) =>
+      handles.map((h) => ({ uid: userUid(h), handle: h, contactOf: [of] }));
+    this.known = [
+      ...contacts(["bob", "carol", "dave", "erin", "frank", "grace", "mallory"], me.uid),
+      ...contacts(["nina", "otto"], alias.uid),
+      // known from requests that were not accepted: contacts of nobody
+      { uid: userUid("zed"), handle: "zed", contactOf: [] },
+      { uid: userUid("quinn"), handle: "quinn", contactOf: [] },
+    ];
     this.set({
       me,
+      identities,
+      people: this.dressPeople(),
       phase: "ready",
       progress: "",
       connected: true,
@@ -257,8 +401,13 @@ class MockEngine implements Engine {
       head: { seq: 1093, h: "q2Vh3…" },
     });
     const now = Date.now();
-    const m = (p: Partial<MessageView> & Pick<MessageView, "kind">) => this.msg(p);
+    const m = (p: Parameters<MockEngine["msg"]>[0]) => this.msg(p);
+    /** A member who is one of the user's accounts, holding the conversation. */
+    const self = (left = false) => member(handle, left, me.uid);
     this.versions.clear();
+    this.lines.clear();
+    this.titles.clear();
+    this.parked.clear();
     /** A message that was edited: `text` is its own, each of `edits` a later version (§11.18). */
     const edited = (
       p: Partial<MessageView> & Pick<MessageView, "kind">,
@@ -268,11 +417,18 @@ class MockEngine implements Engine {
       this.versions.set(x.key, [{ text: x.text ?? "", ts: x.ts }, ...edits]);
       return this.asEdited(x);
     };
-    const dm: ConversationView = {
-      id: randomId(),
+    /** A conversation of the owner, with its own name when `title` is given. */
+    const conv = (
+      title: string | undefined,
+      c: Omit<ConversationView, "id" | "as" | "name"> & { as?: string },
+    ): ConversationView => {
+      const id = randomId();
+      if (title !== undefined) this.titles.set(id, title);
+      return { id, as: me.uid, name: "", ...c };
+    };
+    const dm = conv(undefined, {
       ref: mockRef("dm"),
-      name: "bob",
-      members: [member(handle), member("bob")],
+      members: [self(), member("bob")],
       epoch: 0,
       canSend: true,
       blocked: "",
@@ -282,7 +438,11 @@ class MockEngine implements Engine {
       lastTs: now - 2 * MIN,
       unread: 0,
       messages: [
-        m({ kind: "system", text: `${handle} started a conversation with bob`, ts: now - 2 * DAY }),
+        m({
+          kind: "system",
+          line: (w) => `${w(handle)} started the conversation`,
+          ts: now - 2 * DAY,
+        }),
         edited({ kind: "text", fromHandle: "bob", text: "hey", ts: now - 2 * DAY + MIN }, [
           { text: "hey, you around", ts: now - 2 * DAY + MIN + 20_000 },
           { text: "hey, are you around?", ts: now - 2 * DAY + 2 * MIN },
@@ -329,7 +489,7 @@ class MockEngine implements Engine {
           ts: now - 2 * MIN,
         }),
       ],
-    };
+    });
     // A thread (§11.17): two replies to "shipping friday?", each with replies of its own, and one to a message that
     // is not loaded.
     const ship = m({
@@ -385,11 +545,9 @@ class MockEngine implements Engine {
       ts: now - 4 * MIN,
       reply: { key: "", state: "waiting" },
     });
-    const group: ConversationView = {
-      id: randomId(),
+    const group = conv("project 夜明け", {
       ref: mockRef("group"),
-      name: "project 夜明け",
-      members: [member(handle), member("bob"), member("carol"), member("dave", true)],
+      members: [self(), member("bob"), member("carol"), member("dave", true)],
       epoch: 3,
       canSend: true,
       blocked: "",
@@ -399,8 +557,16 @@ class MockEngine implements Engine {
       lastTs: now - 4 * MIN,
       unread: 3,
       messages: [
-        m({ kind: "system", text: `${handle} created "project 夜明け"`, ts: now - 3 * DAY }),
-        m({ kind: "system", text: `${handle} added bob, carol, dave`, ts: now - 3 * DAY }),
+        m({
+          kind: "system",
+          line: (w) => `${w(handle)} renamed the conversation to “project 夜明け”`,
+          ts: now - 3 * DAY,
+        }),
+        m({
+          kind: "system",
+          line: (w) => `${w(handle)} added ${["bob", "carol", "dave"].map(w).join(", ")}`,
+          ts: now - 3 * DAY,
+        }),
         m({ kind: "text", fromHandle: "carol", text: "hi all", ts: now - 3 * DAY + HOUR }),
         m({
           kind: "image",
@@ -433,11 +599,9 @@ class MockEngine implements Engine {
           ts: now - 8 * MIN,
         }),
       ],
-    };
-    const removed: ConversationView = {
-      id: randomId(),
+    });
+    const removed = conv("old team", {
       ref: mockRef("removed"),
-      name: "old team",
       members: [member("erin"), member("frank")],
       epoch: 5,
       canSend: false,
@@ -449,14 +613,12 @@ class MockEngine implements Engine {
       unread: 0,
       messages: [
         m({ kind: "text", fromHandle: "erin", text: "see you all", ts: now - 6 * DAY - HOUR }),
-        m({ kind: "system", text: `erin removed ${handle}`, ts: now - 6 * DAY }),
+        m({ kind: "system", line: (w) => `${w("erin")} removed you`, ts: now - 6 * DAY }),
       ],
-    };
-    const old: ConversationView = {
-      id: randomId(),
+    });
+    const old = conv(undefined, {
       ref: mockRef("old"),
-      name: "carol",
-      members: [member(handle), member("carol")],
+      members: [self(), member("carol")],
       epoch: 0,
       canSend: true,
       blocked: "",
@@ -466,12 +628,10 @@ class MockEngine implements Engine {
       lastTs: now - 40 * DAY,
       unread: 0,
       messages: [m({ kind: "text", fromHandle: "carol", text: "ping", ts: now - 40 * DAY })],
-    };
-    const pending: ConversationView = {
-      id: randomId(),
+    });
+    const pending = conv("release", {
       ref: mockRef("pending"),
-      name: "# release",
-      members: [member(handle), member("bob"), member("erin")],
+      members: [self(), member("bob"), member("erin")],
       epoch: 2,
       canSend: false,
       blocked: "pending",
@@ -483,12 +643,10 @@ class MockEngine implements Engine {
       messages: [
         m({ kind: "text", fromHandle: "erin", text: "adding frank in a sec", ts: now - 30 * MIN }),
       ],
-    };
-    const frozen: ConversationView = {
-      id: randomId(),
+    });
+    const frozen = conv("infra", {
       ref: mockRef("frozen"),
-      name: "# infra",
-      members: [member(handle), member("dave"), member("mallory")],
+      members: [self(), member("dave"), member("mallory")],
       epoch: 4,
       canSend: false,
       blocked: "frozen",
@@ -497,13 +655,17 @@ class MockEngine implements Engine {
       byContact: true,
       lastTs: now - 3 * HOUR,
       unread: 0,
-      messages: [m({ kind: "system", text: "@mallory removed @dave", ts: now - 3 * HOUR })],
-    };
-    const request: ConversationView = {
-      id: randomId(),
+      messages: [
+        m({
+          kind: "system",
+          line: (w) => `${w("mallory")} removed ${w("dave")}`,
+          ts: now - 3 * HOUR,
+        }),
+      ],
+    });
+    const request = conv(undefined, {
       ref: mockRef("request"),
-      name: "zed",
-      members: [member(handle), member("zed")],
+      members: [self(), member("zed")],
       epoch: 0,
       canSend: true,
       blocked: "",
@@ -520,13 +682,11 @@ class MockEngine implements Engine {
           ts: now - 50 * MIN,
         }),
       ],
-    };
+    });
     // A group request: only its inviter is resolved, the other members stay `?…` until accepted (§11.5).
-    const groupRequest: ConversationView = {
-      id: randomId(),
+    const groupRequest = conv("deals", {
       ref: mockRef("groupRequest"),
-      name: "# deals",
-      members: [member("quinn"), member(handle), member("?Xk3f9QaZ")],
+      members: [member("quinn"), self(), member("?Xk3f9QaZ")],
       epoch: 0,
       canSend: true,
       blocked: "",
@@ -536,7 +696,11 @@ class MockEngine implements Engine {
       lastTs: now - 4 * HOUR,
       unread: 2,
       messages: [
-        m({ kind: "system", text: "@quinn started the conversation", ts: now - 4 * HOUR - MIN }),
+        m({
+          kind: "system",
+          line: (w) => `${w("quinn")} started the conversation`,
+          ts: now - 4 * HOUR - MIN,
+        }),
         m({
           kind: "text",
           fromHandle: "quinn",
@@ -550,12 +714,10 @@ class MockEngine implements Engine {
           ts: now - 4 * HOUR,
         }),
       ],
-    };
-    const left: ConversationView = {
-      id: randomId(),
+    });
+    const left = conv("book club", {
       ref: mockRef("left"),
-      name: "# book club",
-      members: [member(handle, true), member("erin"), member("grace")],
+      members: [self(true), member("erin"), member("grace")],
       epoch: 2,
       canSend: false,
       blocked: "left",
@@ -573,10 +735,128 @@ class MockEngine implements Engine {
         }),
         m({ kind: "leave", fromHandle: handle, mine: true, ts: now - 9 * DAY }),
       ],
+    });
+    // The temporary handle's own conversation: nina knows it only as @_k7m2_q9x4.
+    const am = (p: Parameters<MockEngine["msg"]>[0]) => this.msg(p, alias);
+    const flat = conv(undefined, {
+      as: alias.uid,
+      ref: mockRef("flat"),
+      members: [member(alias.handle, false, alias.uid), member("nina")],
+      epoch: 0,
+      canSend: true,
+      blocked: "",
+      frozen: false,
+      request: false,
+      byContact: true,
+      lastTs: now - 15 * MIN,
+      unread: 1,
+      messages: [
+        am({
+          kind: "system",
+          line: (w) => `${w(alias.handle)} started the conversation`,
+          ts: now - HOUR,
+        }),
+        am({
+          kind: "text",
+          fromHandle: alias.handle,
+          text: "hi, is the flat on 3rd street still available?",
+          ts: now - HOUR,
+        }),
+        am({
+          kind: "text",
+          fromHandle: "nina",
+          text: "it is! viewings on saturday, 10:00 or 14:00",
+          ts: now - 15 * MIN,
+        }),
+      ],
+    });
+    // Carol added both of the user's accounts to one group: two copies, one for each (§2.6), in which the other account
+    // is a member like any other ("your other handle").
+    const street = (as: { uid: string; handle: string }, ref: string): ConversationView => {
+      const sm = (p: Parameters<MockEngine["msg"]>[0]) => this.msg(p, as);
+      return conv("street party", {
+        as: as.uid,
+        ref: mockRef(ref),
+        members: [
+          member("carol"),
+          member(handle, false, me.uid),
+          member(alias.handle, false, alias.uid),
+          member("nina"),
+        ],
+        epoch: 1,
+        canSend: true,
+        blocked: "",
+        frozen: false,
+        request: false,
+        byContact: true,
+        lastTs: now - 70 * MIN,
+        unread: 0,
+        messages: [
+          sm({
+            kind: "system",
+            line: (w) => `${w("carol")} added ${[handle, alias.handle, "nina"].map(w).join(", ")}`,
+            ts: now - 2 * HOUR,
+          }),
+          sm({
+            kind: "text",
+            fromHandle: "carol",
+            text: "street party on the 14th! who can bring tables?",
+            ts: now - 2 * HOUR,
+          }),
+          sm({
+            kind: "text",
+            fromHandle: alias.handle,
+            text: "i can bring two",
+            ts: now - 70 * MIN,
+          }),
+        ],
+      });
     };
-    const list = [dm, group, removed, old, pending, frozen, request, groupRequest, left].sort(
-      (a, b) => b.lastTs - a.lastTs,
-    );
+    const streetMain = street(me, "street");
+    const streetAlias = street(alias, "streetAlias");
+    // The retired handle's conversation, shown again once it is brought back.
+    this.parked.set(retired.uid, [
+      conv(undefined, {
+        as: retired.uid,
+        ref: mockRef("parked"),
+        members: [member(retired.handle, false, retired.uid), member("otto")],
+        epoch: 0,
+        canSend: true,
+        blocked: "",
+        frozen: false,
+        request: false,
+        byContact: true,
+        lastTs: now - 12 * DAY,
+        unread: 0,
+        messages: [
+          this.msg(
+            {
+              kind: "text",
+              fromHandle: "otto",
+              text: "is the bike still for sale?",
+              ts: now - 12 * DAY,
+            },
+            retired,
+          ),
+        ],
+      }),
+    ]);
+    const list = [
+      dm,
+      group,
+      removed,
+      old,
+      pending,
+      frozen,
+      request,
+      groupRequest,
+      left,
+      flat,
+      streetMain,
+      streetAlias,
+    ]
+      .map((c) => this.dress(c))
+      .sort((a, b) => b.lastTs - a.lastTs);
     this.set({ conversations: list });
   }
 
@@ -622,6 +902,8 @@ class MockEngine implements Engine {
     this.set({
       phase: "signed-out",
       me: null,
+      identities: [],
+      people: [],
       conversations: [],
       connected: false,
       warnings: [],
@@ -631,21 +913,37 @@ class MockEngine implements Engine {
   }
 
   // ---- conversations ----
-  async createConversation(handles: string[], name?: string): Promise<string> {
+  async createConversation(handles: string[], name?: string, as?: string): Promise<string> {
     const me = this.state.me;
     if (!me) this.fail("not signed in");
+    const self = as ? this.identity(as) : this.state.identities[0];
+    // as the engine's accountFor: only an account this device runs (util.runs)
+    if (!self || (self.status !== "ready" && self.status !== "starting"))
+      this.fail(self?.retired ? "this temporary handle is retired" : "unknown account");
     for (const h of handles) {
       if (!HANDLE_RE.test(h)) this.fail(`invalid handle: ${h}`);
-      if (h === "nobody") this.fail(`unknown handle: ${h}`);
+      if (h === "nobody") this.fail(`unknown: @${h}`);
+      // §2.6: the others would see the user's two accounts meet
+      if (h !== self.handle && this.state.identities.some((i) => i.handle === h))
+        this.fail(`@${h} is one of your own handles`);
     }
+    const others = handles.filter((h) => h !== self.handle);
+    this.set({ progress: "looking up handles…" });
+    await sleep(500);
     this.set({ progress: "creating conversation…" });
     await sleep(400);
     const now = Date.now();
+    const id = randomId();
+    if (name) this.titles.set(id, name);
     const c: ConversationView = {
-      id: randomId(),
+      id,
+      as: self.uid,
       ref: randomId(9),
-      name: name || handles.join(", "),
-      members: [member(me.handle), ...handles.map((h) => member(h))],
+      name: "",
+      members: [
+        member(self.handle, false, self.uid),
+        ...others.map((h) => member(h, false, this.uidOf(h))),
+      ],
       epoch: 0,
       canSend: true,
       blocked: "",
@@ -654,13 +952,95 @@ class MockEngine implements Engine {
       byContact: true,
       lastTs: now,
       unread: 0,
-      messages: [],
+      messages: [
+        this.msg(
+          {
+            kind: "system",
+            line: (w) => `${w(self.handle)} added ${others.map(w).join(", ")}`,
+            ts: now,
+          },
+          self,
+        ),
+      ],
     };
-    c.messages.push(
-      this.msg({ kind: "system", text: `${me.handle} added ${handles.join(", ")}`, ts: now }),
-    );
-    this.set({ conversations: [c, ...this.state.conversations], progress: "" });
+    this.learn(self.uid, others);
+    this.set({ conversations: [this.dress(c), ...this.state.conversations], progress: "" });
     return c.id;
+  }
+
+  // ---- temporary handles and nicknames (§2.6, §11.19) ----
+  /** As the engine's: at most MAX_LIVE_ALIASES temporary handles that are not retired (§2.6). */
+  private checkCap() {
+    const live = this.state.identities.filter((i) => i.alias && !i.retired).length;
+    if (live >= MAX_LIVE_ALIASES)
+      this.fail(`at most ${MAX_LIVE_ALIASES} temporary handles can be active; retire one first`);
+  }
+  async createAlias(): Promise<string> {
+    if (!this.state.me) this.fail("not signed in");
+    this.checkCap();
+    this.set({ progress: "solving proof of work…", error: "" });
+    await sleep(1500);
+    const index = Math.max(-1, ...this.state.identities.map((i) => i.index)) + 1;
+    const handle = aliasHandle();
+    const alias: IdentityView = {
+      uid: `uid-alias-${index}`,
+      handle,
+      fingerprint: fakeFingerprint(handle),
+      alias: true,
+      index,
+      retired: false,
+      status: "starting",
+    };
+    this.set({ identities: [...this.state.identities, alias], progress: "starting it…" });
+    await sleep(300);
+    this.setIdentity(alias.uid, { status: "ready" });
+    this.set({ progress: "" });
+    return alias.uid;
+  }
+  async setAliasRetired(uid: string, retired: boolean): Promise<void> {
+    const a = this.identity(uid);
+    if (!a?.alias) this.fail("not a temporary handle");
+    if (!retired && a.retired) this.checkCap();
+    await sleep(250);
+    if (retired) {
+      // its conversations are not shown while it is retired
+      const mine = this.state.conversations.filter((c) => c.as === uid);
+      this.parked.set(uid, [...(this.parked.get(uid) ?? []), ...mine]);
+      this.setIdentity(uid, { retired: true, status: "retired" });
+      this.set({ conversations: this.state.conversations.filter((c) => c.as !== uid) });
+      return;
+    }
+    this.setIdentity(uid, { retired: false, status: "starting" });
+    await sleep(500);
+    const back = (this.parked.get(uid) ?? []).map((c) => this.dress(c));
+    this.parked.delete(uid);
+    this.setIdentity(uid, { status: "ready" });
+    this.set({
+      conversations: [...this.state.conversations, ...back].sort((a, b) => b.lastTs - a.lastTs),
+    });
+  }
+  private setIdentity(uid: string, patch: Partial<IdentityView>) {
+    this.set({
+      identities: this.state.identities.map((i) => (i.uid === uid ? { ...i, ...patch } : i)),
+    });
+  }
+  /** As the engine's (§11.19): `validName`, never one of the user's own accounts; "" removes it. */
+  async setNickname(uid: string, nickname: string): Promise<void> {
+    if (this.identity(uid)) this.fail("you cannot give your own handles a nickname");
+    const n = nickname;
+    if (
+      n !== "" &&
+      (!n.trim() || [...n].length > 64 || n.normalize("NFKC").trimStart().startsWith("@"))
+    )
+      this.fail("a nickname: 1–64 characters, not starting with @");
+    await sleep(150);
+    if (n) this.nicks.set(uid, n);
+    else this.nicks.delete(uid);
+    // names, lines and senders are drawn again, without reading anything again
+    this.set({
+      people: this.dressPeople(),
+      conversations: this.state.conversations.map((c) => this.dress(c)),
+    });
   }
 
   private pushMessage(convId: string, m: MessageView, bumpUnread = false) {
@@ -689,13 +1069,16 @@ class MockEngine implements Engine {
     const key = `local:${++this.local}`;
     this.pushMessage(
       convId,
-      this.msg({ kind: "text", text, mine: true, status: "sending", seq: 0, key, reply }),
+      this.msg(
+        { kind: "text", text, mine: true, status: "sending", seq: 0, key, reply },
+        this.selfOf(c),
+      ),
     );
     await sleep(500);
     const failed = /\bfail\b/i.test(text);
     const sent = this.settle(convId, key, failed ? "failed" : "sent");
     if (failed) return;
-    const other = c.members.find((m) => m.uid !== this.state.me?.uid && !m.left);
+    const other = c.members.find((m) => !m.you && !m.left && !m.handle.startsWith("?"));
     if (other) {
       // a reply is answered with a reply to it, so that a thread grows
       const to = reply ? { key: sent, state: "shown" as const } : undefined;
@@ -724,7 +1107,10 @@ class MockEngine implements Engine {
     const image: ImageRef = { id, k: "k", mime: file.type, w, h };
     this.pushMessage(
       convId,
-      this.msg({ kind: "image", image, mine: true, status: "sending", seq: 0, key, reply }),
+      this.msg(
+        { kind: "image", image, mine: true, status: "sending", seq: 0, key, reply },
+        this.selfOf(c),
+      ),
     );
     await sleep(700);
     this.settle(convId, key, "sent");
@@ -741,34 +1127,45 @@ class MockEngine implements Engine {
     const ref: FileRef = { id, k: "k", name: file.name || "file", size: file.size };
     this.pushMessage(
       convId,
-      this.msg({ kind: "file", file: ref, mine: true, status: "sending", seq: 0, key, reply }),
+      this.msg(
+        { kind: "file", file: ref, mine: true, status: "sending", seq: 0, key, reply },
+        this.selfOf(c),
+      ),
     );
     await sleep(700);
     this.settle(convId, key, "sent");
   }
 
   async addMembers(convId: string, handles: string[]): Promise<void> {
-    const me = this.state.me!;
-    for (const h of handles) if (!HANDLE_RE.test(h)) this.fail(`invalid handle: ${h}`);
+    const c = this.conv(convId);
+    const self = this.selfOf(c);
+    for (const h of handles) {
+      if (!HANDLE_RE.test(h)) this.fail(`invalid handle: ${h}`);
+      if (this.state.identities.some((i) => i.handle === h))
+        this.fail(`@${h} is one of your own handles`);
+    }
     await sleep(300);
-    this.updateConv(convId, (c) => ({
-      ...c,
-      epoch: c.epoch + 1,
-      members: [
-        ...c.members,
-        ...handles.filter((h) => !c.members.some((m) => m.handle === h)).map((h) => member(h)),
-      ],
+    const added = handles.filter((h) => !c.members.some((m) => m.handle === h));
+    this.updateConv(convId, (x) => ({
+      ...x,
+      epoch: x.epoch + 1,
+      members: [...x.members, ...added.map((h) => member(h))],
     }));
+    this.learn(self.uid, added);
     this.pushMessage(
       convId,
-      this.msg({ kind: "system", text: `${me.handle} added ${handles.join(", ")}` }),
+      this.msg(
+        { kind: "system", line: (w) => `${w(self.handle)} added ${added.map(w).join(", ")}` },
+        self,
+      ),
     );
   }
   async removeMember(convId: string, uid: string): Promise<void> {
-    const me = this.state.me!;
     const c = this.conv(convId);
+    const self = this.selfOf(c);
     const who = c.members.find((m) => m.uid === uid);
     if (!who) this.fail("not a member");
+    if (who.you) this.fail("use “leave” to leave a conversation");
     await sleep(300);
     this.updateConv(convId, (x) => ({
       ...x,
@@ -777,14 +1174,15 @@ class MockEngine implements Engine {
     }));
     this.pushMessage(
       convId,
-      this.msg({ kind: "system", text: `${me.handle} removed ${who.handle}` }),
+      this.msg({ kind: "system", line: (w) => `${w(self.handle)} removed ${w(who.handle)}` }, self),
     );
   }
   async leave(convId: string): Promise<void> {
+    const self = this.selfOf(this.conv(convId));
     await sleep(300);
     this.pushMessage(
       convId,
-      this.msg({ kind: "leave", fromHandle: this.state.me!.handle, mine: true }),
+      this.msg({ kind: "leave", fromHandle: self.handle, mine: true }, self),
     );
     this.updateConv(convId, (c) => ({ ...c, canSend: false, blocked: "left" }));
   }
@@ -851,8 +1249,8 @@ class MockEngine implements Engine {
     this.set({ preview: p });
   }
 
-  markRead(convId: string): void {
-    // The pane is open: it accepts nothing (§11.11).
+  markRead(convId: string, _opened = true): void {
+    // The pane is open: it accepts nothing (§11.11). No BELL rows here: `opened` only matters to the engine (§11.13).
     const c = this.state.conversations.find((x) => x.id === convId);
     if (c?.unread) this.updateConv(convId, (x) => ({ ...x, unread: 0 }));
   }
@@ -933,9 +1331,11 @@ class MockEngine implements Engine {
 
   // ---- test hooks ----
   incoming(convId: string, fromHandle: string, text: string, reply?: MessageView["reply"]) {
+    const c = this.state.conversations.find((x) => x.id === convId);
+    if (!c) return;
     this.pushMessage(
       convId,
-      this.msg({ kind: "text", fromHandle, text, mine: false, reply }),
+      this.msg({ kind: "text", fromHandle, text, mine: false, reply }, this.selfOf(c)),
       true,
     );
   }
@@ -951,7 +1351,7 @@ class MockEngine implements Engine {
   }
   incomingAt(index: number, text: string) {
     const c = this.state.conversations[index];
-    const other = c?.members.find((m) => m.uid !== this.state.me?.uid);
+    const other = c?.members.find((m) => !m.you && !m.handle.startsWith("?"));
     if (c && other) this.incoming(c.id, other.handle, text);
   }
   setPatch(p: Partial<EngineState>) {

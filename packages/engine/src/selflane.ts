@@ -129,6 +129,12 @@ export class SelfFold {
   readonly ctlAt = new Map<string, P.EraCount>();
   /** PREFS: the latest value per key */
   readonly prefs = new Map<number, Bytes>();
+  /** NICK per b64u uid: the latest non-empty name, as written (an owner's lane only, §7.3, §11.19) */
+  readonly nicks = new Map<string, string>();
+  /** bumped whenever `nicks` changes */
+  nickVersion = 0;
+  /** bumped whenever the alias table (PREFS key 1 of an owner's lane, §2.6) changes */
+  aliasVersion = 0;
   /** the lane order of each copy's first CONV_JOIN or REQUEST (a snapshot keeps that order, §7.4) */
   readonly firstOrder = new Map<string, number>();
   /** CONV_JOINs that a snapshot held: a restore starts such a copy at its snapshot's top (§11.4 step 5) */
@@ -139,7 +145,20 @@ export class SelfFold {
   /** applying a snapshot: every record is under its own copy's key, so no placement rule of §7.2 applies */
   private inSnapshot = false;
 
-  constructor(private readonly hooks: FoldHooks) {}
+  /**
+   * `owner`: the lane of an owner, whose NICK records and alias table apply; an alias's fold ignores them (§2.6, §7.2:
+   * they are written and read only there).
+   */
+  constructor(
+    private readonly hooks: FoldHooks,
+    readonly owner = true,
+  ) {}
+
+  /** The owner's alias table (PREFS key 1, §2.6): empty without one, or when it is malformed, or on an alias's lane. */
+  aliasTable(): P.AliasEntry[] {
+    const v = this.owner ? this.prefs.get(P.PREFS_ALIASES) : undefined;
+    return (v && P.parseAliasTable(v)) || [];
+  }
 
   /**
    * The live REQUESTs at era `Enow`: at most 64, the newest in lane order, none whose bundle was registered more than 4
@@ -391,9 +410,23 @@ export class SelfFold {
         }
         return;
       }
-      case P.RT.PREFS:
+      case P.RT.PREFS: {
+        const had = this.prefs.get(r.key);
         this.prefs.set(r.key, r.value);
+        if (this.owner && r.key === P.PREFS_ALIASES && !(had && P.equalBytes(had, r.value)))
+          this.aliasVersion++;
         return;
+      }
+      case P.RT.NICK: {
+        // the latest per uid wins; an empty name removes it (§7.3)
+        if (!this.owner) return;
+        const u = P.b64u(r.uid);
+        if ((this.nicks.get(u) ?? "") === r.name) return;
+        if (r.name === "") this.nicks.delete(u);
+        else this.nicks.set(u, r.name);
+        this.nickVersion++;
+        return;
+      }
       case P.RT.SNAP:
         return; // never at Lself (the codec refuses it)
     }
@@ -430,12 +463,14 @@ export class SelfLane {
   /** the restore looked for a snapshot (steps 2–3 run once per session) */
   snapshotRead = false;
 
+  /** `owner`: false for an alias's lane, whose fold ignores NICK records and the alias table (§2.6) */
   constructor(
     private readonly api: Api,
     private readonly id: P.Identity,
     private readonly hooks: SelfLaneHooks,
+    owner = true,
   ) {
-    this.fold = new SelfFold(hooks);
+    this.fold = new SelfFold(hooks, owner);
   }
 
   /**

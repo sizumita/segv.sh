@@ -2177,6 +2177,8 @@ const records: [string, P.SelfRecord, B, number][] = [
     57 + 17 * 2,
   ],
   ["BELLS (none known)", { rtype: 0x15, ...copy, e: 4, g: 0xffffffff, entries: [] }, cat(refCopy, be32(4), be32(0xffffffff), be8(0)), 57],
+  ["NICK", { rtype: 0x16, uid: bob.uid, name: "Bobby 🍜" }, cat(bob.uid, s2b("Bobby 🍜")), 16 + 10],
+  ["NICK (removed)", { rtype: 0x16, uid: bob.uid, name: "" }, bob.uid, 16],
   [
     "SNAP",
     { rtype: 0x20, blobId: fill(32, 0x73), key: fill(32, 0x74), size: 4096, pos: { E: 7, n: 12 } },
@@ -2211,7 +2213,7 @@ describe("self records (§7.2)", () => {
   });
 
   it.each(records)("%s: a missing or extra byte is rejected", (_, rec, content) => {
-    if (rec.rtype === P.RT.PREFS) return; // PREFS has a free-length value
+    if (rec.rtype === P.RT.PREFS || rec.rtype === P.RT.NICK) return; // a free-length value or name
     expect(() => P.parseRecord(rec.rtype, content.slice(0, -1))).toThrow(P.CodecError);
     expect(() => P.parseRecord(rec.rtype, cat(content, be8(0)))).toThrow(P.CodecError);
   });
@@ -2311,6 +2313,11 @@ describe("self records (§7.2)", () => {
       ["LEFT (E, n) = (0xFFFF, 0)", 0x0e, cat(refCopy, be32(4), bob.uid, be32(1), be16(0xffff), be32(0))],
       ["LEFT (E, n) = (0xFFFF, 0xFFFFFFFE)", 0x0e, cat(refCopy, be32(4), bob.uid, be32(1), be16(0xffff), be32(0xfffffffe))],
       ["ENDED claim NONE", 0x12, cat(refCopy, be32(6), be16(0xffff), be32(0xffffffff))],
+      ["NICK without a whole uid", 0x16, fill(15, 1)],
+      ["NICK name of invalid UTF-8", 0x16, cat(bob.uid, Uint8Array.of(0xc3, 0x28))],
+      ["NICK name of 65 code points", 0x16, cat(bob.uid, s2b("a".repeat(65)))],
+      ["NICK of 273 bytes", 0x16, cat(bob.uid, s2b("😀".repeat(64)), be8(0x61))],
+
       ["ENDED claim era 0xFFFF outside NONE", 0x12, cat(refCopy, be32(6), be16(0xffff), be32(0))],
     ];
     for (const [what, rtype, c] of bads)
@@ -2652,8 +2659,9 @@ describe("fuzz: truncations, extensions and random bytes are rejected", () => {
       P.parseSnapshot,
       [P.encodeSnapshot({ pos: P.NONE, ts: TS, records: [records[0][1], records[11][1]] })],
     ],
+    // PREFS and NICK end in a free-length value or name, so a truncation or an extension can still parse
     ...records
-      .filter(([, x]) => x.rtype !== P.RT.PREFS)
+      .filter(([, x]) => x.rtype !== P.RT.PREFS && x.rtype !== P.RT.NICK)
       .map(([n, x, c]): [string, (b: B) => unknown, B[]] => [`record ${n}`, (b) => P.parseRecord(x.rtype, b), [c]]),
   ];
 
@@ -2723,7 +2731,7 @@ function computeKat() {
       ts: TS,
       records: [records[3][1], records[0][1]],
     });
-    // LEFT (0x0E), TREG (0x0F), ENDED (0x12) and BELLS (0x15) came after this vector was pinned: they have vectors
+    // LEFT (0x0E), TREG (0x0F), ENDED (0x12), BELLS (0x15) and NICK (0x16) came after this vector was pinned: they have vectors
     // of their own (below)
     const snap = P.encryptSnapshot({
       pos: { E: 7, n: 30 },
@@ -2731,7 +2739,12 @@ function computeKat() {
       records: records
         .filter(
           ([, r]) =>
-            r.rtype !== 0x20 && r.rtype !== 0x0e && r.rtype !== 0x0f && r.rtype !== 0x12 && r.rtype !== 0x15,
+            r.rtype !== 0x20 &&
+            r.rtype !== 0x0e &&
+            r.rtype !== 0x0f &&
+            r.rtype !== 0x12 &&
+            r.rtype !== 0x15 &&
+            r.rtype !== 0x16,
         )
         .map(([, r]) => r),
     });

@@ -65,6 +65,8 @@ export interface SendCtx {
   qualifies?: (c: Copy, ep: Epoch, uid: Bytes) => boolean;
   /** a TEXT, IMAGE, FILE or REPLY is stored (also a late one): ring the other members' bells (§11.13); never waits */
   ring?: (c: Copy, ep: Epoch, E: number, label: Bytes) => void;
+  /** once per epoch, just before the row is built there: an alias's BELL row goes first (§2.6, §11.13) */
+  beforeRow?: (c: Copy) => Promise<void>;
 }
 
 /** §11.3 step 2 refused a WELCOME: the epoch no longer qualifies (§6.12 step 1); send an inbox invite instead. */
@@ -195,7 +197,17 @@ export async function sendRow(ctx: SendCtx, c: Copy, content: P.MBody): Promise<
   let { ep, sent, answered } = await steps12(ctx, c, content.type);
   const triedEras = new Set<number>();
   let EnowOverride: number | null = null;
+  let before = -1;
   for (let attempt = 0; attempt < SEND_ATTEMPTS;) {
+    if (ctx.beforeRow && before !== ep.e) {
+      before = ep.e;
+      await ctx.beforeRow(c);
+      ctx.check();
+      if (c.current !== ep.e) {
+        ({ ep, sent, answered } = await steps12(ctx, c, content.type));
+        continue;
+      }
+    }
     // Step 4: the slot, never below the lane head's era.
     const lane = ep.lanes[ep.myIndex];
     const Enow = EnowOverride ?? P.era(ctx.api.serverNow());

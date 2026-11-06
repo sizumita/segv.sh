@@ -82,6 +82,17 @@ export class ImageCache {
     if (e.holds === 0) this.evict();
   }
 
+  /**
+   * Drops an image whatever holds it (the account that showed it stopped, §2.6 "Retiring"): its URL is revoked now,
+   * or, while it is still being made, once it is. A later `release` of it does nothing.
+   */
+  drop(key: string): void {
+    const e = this.entries.get(key);
+    if (!e) return;
+    this.entries.delete(key);
+    if (e.settled) void e.url.then(this.revoke);
+  }
+
   /** Revokes every image (the session ends). */
   clear(): void {
     for (const e of this.entries.values()) if (e.settled) void e.url.then(this.revoke);

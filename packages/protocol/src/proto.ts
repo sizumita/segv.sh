@@ -698,6 +698,82 @@ export function fingerprint(uid: Bytes, sigPk: Bytes, kemPk: Bytes): string {
 /** TOFU pin of a bundle (§2.2): H(enc("segv.sh/v2/pin", bundleBytes, bundleSig)). */
 export const pin = (bundle: string, bundleSig: Bytes): Bytes => H(enc("segv.sh/v2/pin", utf8(bundle), bundleSig));
 
+// ───────────────────────── aliases (§2.6) ─────────────────────────
+
+/** The alphabet of alias handles (§2.6): Crockford's base32 in lower case, without i, l, o and u. */
+export const ALIAS_CHARS = "0123456789abcdefghjkmnpqrstvwxyz";
+/** An alias handle: `_`, 4 characters, `_`, 4 characters (§2.6). Every handle that starts with `_` is one. */
+export const ALIAS_HANDLE_RE = /^_[0-9a-hjkmnp-tv-z]{4}_[0-9a-hjkmnp-tv-z]{4}$/;
+/** `c` of `aliasHandle` runs over 0..ALIAS_TRIES − 1 (§2.6, §10.6). */
+export const ALIAS_TRIES = 4;
+/** An alias handle, or a handle that claims to be one: it starts with `_` (§2.1). */
+export const isAliasHandle = (handle: string): boolean => handle.startsWith("_");
+
+/** AK_i = HKDF(AK, "", enc("segv.sh/v2/alias", u32 i), 32): the account key of the owner's alias i (§2.6). */
+export function aliasKey(AK: Bytes, i: number): Bytes {
+  if (AK.length !== 32) throw new Error("AK must be 32 bytes");
+  if (!Number.isInteger(i) || i < 0 || i > 0xffffffff) throw new Error("bad alias index");
+  return HKDF(AK, "", enc("segv.sh/v2/alias", u32(i)), 32);
+}
+
+/** uid_i = HKDF(AK_i, "", "segv.sh/v2/alias/uid", 16): the uid of an alias, from its own account key (§2.6). */
+export const aliasUid = (AKi: Bytes): Bytes => HKDF(AKi, "", "segv.sh/v2/alias/uid", 16);
+
+/** aliasHandle(uid, sigPk, kemPk, c) (§2.6): ten characters such as `_k7m2_q9x4`, from 40 bits of a hash of the keys. */
+export function aliasHandle(uid: Bytes, sigPk: Bytes, kemPk: Bytes, c: number): string {
+  if (!Number.isInteger(c) || c < 0 || c >= ALIAS_TRIES) throw new Error("bad alias handle counter");
+  const a = H(enc("segv.sh/v2/alias/handle", uid, sigPk, kemPk, u8(c)));
+  let x = 0;
+  for (let j = 0; j < 5; j++) x = x * 256 + a[j]; // u40, exact in a double
+  let s = "";
+  for (let k = 0; k < 8; k++) {
+    s += ALIAS_CHARS[Math.floor(x / 2 ** (35 - 5 * k)) % 32];
+    if (k === 3) s += "_";
+  }
+  return "_" + s;
+}
+
+/** The `c` for which `handle` is `aliasHandle(uid, sigPk, kemPk, c)`, or -1 when it is none of them (§10.6). */
+export function aliasHandleTry(handle: string, uid: Bytes, sigPk: Bytes, kemPk: Bytes): number {
+  if (!ALIAS_HANDLE_RE.test(handle)) return -1;
+  for (let c = 0; c < ALIAS_TRIES; c++) if (aliasHandle(uid, sigPk, kemPk, c) === handle) return c;
+  return -1;
+}
+
+/** Nicknames (§11.19): what `validName` (§5.1) allows, 1..MAX_NAME code points. */
+export const validNickname = (name: unknown): name is string => validName(name);
+/** NICK names are at most 64 code points of UTF-8 (§7.1): at most 256 bytes. */
+export const MAX_NICK_BYTES = 256;
+
+/** At most this many aliases run at once (§2.6); creating and bringing back fail beyond it. */
+export const MAX_LIVE_ALIASES = 16;
+
+/** The PREFS key of an owner's alias table (§2.6, §7.2). */
+export const PREFS_ALIASES = 1;
+
+/**
+ * One entry of the alias table: the `c` of the alias's handle, whether it is retired (§2.6), and bits 3–7 as read
+ * (`rest`, 0 when written new): a reader ignores them and a writer keeps them (§7.1).
+ */
+export interface AliasEntry {
+  c: number;
+  retired: boolean;
+  rest?: number;
+}
+
+/** The alias table (PREFS key 1, §7.2): one byte per index 0..n−1, bits 0–1 `c`, bit 2 retired, bits 3–7 kept. */
+export function encodeAliasTable(entries: readonly AliasEntry[]): Bytes {
+  return Uint8Array.from(entries, (x) => {
+    if (!Number.isInteger(x.c) || x.c < 0 || x.c >= ALIAS_TRIES) throw new Error("alias table: bad c");
+    return ((x.rest ?? 0) & 0xf8) | x.c | (x.retired ? 4 : 0);
+  });
+}
+
+/** The entries of an alias table's value (§7.1: bits 3–7 are kept in `rest` and otherwise ignored). */
+export function parseAliasTable(value: Bytes): AliasEntry[] {
+  return Array.from(value, (b) => ({ c: b & 3, retired: (b & 4) !== 0, rest: b & 0xf8 }));
+}
+
 // ── unlock secrets (§2.3) ──
 
 export const PRF_INPUT = "segv.sh/v2/prf";
@@ -2736,6 +2812,7 @@ export const RT = {
   TREG: 0x0f,
   ENDED: 0x12,
   BELLS: 0x15,
+  NICK: 0x16,
   SNAP: 0x20,
 } as const;
 export type RType = (typeof RT)[keyof typeof RT];
@@ -2911,6 +2988,12 @@ export interface EndedRec extends CopyRef {
   e: number;
   claim: Pos;
 }
+/** The account's private nickname for user `uid` (§7.2, §11.19); "" removes it. The latest per uid wins. */
+export interface NickRec {
+  rtype: typeof RT.NICK;
+  uid: Bytes;
+  name: string;
+}
 export interface SnapRec {
   rtype: typeof RT.SNAP;
   blobId: Bytes;
@@ -2938,6 +3021,7 @@ export type SelfRecord =
   | TregRec
   | EndedRec
   | BellsRec
+  | NickRec
   | SnapRec;
 
 const wrCopy = (x: CopyRef): Bytes => concat(fixed(x.conv, 16, "record conv"), fixed(x.root, 32, "record root"));
@@ -3028,6 +3112,8 @@ function recordContent(x: SelfRecord): Bytes {
         u8(x.entries.length),
         ...x.entries.map((b) => concat(u8(b.lane), fixed(b.bell, 16, "BELLS bell"))),
       );
+    case RT.NICK:
+      return concat(fixed(x.uid, 16, "NICK uid"), encodeUtf8(x.name, "NICK name"));
     case RT.SNAP:
       return concat(
         fixed(x.blobId, 32, "SNAP blobId"),
@@ -3176,6 +3262,15 @@ export function parseRecord(rtype: number, c: Bytes): SelfRecord | null {
       for (let i = 0; i < k; i++) entries.push({ lane: r.u8(), bell: r.bytes(16) });
       checkBellsEntries(entries, what);
       x = { rtype, ...copy, e, g, entries };
+      break;
+    }
+    case RT.NICK: {
+      // §7.1: 16 ≤ len ≤ 272, a name of valid UTF-8 of at most 64 code points; "" removes the nickname
+      if (c.length > 16 + MAX_NICK_BYTES) bad(`${what}: too long`);
+      const uid = r.bytes(16);
+      const name = decodeUtf8(r.bytes(c.length - 16), what);
+      if ([...name].length > MAX_NAME) bad(`${what}: name too long`);
+      x = { rtype, uid, name };
       break;
     }
     case RT.SNAP:

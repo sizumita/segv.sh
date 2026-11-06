@@ -37,7 +37,8 @@ texts.
   seen, are held in the memory of the push objects only, for at most a few minutes, and never written. Bells are
   hashes of secrets that only the account's devices hold, one per conversation (§4.1), so the stored registrations link
   no conversation or account to another; the devices of one account register the same bells and the same quiet tag, so
-  theirs are linked (§13.4). The store keeps no history of a
+  theirs are linked, and an owner's devices register its aliases' bells beside its own under its quiet tag, so they
+  link each alias to its owner (§2.6, §13.4). The store keeps no history of a
   key's earlier values (§9.8), so a registration that was replaced or deleted is gone once the change is written.
 - Conversation data is stored as **rows** `(E, label) → (t, cls, body)`:
   - `E` is the **era**, one week (§3.1).
@@ -62,7 +63,7 @@ texts.
   - `C` **ConnDOs**, which hold the WebSocket connections, and `F` **FeedDOs**, which keep which ConnDOs' sockets
     subscribed to each topic and forward published rows to them (`C` and `F` are deployment parameters, §9.4);
   - one **CheckpointDO**, which signs the heads of the public data every 60 s;
-  - the **directory** in D1 (accounts and key wraps): one log database and `K` user databases (`DIR_SHARDS`,
+  - the **directory** in D1 (accounts, aliases and key wraps): one log database and `K` user databases (`DIR_SHARDS`,
     §9.6);
   - R2 for blobs, and for the rows of sealed eras (§9.1 "Paging");
   - optionally, for push, the push store (a KV namespace), `PUSH_SHARDS` **QuietDOs**, which hold nothing durable, a
@@ -125,6 +126,15 @@ texts.
    - signed receipts prove that a write was accepted;
    - a signed checkpoint chain, persisted locally, detects rewrites and rollbacks;
    - checkpoint references inside messages (`ck`, 16 bytes) detect checkpoint forks between members (§12).
+9. **Aliases against P and members.** An account's aliases (temporary handles, §2.6) are accounts of their own to P
+   and to every member, recognisable as aliases by their handles but not as whose: nothing that is stored, served or
+   written in a conversation names the account that owns an alias, and a conversation may list an account and its aliases together, each as a separate member. What can link
+   them is time: the public dirlog dates every registration to the minute, so aliases registered close together, or
+   close to their owner's registration, can be linked where few accounts register; and the accounts that one device
+   runs act when its user acts, so members of conversations of two of them can link them by the times of what the user
+   does there, and by when the owner's devices are online (§2.6, §13.1). No row of an alias has a time that a
+   member's act decides. Nicknames (§7.2 NICK) are readable only on the owner's devices, and, with a preview, by their
+   operating system's notifications (§11.19).
 
 ### 0.4 Non-guarantees
 
@@ -132,10 +142,19 @@ These hold in stage 1. §13 has the full leakage table and the explicit list of 
 
 - O sees the social graph: each WebSocket topic set, each point lookup, each writer IP, and a prefix of every
   directory lookup. Hiding this needs OHTTP / PIR (stage 2/3).
+- O links every alias to the account that owns it (§2.6): the owner's devices run its aliases from the same IP
+  addresses, register their bells on the same push endpoints under the owner's quiet tag, mark the rows they show with
+  the owner's quiet secret, and look the aliases' own directory entries up by uid (§13.1).
+- Members who share conversations with two of an owner's accounts can link them by timing: the times at which the
+  user acts as each, and, for the owner, when its devices are online, which its BELL rows show after any epoch change
+  that a member makes (§2.6, §13.1). A device that is closed when an alias is retired keeps the alias's bells
+  registered, and its notification handler keeps showing the alias's conversations, until it next runs or its
+  registration expires (§9.8).
 - O can selectively omit rows, or give different members different answers (including about blob registration and
   the directory), without clients being able to prove it in stage 1. There are no inclusion proofs and no witnesses
   (§12.6).
 - No forward secrecy if a passkey PRF output, recovery code or AK leaks. No post-compromise security within an epoch.
+  An owner's passkey, recovery code or AK also gives every alias (§2.6).
 - No deniability among members. No deletion: the archive is public, and an edit (§11.18) removes nothing: the
   original text stays stored and readable by every member who holds its epoch. No censorship resistance.
 - Not defended against: malicious served JavaScript (in a browser; a native app runs only the code of its signed
@@ -158,18 +177,20 @@ These hold in stage 1. §13 has the full leakage table and the explicit list of 
     miss rows, show a row that the app later drops, or show a message's text from before an edit: a notification
     already shown is not updated, and the handler applies only the edits that its own read finds (§11.13, §11.18).
   - **Previews** (§11.13). On a device whose preview is `name` or `message`, conversation names, and with `message`
-    handles and message text, pass to the operating system's notifications, which show them on the lock screen as its
+    handles (or nicknames, §11.19) and message text, pass to the operating system's notifications, which show them on the lock screen as its
     settings say, may keep them in a notification history after the messages, the app or its data are gone, and may
-    forward them to paired devices; the device also keeps the names and handles, sealed under a device key. With
+    forward them to paired devices; the device also keeps the names, handles and nicknames, sealed under a device key. With
     `message`, every push makes the device read its conversation's rows, also while the app is closed, so O learns at
     each push the device's IP address and that it received the push, and can link its endpoint to that address; a
     member can cause this by ringing, and O by sending a push.
   - A device that is closed while a member of a conversation is removed keeps the old bell registered (§11.13): senders
     ring it until another device of its account posts the new bell, or until the epoch changes once more, and the
-    device then gets no notification for that conversation until it is opened. Additions and renames change no bell.
+    device then gets no notification for that conversation until it is opened (an alias: until its user acts or opens
+    the conversation there, §2.6). Additions and renames change no bell.
   - A member that joins a conversation learns the other members' bells only from their BELL rows in the epochs it
     holds, from its join epoch on (§11.13). A member that has posted no BELL row there (its devices have all stayed
-    closed since the join) is not rung by the joiner's messages until one of its devices posts one; the other members'
+    closed since the join, or, for an alias, its user has neither acted nor opened the conversation there, §2.6) is not
+    rung by the joiner's messages until one of its devices posts one; the other members'
     messages ring it meanwhile.
   - **Seen elsewhere** (§11.13). While a device of an account is in use, as that device judges it (visible, focused,
     and the user's last input on it at most a minute old), the account's devices get no push for the rows it shows,
@@ -188,12 +209,15 @@ These hold in stage 1. §13 has the full leakage table and the explicit list of 
     show notifications, at most one per device per `PUSH_WINDOW`, until that member posts its new bell or the epoch
     changes again. It learns nothing from ringing, since the answer is the same whatever the ring reaches (§10.10), and
     it cannot register under the bells: registering needs the bell's secret, which only its owner's devices hold.
-  - **BELL rows** (§11.13). A device posts a BELL row in every epoch of a conversation, additions and renames included,
-    within `BELL_DELAY` = 60 s of first finding self's lane there without one, whether or not it has notifications on.
-    The row's `t` (Δ-rounded) lies on a lane that every member reads, so the members learn, at every epoch change, when
-    the first device of each other member processed the new epoch, to within about `BELL_DELAY` + Δ (70 s): when that
-    member's first device was online after the change, or, when all its devices were closed, when it came back. The
-    random delay only blurs the moment.
+  - **BELL rows** (§11.13). For each account that is not an alias, a device posts a BELL row in every epoch of a
+    conversation, additions and renames included, within `BELL_DELAY` = 60 s of first finding self's lane there without
+    one, whether or not it has notifications on. The row's `t` (Δ-rounded) lies on a lane that every member reads, so
+    the members learn, at every epoch change, when the first device of each other member that is not an alias processed
+    the new epoch, to within about `BELL_DELAY` + Δ (70 s): when that member's first device was online after the change,
+    or, when all its devices were closed, when it came back. The random delay only blurs the moment. An alias (§2.6)
+    posts its BELL row in an epoch only just before its first act there, or after its user opens the conversation: its
+    BELL rows date its user's acts, and until then the others' messages in that epoch do not notify it (after a removal,
+    only until the next epoch change).
   - Notifications are shown also while the app is open.
   - **Native apps** (§11.14). A native app's notification code may be unable to read its keys before the device is
     first unlocked after a restart, and then shows the fixed text. Android may deliver a push late while the device
@@ -310,8 +334,11 @@ bS = HKDF(AK, "", "segv.sh/v2/self/bell",   32)       // bell secret (§4.1, §1
 kN = HKDF(AK, "", "segv.sh/v2/self/note",   32)       // sync notes (§11.16)
 ```
 
-- `uid` = 16 random bytes, public.
-- `handle` matches `^[a-z0-9_]{3,20}$` and is unique.
+- `uid` = 16 random bytes, public (an alias's is derived, §2.6).
+- `handle` matches `^[a-z0-9_]{3,20}$` and is unique. A handle that starts with `_` is reserved for aliases: a
+  registration takes one only as an **alias handle**, `aliasHandle` of its own uid and keys (§2.6), so nobody chooses
+  it. Every other handle is chosen at registration (§2.5). An account registered before aliases existed may hold
+  another handle that starts with `_`; it is not an alias.
 - `checkUserKeys(sigPk, kemPk)`: `validSigPk(sigPk)` (§1.1: canonical, not of small order, in the prime-order
   subgroup), and `KEM.encap(kemPk)` succeeds. Whether an X-Wing encapsulation succeeds depends only on the key, never
   on its randomness (the ML-KEM modulus check and the X25519 all-zero check reject the same keys for every
@@ -324,7 +351,7 @@ bundleBytes = utf8(JSON.stringify({v:2, uid:b64u(uid), handle, sig:b64u(sigPk), 
 bundleSig   = SIG.sign(enc("segv.sh/v2/bundle", bundleBytes), sigSk)
 ```
 
-- `ts` is the signer's clock in Unix ms: a JSON integer in 0..2^53 − 1 (canonical, §1.2). It is informational. The
+- `ts` is the signer's clock in Unix ms (an alias's is random, §2.6): a JSON integer in 0..2^53 − 1 (canonical, §1.2). It is informational. The
   server MUST NOT compare it with its own clock, and no client or server decision depends on it. The time the
   directory keeps is `reg_era` = era(server time at registration) (§9.6). The same holds for `ts` of `recordBytes`
   (§2.4).
@@ -394,7 +421,8 @@ A failed unlock MUST NOT create keys or write anything.
 
 **Register**:
 
-1. Normalise the handle (trim, lowercase, strip one leading `@`).
+1. Normalise the handle (trim, lowercase, strip one leading `@`). It must match the handle regex (§2.1) and not
+   start with `_`, which alias handles start with (§2.6).
 2. Check that it is free with a handle-prefix query (§10.6), filtering locally.
 3. Generate `AK` and `uid`, then build the bundle.
 4. Call `navigator.credentials.create` with:
@@ -434,11 +462,161 @@ The server never sees WebAuthn data.
 - `upre(uid) = u32(H(enc("segv.sh/v2/dir/uid", uid))[0..4])`
 
 A query names only the top `p` bits (§10.6), so O learns one of about 64–128 accounts (all accounts while there are
-fewer than 64). The client bounds `p` by the
+fewer than 64; an alias counts as an account, §2.6). The client bounds `p` by the
 public dirlog size, so a server that overstates its user count cannot make lookups exact without inflating the
 audited dirlog. This is still more than v1 revealed: v1 clients resolved handles locally from the full directory
 (§13.2 item 10). Two lookups are exact, and both match v1: a client's own bundle by uid (it already reveals its uid
-when it unlocks), and wrap records by id.
+when it unlocks), and wrap records by id. The bundles of the account's own aliases are looked up by uid too (§2.6),
+which tells O which aliases belong to the account.
+
+### 2.6 Aliases (temporary handles)
+
+An **alias** is an account that another account, its **owner**, derives from its own AK and runs on its own devices.
+It has its own uid, handle, keys, self lane, inbox, contacts and conversations, and no passkey or recovery code: the
+owner's unlock opens it. The UI calls it a **temporary handle**. To P and to every member it is an account like any
+other: nothing it stores, serves or writes names its owner or another alias of its owner, and the owner and its
+aliases may be members of one conversation, each as a separate member with its own lane, as separate accounts would
+be. What remains is timing ("What P and members learn" below, §13.1). An alias has no aliases.
+
+```
+AK_i  = HKDF(AK, "", enc("segv.sh/v2/alias", u32 i), 32)       the account key of alias i = 0, 1, … of the owner
+uid_i = HKDF(AK_i, "", "segv.sh/v2/alias/uid", 16)
+a     = H(enc("segv.sh/v2/alias/handle", uid, sigPk, kemPk, u8 c))     c ∈ 0..3
+x     = u40 of a[0..5]
+aliasHandle(uid, sigPk, kemPk, c) = "_" ‖ ch(0) ‖ ch(1) ‖ ch(2) ‖ ch(3) ‖ "_" ‖ ch(4) ‖ ch(5) ‖ ch(6) ‖ ch(7)
+ch(k) = "0123456789abcdefghjkmnpqrstvwxyz"[(x >> (35 − 5k)) & 31]
+```
+
+- **Keys.** Alias i is the account whose account key is `AK_i`: §2.1 derives its `sigSk`, `kemSeed`, `kS`, `rS`, `nS`,
+  `qS`, `bS` and `kN` from `AK_i` as it derives the owner's from AK, and its uid is `uid_i` instead of random bytes.
+  Every rule of this spec for an account applies to an alias with `AK_i` in place of AK, except where this section
+  says otherwise and where §7.2, §7.4, §10.6, §10.8, §10.10, §10.11, §11.1, §11.4, §11.8, §11.9, §11.11, §11.13, §11.16
+  and §11.19 name aliases. Wherever the spec says self, it is the account that reads the bucket, holds the copy or owns
+  the link, and a device uses no account's keys, state or rows for another, with three exceptions on the owner's
+  devices: the owner's quiet secret and quiet tag serve every account the device runs (§10.10, §11.13, §11.16); the
+  owner's NICK records apply in the copies of all its accounts (§11.19); and its other accounts count as self for
+  rings, unread and notifications ("Per account, and shared" below). Only the
+  owner's devices can compute `AK_i`, from AK: a passkey or the recovery code of the owner gives every alias, and
+  nothing else gives any.
+- **Handle.** `aliasHandle(uid, sigPk, kemPk, c)` of the alias's own uid and keys: ten characters such as `_k7m2_q9x4`
+  (40 bits; the alphabet leaves out `i`, `l`, `o` and `u`). It matches the regex of §2.1 and is the only kind of handle
+  that starts with `_`. `c` is 0, or the next value when that handle is taken ("Creating" below). The user does not
+  choose it, and the server accepts only a handle derived from the bundle's own keys (§10.6). Anyone can still register
+  an alias-shaped account of their own, and finding one whose handle matches a given alias handle in k of its 8
+  characters costs about 2^(5k) hashes, so a handle that looks like a known one proves nothing: fingerprints do (§2.2).
+- **Bundle.** An ordinary bundle (§2.2) whose `ts` is a random integer in 0..2^53 − 1, chosen once per creation and
+  kept by its resends: it carries no clock, and no two creations send the same body.
+- **Registration.** `POST /api/v2/register` (§10.6) with no wrap record. The server accepts a registration without
+  wraps only for a handle that is `aliasHandle` of the bundle's own uid and keys for some `c ≤ 3`, and never a wrap
+  record for a uid whose handle is `aliasHandle` of its registered uid and keys, so nobody signs in to an alias except
+  through its owner. The directory
+  serves an alias as it serves any account.
+- **The alias table.** The owner's self lane lists its aliases in the value of PREFS key 1 (§7.2): one byte per alias
+  index 0..n − 1, bits 0–1 the `c` of its handle and bit 2 set while it is retired. With it a device computes every
+  alias's uid, keys and handle, retired ones included, without a lookup. It is a PREFS key, not a record type of its
+  own, because clients that predate aliases keep every PREFS key in the snapshots they write, and would drop a record
+  type they do not know (§7.4). A device writes the whole table whenever it adds, retires or brings back an alias, in a
+  row of its own (§7.3). On a CONFLICT it applies the occupant, applies its own change again to the table that its fold
+  then holds, and writes that, so a sibling's change is never undone.
+- **The owner's accounts** are the owner and every alias of the table, retired ones included. In a descriptor, a member
+  is one of them only when D lists its uid with its own `sigPk` and `kh`, which the device derives (§5.1); a member
+  that lists such a uid with other keys is an unknown member (§11.2), rung, counted and notified like any other, so a
+  committer cannot learn from a forged slot which accounts one device runs.
+- **Creating** (`createAlias`, §11.11), on a device of the owner, once the owner's restore has applied its self delta
+  (§11.4 step 4):
+  1. Catch up the owner's self lane (§11.6), so that the fold holds the table as written so far. Let i be its length
+     (0 without a table). The creation fails with "at most 16 temporary handles can be active; retire one first" when
+     at least `MAX_LIVE_ALIASES` = 16 aliases of the table are live (not retired).
+  2. Add i to the table, with `c = 0`, not retired, before any request: every device of the owner knows the alias
+     from then on, and runs it (below), whether or not this creation finishes.
+  3. Derive `AK_i`, `uid_i` and the keys, build the bundle with the table's `c` and a fresh random `ts`, and register
+     it, retried as §2.5 step 8 says. A 200 answers only this creation's own body, since every creation sends another
+     `ts`.
+  4. On a 409, look `uid_i` up exactly (`GET /api/v2/dir/uid/{uid_i}`, §10.6), retrying a transient failure:
+     - if it is registered with the alias's derived keys and the handle `aliasHandle(uid_i, sigPk_i, kemPk_i, c′)` for
+       some `c′ ≤ 3`, another device of the owner registered alias i ("Running aliases"): write the table with `c′` for
+       i when it holds another `c`, and go on at step 5;
+     - if it is not registered, the handle is taken: write the table with the next `c` for i and go back to step 3, and
+       fail after `c = 3` (each try collides with probability about N / 2^40, N the number of registered aliases);
+     - otherwise fail.
+
+     The creation fails with "could not create a temporary handle; try again" here, and on any other failure of step 3.
+     It then sets i's retired bit, so that no device runs an alias that may not be registered; bringing it back runs
+     it, which registers it (below).
+  5. Run the alias (below). Its first self row is the registration HEADS of §11.1, whose cursor comes from the
+     `x-segv-now` of the 200 that answered its own register request (§11.5); after a 409, the device writes none.
+
+  `createAlias` resolves once the alias runs, with its uid. Since the table names every alias before it is registered,
+  no alias is ever registered without an entry, and no device needs to search the directory for one.
+- **Running aliases.** Once the owner's restore has applied its self delta, the device runs every live alias of the
+  table as an account of its own: §11.1 step 2 for it; then its restore (§11.4) from its own self lane, the aliases one
+  after another and alongside the owner's §11.4 steps 5–11; then its catch-ups, polls and deliveries (§11.5, §11.6,
+  §6.11). Its topics share the tab's sockets with the owner's (§10.8), and the checkpoints are the device's: §11.1 step
+  3 is not repeated. In its §11.1 step 2:
+  - a 404 means that the alias's creation stopped after "Creating" step 2: the device registers it as "Creating" steps
+    3–4 say, and its registration HEADS, when its own register request got the 200, is the alias's first self row;
+  - a bundle with the alias's derived keys and the handle `aliasHandle(uid_i, sigPk_i, kemPk_i, c′)` for another
+    `c′ ≤ 3` than the table's (a creation that stopped between registering with `c′` and writing it) makes the device
+    write the table with `c′` for i;
+  - where §11.1 step 2 would make the session fatal for the owner, or the alias cannot be registered, the device does
+    not run that alias, and raises the critical warning "the directory does not list one of your temporary handles as
+    created; it is not used on this device".
+
+  A device that finds more than 16 live aliases in the table runs the 16 with the highest indices, with the noise
+  warning "more than 16 temporary handles are active; only 16 run on this device". A device starts an alias that a
+  sibling's table adds or brings back when it applies that row (§11.7), and stops one that the table retires.
+- **Rows that members can cause.** A member can make a device write: when it commits an epoch (a rename costs it
+  nothing), the device posts a BELL row there (§11.13), or repeats a LEAVE of a copy that self has left (§6.9). A device
+  that wrote these at once for every account it runs would answer for all of them together, and a member of
+  conversations of two of them could tell that one device runs both. So an alias writes nothing at a time that another
+  member's act decides:
+  - it posts its BELL row in an epoch of a copy only just before its own first row there that the user causes (a
+    TEXT, IMAGE, FILE, REPLY, REACTION, EDIT or LEAVE, or a claim it commits), or when the user opens that copy on a
+    device in use, never because rows arrive in a pane already open (§11.13 "An alias's BELL row");
+  - it repeats a LEAVE (§6.9) only after an independent random delay, uniform up to 12 hours, from when it finds the
+    repeat due, which the device keeps in its local state (§11.15) so that a restart does not draw again, and it never
+    rotates proactively (§6.9). Until the repeat, a member added by a racing commit keeps the alias listed (§6.9);
+  - every M (§3.3) and every D (§5.1) that it writes carries as `ts` the device's estimate of the server's time (§10.1),
+    never the device's own clock, whose offset would be the same for every account that the device runs.
+
+  The owner writes as any account. Its BELL rows tell members when one of its devices processes an epoch, which is when
+  that device is online: a member who commits in a conversation of the owner right after each act of an alias learns
+  each time whether the owner's device was online then, so many such acts can link them, for a user who is seldom
+  online (§13.1).
+- **Retiring** (`setAliasRetired`, §11.11) sets bit 2 of the alias's entry; bringing it back clears it, and fails as
+  "Creating" step 1 does when at least 16 aliases of the table are live. A device that applies a retirement, its own or
+  a sibling's, stops the alias: it ends the alias's polls, catch-ups and background deliveries, takes the alias's
+  topics off the tab's sockets (UNSUB, §10.8; a topic that another account still needs stays), revokes its image and
+  file URLs and drops its state, its local state included (§11.15); it keeps the sockets, the remembered session and
+  the notification setting. It then sends its registration set without the alias's bells and writes its notification
+  cache again (§11.13). No device of the owner runs a retired alias: it reads no invite, writes no row
+  and resumes no delivery, and its conversations are not shown. Its directory entry stays (the directory deletes
+  nothing, §9.6), so others can still look it up and send it invites, which nobody reads while it is retired, and its
+  members see a member that has gone silent. Brought back, it restores from its own self lane as after any absence
+  (§11.4): its conversations and their history, the invites of the retained inbox eras after its cursor (§11.5), and
+  its unfinished deliveries (§6.11).
+- **Per account, and shared.** Contacts, MEMBER pins, requests, bells, links, read positions, copy settings, the inbox
+  cursor and snapshots are per account: an alias's are its own, and a conversation that a contact of the owner starts
+  with an alias is a request to it like any first contact (§11.5). Nicknames are the owner's alone (NICK, §7.2), and
+  apply to what the device shows in the conversations of every one of the owner's accounts (§11.19). On the owner's
+  devices, in a copy of one of the owner's accounts, the lane of another of the owner's accounts counts as self's lane
+  does for rings, unread and notifications: a sender rings no bell of it (§11.13), its rows and the epochs it commits
+  never count as unread (§11.8), and no notification shows them (§11.13); members learn nothing of this. A device
+  registers the bells of every account it runs under the owner's quiet tag, marks the rows it shows with the owner's
+  `qS`, and sends an alias's sync notes with the owner's `qS` (§10.11, §11.13, §11.16).
+- **A client never invites one of the owner's accounts into a conversation of another.** Creating a conversation, or
+  adding members, with the handle of one of the owner's accounts other than the one that acts fails with "@x is one of
+  your own handles" before any request, and so does a handle that resolves (§6.1 step 1, §6.3) to the uid of one of
+  them, before any row is written: the other members would see the two meet. The acting account's own handle is left
+  out as before ("you are always included").
+- **What P and members learn.** A member sees the alias's handle, which shows that it is an alias (anyone can check
+  that it is `aliasHandle` of the alias's own uid and keys), and its fingerprint
+  (§2.2), which is its own. The directory serves each account's registration era and dirseq, and the checkpoints date
+  every dirlog entry to the minute (§9.5, §9.6), so anyone, a member included, can link aliases registered close
+  together, or close to their owner's registration, where few accounts register in that window. The accounts that one
+  device runs act at the times its user acts, and their rows carry the device's latest verified checkpoint (`ckq`,
+  `ck16`, §3.3), so members of conversations of two of them can link them by the times of what the user does there
+  (§13.1).
 
 ## 3. Clock, eras, classes, envelopes
 
@@ -534,7 +712,7 @@ body = aeadSeal(mk_e, pad(M ‖ sig, CLASSES), aad = enc("segv.sh/v2/msg", u16 E
 | `lane` | For lane rows (types 1, 2, 3, 4, 5, 6, 7, 8, 17): equal to `from` (stage 1: one lane per member). For CLAIM: `0xFFFF`. |
 | `n` | The slot within era `E`: the lane counter, or `k` for CLAIM. |
 | `Eprev, nprev, prevh` | Lane rows only: the position of the sender's previous **valid** row on this lane in this epoch, and `prevh = t16(H(enc("segv.sh/v2/prev", label_prev, body_prev)))`, where `body_prev` is that row's stored body. For the first row of the lane in the epoch, and for every CLAIM: NONE and `ZERO16`. |
-| `ts` | The sender's clock in ms (display only, §11.8). |
+| `ts` | The sender's clock in ms (an alias's: the device's estimate of the server's time, §2.6); display only (§11.8). |
 | `ckq, ck16` | The sender's latest verified checkpoint: `q` and `t16(C_q)`. `(0, 00…)` if it has none (§12.3, §12.4). |
 
 **Parse rules** (normative; they decide "the envelope parses" in §6.4(a)). A body *does not decrypt* if its length is
@@ -1440,7 +1618,7 @@ shown before it is decided. A receiver never accepts a row because it lacks `C_j
 - **Repeating a LEAVE.** The others see a LEAVE row only if it lies in their current epoch, or in the previous one
   while they follow the leaver's lane there (§11.2). So whenever a leaver's copy is in an epoch c that still lists self
   (self was not removed or dropped), its leave is current, and its latest LEAVE record names an epoch `e_L < c`, a
-  device of the account puts a LEAVE in c. Devices check this after every catch-up and restore, and in §11.3 step 8,
+  device of the account puts a LEAVE in c (an alias after a random delay, §2.6). Devices check this after every catch-up and restore, and in §11.3 step 8,
   also in a frozen copy (the freeze itself posts nothing, §11.4 step 5). The put runs §11.3 steps 1 and 2 (without the
   "you left" refusal), then steps 4–8, and writes its own LEAVE record after its OK. This is how a late LEAVE (§11.3
   step 8) is repeated, also by another device or after a reload. The rule does not test whether the others still
@@ -1448,7 +1626,7 @@ shown before it is decided. A receiver never accepts a row because it lacks `C_j
   one row, and a duplicate LEAVE is harmless.
 - **Rotation after a leave.** A remaining member MUST commit an epoch without the leavers (§6.3) before sending a TEXT,
   IMAGE, FILE, REPLY, REACTION or EDIT in an epoch that lists a member who has left, unless it is frozen in that epoch
-  or the epoch is `2^32 − 2` (§11.3). Clients MAY rotate proactively: the remaining member of rank r (by index among
+  or the epoch is `2^32 − 2` (§11.3). Clients MAY rotate proactively (an alias never does, §2.6): the remaining member of rank r (by index among
   non-leavers) waits `r × 30 s + random(0..10 s)` after seeing the leave, and aborts if a claim appears first. A member
   added by a commit that raced the LEAVE (its committer built `D′` before the row reached it, so `D′` still lists the
   leaver) holds no epoch of that row and does not see it. It records the leave only when the leaver's device repeats it
@@ -1603,7 +1781,10 @@ body = aeadSeal(kS, pad(S, CLASSES), aad = enc("segv.sh/v2/self", u16 E, label))
   position other than NONE; LINK only flag bits 0–1; PREFS `len ≥ 1`; the counts of §7.2; DESC and
   REQUEST `224 ≤ dlen ≤ 2960`; MEMBER's handle; LEFT's `(E, n)` a position; SNAP's `(Eh, nh)` a position; READ
   `1 ≤ m ≤ 32` and only flag bit0; CONV_PREFS `len ≥ 50`, and for key 1 `len = 53`. A CONV_PREFS with a key that the
-  reader does not know is ignored, not malformed, so later keys never make a row unreadable.
+  reader does not know is ignored, not malformed, so later keys never make a row unreadable. NICK `16 ≤ len ≤ 272`,
+  with a name of valid UTF-8 of at most 64 code points (§1.2). A PREFS of key 1 (the alias table) whose value sets a
+  bit above bit 2 in a byte is not malformed: it is still the latest value of key 1, and a reader ignores bits 3–7 of
+  each byte. A device that writes the table keeps those bits as it read them.
 - A row at `Lself` MUST NOT hold a SNAP. A row at `Lsnap` MUST hold exactly one known record, a SNAP. Writers write
   `count = 1` and prev fields NONE / `ZERO16` there; readers do not use a pointer row's prev fields.
 - S2 (§7.4) is malformed unless, after removing the padmé padding, it is `"SGS2"`, `ver = 1`, `(Eh, nh)` a position,
@@ -1624,7 +1805,7 @@ body = aeadSeal(kS, pad(S, CLASSES), aad = enc("segv.sh/v2/self", u16 E, label))
 | 0x04 | LEAVE | `conv[16] | root[32] | u32 e` (52 B) |
 | 0x05 | CONTACT | `uid[16] | pin[32]` (48 B). TOFU pin of the bundle (§2.2). |
 | 0x06 | LINK | `s[16] | u16 Ecreated | u16 Eexpires | u8 flags` (21 B). bit0 = one-shot, bit1 = revoked. |
-| 0x07 | PREFS | `u8 key | value[len−1]`. No keys are defined in stage 1. The latest value per key wins. |
+| 0x07 | PREFS | `u8 key | value[len−1]`. The latest value per key wins. Key 1, in an owner's self lane only: the **alias table** (§2.6), one byte per alias index 0..n − 1, bits 0–1 the `c` of the alias's handle, bit 2 set while it is retired, bits 3–7 zero. A reader ignores the other keys, and key 1 in an alias's self lane. Every client folds PREFS by key (the first release included), and every client that writes snapshots keeps the latest of every key in them (§7.4), so the table outlives the clients that predate it. |
 | 0x08 | HEADS | `u16 Ein | u32 relIn | u16 c | entry × c`, with `entry = conv[16] | root[32] | u32 e | u64 lastTs | u16 ctlE | u32 ctlCnt | u8 m | (u16 E | u32 cnt) × m | u8 f | (u32 ef | u16 ℓ | u16 E | u32 cnt) × f` (68 + 6m + 12f B per entry). Processed positions (§7.3). `c = 0` records only the inbox cursor. |
 | 0x09 | CONFIRMED | `conv[16] | root[32]`. The copy is corroborated (§6.7), by a row or by a claim (§6.7 step 6). |
 | 0x0A | DELIVERED | `conv[16] | root[32] | u32 e | bundleId[32] | u8 a | uid[16] × a` (85 + 16a B). These uids have been sent J for that EPOCH_PENDING (§6.12 step 3). Its row is padded to class ≥ 1 (§7.1). |
@@ -1637,6 +1818,7 @@ body = aeadSeal(kS, pad(S, CLASSES), aad = enc("segv.sh/v2/self", u16 E, label))
 | 0x13 | READ | `conv[16] | root[32] | u32 e | u8 flags | u8 m | (u16 E | u32 cnt) × m` (54 + 6m B). The account's read positions in epoch e of the copy: on lane ℓ of `D_e`, every row before `(E, cnt)` has been read on one of its devices (§11.8). `flags` bit0: the user marked the copy unread. The first release skips it (§7.1). |
 | 0x14 | CONV_PREFS | `conv[16] | root[32] | u8 key | value[len − 49]`. A setting of the copy that every device of the account applies. Key 1, mute: `value = u32 until`, the time (seconds since T0) until which the copy is muted, 0 for not muted and `0xFFFFFFFF` for until the user unmutes it (§11.13). The first release skips it (§7.1). |
 | 0x15 | BELLS | `conv[16] | root[32] | u32 e | u32 g | u8 k | (u8 ℓ | bell[16]) × k` (57 + 17k B). The bells of epoch e of the copy as the writing device knows them (§11.13): `g` is that of self's latest BELL row among the held epochs of e's generation, or `0xFFFFFFFF` when the device knows none there, and each entry gives, for lane ℓ of `D_e` other than self's, that member's bell of the same generation. Written beside every HEADS entry for epoch e, in the same row or snapshot (§7.3), and read at restore with it (§11.4 step 5). The first release skips it (§7.1). |
+| 0x16 | NICK | `uid[16] | name[len − 16]` (16–272 B). The account's private **nickname** for the user `uid`, which its devices show in place of that user's handle (§11.19); an empty name removes it. Written only to the self lane of an owner, never to an alias's (§2.6), and read only from there. The first release skips it (§7.1). |
 | 0x20 | SNAP | `blobId[32] | key[32] | u32 size | u16 Eh | u32 nh` (74 B). Allowed only in rows at `Lsnap`. |
 
 **Why TREG is a record of its own**. Appending `u32 t_reg` to CONV_JOIN and EPOCH would make them 141 and
@@ -1781,6 +1963,8 @@ records are idempotent:
 | CONV_PREFS | `(conv, root, key)` | the latest wins |
 | BELLS | `(conv, root)` | the latest wins; a reader uses it only beside the HEADS entry it was written with (§7.3, §11.4 step 5) |
 | LINK | `s` | |
+| NICK | `uid` | the latest wins; an empty name means no nickname |
+| PREFS | `key` | the latest wins; key 1 is the alias table (§2.6) |
 | CONFIRMED | `(conv, root)` | (written for a confirming row or claim, §6.7 step 6); one of a legacy copy's key that the first release wrote after a bit1 record, in a row without a HEADS record, belongs to the copy that §7.2 assigns it to |
 | HEADS | per copy | the latest entry wins (an entry of a legacy copy belongs to the copy that §7.2 assigns its epoch to); `(Ein, relIn)` takes the maximum. A record may hold any subset of copies. A restore also keeps, per epoch of a copy, the furthest control position `(ctlE, ctlCnt)` of the entries it applied, the replaced ones included (§11.4 step 5). |
 
@@ -1832,6 +2016,10 @@ upgrade, where a conversation that the first release continued by a skip shows t
   claim causes (§6.6 step 3, §6.7 step 6), since no self row follows a claim observed from another member (§13.1); LEFT
   records ride in every HEADS row or snapshot that holds an entry for their epoch (below). The device uses them locally
   at once. The MEMBER for a request's `D.by` rides in the REQUEST's row.
+- **NICK and the alias table** are written at once, each in a row of its own: a NICK when the
+  user sets or removes a nickname (`setNickname`, §11.11), the alias table (PREFS key 1) when an alias is created
+  (before it is registered), when the `c` of its handle changes, and when it is retired or brought back, rebuilt on a CONFLICT as §2.6 says. The device applies them locally once the
+  row is written.
 - **CONFIRMED and accepting records.** Every CONFIRMED and every CONV_JOIN with `via = 5` is written in a self row
   that also holds a HEADS record (at least `c = 0` with the inbox cursor), whatever its key, so that §7.2 never moves
   it to a copy that a legacy skip record starts, also when such a record lands only later or in another era: the first
@@ -1948,9 +2136,17 @@ blob = aeadSeal(skey, padme(S2), aad = utf8("segv.sh/v2/snapshot")); skey = rand
     CONTACT (other MEMBER records are dropped, and looked up again if ever needed);
   - every LINK that has not expired;
   - the latest PREFS per key;
+  - in an owner's snapshot, the latest NICK of every uid whose name is not empty (§11.19); the alias table is the latest
+    PREFS of key 1, above;
   - for every copy that the snapshot keeps, its READ (its highest epoch, with the merged positions and the latest
     flags) and its latest CONV_PREFS per key;
   - a HEADS record with the inbox cursor.
+
+  **Compatibility.** A client that predates a record type drops its records from the snapshots it writes, as it drops
+  every record it does not know. A device that runs such a client after NICK records were written (a tab not yet
+  reloaded, an app not yet updated) can therefore make the next restores lose the nicknames. The alias table is kept:
+  every client folds PREFS by key, and every client that writes snapshots keeps the latest PREFS of every key in them.
+  An alias's own state is in its own self lane, which such a client never reads or writes.
 - **Pointer.** A self row whose only record is `SNAP{blobId, skey, size, Eh, nh}`, with prev fields NONE / `ZERO16`
   (§7.1), is put at `Lsnap(E, j)` with `E = max(E_now, regEra)` (never below `regEra`, as for self rows, §7.3), where
   `j` is the first empty slot. Slots are dense per era, and the first writer of a slot wins.
@@ -2946,7 +3142,8 @@ n/<hex nk>   →  (ep[16] ‖ u16 len ‖ box) × m, m ≤ 8            the acco
 
 `PUSH_KEY` protects the boxes against a leak of the store alone, not against O. Each key has one writer, the QuietDO of
 its account: an `e/` or `n/` key that of its endpoint's owner, the account its record names, and a `b/` key that of the
-bell's account, since only that account's devices hold the secret that registers under the bell (§10.10). An endpoint
+account whose quiet tag registers the bell, since only that account's devices hold the secret that registers under
+the bell (§10.10): the owner's for an alias's bell (§2.6). An endpoint
 whose registration comes from another account (a second account on the same browser or phone) changes owner: its old
 owner's QuietDO takes it out of its bells and deletes its record first, and only then does the new owner's register it
 (§10.10, `sub`); a QuietDO never writes the keys of a record whose owner's QuietDO is another. So no write races
@@ -3514,13 +3711,16 @@ Cache rules:
 
 **`POST /api/v2/register`** (PoW `register`; `RL_WRITE`; body ≤ 64 KiB):
 
-- Body `{"bundle": text, "sig": b64u, "wraps": [{"record": text, "sig": b64u}, …1..4]}`.
+- Body `{"bundle": text, "sig": b64u, "wraps": [{"record": text, "sig": b64u}, …0..4]}`.
 - The server checks the canonical bundle, the field sizes, the handle regex, `bundleSig`, and `checkUserKeys`. For
   every record it checks canonical form, sizes, `uid` equal to the bundle's, `recordSig` under the bundle key, and
-  that ids are distinct (compared as decoded bytes).
-- Every failed check is 400: shape, size, canonical form, handle, `bundleSig`, `checkUserKeys`, a record `uid` that
-  differs from the bundle's, a repeated id, a bad `recordSig`, and 0 or more than 4 wraps. 409 is only for a handle or
-  uid that is already registered.
+  that ids are distinct (compared as decoded bytes). An **alias registration** (§2.6) has no wraps, and a handle
+  that starts with `_` and equals `aliasHandle(uid, sigPk, kemPk, c)` of the bundle's own uid and keys for some
+  `c ∈ 0..3`; every other registration has 1 to 4 wraps and a handle that does not start with `_`.
+- Every failed check is 400: shape, size, canonical form, handle (one that starts with `_` and is not `aliasHandle` of
+  the bundle's own uid and keys for any `c ≤ 3`, or one that is but comes with wraps), `bundleSig`, `checkUserKeys`, a record `uid` that differs from
+  the bundle's, a repeated id, a bad `recordSig`, no wraps for a handle that does not start with `_`, and more than 4
+  wraps. 409 is only for a handle or uid that is already registered.
 - It appends the dirlog entries atomically, then writes the user and the wraps (§9.6: the request answers 200 only
   once its rows landed, and rows that a failure leaves behind land from the DirSeqDO's write-ahead log).
 - On success: 200 `{"dirseq": n}`, where n is the dirlog seq of the user entry (kind 1), i.e. the user's `dirseq` in
@@ -3529,8 +3729,10 @@ Cache rules:
 **`POST /api/v2/wraps`** (PoW `wrap`; `RL_WRITE`; body ≤ 16 KiB):
 
 - Body `{"record": text, "sig": b64u}`.
-- The server checks, in this order: body and record shape, size and canonical form (400); unknown uid (404);
-  `recordSig` under the uid's registered bundle key (400); the cap of 64 records per uid, counted by the DirSeqDO
+- The server checks, in this order: body and record shape, size and canonical form (400); unknown uid (404); a uid
+  whose handle is `aliasHandle` of its registered uid and keys for some `c ≤ 3`, an alias, which has no wraps (§2.6;
+  400); `recordSig` under the uid's registered
+  bundle key (400); the cap of 64 records per uid, counted by the DirSeqDO
   before the write (§9.6; 400 when the uid already has 64); then the insert, where a duplicate `(uid, id)` is 409.
   A request that is both over the cap and a duplicate therefore answers 400.
 - On success: 200 `{"dirseq": n}`, the seq of the wrap's dirlog entry.
@@ -3557,9 +3759,11 @@ Cache rules:
   with `uid > after` in the same order.
 - **Client choice of p.** The client MUST use `p = max(0, min(P* − 1, ⌊log2(dirSeq / 64)⌋, 16))` with
   `P* = max(P, ⌊log2(dirSeq / 2080)⌋)`, where `P` is the params value and `dirSeq` is the dirlog head `seq` (read once
-  per session, before its first prefix lookup, from `/api/v2/dirlog`; every account adds at least two dirlog entries).
-  The second term of `P*` counts only when `dirSeq ≥ 2080`. Every account adds at most 65 dirlog entries (one user
-  entry and at most 64 wraps), so the true `P` is at least `⌊log2(dirSeq / 2080)⌋`: `P*` is never above the current
+  per session, before its first prefix lookup, from `/api/v2/dirlog`; every account adds at least one dirlog entry,
+  and every account but an alias at least two, so the cap `⌊log2(dirSeq / 64)⌋` is at least `P − 1` when the client
+  reads `dirSeq`). The second term of `P*` counts only when `dirSeq ≥ 2080`. Every account adds at most 65 dirlog
+  entries (one user entry and at most 64 wraps; an alias adds one, §2.6), and every account, an alias included, counts
+  in `users` (§9.6), so the true `P` is at least `⌊log2(dirSeq / 2080)⌋`: `P*` is never above the current
   `P`, and a `P` of 0 (or a stale `P`) reported during a D1 outage (§9.6) widens lookups at most down to that bound.
   An operator that inflates `P` to make lookups exact must also inflate the public, audited dirlog. A client whose
   params `P` is below `⌊log2(dirSeq / 2080)⌋` MAY re-read params first (at most once per 60 s), because the bound is
@@ -3595,7 +3799,8 @@ Cache rules:
   member unknown (§11.2), and a join that needs the lookup is parked (§6.7).
 
 **`GET /api/v2/dir/uid/{uid}`** is the exact lookup of one user, in the same shape (`inbox` included). Clients use it
-only for their own account: at unlock, and for their own inbox buckets (§11.5). Response: `{"user": {…} }`, or 404.
+only for their own account: at unlock, and for their own inbox buckets (§11.5); an owner's devices also use it for its
+aliases (§2.6: creating and running them). Response: `{"user": {…} }`, or 404.
 
 **`GET /api/v2/dir/wraps/{id}[?uid=<b64u>]`** returns `{"wraps": [{"uid", "record", "sig", "dirseq"}]}`:
 
@@ -3712,9 +3917,18 @@ that a withdrawal took is never a row's. A GAP only costs a catch-up (§11.6), n
 - Subscribe to at most 256 topics per socket and use at most 2 sockets per tab, in priority order: `Tself`, the
   inbox notice topics (below), the current epochs of accepted copies by recent activity, followed old epochs (§11.2),
   then links. Request copies are never subscribed (§11.5). Copies beyond the budget are covered by catch-up (§11.6).
+- **A tab that runs aliases** (§2.6) uses these 2 sockets for every account it runs, never sockets of its own per
+  account, with one priority order: the `Tself` of every account (the owner's, then the live aliases' by index), the
+  inbox notice topics of every account, the current epochs of every account's accepted copies by recent activity,
+  followed old epochs, then links. A topic that several accounts need (the `T_e` of copies that the owner and an alias
+  both hold, or the notice topic of a bucket they share) is subscribed once, and its rows go to every account that
+  needs it. Topics beyond the budget, an alias's `Tself` and notice topics included, are covered by catch-up (§11.6),
+  and an account whose notice topics are not subscribed polls its inbox at every catch-up (§11.5). A GAP, and a
+  reconnect without RESUMED, start a catch-up of every account.
 - On reconnect, send RESUME, and SUB any further topics.
 - Send NOTES on every socket: right after its RESUME, or as its first frame when it sends none. On a NOTE frame for
-  `Tself`, apply the note (§11.16); ignore a NOTE frame for any other topic.
+  `Tself`, apply the note (§11.16); ignore a NOTE frame for any other topic. A tab that runs aliases applies a NOTE
+  frame for the `Tself` of any account it runs to that account.
 - Subscribe, on the first socket and right after `Tself` in priority, to the notice topics `Tinbox(E, g_E)` (§9.3) of
   the eras `E_now − 1`, `E_now` and `E_now + 1` that lie in `max(E_FIRST, E_now − 3)..0xFFFE`, with `g_E` the
   account's own bucket of E (from its directory entry, §10.6, §11.5; an era whose bucket is not known yet is left out
@@ -3722,7 +3936,7 @@ that a withdrawal took is never a row's. A GAP only costs a catch-up (§11.6), n
   of them, poll the inbox (§11.5) after a delay drawn uniformly from `[0, max(0, Δin − SKEW − 2)]` seconds (6 s in
   production); an INBOX frame that comes while such a poll waits joins it instead of starting another. When the poll's
   read of an era it was for reports `closed < rel`, poll once more after Δin. Ignore an INBOX frame for any other
-  bucket. Every online device of the bucket gets the same notice at the same moment, `SKEW + 1` s after the slot
+  bucket; in a tab that runs aliases, an INBOX frame makes every account whose own bucket of E is g poll. Every online device of the bucket gets the same notice at the same moment, `SKEW + 1` s after the slot
   closed (§9.3); the delay spreads their reads over the rest of that slot, where every read reports the same `closed`
   and a response stays in the edge cache until the slot ends (§10.5), so that a colo sends the InboxDO only the reads
   that arrive before its first response is stored, instead of all of them at once.
@@ -3965,17 +4179,21 @@ note.
 - **Without push.** Unlike the endpoints of §10.10, `sync` exists whether or not push is on; while it is off, notes
   reach the sockets only.
 - **Who can send.** A device sends its account's `qS` and `Tself` (§4.1), which only the account's devices know, and O,
-  which sees them in `seen`, `sync` and SUB frames. The note is sealed under `kN` (§11.16), which the server never sees,
+  which sees them in `seen`, `sync` and SUB frames; for an alias's note, the owner's `qS` with the alias's `Tself`
+  (§2.6, §11.16), since its devices registered their endpoints under the owner's quiet tag. The server checks no link
+  between the two. The note is sealed under `kN` (§11.16), which the server never sees,
   and a note that does not open is dropped by every device: whoever sends a request with the account's secrets but not
   its key only wakes the account's devices, within `RL_SYNC` and the QuietDO's limits.
 - **What it tells.** The server cannot read a note, and every note has the same length. It learns that a device of the
-  account sent one at that moment, from that IP, and that `Tself` and `Qself` belong to one account (§13.4).
+  account sent one at that moment, from that IP, and that `Tself` and `Qself` belong to one account, or to an alias and
+  its owner (§2.6, §13.4).
 
 ## 11. Client algorithms
 
 Constants: `W = 8` (lane lookahead and gallop chunk), `P0 = 2` (probe depth of an idle lane), `SEND_ATTEMPTS = 8`,
 `HISTORY_INITIAL = 30` rows per lane, `HISTORY_COPIES = 20`, `VIEW_MESSAGES = 500`, `MAX_TEXT_BYTES = 12000`,
-`MAX_REQUESTS = 64`, `RESUME_AFTER = 10 min`, `MAX_REACTIONS = 8` (emoji per member and message, §11.12).
+`MAX_REQUESTS = 64`, `RESUME_AFTER = 10 min`, `MAX_REACTIONS = 8` (emoji per member and message, §11.12),
+`MAX_LIVE_ALIASES = 16` (§2.6).
 
 Every protocol delay (the rotation rank delay, `RESUME_AFTER`, the HEADS delay, the poll and catch-up intervals, the
 processing wait of §11.3) is a named engine option, so tests can shorten it. Waits on server
@@ -3993,11 +4211,15 @@ time (§6.3 step 5) use the injectable clock.
 3. Load and verify checkpoints (§12.3).
 4. Restore (§11.4), open the realtime socket, which subscribes to the inbox notices (§10.8), and start the catch-up
    loop (§11.6).
+5. Within step 4, once the self delta is applied (§11.4 step 4), run the live aliases of the account's table (§2.6), one alias after another and alongside the owner's §11.4 steps 5–11: each one from its own step 2, without
+   step 1 (its `AK_i` comes from AK) or step 3 (the checkpoints are the device's), and with its topics on the tab's
+   sockets (§10.8) instead of sockets of its own. A failed step 2 of an alias is not fatal: that alias is not run, with
+   the warning of §2.6.
 
 After `register`, the client writes its first self row: a HEADS record (`c = 0`) whose cursor is the registration
 cursor of §11.5, taken once from the register response's `x-segv-now` and kept by every retry of the write, so its
 first restore does not scan the inbox from the start of the era. Like every self row, it is written in an era no lower
-than `regEra` (§7.3).
+than `regEra` (§7.3). A new alias's first self row is the same, from its own register response (§2.6).
 
 ### 11.2 Per-copy state
 
@@ -4158,7 +4380,8 @@ fails with the same error instead, nothing keeps its body, and it is not retried
    (so the others still follow self's lane of e). Otherwise, or if the probe fails or the wait times out: a TEXT,
    IMAGE, FILE or REPLY echo becomes `failed` with the same "not delivered" error, and its retry builds the message
    again in the current epoch; a REACTION's or an EDIT's send fails with that error; a BELL is done either way (its row
-   exists, and §11.13 posts another in the current epoch when self's lane there has none); a LEAVE is put again in the
+   exists, and §11.13 posts another in the current epoch when self's lane there has none, an alias only with its
+   user's next act or opening there); a LEAVE is put again in the
    current epoch by the rule of §6.9 (its record for the late row stays, since that row exists); a WELCOME's uid stays
    pending (§6.12 step 4). A member that did see the late row then sees the message twice.
 
@@ -4192,7 +4415,8 @@ the device left off, and otherwise from the server alone, as below.
    - whenever every slot of a probe hits, the next `W` slots of its era (gallop);
    - apply the records in order.
 
-   An idle era costs one probe key.
+   An idle era costs one probe key. Each live alias of the owner's table then restores as an account of its own (§2.6,
+   §11.1 step 5), alongside the owner's steps 5–11.
 5. **Per accepted copy.**
    - Epoch keys come from CONV_JOIN and EPOCH records and from the claims the restore processes (the own entry, §6.6
      step 4). An EPOCH_PENDING never gives a held epoch: its commit may have lost, and when its claim is
@@ -4320,7 +4544,8 @@ the device left off, and otherwise from the server alone, as below.
 10. If more than 200 self records were applied since the snapshot, or there is no snapshot in `max(E_now, regEra)`,
     write a snapshot (§7.4; nothing defers it). Write HEADS when positions advanced (§7.3).
 11. **Notifications.** Post the BELL rows that §11.13 calls for. If this device has notifications on, send its
-    registration set, and write the notification cache when its preview is not `none` (§11.13).
+    registration set, and write the notification cache when its preview is not `none` (§11.13); with aliases, once
+    every account's restore has ended (§11.13).
 
 Requests are paced to `RL_READ`: on 429 the client waits for `retry-after` and continues where it stopped.
 
@@ -4371,6 +4596,9 @@ Requests are paced to `RL_READ`: on 429 the client waits for `retry-after` and c
   co-member that has no MEMBER record. With a current snapshot or HEADS that is none, except for listed uids that are
   not registered (§7.3; a member whose keys disagree with D has a MEMBER record and costs nothing), so the directory
   bytes of a restore do not grow with the directory or with the number of co-members.
+
+An owner's restore also costs the restore of each live alias, which costs what an account's restore costs, by its own
+copies; a retired alias costs nothing.
 
 It does not depend on the number of messages ever sent. As an example, 100 copies of 8 members are about 1 800 probe
 keys (8 `get` requests) plus at most 4 800 history rows (about 1.4 MB at class 0), plus about 3 KB for the own bundle,
@@ -4498,7 +4726,8 @@ restore (§11.4 cost), again for each such J sent.
 
 **On a ROWS frame**, for each row, look up its topic:
 
-- **`Tself`**: decrypt under `kS`, apply in self-lane order, and fill holes by probing.
+- **the `Tself` of an account the tab runs** (the owner or an alias, §2.6): decrypt under that account's `kS`, apply in
+  self-lane order, and fill holes by probing.
 - **`T_e`**:
   1. If the label is in the expected-label map, use that position.
   2. Otherwise decrypt with `mk_e`. Parse M and recompute the label from `(type, lane, E, n)`. If it does not match,
@@ -4512,9 +4741,11 @@ restore (§11.4 cost), again for each such J sent.
 Rows on a slot in the expected map that fail decryption occupy the slot: the client gives the noise warning "ignored
 an undecryptable message" and advances.
 
-**On a NOTE frame** (§10.8) for `Tself`, the client applies the note (§11.16); it ignores one for any other topic.
+**On a NOTE frame** (§10.8) for the `Tself` of an account the tab runs (the owner or an alias, §2.6), the client
+applies the note to that account (§11.16); it ignores one for any other topic.
 
-**On an INBOX frame** (§10.8) for a watched bucket, the client polls the inbox (§11.5) after the random delay of
+**On an INBOX frame** (§10.8) for a watched bucket, every account the tab runs whose own bucket of that era it is
+polls its inbox (§11.5) after the random delay of
 §10.8, one poll for the frames that come while it waits.
 
 **Catch-up** runs:
@@ -4568,7 +4799,7 @@ not stay followed are swept to their heads first (§11.2). Then it polls the inb
     copy and a copy that a legacy skip record starts included, §6.7 step 6, §7.2) and also for the creator's own copy,
     shows at `D.ts` of the joined epoch's descriptor, clamped to the same window around the stored time `t_reg` of that
     epoch's bundle (seconds since T0, a multiple of Δ, §9.2):
-    `[T0 + t_reg·1000 − 300 000, T0 + (t_reg + Δ)·1000 + 300 000]`. `D.ts` is the committer's clock, so a far-future
+    `[T0 + t_reg·1000 − 300 000, T0 + (t_reg + Δ)·1000 + 300 000]`. `D.ts` is the committer's clock (an alias's: its estimate of the server's time, §2.6), so a far-future
     value would otherwise keep the copy at the top of the conversation list through `lastTs`, a request from a spammer
     included. The device holds `t_reg` from the `meta` answer of §6.7 step 1 (from the PUT response for its own
     creation, §6.1 step 4), and a restore takes it as §4.2 says: from a TREG for the epoch's bundleId, or a REQUEST or
@@ -4584,8 +4815,9 @@ not stay followed are swept to their heads first (§11.2). Then it polls the inb
   was.
 - **`unread`** counts the copy's unread rows: the TEXT, IMAGE, FILE and REPLY rows of other members' lanes (and the
   epochs committed by others) that lie at or after their lane's read position in the epoch that the copy's READ names
-  (§7.2), or in a later epoch; never a REACTION or EDIT row, a row of self's lane (a sibling device's included), or a
-  row later dropped by §6.8. A row counts whether the client applied it live or at a restore, so the messages that
+  (§7.2), or in a later epoch; never a REACTION or EDIT row, a row of self's lane (a sibling device's included) or of
+  the lane of another of the owner's accounts (§2.6), whose commits do not count either, or a row later dropped by
+  §6.8. A row counts whether the client applied it live or at a restore, so the messages that
   arrived while every device of the account was closed stay unread when one opens. A copy without a READ for an epoch
   that it holds (one that only the first release read, say) counts, until its first READ, the rows applied after its
   restore finished, while `live`, as the first release did, so its old history never turns unread. A copy whose READ
@@ -4602,7 +4834,10 @@ not stay followed are swept to their heads first (§11.2). Then it polls the inb
 
 ### 11.9 System lines (exact text)
 
-These strings are kept from v1. `who(u)` is "you" for self and `@handle` otherwise.
+These strings are kept from v1. `who(u)` is "you" for self, u's nickname when the owner gave u one and u is not an unknown member (§11.2, §11.19), and
+`@handle` otherwise. Self is the account that holds the copy, the owner or an alias (§2.6); another account of the
+same owner in the copy is a member like any other. In this table, and wherever this spec quotes its lines, `@by` and
+`@x` are shown as `who(by)` and `who(x)`, which are never "you" there.
 
 | event | system line |
 | ----- | ----------- |
@@ -4683,7 +4918,10 @@ live final sweep dropped it). Older rows are never counted as unread.
 | Engine call | protocol |
 | ----------- | -------- |
 | `register`, `login`, `loginWithRecovery`, `addPasskey`, `logout` | §2.5. `logout` bumps the generation, closes the socket and stops polls and background deliveries, clears the remembered session, revokes image and file URLs, and drops all state. Another device or the next session finishes pending deliveries (§6.11). |
-| `createConversation(handles, name)` | §6.1, by handle. It resolves after step 5, with the new copy in `conversations`; steps 6–9 run in the background. |
+| `createConversation(handles, name, as)` | §6.1, by handle, as the account `as` (the uid of the owner or of a live alias, §2.6; the owner when it is absent). It resolves after step 5, with the new copy in `conversations`; steps 6–9 run in the background. A handle of another of the owner's accounts, or a handle that resolves to one of them, fails with "@x is one of your own handles" (§2.6). `addMembers` refuses them in the same way. |
+| `createAlias()` | §2.6 "Creating": resolves with the new alias's uid once it runs, its first copies to come. Fails with "at most 16 temporary handles can be active; retire one first" (step 1) or "could not create a temporary handle; try again" (steps 2–3). |
+| `setAliasRetired(uid, retired)` | Writes the alias table with that alias's entry retired or not (§2.6 "Retiring"): a retired alias stops on every device of the owner and its conversations leave `conversations`; one brought back starts again, and bringing one back fails with "at most 16 temporary handles can be active; retire one first" beyond `MAX_LIVE_ALIASES`. |
+| `setNickname(uid, nickname)` | Writes a NICK record at once (§7.3, §11.19), with an empty name for `""`. Fails with §11.19's errors. |
 | `sendText` / `sendImage` / `sendFile` / `leave` | §11.3. An image or a file is uploaded first (§8.1, §8.3); the echo shows a local preview (a file's name and size). Given the message key of a TEXT, IMAGE, FILE or REPLY row that the copy holds and accepts, `sendText`, `sendImage` and `sendFile` send their message as a REPLY to that row (§11.17), and fail with "unknown message" for any other key. Each `MessageView` of a REPLY carries `reply: {key, state}` (§11.17). |
 | `react(convId, messageKey, emoji, on)` | §11.3 and §11.12: one REACTION row for the TEXT, IMAGE, FILE or REPLY row of that message, with `op` 1 for `on` and 0 otherwise. It resolves when the row counts as delivered (§11.3 step 8) and fails with §11.3's errors; there is no echo. Each `MessageView` carries `reactions: {emoji, count, mine}[]`. |
 | `editText(convId, messageKey, text)` | §11.3 and §11.18: one EDIT row with `text` for self's TEXT row, or REPLY row of `kind` 1, of that message, which the copy holds and accepts. It fails with "unknown message" for a key that names no message, with "this message cannot be edited" for another member's message, an image, a file or an echo not yet sent, with "an edit cannot be empty" for a text that is empty or only white space, and with "message is too long" for one over 12000 bytes; a text equal to the current one resolves at once without a row. It resolves when the row counts as delivered (§11.3 step 8) and fails with §11.3's errors; there is no echo. Each `MessageView` carries its current text as `text`, and `edited: {ts, count, sending}` while an EDIT row edits it or an edit of this device is being sent (§11.18 "Display"). |
@@ -4691,7 +4929,7 @@ live final sweep dropped it). Older rows are never counted as unread.
 | the notification setting of the device | §11.13: turning it on subscribes the browser (a native app: gets its token and push keys) and registers the set; turning it off unsubscribes (a native app: gives up its token and deletes its push keys), then deletes the registration and the notification cache. The preview (`none`, `name`, `message`) decides what notifications show. The names of these calls are implementation-defined. |
 | `addMembers` | Drop leavers (a separate commit first if a requested user is a listed leaver), then §6.3 with the added uids. Resolves after the switch and the first delivery attempt. |
 | `removeMember` | §6.3 without that uid and without leavers. Removing self is refused ("use “leave” to leave a conversation"). |
-| `markRead(convId)` | Reports that the conversation's pane is open: it moves the copy's read positions and clears its mark (§11.8), and starts scrollback once (§11.10). It accepts no copy and writes no CONTACT, whatever the copy (§11.5). |
+| `markRead(convId, opened)` | Reports that the conversation's pane is open: it moves the copy's read positions and clears its mark (§11.8), and starts scrollback once (§11.10). It accepts no copy and writes no CONTACT, whatever the copy (§11.5). `opened` (true when absent) says that the user opened the pane, or that its page or window became visible again, rather than that rows arrived in a pane already open; only such an opening posts an alias's BELL row (§11.13). |
 | `markUnread(convId)` / `markAllRead()` | Set the copy's mark, or move every copy's read positions to the rows the client holds and clear every mark (§11.8). Both are written like other read positions. |
 | `setMuted(convId, until)` | Writes a CONV_PREFS mute for the copy (§7.2): every device of the account drops its bell from its registration set until `until` (§11.13). |
 | `accept(convId)` | The user's acceptance, from the accept control (§11.5). For a live copy whose `rootBy` is neither self nor a contact it writes, at once, in a self row that also holds a HEADS record (§7.3): for a request, unless §11.5 lets nothing accept it, the CONV_JOIN with `via = 5` and the CONTACT for `D.by`; for another such copy, the CONTACT for its `rootBy`. For any other copy, an ended one included, it does nothing. When `rootBy` has no MEMBER record (§7.3), which only a copy that is not a request can lack, `accept` first looks it up by uid as §10.6 does and writes the MEMBER in the CONTACT's row; when the lookup fails or finds no verified bundle for `rootBy`, `accept` fails with "could not verify who started this conversation; try again" and writes nothing. It resolves when that row is written and fails with the write's error. Each `ConversationView` carries `byContact`, false when the copy's `rootBy` is neither self nor a contact; while it is false and the copy has not ended, the UI shows the copy as a request's read-only preview, with the accept control, which calls `accept`. |
@@ -4700,7 +4938,17 @@ live final sweep dropped it). Older rows are never counted as unread.
 
 Links (§4.3, §5.5) are implemented in the engine as internal operations (`createLink`, `openLink`), together with the
 LINK record, `Tlink` subscriptions and hello probing. They are not on the `Engine` interface in stage 1, because the
-link-sharing UI is deferred (§14).
+link-sharing UI is deferred (§14). The engine makes and opens links as the owner only.
+
+**Accounts in the view**. `EngineState.identities` lists the owner and then its aliases by index, each with its uid,
+handle, fingerprint, whether it is retired, and its status: `starting` until its restore (§11.4) ends, `ready` after
+it, `failed` when §2.6 does not run it because of its directory entry, `idle` when it is live but not among the 16 that
+the device runs, and `retired`. An alias is listed once the alias table that names it is
+applied, with the handle that the table's `c` gives. `syncing` stays true while the owner or a live alias is
+`starting`. Every `ConversationView` carries `as`, the uid of the account that holds the copy, and its `id` names the
+copy among the copies of every account on the device: the copies of one conversation that two of the owner's accounts
+hold are two views. `MemberView.you` is true for the member that is the copy's own account, and `MemberView.own` for a
+member that is another of the owner's accounts (§2.6).
 
 **Ended copies**. A copy that has ended (§6.6 step 3) stays in `conversations`, under its own key (§7.3
 "Copy keys"), with its history and lines and `canSend = false`; an ended request stays until it expires (§11.5).
@@ -4806,15 +5054,19 @@ decrypts itself.
   whose `rootBy` is neither self nor a contact (§11.5), so a conversation started by someone who is not a contact never
   rings before the user accepts it or self sends a TEXT, IMAGE, FILE, REPLY, REACTION or EDIT in it (either makes
   `rootBy` a contact, §11.5). When the set has more than `push.maxTokens` secrets, it holds those of the copies with the
-  newest `lastTs`.
-- **Registering.** `POST /api/v2/push/sub` (§10.10) with the whole set, and with `quiet` = `Qself` (§4.1), replaces
-  the endpoint's registration. A native app also sets `notes` when its preview is `name` or `message` and its handler
+  newest `lastTs`. A device that runs aliases (§2.6) registers one set for its endpoint: these secrets for the copies
+  of the owner and of every alias it runs, each from the bell secret key `bS` of the account that holds the copy, ranked
+  together by `lastTs`. A retired alias has none in it.
+- **Registering.** `POST /api/v2/push/sub` (§10.10) with the whole set, and with `quiet` = `Qself` (§4.1) of the owner
+  (never an alias's: the devices of an alias are its owner's), replaces the endpoint's registration. A native app also sets `notes` when its preview is `name` or `message` and its handler
   can show nothing for a push: on iOS and macOS only with the notification filtering entitlement
   (`com.apple.developer.usernotifications.filtering`), on Android always, since a quiet push is a data message of normal
   priority. Its handler then gets the account's sync notes (§11.16) while the app is closed. A device sends it when the
   set changes (a new generation of a copy's bell, a join, an accepted request, a new contact, a leave, an ended copy,
+  an alias started or retired (§2.6),
   a mute, or a preview change that turns `notes` on or off), at most once per Δ (changes within Δ go together); after each restore (§11.4
-  step 11); and at least once per 24 hours while the session runs, so that a registration in use never reaches its
+  step 11; a device that runs aliases sends it, and writes its cache, only once the restores of the owner and of every
+  alias it runs have ended, an alias that is not run counting as ended, never with the copies of only some of them); and at least once per 24 hours while the session runs, so that a registration in use never reaches its
   expiry, and one that the server lost comes back within a day. Each time, it first reads
   `pushManager.getSubscription()`: when the endpoint differs from the one it last registered, it sends the old endpoint
   with an empty set before the new one; when the subscription is gone, or was made with another `applicationServerKey`
@@ -4826,7 +5078,7 @@ decrypts itself.
 - **Ringing.** After each successful put of a TEXT, IMAGE, FILE or REPLY row (§11.3 step 6: an OK with a verified receipt, a
   CONFLICT with its own body, or a probe that finds its own body), also a late one (§11.3 step 8), the sender sends one
   `POST /api/v2/ring` (§10.10) for the row's `(E, label)` with these bells, e being the send's epoch: for each member of
-  `D_e` other than self, the bell of that member's latest BELL row among the held epochs of e's generation ("Bells",
+  `D_e` other than self and the owner's other accounts (§2.6), the bell of that member's latest BELL row among the held epochs of e's generation ("Bells",
   below); or, when e started its generation, the device has loaded e − 1 and the member is in `D_{e−1}`, the bell of its
   latest BELL row among the held epochs of e − 1's generation; a member with neither is not rung. With no bell nothing
   is sent. The sender rings every such member, whether or not it turned notifications on, which the sender does not
@@ -4838,8 +5090,8 @@ decrypts itself.
   epoch whose `D` lacks a member of the previous epoch's (§4.1). An epoch whose previous epoch the device has not loaded
   (one below the start of its restore, §11.4 step 5, until the history reads it, §11.10) also counts as a start: the
   device cannot tell from it whether anyone was dropped, and a start it adds only gives a new bell, which no removed
-  member knows. The epochs of one generation form a run, and a member posts its bell once per epoch. A device posts a
-  BELL row on self's lane in the current epoch c of each copy that the registration set would hold if the device had
+  member knows. The epochs of one generation form a run, and a member posts its bell once per epoch. For each account
+  that is not an alias, a device posts a BELL row on self's lane in the current epoch c of each copy that the registration set would hold if the device had
   notifications on and the copy were not muted (above: a live copy that is not a request, has not ended, whose leave is
   not current and whose `rootBy` is self or a contact; frozen copies included), when params carry `push` and self's lane
   in c has no BELL row that the device has seen or put. The row carries `g` = c's generation and `bell(s(conv, g))`; it
@@ -4852,8 +5104,19 @@ decrypts itself.
   the lane's latest BELL row (the member's bell and `g`), replaced by a later row of the lane; a restore seeds those of
   its HEADS epoch from the BELLS record (§7.3, §11.4 step 5). The row is posted whether or not the device has
   notifications on, so the other members cannot tell from it whether it has.
+- **An alias's BELL row** (§2.6 "Rows that members can cause"). An alias posts no BELL row because it finds its lane
+  in c without one. It posts the row of c in a copy that the rule above covers just before its own first row in c
+  that the user causes (a TEXT, IMAGE, FILE, REPLY, REACTION, EDIT or LEAVE, or a claim it commits), as a put of its
+  own with no delay, or when the user opens that copy on a device in use (`markRead` of an opening, §11.11), after the
+  random delay above. An opening is the user's: the copy's pane opens, or the page or window that shows it becomes
+  visible again; rows that arrive in a pane already open are no opening, so an epoch that begins while the pane stays
+  open waits for the user's next act there or the next opening. Its creation of a conversation counts as its first act there. When the BELL put fails, the user's row is
+  still sent, and the BELL is tried again before the user's next row in c or the next opening. So the other members
+  ring an alias in an epoch only once it has acted or been opened there or earlier in that generation, and a member
+  that joined later only once it has done so in an epoch that member holds; until then the others' messages there
+  notify none of its devices, and after a removal its old bell is rung only until the next epoch change (below).
 - **Why the previous generation.** A device that is closed while a member is removed keeps the old bell registered
-  until it is opened and posts the new one. Senders ring that bell while its member has posted no bell in the new
+  until it is opened and posts the new one (an alias: when its user acts there or opens the copy, above). Senders ring that bell while its member has posted no bell in the new
   generation, and stop once a device of that member has, or once the epoch changes again. A member removed at the
   change knows the old bells and can ring them meanwhile, which makes the silent members' devices show notifications,
   at most one per device per `PUSH_WINDOW`, and tells it nothing: the answer to a ring is the same whatever it reaches
@@ -4870,11 +5133,14 @@ decrypts itself.
   storage), under a device key that the system's key store holds (the Keychain, shared with the extension and
   readable once the device has been unlocked after a restart; the Android Keystore). For each
   copy of the registration set it holds the copy's bell (`bell(s)` of its secret, §4.1), the copy's `ref` (below), the name that the client
-  shows for it, its mute (CONV_PREFS, §7.2), whether the client counts it as unread (§11.8) and the time of its newest
-  notification; and it holds `kN` (§11.16). With `message` it also holds the copy's current epoch c, `conv`, `mk_c`,
-  `rk_c`, self's lane index, the `sigPk` of each member of `D_c` and the handle that the client shows for it, and for
+  shows for it, its mute (CONV_PREFS, §7.2), whether the client counts it as unread (§11.8), the time of its newest
+  notification and the account that holds it (the owner, or an alias, §2.6); and it holds `kN` and `Tself` of each
+  account it covers (§11.16). With `message` it also holds the copy's current epoch c, `conv`, `mk_c`, `rk_c`, self's
+  lane index and those of the owner's other accounts in `D_c` (§2.6), the `sigPk` of each member of `D_c` and the
+  handle that the client shows for it, with the member's nickname when the owner gave it one (§11.19), and for
   each lane of c its **next slot**: the slot after the lane's head as the client last knew it, or `(E_start(c), 0)`; the
-  copy's `root` and its read positions in c; and `qS` and `Tself`, which the actions need (below). The client writes the
+  copy's `root` and its read positions in c; and the owner's `qS`, which the actions need (below), with the `Tself` and
+  `kN` of the copy's account. The client writes the
   cache whenever it sends the registration set, when a copy's name changes, when the page is hidden, and at least every
   5 minutes while the session runs, each lane's next slot as the later of the stored one and its own, and each copy's
   read positions as the merge of the stored ones and its own (§7.3). It merges the cache's read positions into its own
@@ -4912,7 +5178,7 @@ decrypts itself.
      order. With `name` its title is the copy's name and its body the fixed `body` of §9.8 (`new messages`), whatever
      the payload's `body` is; its `tag` is the copy's `ref`, and it opens the copy's URL (below).
   3. With `message` it first makes one `POST /api/v2/get` (§10.4) for those copies: for each lane of each copy's cached
-     epoch other than self's, the slot before the lane's next slot when it is in the same era, and the slots from the
+     epoch other than self's and those of the owner's other accounts (§2.6), the slot before the lane's next slot when it is in the same era, and the slots from the
      next slot on, at most `W` of those per lane and at most 256 keys in all, with slot 0 of `E_now` in place of the
      last of them when the next slot's era is below `E_now`. It keeps a row only when it opens under the cached `mk_c`
      and parses (§3.3), its label recomputes as `Lmsg_c(from, E, n)` with `from` its lane, its signature verifies under
@@ -4920,7 +5186,8 @@ decrypts itself.
      row in the slot before the next slot, which the client has already read (as it does when it is open while the push
      comes), only when it was stored in the last 5 minutes. A copy's notification is then that of step 2 with, as its
      body, the copy's newest such row by clamped `ts` (§11.8): `@handle: ` and its text, cut to 200 characters, or
-     `@handle sent an image` or `@handle sent a file` (a REPLY by its `kind`), followed by ` (+k)` when it found k more.
+     `@handle sent an image` or `@handle sent a file` (a REPLY by its `kind`), followed by ` (+k)` when it found k more;
+     `@handle` is the sender's nickname instead (without `@`) when the cache holds one for it (§11.19).
      An EDIT row found in that read that opens, parses, recomputes and verifies as above, and whose target (§11.18) is
      a TEXT, or a REPLY of `kind` 1, kept there, in the cached epoch on the EDIT's own lane (`te = c`, `tl` its lane),
      with `th` verifying under the cached `rk_c`, gives that row its text (that of the latest such EDIT by `(E, n)`);
@@ -4955,14 +5222,16 @@ decrypts itself.
 - **Presentation** (native apps). The handler groups a copy's notifications under its `ref` (the thread identifier on
   iOS and macOS, the group key on Android) and MAY show them as conversations: on iOS and macOS as communication
   notifications, on Android in the messaging style with a conversation shortcut, with the copy's `ref` as the
-  conversation's identifier, its name as the conversation's name and the row's `@handle` as the sender. It hands the
+  conversation's identifier, its name as the conversation's name and the row's `@handle` (or the sender's nickname,
+  §11.19) as the sender. It hands the
   system nothing else (§13.5).
 - **Conversation URLs** (informative). The client names a copy in its page URL by
   `ref = b64u(HMAC(HKDF(AK, "", "segv.sh/ui/ref"), utf8(key))[0..9])` (12 characters), where `key` is the copy key
   (§7.3): the same on every device of the account, except where §7.3 lets copy keys differ, another value for any
   other account, and nothing that tells `conv`. The URL is `https://<host>/#c/<ref>`, whose fragment never reaches
   the server. Opening it shows that copy once the client holds it, and the conversation list when no copy has that
-  `ref` once the restore has ended. A notification of a copy opens that URL, and the client closes the notifications
+  `ref` once the restores of the owner and of every live alias have ended (§2.6; an alias that is not run counts as
+  ended). A notification of a copy opens that URL, and the client closes the notifications
   whose `tag` is a copy's `ref` when it shows that copy.
 - **Seen elsewhere.** A device is **in use** while its page is visible (`document.visibilityState` is `visible`), its
   window has focus (`document.hasFocus()`), and the user's last input on the page (a key, a pointer press, a pointer
@@ -4971,7 +5240,8 @@ decrypts itself.
   a pointer move at the same position, which a browser may report when content moves under a still pointer. While it is in use, a device whose setting (below) is on
   **marks seen** each TEXT, IMAGE, FILE or REPLY row of another member that it shows and counts as unread (§11.8), when the row
   was stored recently enough to have rung (`t + Δ ≥ sec(now) − RING_FRESH`, §10.10): it sends `POST /api/v2/seen`
-  (§10.10) with `qS` and the rows, gathering the rows of up to 1 s, at most 16 per request. It does not wait for the
+  (§10.10) with `qS` and the rows, gathering the rows of up to 1 s, at most 16 per request; `qS` is the owner's, for the
+  rows of an alias's copies too (§2.6), since the device registered their bells under the owner's `Qself`. It does not wait for the
   answer; after a network error, a timeout or a 5xx it sends the same request once more, after 1 s, and never otherwise.
   The server then sends no push for those rows to any endpoint registered with `Qself`, the marking device's own included,
   unless the push has already gone (each waits at least `PUSH_HOLD` = 5 s after its ring, §9.8). A device marks nothing
@@ -4990,7 +5260,7 @@ decrypts itself.
   seen never reaches it.
 - **Apps without push.** A native app without a push transport (a desktop app on Windows or Linux, or one on macOS
   that does not use APNs, §11.14) registers no endpoint and gets no push. It MAY still notify while it runs, also with
-  its window closed: for each TEXT, IMAGE, FILE or REPLY row of another member that reaches it (§11.6) while it is not in use,
+  its window closed: for each TEXT, IMAGE, FILE or REPLY row of another member, not one of the owner's accounts (§2.6), that reaches it (§11.6) while it is not in use,
   in a copy that its registration set would hold, it shows the notification that the handler would show for that
   copy with the device's preview (step 2, with step 3's text when the preview is `message`), at most one per copy per
   `PUSH_WINDOW`. It builds a notification when it shows it, from the current text of its message (§11.18), so an edit
@@ -5107,7 +5377,8 @@ A device that keeps its session (§11.11) SHOULD keep its **local state** across
 conversations and their recent messages as soon as it starts, also offline, and catches up from where it stopped
 rather than restoring from scratch:
 
-- **What it holds**: the fold of the self lane as the device applied it (§7.3) with the device's self position; for
+- **What it holds**, for the owner and for each alias the device runs (§2.6), each apart: the fold of the self lane as
+  the device applied it (§7.3) with the device's self position; for
   each copy its state of §11.2 (epochs, keys, descriptors, members, claims and cuts, lane positions, the followed lanes,
   read positions and settings) and its messages: at least those of the initial history (§11.4 step 6), every unread
   one, and those the user has scrolled back to, up to an implementation-defined bound, with the REACTION and EDIT rows
@@ -5125,12 +5396,13 @@ rather than restoring from scratch:
   position, and each copy's lanes and control lane from the state's positions, which are at least as far as anything
   the device wrote to its self lane. Rows already held are not fetched again. The state holds only what the device has
   itself verified, so the restore that follows reaches the same verdicts as a restore from the server alone would for
-  every row; a local state that is missing, does not open, fails to parse, belongs to another account or another
+  every row; a local state that is missing, does not open, fails to parse, belongs to another owner or another
   deployment, or names a protocol version that the client does not support is deleted, and the device restores from the
   server alone.
 - **Integrity** (§12) is unchanged: the state only lets the device keep more of what it saw, which gives the
   immutability check of §12.1 more rows to compare.
-- **Deletion**: at `logout`, when the device stops keeping its session, and when another account signs in on it.
+- **Deletion**: at `logout`, when the device stops keeping its session, and when another account signs in on it; an
+  alias's part when the alias is retired (§2.6).
 
 The local state adds no request and nothing that the server stores. What it adds on the device is the history that it
 holds at rest, sealed under a key of the device (§13.5).
@@ -5157,9 +5429,14 @@ sealed note = aeadSeal(kN, pad(note, [512]), aad = enc("segv.sh/v2/note"))      
   epoch, and when it writes a CONV_PREFS, with that record. It gathers the changes of up to 2 s, puts them in as few
   notes as hold them, and sends each in a `POST /api/v2/sync` (§10.11) with `qS` and `Tself`. It does not wait for the
   answer; after a network error, a timeout or a 5xx it sends the same request once more, after 2 s, and never otherwise.
-  It sends nothing after `logout`, or for another session than the one that made the change.
+  It sends nothing after `logout`, or for another session than the one that made the change. An alias (§2.6) sends the
+  notes of its own copies sealed under its own `kN`, on its own `Tself`, with the owner's `qS`: they reach the sockets
+  that subscribe to its `Tself`, and the pushes of the owner's endpoints that take notes, which are registered under
+  the owner's quiet tag (§11.13). A handler opens a pushed note under each `kN` its cache holds and applies it only to
+  the copies of the account whose `kN` opens it.
 - **Receiving.** A device gets notes as NOTE frames on its realtime sockets (§10.8) and, when its endpoint takes notes,
-  in its pushes (§9.8). It applies the records of a note to the copies that it holds, and ignores the rest:
+  in its pushes (§9.8). It applies the records of a note to the copies of the account whose `Tself` the frame names (in
+  a handler, whose `kN` opens it), and ignores the rest:
   - a READ is merged into the copy's read positions as §7.3 merges one of the self lane, and its mark is taken when `ts`
     is later than the last change of the device's own mark. The device then closes the notifications that the positions
     cover (§11.13) and counts `unread` again (§11.8). It writes nothing for the note: the device that sent it writes the
@@ -5285,6 +5562,35 @@ left), accepted by §3.3 and §6.8, and part of its lane's `prev` chain (§12.2)
   catch-up with the warning "the server is showing different messages from @x to different members", and its scrollback
   does not move to an earlier era through one.
 
+### 11.19 Nicknames
+
+A **nickname** is a name that the user gives another user for their own eyes: the account's devices show it in place
+of that user's handle, and nobody else ever sees it. It is a NICK record of the owner's self lane (§7.2), keyed by the
+user's uid, so every device of the account, and every alias that the account owns (§2.6), shows the same nicknames.
+
+- **Rules.** A nickname is written only if it satisfies `validName` (§5.1), so it never starts with `@`, and, shown
+  without one, never reads as a handle (below); `setNickname` (§11.11) fails with "a nickname: 1–64 characters, not starting with @" otherwise. A
+  reader shows a NICK only while its name satisfies the reader's own `validName`. An empty name removes the nickname.
+  The user gives nicknames only to other users: `setNickname` fails with "you cannot give your own handles a
+  nickname" for the owner and for its aliases.
+- **Where it shows.** For every user u that the client shows by handle (§11.2: a member whose keys match its verified
+  bundle, a sender, an inviter), the client shows u's nickname instead, without `@`: in `who(u)` of system lines
+  (§11.9), in the name of a conversation without a name of its own (its other members, §5.1), as the sender of
+  messages, and in the notifications it shows (§11.13). An unknown member (`?…`, §11.2) never shows a nickname,
+  even when D lists the uid of a user that has one: a slot whose keys do not belong to that user is never shown as
+  that user. The warnings of this spec name users by `@handle` only, never by nickname, so a nickname never hides who
+  a warning is about. A client that shows nicknames shows every handle with its leading `@` wherever it names a user (a
+  sender, a member list, a quote, a system line), and a nickname without one, so that a nickname spelled like a handle
+  never reads as one. Informative: a client SHOULD keep the handle in sight beside a nickname wherever there is room
+  (a member list, a hover title), since a nickname is whatever the user typed.
+- **Engine.** `MemberView.nickname` carries u's nickname ("" for none, and for an unknown member) beside its handle,
+  and `MessageView.fromNickname` that of a message's sender; `conversations` carry names, lines and notification texts
+  with nicknames already applied. A nickname change makes the client build them again, without reading any row
+  again, and write the notification cache (§11.13).
+- **Leakage.** A nickname is written only to the self lane, under `kS`, and is never sent elsewhere: P sees one self
+  row per change, of class 0 for a name of at most 204 bytes and of class 1 otherwise (§3.2, §13.1). With the preview `message` or `name`, the notification cache
+  holds the nicknames it shows, and the operating system shows them (§13.4).
+
 ## 12. Integrity (replacing the v1 global hash chain)
 
 ### 12.1 Row immutability
@@ -5378,7 +5684,8 @@ fingerprints expose this. Mirrors and auditors that download the feed and the di
 
 ### 12.7 Fatal conditions
 
-The engine enters phase `fatal` only for an account check failure (§11.1). Every integrity finding above is a sticky
+The engine enters phase `fatal` only for a check failure of the signed-in account (§11.1); an alias's is a critical
+warning, and that alias is not run (§2.6). Every integrity finding above is a sticky
 critical warning, and messaging continues.
 
 Noise warnings (anything an outsider or a member can trigger at will) are deduplicated as "text (×n)", and at most 5
@@ -5393,16 +5700,18 @@ are kept. Critical warnings are kept until sign-out.
 | message ↔ sender | None: no sender column, the signature is inside the AEAD, writes are anonymous. Only Δ-rounded `t` and the class. | The writer's IP for every put, which with an IP-to-account match (unlock, own-bundle lookup) gives the account. | Verifiable, not deniable. | — |
 | message ↔ recipients | None for rows. Inbox invite: one of all users while an era has one bucket, even against a quantum P. With buckets (§9.3), one of the invite's bucket, about `N_E / 2^{β_E} ≥ K` users: the bucket is public, and so is every user's bucket of `E_now − 3 .. E_now + 1` in the directory's prefix pages (§10.6), so a P\* that reads the directory while the era is listed knows the users of each bucket. `kbucket_E` keeps that map out of the public archive (directory answers are `no-store`) and ends it with the key, nothing more. | Exactly, through the socket's topic set and the labels each client fetches; an invite's bucket, which O can compute from any handle anyway. | The member list. | — |
 | message ↔ message (same conversation) | No identifiers. Rows in the same Δ batch and rare classes are visible. With few shards and low traffic, timing correlation is strong. | Exactly: same topic, same IP. | Everything. | — |
-| user ↔ conversation | None. The directory reveals that the account exists and when it registered (the client's `ts`, and the minute through the dirlog head in checkpoints). | The topic set and fetch pattern per socket / IP, linked to the uid at unlock. | Co-members of shared conversations. | — |
+| user ↔ conversation | None. The directory reveals that the account exists and when it registered (the client's `ts`, random for an alias, and the minute through the dirlog head in checkpoints). | The topic set and fetch pattern per socket / IP, linked to the uid at unlock. | Co-members of shared conversations. | — |
 | user ↔ user | None. Global inbox counts per slot are public. | The whole social graph, including a p-bit prefix of every handle and co-member lookup (§13.2 item 10). | Co-members only. | — |
-| activity of a user | Directory events (registration, wrap additions); the size of the global inbox; self rows (one after each own creation, commit, join or leave, and at most one HEADS row per 30 minutes while active), which P cannot tell from other rows except by timing. Per-user send volume is not visible. | Per-IP read and write volume and times; online time; topic sets; with a `message` preview, when each such device receives a push, also while the app is closed (§13.4); from sync notes, when a device of the account changes its read state or a setting (§13.4). | Send times in shared conversations. With push, from each member's BELL row, when that member's first device processed each epoch change, to within about `BELL_DELAY` + Δ (§11.13, §13.4). | When each of its devices that turned notifications on is notified (§11.13), and when a native device that takes notes gets a quiet push, that is, when another device of its account changed its read state. |
+| activity of a user | Directory events (registration, wrap additions); the size of the global inbox; self rows (one after each own creation, commit, join or leave, and at most one HEADS row per 30 minutes while active), which P cannot tell from other rows except by timing. Per-user send volume is not visible. | Per-IP read and write volume and times; online time; topic sets; with a `message` preview, when each such device receives a push, also while the app is closed (§13.4); from sync notes, when a device of the account changes its read state or a setting (§13.4). | Send times in shared conversations. With push, from the BELL row of each member that is not an alias, when that member's first device processed each epoch change, to within about `BELL_DELAY` + Δ; from an alias's, when its user first acted in or opened the conversation in that epoch (§2.6, §11.13, §13.4). | When each of its devices that turned notifications on is notified (§11.13), and when a native device that takes notes gets a quiet push, that is, when another device of its account changed its read state. |
 | activity of a conversation | Not directly: rows have uniform labels. | Exact per-topic volume and times. | Everything. After removal: only that a claim happened, its `rm` bits and its cuts. With push it can still ring the bells of its last generation, which makes the devices of the members silent since the change show notifications until they post their new bells or the epoch changes again, and tells it nothing (§13.4). | — |
-| membership changes and creations | Both show the same row pattern: a class-1 self row, one class-1 row at least Δ+SKEW later (claim or decoy, which P cannot tell from a medium text), then J deliveries and one class-1 self row (DELIVERED, padded for any number of recipients, §6.12). Members who receive J by inbox add that many inbox rows within seconds, while a removal or rotation adds none, so P can tell "someone was invited by inbox" from "nobody was" (§13.2 item 12). Not the member count, not who. No self rows follow a claim observed by other members, and a freeze writes nothing. With push, each member whose device is open posts one class-0 row (its BELL row, §11.13) within a minute of the claim, so on a quiet server P can estimate how many members were online at the change. | Which IPs fetch the bundle blob, so the members. | The members of e+1 see D′. Every member of e, removed ones included, sees `rm` (who of the old members was dropped). With push, the members of e+1 see from each other's BELL rows when each member's first device processed the change (§13.4). | — |
+| membership changes and creations | Both show the same row pattern: a class-1 self row, one class-1 row at least Δ+SKEW later (claim or decoy, which P cannot tell from a medium text), then J deliveries and one class-1 self row (DELIVERED, padded for any number of recipients, §6.12). Members who receive J by inbox add that many inbox rows within seconds, while a removal or rotation adds none, so P can tell "someone was invited by inbox" from "nobody was" (§13.2 item 12). Not the member count, not who. No self rows follow a claim observed by other members, and a freeze writes nothing. With push, each member whose device is open, aliases aside (§2.6), posts one class-0 row (its BELL row, §11.13) within a minute of the claim, so on a quiet server P can estimate how many members were online at the change. | Which IPs fetch the bundle blob, so the members. | The members of e+1 see D′. Every member of e, removed ones included, sees `rm` (who of the old members was dropped). With push, the members of e+1 see from each other's BELL rows when each member's first device processed the change, aliases aside (§2.6, §13.4). | — |
 | content | The size class only (a reaction is a class-0 row, like a short text; an edit takes the class of a text 28 B longer). Safe against a quantum P. | Same, plus blob uploads and fetches per IP with the blob's padded length (§3.2), which bounds the size of the image or file in it (fetches: image recipients, and the members who save a file, §8.3); with push, which puts are texts, images or files, since a ring follows them (§13.4). | Everything in epochs held. | Nothing: every push has the same length and fixed text, and the bells in it are encrypted to the device (§9.8). |
 | directory | handle ↔ uid ↔ keys, registration time, every wrap (credential ids, recovery ids). | The same, plus a p-bit prefix of every lookup, and the exact wrap id and own uid at every login. | — | — |
 | device ↔ notifications (§9.8, §11.13) | None: push data is not public. | At each `push/sub`: the IP ↔ the endpoint ↔ its bells. Stored: the endpoint ↔ keyed hashes of its bells ↔ the day of its last registration, in a store that keeps no history of earlier values (§13.4); the number of bells is about the number of conversations it is notified for. With a `message` preview, each push is followed by a `get` of the conversation's lanes from the device's IP, which links the endpoint to that IP and dates the push's arrival (§13.4). | — | That the device uses this server (the VAPID key), linked to its subscription and often to an account with the browser's vendor. |
 | message ↔ recipients' devices | None. | At each ring: the writer's IP ↔ the row ↔ the other members' bells ↔ every endpoint registered under them, **offline devices included** (held in memory only, never stored). | — | When each device is notified (`PUSH_HOLD` plus up to `PUSH_JITTER` after the ring, at most once per `PUSH_WINDOW`); comparing the times of its devices suggests which share a conversation. |
 | devices ↔ account | None. | The devices of one account register the same bells, so the stored registrations link them (not to the account). | — | — |
+| alias ↔ owner (§2.6) | An alias's directory entry shows that it is an alias (its handle is `aliasHandle` of its own uid and keys, and it has no wraps) and nothing about its owner; its bundle's `ts` is random. By time: the directory serves every account's dirseq and registration era, and the checkpoints date each dirlog entry to the minute, so aliases registered close together, or close to their owner's registration, can be linked where few accounts register in that window. | Exactly: the owner's devices run its aliases from the same IPs and sockets, look the aliases' entries up by uid, register the aliases' bells on the owner's endpoints under the owner's `Qself`, mark the aliases' rows seen and send their sync notes with the owner's `qS` (§10.11, §11.13). | A separate member, with its own keys and fingerprint. As P, by registration time. A member of conversations of two of them can compare the times of what the user does as each (sends, reactions, edits, commits, leaves, and the BELL row that an alias posts with its first act in an epoch or when the user opens the copy), which are those of one device, and their rows' `ckq` (§3.3), the device's latest verified checkpoint. No alias row has a time that a member's act decides (§2.6), and an alias's `ts` is the server's time, not the device's clock; the owner's BELL rows show when its devices are online, which a member can test right after an alias acts by committing in a conversation of the owner. | The same as O for the devices it serves: the aliases' notifications reach the owner's devices. |
+| nicknames (§11.19) | One self row per change, which P cannot tell from other self rows. | The same, by IP and time. | — | — |
 
 Never stored anywhere: topics, WebSocket topic subscriptions (the ConnDOs' socket attachments and the FeedDOs' indexes
 live with the open sockets, §9.4), IPs, RESUME rings, rate-limit keys, arrival order inside a Δ batch, inbox jitter,
@@ -5609,7 +5918,8 @@ them. While a device of the account is in use, the rows it shows notify none of 
   account marked seen, live in the memory of the account's QuietDO only, for at most a few minutes (§9.8). Bells are
   hashes of secrets that only the account's devices hold, one per conversation and generation (§4.1), and their stored
   hashes are keyed under `PUSH_KEY`, so the stored data links no conversation or account to another, except that the
-  devices of one account hold the same bells and the same quiet tag, and the number of an endpoint's bells tells about
+  devices of one account hold the same bells and the same quiet tag, an owner's endpoints hold its aliases' bells
+  beside its own, under its quiet tag (§2.6), and the number of an endpoint's bells tells about
   how many conversations it is notified for. A bell changes only when a member leaves its conversation (§4.1), and the
   quiet tag never does, so its stored hash links the endpoints of one account also when they never shared a bell (an
   old phone and its replacement, say) for as long as both are stored. The store is a KV namespace,
@@ -5645,7 +5955,9 @@ them. While a device of the account is in use, the rows it shows notify none of 
   cannot register under another member's bell: registering needs the bell's secret, which only that member's devices
   hold (§10.10), so M can neither keep a member's devices from registering, nor learn from the registrations whether a
   member has notifications on; every member posts its BELL rows whether or not it has notifications on (§11.13). The
-  BELL rows themselves tell M when each other member's devices came online: a device posts one in every epoch,
+  BELL rows themselves tell M when each other member's devices came online: a device posts one in every epoch for
+  every account that is not an alias (an alias's BELL row dates its user's first act in the epoch, or the opening of
+  the conversation, §2.6),
   additions and renames included, within `BELL_DELAY` = 60 s of first processing it, and the row's Δ-rounded `t` is on
   a lane that M reads, so M learns, for every member and every epoch change, when the first device of that member
   processed the change, to within about `BELL_DELAY` + Δ (70 s): soon after the change when a device of the member was
@@ -5686,7 +5998,7 @@ them. While a device of the account is in use, the rows it shows notify none of 
   its conversations. What a preview shows passes to the operating system: the lock screen, as its settings say; the
   notification history, which may keep it after the messages, the app or its data are deleted, and from which
   forensic tools have recovered messages of other messengers; and paired devices. A device's notification history
-  holds the times of its notifications and what they showed. The device keeps the names and handles of its
+  holds the times of its notifications and what they showed. The device keeps the names, handles and nicknames of its
   conversations, and with `message` the keys of their current epochs, in the notification cache, sealed under a device
   key beside the kept session. In a native app the handler reads the rows in the same way, while the app is closed; the
   cache, its device key and the push keys stay in the system's key store and the app's own storage (§11.13).
@@ -5727,7 +6039,8 @@ A native app (§11.14) changes whom a user trusts for the client's code, and add
   of this from whoever can read those files: the notification handler reads them while the device is locked.
 - **Apps without push** (§11.13) send nothing for their notifications, and notify also of rows that another device of
   the account shows.
-- **Conversation notifications** (§11.13) give the system each notified copy's name and `ref` and the senders' handles,
+- **Conversation notifications** (§11.13) give the system each notified copy's name and `ref` and the senders' handles
+  or nicknames (§11.19),
   which it may keep on the device beyond the notification, for instance to suggest conversations when the user shares
   something.
 
@@ -5762,6 +6075,8 @@ A native app (§11.14) changes whom a user trusts for the client's code, and add
 **Cryptography and accounts:**
 
 - PIR for the directory and inbox; ML-DSA signatures;
+- aliases that O cannot link to their owner (separate sockets, IPs and push endpoints per account, §2.6, §13.1), and
+  aliases registered ahead of use at random times, so that the dirlog's order and minutes link fewer of them;
 - AK rotation and bundle versions (`bundle_hist`, `prevsig`); a rotated `kemPk` must enter each conversation through a
   commit that changes that member's `kh` (§5.1, §5.4), which the D′ checks of stage 1 forbid;
 - delayed rekeying after AK rotation; periodic PCS-lite rotation.
@@ -5799,6 +6114,8 @@ A native app (§11.14) changes whom a user trusts for the client's code, and add
 | Re-add after a removal | the skip rule: the removed copy continues at the re-add's epoch | a separate copy, rooted at the re-add's descriptor, as a first contact; the removed copy has ended and keeps its history (§6.6 step 3, §6.7 step 6, §13.2 item 16) |
 | Reactions | none | REACTION rows (type 3) on the sender's lane, bound to the target row's label and body; per member and emoji the latest row decides, at most 8 emoji per member and message; no unread count, no `lastTs`, no line (§11.12) |
 | Replies | none | REPLY rows (type 6): a text, image or file that names its target row as a reaction does; a reply shows a line naming its target, and a client may show a message's thread from the rows it holds (§11.17) |
+| Aliases | none | temporary handles: accounts derived from the owner's AK by index, with a handle derived from their keys (`_xxxx_xxxx`: 8 characters of a 32-letter alphabet), registered without wraps, listed in the owner's alias table (PREFS key 1) and run on the owner's devices over the same sockets; nothing stored or written names the owner, timing aside, and no alias row has a time that a member's act decides; linked for O (§2.6, §13.1) |
+| Nicknames | none | private names for other users in NICK records of the owner's self lane, shown in place of handles everywhere but in warnings and never for an unknown member (§11.19) |
 | Edits | none | EDIT rows (type 7): a new text for a member's own earlier text, naming it as a reaction does; the latest edit in lane order decides, with no limit on their number or time; the original row stays stored and readable, and a client may show every version; an "edited" mark; no unread count, no `lastTs`, no line, no ring (§11.18) |
 | Notifications | none | optional push (Web Push, and APNs and FCM for native apps): devices register bells of their own (a secret per conversation, whose hash the members learn from BELL rows on its lane), a sender rings the other members' bells after a text, image or file, and the Worker sends a contentless push, coalesced per device; it stores no uid, conversation or IP; a device may show a preview that it decrypts itself; a device in use marks the rows it shows seen, and the account's devices get no push for them (§9.8, §10.10, §11.13, §13.4) |
 | Integrity | client-verified global chain (fatal on gaps); `head` in messages; local checkpoint | signed checkpoint chain (local persistence, range verification), `ck` in messages, `prevh`, immutability, receipts, public feed for auditors |

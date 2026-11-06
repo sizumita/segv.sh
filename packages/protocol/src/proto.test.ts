@@ -796,6 +796,105 @@ describe("accounts: identity derivation (§2.1)", () => {
   });
 });
 
+describe("aliases (§2.6)", () => {
+  /** The reference alias handle: "_" + 4 + "_" + 4 characters of 40 bits of the hash, by BigInt shifts. */
+  const refAliasHandle = (uid: B, sigPk: B, kemPk: B, c: number): string => {
+    const a = sha(refEnc("segv.sh/v2/alias/handle", uid, sigPk, kemPk, be8(c)));
+    const x = beToBig(a.slice(0, 5));
+    const ch = (k: number) => "0123456789abcdefghjkmnpqrstvwxyz"[Number((x >> BigInt(35 - 5 * k)) & 31n)];
+    return `_${ch(0)}${ch(1)}${ch(2)}${ch(3)}_${ch(4)}${ch(5)}${ch(6)}${ch(7)}`;
+  };
+
+  it("derives AK_i and uid_i with the §2.6 labels; every key of the alias is §2.1 under AK_i", () => {
+    const AK = seqBytes(32);
+    for (const i of [0, 1, 2, 0xffffffff]) {
+      const AKi = P.aliasKey(AK, i);
+      expect(toHex(AKi)).toBe(toHex(hkdfN(AK, "", refEnc("segv.sh/v2/alias", be32(i)))));
+      const uid = P.aliasUid(AKi);
+      expect(toHex(uid)).toBe(toHex(hkdfN(AKi, "", "segv.sh/v2/alias/uid", 16)));
+      expect(uid.length).toBe(16);
+      const id = P.deriveIdentity(AKi);
+      expect(toHex(id.sigSk)).toBe(toHex(hkdfN(AKi, "", "segv.sh/v2/id/ed25519")));
+      expect(toHex(P.bellKey(AKi))).toBe(toHex(hkdfN(AKi, "", "segv.sh/v2/self/bell")));
+    }
+    // aliases of one owner, and the owner, are unrelated
+    const keys = [AK, P.aliasKey(AK, 0), P.aliasKey(AK, 1), P.aliasKey(seqBytes(32, 1), 0)].map(toHex);
+    expect(new Set(keys).size).toBe(4);
+    for (const i of [-1, 1.5, 2 ** 32]) expect(() => P.aliasKey(AK, i)).toThrow(/alias index/);
+    expect(() => P.aliasKey(new Uint8Array(31), 0)).toThrow(/32 bytes/);
+  });
+
+  it("aliasHandle matches the reference, the regex of §2.1 and the alias pattern, for every c", () => {
+    for (let t = 0; t < 40; t++) {
+      const id = P.deriveIdentity(P.aliasKey(fill(32, t), t));
+      const uid = P.aliasUid(P.aliasKey(fill(32, t), t));
+      const seen = new Set<string>();
+      for (let c = 0; c < P.ALIAS_TRIES; c++) {
+        const h = P.aliasHandle(uid, id.sigPk, id.kemPk, c);
+        expect(h).toBe(refAliasHandle(uid, id.sigPk, id.kemPk, c));
+        expect(h).toMatch(P.HANDLE_RE);
+        expect(h).toMatch(P.ALIAS_HANDLE_RE);
+        expect(h).toHaveLength(10);
+        expect(P.isAliasHandle(h)).toBe(true);
+        expect(P.aliasHandleTry(h, uid, id.sigPk, id.kemPk)).toBe(c);
+        seen.add(h);
+      }
+      expect(seen.size).toBe(P.ALIAS_TRIES);
+      // another key gives another handle: the handle is bound to the bundle's own keys
+      const other = P.deriveIdentity(fill(32, 200 + t));
+      expect(P.aliasHandleTry(P.aliasHandle(uid, id.sigPk, id.kemPk, 0), uid, other.sigPk, id.kemPk)).toBe(-1);
+      expect(P.aliasHandleTry(P.aliasHandle(uid, id.sigPk, id.kemPk, 0), fill(16, t), id.sigPk, id.kemPk)).toBe(-1);
+    }
+    for (const c of [-1, 4, 0.5]) expect(() => P.aliasHandle(fill(16, 0), fill(32, 0), fill(1216, 0), c)).toThrow();
+  });
+
+  it("the alias alphabet leaves out i, l, o and u; chosen handles never look like aliases", () => {
+    expect(P.ALIAS_CHARS).toHaveLength(32);
+    for (const ch of "ilou") expect(P.ALIAS_CHARS).not.toContain(ch);
+    for (const h of ["alice", "bob_1", "a_b_c", "0123"]) expect(P.isAliasHandle(h)).toBe(false);
+    for (const h of ["_abcd_efgh", "_k7m2_q9x4"]) expect(P.ALIAS_HANDLE_RE.test(h)).toBe(true);
+    for (const h of ["_abcd_efgi", "_abc_defgh", "abcd_efgh_", "_ABCD_efgh", "__abcd_efg"])
+      expect(P.ALIAS_HANDLE_RE.test(h)).toBe(false);
+  });
+
+  it("the alias table (PREFS key 1, §7.2): one byte per index, c in bits 0–1, retired in bit 2", () => {
+    const t: P.AliasEntry[] = [
+      { c: 0, retired: false },
+      { c: 3, retired: true },
+      { c: 1, retired: false },
+    ];
+    const v = P.encodeAliasTable(t);
+    expect(toHex(v)).toBe("000701");
+    expect(P.parseAliasTable(v)).toEqual(t.map((x) => ({ ...x, rest: 0 })));
+    expect(P.parseAliasTable(new Uint8Array(0))).toEqual([]);
+    // bits 3–7 are ignored by a reader and kept by a writer (§7.1)
+    const odd = P.parseAliasTable(Uint8Array.of(0x0d, 0xf8));
+    expect(odd).toEqual([
+      { c: 1, retired: true, rest: 8 },
+      { c: 0, retired: false, rest: 0xf8 },
+    ]);
+    expect(toHex(P.encodeAliasTable(odd))).toBe("0df8");
+    expect(toHex(P.encodeAliasTable([{ ...odd[0], retired: false }]))).toBe("09");
+    expect(() => P.encodeAliasTable([{ c: 4, retired: false }])).toThrow();
+    // it rides in a PREFS record, which every reader since the first release folds and snapshots by key
+    const rec = { rtype: P.RT.PREFS, key: P.PREFS_ALIASES, value: v } as const;
+    expect(P.parseRecord(rec.rtype, P.encodeRecord(rec).subarray(3))).toEqual(rec);
+    expect(P.PREFS_ALIASES).toBe(1);
+    expect(P.MAX_LIVE_ALIASES).toBe(16);
+  });
+
+  it("known answers", () => {
+    const AK = seqBytes(32);
+    const AK0 = P.aliasKey(AK, 0);
+    const id = P.deriveIdentity(AK0);
+    const uid = P.aliasUid(AK0);
+    expect({ uid: toHex(uid), handle: P.aliasHandle(uid, id.sigPk, id.kemPk, 0) }).toEqual({
+      uid: toHex(hkdfN(hkdfN(AK, "", refEnc("segv.sh/v2/alias", be32(0))), "", "segv.sh/v2/alias/uid", 16)),
+      handle: refAliasHandle(uid, id.sigPk, id.kemPk, 0),
+    });
+  });
+});
+
 describe("accounts: bundles (§2.2)", () => {
   it("make → verify → parse with the exact v2 JSON (key order, no scan key)", () => {
     const u = alice.user;

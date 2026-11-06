@@ -43,9 +43,12 @@ export async function web({ base, browser, shots, P, Wire }) {
   const t6 = `from alice's second device secret-6 ${sfx}`;
   // alice's edit of t1; it keeps t1 in it, so that later steps still find the message by t1
   const t7 = `${t1} — edited secret-7`;
+  // a temporary handle's conversation with bob (§2.6)
+  const t8 = `from a temporary handle secret-8 ${sfx}`;
+  const t9 = `bob answers the temporary handle secret-9 ${sfx}`;
   const fileName = `minutes-${sfx}.txt`;
   const fileText = `議事録 secret-file ${sfx}\n`;
-  const secrets = [t1, t2, t3, t4, t5, t6, t7, fileName, fileText];
+  const secrets = [t1, t2, t3, t4, t5, t6, t7, t8, t9, fileName, fileText];
   const screen = (d, title) => shots.screen(d.page, title);
   let codeAlice = "";
 
@@ -235,6 +238,69 @@ export async function web({ base, browser, shots, P, Wire }) {
     },
   );
 
+  await step(
+    "a temporary handle: alice starts a 1:1 as a new random handle, bob never sees @alice there; a nickname",
+    async () => {
+      await A.page
+        .locator(".newconv")
+        .getByRole("button", { name: "new conversation", exact: true })
+        .click({ timeout: T });
+      const dialog = A.page.getByRole("dialog", { name: "new conversation" });
+      await dialog.waitFor({ timeout: T });
+      // making it registers a new account (a proof of work) and selects it
+      await dialog.getByRole("button", { name: /new temporary handle/ }).click({ timeout: T });
+      const chosen = dialog.locator(".idcard.on .idhandle");
+      await chosen.filter({ hasText: /^@_[0-9a-z]{4}_[0-9a-z]{4}$/ }).waitFor({ timeout: 4 * T });
+      const alias = (await chosen.innerText()).slice(1);
+      check(/^_[0-9a-hjkmnp-tv-z]{4}_[0-9a-hjkmnp-tv-z]{4}$/.test(alias), `alias handle ${alias}`);
+      const people = dialog.getByRole("combobox", { name: "people" });
+      await people.fill(H.bob);
+      await people.press("Enter");
+      await dialog
+        .getByRole("button", { name: `remove @${H.bob}`, exact: true })
+        .waitFor({ timeout: T });
+      await dialog.getByText(`as @${alias}`).first().waitFor({ timeout: T });
+      await screen(A, "new conversation as a temporary handle");
+      await dialog.getByRole("button", { name: "start", exact: true }).click();
+      await dialog.waitFor({ state: "hidden", timeout: 4 * T });
+      await A.page.locator(".convhead", { hasText: `as @${alias}` }).waitFor({ timeout: T });
+      await send(A, t8);
+      // bob is alice's contact, not the temporary handle's: a request from @alias, which names nothing of alice
+      await openRequest(B, `@${alias}`, t8);
+      const pane = B.page.locator("section.right");
+      check(
+        !(await pane.innerText()).includes(H.alice),
+        `bob's view of the temporary handle's conversation names @${H.alice}`,
+      );
+      await screen(B, "request from a temporary handle");
+      await accept(B);
+      await send(B, t9);
+      await seen(A, t9);
+      // a nickname for bob, shown in place of his handle, only on alice's devices
+      await openMembers(A);
+      await A.page
+        .locator("aside.members")
+        .getByRole("button", { name: `give @${H.bob} a nickname` })
+        .click({ timeout: T });
+      const nick = A.page.getByLabel(`nickname for @${H.bob}`);
+      await nick.fill("Bobby");
+      await nick.press("Enter");
+      await A.page.locator("aside.members li", { hasText: "Bobby" }).waitFor({ timeout: T });
+      await closeMembers(A);
+      await A.page
+        .locator(".thread .m", { hasText: t9 })
+        .getByText("Bobby")
+        .first()
+        .waitFor({ timeout: T });
+      await A.page.locator(".conv .name", { hasText: "Bobby" }).first().waitFor({ timeout: T });
+      await screen(A, "a temporary handle's conversation, with a nickname");
+      check(
+        !(await B.page.locator("body").innerText()).includes("Bobby"),
+        "bob sees alice's nickname",
+      );
+    },
+  );
+
   await step("the public data verifies and leaks no plaintext", async () => {
     const getBytes = async (path) => {
       const r = await fetch(`${base}${path}`);
@@ -372,14 +438,15 @@ export async function web({ base, browser, shots, P, Wire }) {
         check(r.body.length === P.INBOX_BODY_LEN, `invite size ${r.body.length}`);
         clean(`an invite of era ${E}`, r.body);
       }
-    // bob's 1:1 invite and carol's group invite; bob's group J is a WELCOME in his 1:1 with alice (§6.12 step 1).
-    check(invites === 2, `expected 2 invites, got ${invites}`);
-    // The directory's public log: three registrations.
+    // bob's 1:1 invite, carol's group invite and bob's invite from alice's temporary handle; bob's group J is a WELCOME
+    // in his 1:1 with alice (§6.12 step 1). The temporary handle has no 1:1 with bob to carry a WELCOME.
+    check(invites === 3, `expected 3 invites, got ${invites}`);
+    // The directory's public log: three registrations and alice's temporary handle, which has no wraps (§2.6).
     const r = await fetch(`${base}/api/v2/dirlog?after=0&limit=1000`);
     check(r.ok, `/api/v2/dirlog: ${r.status}`);
     const log = await r.json();
     const users = log.entries.filter((x) => x.kind === 1).length;
-    check(users === 3, `expected 3 user entries in the dirlog, got ${users}`);
+    check(users === 4, `expected 4 user entries in the dirlog, got ${users}`);
     note(`data: ${rows} rows, ${invites} invites, ${log.entries.length} dirlog entries`);
   });
 

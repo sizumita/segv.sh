@@ -494,6 +494,7 @@ export function systemLine(key: string, ts: number, text: string): MessageView {
     seq: 0,
     from: "",
     fromHandle: "",
+    fromNickname: "",
     mine: false,
     ts,
     kind: "system",
@@ -563,6 +564,10 @@ export interface ViewCtx {
   selfHandle: string;
   /** a user by b64u uid */
   user(uidB: string): KnownUser | undefined;
+  /** the nickname the user gave a user (§11.19), "" for none */
+  nick(uidB: string): string;
+  /** a member is another of the user's accounts than the copy's own, by its uid and keys (§2.6) */
+  otherOwn(m: P.Member): boolean;
   /** the copy is contested by another held copy of its conversation (§6.7 step 6: ⚠ unless confirmed) */
   contested(c: Copy): boolean;
   /** the copy's `rootBy` is self or a contact (§11.11 `byContact`) */
@@ -656,9 +661,10 @@ function fingerprintOf(m: P.Member, kemPk: Bytes): string {
 export function viewOf(c: Copy, x: ViewCtx): ConversationView | null {
   const ep = c.epochs.get(c.current);
   if (!ep) return null;
+  const selfB = P.b64u(x.selfUid);
   const members: MemberView[] = ep.D.members.map((m, j) => {
     const uidB = P.b64u(m.uid);
-    const self = P.equalBytes(m.uid, x.selfUid);
+    const self = uidB === selfB;
     // a request's members other than its D.by (rootBy) are unknown until it is opened (§11.5)
     const known = c.request && !self && !P.equalBytes(m.uid, c.rootBy) ? undefined : x.user(uidB);
     const handle = self ? x.selfHandle : memberHandle(m, known).handle;
@@ -667,15 +673,21 @@ export function viewOf(c: Copy, x: ViewCtx): ConversationView | null {
     return {
       uid: uidB,
       handle,
+      // never for an unknown member: a slot whose keys are not that user's is not shown as that user (§11.19)
+      nickname: self || handle.startsWith("?") ? "" : x.nick(uidB),
+      you: self,
+      own: !self && x.otherOwn(m),
       fingerprint: kemPk && (self || !handle.startsWith("?")) ? fingerprintOf(m, kemPk) : "",
       left: self ? c.left : leftIn(c, ep, uidB),
     };
   });
-  const others = members.filter((m) => m.uid !== P.b64u(x.selfUid)).map((m) => "@" + m.handle);
+  // the other members by nickname, else by handle (§5.1, §11.19)
+  const others = members.filter((m) => !m.you).map((m) => m.nickname || "@" + m.handle);
   const name = displayName(ep.D);
   const blocked = blockedOf(c, ep, x);
   return {
     id: c.key,
+    as: selfB,
     ref: x.ref(c.key),
     name:
       (!c.confirmed && x.contested(c) ? "⚠ " : "") +

@@ -230,6 +230,42 @@ describe("the notifications of a push (§11.13)", () => {
     ]);
   });
 
+  it("`message`: a sender with a nickname in the cache is named by it, without @ (§11.19)", async () => {
+    const a = makeConv();
+    a.copy.epoch!.members[1].nick = "Bobby";
+    const c: NotifyCache = { v: 1, preview: "message", deltaS: 10, copies: [a.copy] };
+    const w = world(c);
+    w.put(a.row(1, 0, { type: P.MT.TEXT, text: "hi" }, { ts: NOW - 2000 }));
+    w.put(a.row(2, 0, { type: P.MT.TEXT, text: "yo" }, { ts: NOW - 1000 }));
+    expect((await notesFor(proposed([a.bell]), w.deps, later)).map((n) => n.body)).toEqual([
+      "@carol: yo (+1)",
+    ]);
+    const w2 = world(c);
+    w2.put(
+      a.row(1, 0, {
+        type: P.MT.IMAGE,
+        image: { id: P.random(32), k: P.random(32), mime: 1, w: 1, h: 1 },
+      }),
+    );
+    expect((await notesFor(proposed([a.bell]), w2.deps, later)).map((n) => n.body)).toEqual([
+      "Bobby sent an image",
+    ]);
+  });
+
+  it("`message`: the lanes of the user's other accounts are skipped as self's is (§2.6)", async () => {
+    const a = makeConv();
+    a.copy.epoch!.own = [2];
+    const c: NotifyCache = { v: 1, preview: "message", deltaS: 10, copies: [a.copy] };
+    const w = world(c);
+    w.put(a.row(1, 0, { type: P.MT.TEXT, text: "hi" }, { ts: NOW - 2000 }));
+    w.put(a.row(2, 0, { type: P.MT.TEXT, text: "from my alias" }, { ts: NOW - 1000 }));
+    expect((await notesFor(proposed([a.bell]), w.deps, later)).map((n) => n.body)).toEqual([
+      "@bob: hi",
+    ]);
+    // only bob's lane was read: 8 slots
+    expect(w.asked[0]).toHaveLength(8);
+  });
+
   it("`message`: a file is `@x sent a file`, without its name", async () => {
     const a = makeConv();
     const c: NotifyCache = { v: 1, preview: "message", deltaS: 10, copies: [a.copy] };

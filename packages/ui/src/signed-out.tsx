@@ -1,7 +1,7 @@
 import { $, component$, noSerialize, useContext, useSignal } from "@qwik.dev/core";
 import { Errors } from "./errors";
 import { StateCtx, UiCtx } from "./state";
-import { act, isHandle, normaliseHandle } from "./util";
+import { act, isHandle, isReservedHandle, normaliseHandle } from "./util";
 
 export const SignedOut = component$(() => {
   const state = useContext(StateCtx);
@@ -18,6 +18,10 @@ export const SignedOut = component$(() => {
     const h = normaliseHandle(handle.value);
     if (!isHandle(h)) {
       handleHint.value = "a handle is 3–20 characters: a–z, 0–9 and _";
+      return;
+    }
+    if (isReservedHandle(h)) {
+      handleHint.value = "handles starting with _ are reserved for temporary handles";
       return;
     }
     handleHint.value = "";
@@ -76,7 +80,7 @@ export const SignedOut = component$(() => {
           </button>
         </form>
         <p class={["small", handleHint.value ? "strong" : "dim"]}>
-          {handleHint.value || "3–20 characters: a–z, 0–9, _. public and permanent."}
+          {handleHint.value || "3–20 characters: a–z, 0–9, _ (not first). public and permanent."}
         </p>
       </section>
 

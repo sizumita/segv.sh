@@ -1,22 +1,34 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as proto from "@segv/protocol/proto";
-import type { MessageView } from "@segv/engine/types";
+import { MAX_LIVE_ALIASES, type MessageView, type PersonView } from "@segv/engine/types";
 import {
   HANDLE_RE,
   MAX_EMOJI_BYTES,
   MAX_FILE_BYTES,
   MAX_MEMBERS,
   MAX_NAME,
+  addChips,
+  atAliasCap,
+  byNickname,
   dayKey,
   editable,
   fitBox,
   fmtBytes,
+  handleOnly,
+  identitiesOf,
   inviterOf,
+  isReservedHandle,
   lastEditable,
   listOf,
+  nameOf,
+  namesExactly,
+  nameWithHandle,
   parseHandles,
   relTime,
+  runs,
   shortName,
+  startsNickname,
+  suggest,
   textTooLong,
 } from "./util";
 
@@ -67,15 +79,193 @@ describe("parseHandles", () => {
   it("rejects empty input", () => {
     expect(parseHandles("  , ").ok).toBe(false);
   });
-  it("rejects self and existing members", () => {
+  it("rejects self and existing members, naming them by @handle", () => {
     expect(parseHandles("alice bob", "alice").ok).toBe(false);
-    expect(parseHandles("bob", "alice", ["alice", "bob"]).ok).toBe(false);
+    expect(parseHandles("bob", "alice", ["alice", "bob"])).toEqual({
+      ok: false,
+      error: "already a member: @bob",
+    });
+  });
+  it("refuses the user's other handles, whichever account invites", () => {
+    expect(parseHandles("bob _k7m2_q9x4", "alice", [], ["_k7m2_q9x4"])).toEqual({
+      ok: false,
+      error: "@_k7m2_q9x4 is one of your own handles",
+    });
+    expect(parseHandles("bob alice", "_k7m2_q9x4", ["_k7m2_q9x4", "carol"], ["alice"])).toEqual({
+      ok: false,
+      error: "@alice is one of your own handles",
+    });
+    expect(parseHandles("bob", "_k7m2_q9x4", ["_k7m2_q9x4"], ["alice"]).ok).toBe(true);
   });
   it("enforces the member cap", () => {
     const many = Array.from({ length: MAX_MEMBERS }, (_, i) => `user${i}`).join(" ");
     expect(parseHandles(many, "alice").ok).toBe(false);
     const max = Array.from({ length: MAX_MEMBERS - 1 }, (_, i) => `user${i}`).join(" ");
     expect(parseHandles(max, "alice").ok).toBe(true);
+  });
+});
+
+describe("new conversation chips", () => {
+  it("adds each valid handle once, in order, and keeps what it cannot add with why", () => {
+    expect(addChips([], "bob, @Carol  dave、ｅｒｉｎ，bob", "alice", [])).toEqual({
+      chips: ["bob", "carol", "dave", "erin"],
+      rest: "",
+      error: "",
+    });
+    expect(addChips(["bob"], "bob carol", "alice", [])).toEqual({
+      chips: ["bob", "carol"],
+      rest: "",
+      error: "",
+    });
+    expect(addChips(["bob"], "x, carol, <b>", "alice", [])).toEqual({
+      chips: ["bob", "carol"],
+      rest: "x, <b>",
+      error: "not a valid handle: x (3–20 of a–z 0–9 _)",
+    });
+  });
+  it("never adds the inviting account or another of the user's handles", () => {
+    expect(addChips([], "alice", "alice", ["_k7m2_q9x4"]).error).toBe(
+      "you are always included — leave yourself out",
+    );
+    expect(addChips([], "bob _k7m2_q9x4", "alice", ["_k7m2_q9x4"])).toEqual({
+      chips: ["bob"],
+      rest: "_k7m2_q9x4",
+      error: "@_k7m2_q9x4 is one of your own handles",
+    });
+    expect(addChips([], "alice", "_k7m2_q9x4", ["alice"]).error).toBe(
+      "@alice is one of your own handles",
+    );
+  });
+  it("stops at MAX_MEMBERS − 1 people besides self", () => {
+    const full = Array.from({ length: MAX_MEMBERS - 2 }, (_, i) => `user${i}`);
+    const r = addChips(full, "last, over", "alice", []);
+    expect(r.chips).toHaveLength(MAX_MEMBERS - 1);
+    expect(r.rest).toBe("over");
+    expect(r.error).toBe(`at most ${MAX_MEMBERS} members per conversation`);
+  });
+});
+
+describe("people and nicknames", () => {
+  const person = (handle: string, nickname = "", contactOf: string[] = []): PersonView => ({
+    uid: `u-${handle}`,
+    handle,
+    nickname,
+    contactOf,
+  });
+  const people = [
+    person("bobby"),
+    person("bob", "Mom Smith", ["u-alice"]),
+    person("carol", "", ["u-alice"]),
+    person("dave", "", ["u-alias"]),
+    person("oscar", "", ["u-alice"]),
+  ];
+  const handles = (ps: PersonView[]) => ps.map((p) => p.handle);
+  it("suggests by handle or nickname: exact first, the account's contacts next, prefixes before the rest", () => {
+    expect(handles(suggest(people, "bob", "u-alice", []))).toEqual(["bob", "bobby"]);
+    expect(handles(suggest(people, "mom", "u-alice", []))).toEqual(["bob"]);
+    expect(handles(suggest(people, "MOM SMITH", "u-alias", []))).toEqual(["bob"]);
+    expect(handles(suggest(people, "car", "u-alice", []))).toEqual(["carol", "oscar"]);
+    expect(handles(suggest(people, "", "u-alias", ["carol"]))).toEqual([
+      "dave",
+      "bobby",
+      "bob",
+      "oscar",
+    ]);
+    expect(suggest(people, "", "u-alice", [], 2)).toHaveLength(2);
+    expect(suggest(people, "zzz", "u-alice", [])).toEqual([]);
+  });
+  it("takes an @handle as a handle only, never as someone's nickname", () => {
+    // @dave is called "carol", and a real @carol is known; @alexander_k is called "alex", and @alex is not known
+    const ps = [
+      person("dave", "carol", ["u-alice"]),
+      person("carol"),
+      person("alexander_k", "alex", ["u-alice"]),
+    ];
+    expect(handleOnly(" ＠alex")).toBe(true);
+    expect(handleOnly("alex")).toBe(false);
+    expect(handles(suggest(people, "@MOM SMITH", "u-alias", []))).toEqual([]);
+    expect(handles(suggest(people, "@mom", "u-alice", []))).toEqual([]);
+    expect(handles(suggest(ps, "@carol", "u-alice", []))).toEqual(["carol"]);
+    expect(handles(suggest(ps, "@alex", "u-alice", []))).toEqual(["alexander_k"]);
+    expect(namesExactly(ps[2], "@alex")).toBe(false);
+    expect(namesExactly(ps[2], "alex")).toBe(true);
+    expect(namesExactly(ps[1], "@Carol")).toBe(true);
+    expect(byNickname(people, "@mom smith")).toBeUndefined();
+    expect(byNickname(ps, "@alex")).toBeUndefined();
+    expect(byNickname(ps, "＠ alex")).toBeUndefined();
+  });
+  it("puts the person whose handle is typed before the one whose nickname it is", () => {
+    const ps = [person("dave", "carol", ["u-alice"]), person("carol")];
+    // the contact whose nickname it is comes second, and a whole nickname does not stand for a known handle
+    expect(handles(suggest(ps, "carol", "u-alice", []))).toEqual(["carol", "dave"]);
+    expect(byNickname(ps, "Carol")).toBeUndefined();
+    expect(byNickname([ps[0]], "Carol")).toBe("dave");
+  });
+  it("finds a person by their whole nickname, and sees one being typed", () => {
+    expect(byNickname(people, " mom smith ")).toBe("bob");
+    expect(byNickname(people, "mom")).toBeUndefined();
+    expect(byNickname(people, "")).toBeUndefined();
+    expect(startsNickname(people, "Mom ")).toBe(true);
+    expect(startsNickname(people, "mom smith")).toBe(true);
+    expect(startsNickname(people, "mom smith,")).toBe(false);
+    expect(startsNickname(people, "bob ")).toBe(false);
+  });
+  it("names a user by nickname, else by handle, always with its @ (never an unknown member's ?…)", () => {
+    expect(nameOf("bob", "Mom")).toBe("Mom");
+    expect(nameOf("bob")).toBe("@bob");
+    expect(nameOf("?Xk3f9QaZ")).toBe("?Xk3f9QaZ");
+    expect(nameOf("")).toBe("");
+    expect(nameWithHandle("bob", "Mom")).toBe("Mom (@bob)");
+    expect(nameWithHandle("bob")).toBe("@bob");
+  });
+  it("counts the live temporary handles against the cap, the retired ones not", () => {
+    const alias = (i: number, retired = false) => ({
+      uid: `u-${i}`,
+      handle: `_a${i}`,
+      fingerprint: "",
+      alias: true,
+      index: i,
+      retired,
+      status: retired ? ("retired" as const) : ("ready" as const),
+    });
+    const live = Array.from({ length: MAX_LIVE_ALIASES - 1 }, (_, i) => alias(i));
+    expect(atAliasCap([...live, alias(99, true)])).toBe(false);
+    expect(atAliasCap([...live, alias(98)])).toBe(true);
+  });
+  it("starts conversations only as an account that runs here", () => {
+    const as = (status: "starting" | "ready" | "failed" | "idle" | "retired") => ({
+      uid: "u-1",
+      handle: "_a1",
+      fingerprint: "",
+      alias: true,
+      index: 1,
+      retired: status === "retired",
+      status,
+    });
+    expect(runs(as("ready"))).toBe(true);
+    expect(runs(as("starting"))).toBe(true);
+    expect(runs(as("idle"))).toBe(false);
+    expect(runs(as("failed"))).toBe(false);
+    expect(runs(as("retired"))).toBe(false);
+  });
+  it("reserves handles starting with _ for temporary handles", () => {
+    expect(isReservedHandle("_k7m2_q9x4")).toBe(true);
+    expect(isReservedHandle("alice_")).toBe(false);
+  });
+  it("lists the owner alone while the engine lists no accounts", () => {
+    const me = { uid: "u-alice", handle: "alice", fingerprint: "1" };
+    expect(identitiesOf({ identities: [], me })).toEqual([
+      {
+        uid: "u-alice",
+        handle: "alice",
+        fingerprint: "1",
+        alias: false,
+        index: -1,
+        retired: false,
+        status: "ready",
+      },
+    ]);
+    expect(identitiesOf({ identities: [], me: null })).toEqual([]);
   });
 });
 
@@ -114,14 +304,22 @@ describe("lists", () => {
     expect(listOf({ blocked: "removed", byContact: false })).toBe("archives");
   });
   it("names a request's inviter: its one resolved member other than self", () => {
-    const m = (uid: string, handle: string) => ({ uid, handle, fingerprint: "", left: false });
-    const me = m("u-me", "me");
+    const m = (uid: string, handle: string, you = false) => ({
+      uid,
+      handle,
+      nickname: "",
+      you,
+      own: false,
+      fingerprint: "",
+      left: false,
+    });
+    const me = m("u-me", "me", true);
     const alice = m("u-a", "alice");
     const unknown = m("u-x", "?Xk3f9QaZ");
-    expect(inviterOf({ request: true, members: [alice, me] }, "u-me")).toBe("alice");
-    expect(inviterOf({ request: true, members: [alice, me, unknown] }, "u-me")).toBe("alice");
-    expect(inviterOf({ request: true, members: [unknown, me] }, "u-me")).toBeUndefined();
-    expect(inviterOf({ request: false, members: [alice, me] }, "u-me")).toBeUndefined();
+    expect(inviterOf({ request: true, members: [alice, me] })).toBe(alice);
+    expect(inviterOf({ request: true, members: [alice, me, unknown] })).toBe(alice);
+    expect(inviterOf({ request: true, members: [unknown, me] })).toBeUndefined();
+    expect(inviterOf({ request: false, members: [alice, me] })).toBeUndefined();
   });
 });
 
@@ -131,6 +329,7 @@ describe("edits", () => {
     seq: 1,
     from: "u-me",
     fromHandle: "me",
+    fromNickname: "",
     mine: true,
     ts: 1,
     kind: "text",

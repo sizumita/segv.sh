@@ -694,6 +694,132 @@ describe("dirRegister", () => {
   });
 });
 
+/** An alias of a fresh owner (§2.6): AK_i, its derived uid and keys, and its handle for `c`; registered with no wraps. */
+function makeAlias(
+  i = 0,
+  c = 0,
+): {
+  AKi: Uint8Array;
+  ident: P.Identity;
+  uid: Uint8Array;
+  handle: string;
+  bundle: string;
+  sig: string;
+} {
+  const AKi = P.aliasKey(P.random(32), i);
+  const ident = P.deriveIdentity(AKi);
+  const uid = P.aliasUid(AKi);
+  const handle = P.aliasHandle(uid, ident.sigPk, ident.kemPk, c);
+  return { AKi, ident, uid, handle, ...P.makeBundle(uid, handle, ident, 0) };
+}
+
+describe("aliases (§2.6, §10.6)", () => {
+  it("registers an alias with no wraps: one user row and one dirlog entry, counted in dirmeta.users", async () => {
+    for (const c of [0, 3]) {
+      const al = makeAlias(c, c);
+      const s0 = await dirState();
+      const now = Date.now();
+      const { dirseq } = await dirRegister(env, { bundle: al.bundle, sig: al.sig, wraps: [] }, now);
+      expect(dirseq).toBe(s0.head + 1);
+      expect(await dirState()).toEqual({
+        users: s0.users + 1,
+        wraps: s0.wraps,
+        head: s0.head + 1,
+        meta: s0.meta + 1,
+      });
+      const [u] = await all<Record<string, unknown>>(
+        "SELECT handle, reg_era, dirseq FROM user WHERE uid = ?1",
+        P.b64u(al.uid),
+      );
+      expect(u).toEqual({ handle: al.handle, reg_era: P.era(now), dirseq });
+      const { entries } = await dirlogPage(env, s0.head, 10);
+      expect(entries.map((e) => e.kind)).toEqual([P.DIRLOG_USER]);
+      // sent again (a lost response, §2.5 step 8): answered as the first time, not logged again
+      expect(await dirRegister(env, { bundle: al.bundle, sig: al.sig, wraps: [] }, now)).toEqual({
+        dirseq,
+      });
+      expect((await dirState()).head).toBe(s0.head + 1);
+    }
+  });
+
+  it("400 for an alias handle with wraps, one that is not the bundle's own, and a chosen handle that starts with _", async () => {
+    const al = makeAlias();
+    const owner = makeAccount();
+    const s0 = await dirState();
+    // with wraps
+    const withWraps = makeAccount(al.handle, al.uid);
+    await rejects(register(withWraps), 400, /without wraps/);
+    // another account's keys under this alias handle (the handle is bound to the bundle's own uid and keys)
+    const stolen = P.makeBundle(owner.uid, al.handle, owner.ident, 0);
+    await rejects(dirRegister(env, { ...stolen, wraps: [] }, Date.now()), 400, /alias handle/);
+    // a handle of the alias pattern that no c gives
+    const other = P.makeBundle(
+      al.uid,
+      al.handle.slice(0, -1) + (al.handle.endsWith("0") ? "1" : "0"),
+      al.ident,
+      0,
+    );
+    await rejects(dirRegister(env, { ...other, wraps: [] }, Date.now()), 400, /alias handle/);
+    // chosen handles that start with _ (with wraps or without)
+    for (const h of ["_alice", "__", "_abc"]) {
+      if (!P.HANDLE_RE.test(h)) continue;
+      const a = makeAccount(h);
+      await rejects(register(a), 400, /without wraps|alias handle/);
+      await rejects(register(a, []), 400, /alias handle/);
+    }
+    // a normal handle without wraps stays a 400
+    await rejects(register(makeAccount(), []), 400, /wraps/);
+    expect(await dirState()).toEqual(s0);
+  });
+
+  it("409 for an alias handle or uid already registered", async () => {
+    const al = makeAlias();
+    await dirRegister(env, { bundle: al.bundle, sig: al.sig, wraps: [] }, Date.now());
+    // the same uid and keys with another signed text (another ts): the uid is taken
+    const again = P.makeBundle(al.uid, al.handle, al.ident, 1);
+    await rejects(dirRegister(env, { ...again, wraps: [] }, Date.now()), 409);
+  });
+
+  it("an account registered before aliases with a handle that starts with _ is no alias: it may add wraps", async () => {
+    // Registered as an older server allowed (written to D1 directly), then a new wrap through dirAddWrap.
+    const a = makeAccount("_old_one");
+    const s0 = await dirState();
+    await dirSeqStub(env).append({
+      kind: "user",
+      uid: a.uidB64,
+      upre: P.upre(a.uid),
+      handle: a.handle,
+      hpre: P.hpre(a.handle),
+      bundle: a.bundle,
+      sig: a.sig,
+      regEra: P.era(Date.now()),
+      wraps: [wrapOf(a, a.passkey)],
+    });
+    expect((await dirState()).users).toBe(s0.users + 1);
+    const w = newPasskey(a);
+    const { dirseq } = await dirAddWrap(env, { ...w });
+    expect(dirseq).toBeGreaterThan(s0.head);
+  });
+
+  it("dirAddWrap refuses a wrap for an alias's uid", async () => {
+    const al = makeAlias();
+    await dirRegister(env, { bundle: al.bundle, sig: al.sig, wraps: [] }, Date.now());
+    const credId = P.random(16);
+    const w = P.makeWrap(
+      al.uid,
+      "passkey",
+      credId,
+      P.credKem(P.random(32), credId),
+      al.AKi,
+      al.ident,
+      Date.now(),
+    );
+    const s0 = await dirState();
+    await rejects(dirAddWrap(env, { ...w }), 400, /alias/);
+    expect(await dirState()).toEqual(s0);
+  });
+});
+
 describe("dirAddWrap", () => {
   it("adds a wrap (one dirlog entry, dirmeta unchanged); 409 for a duplicate (uid, id)", async () => {
     const a = makeAccount();
