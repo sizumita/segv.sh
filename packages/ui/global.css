@@ -1474,7 +1474,8 @@ button.edited:hover:not(:disabled) {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.treply {
+.treply,
+.tjump {
   align-self: center;
   margin-left: auto;
   padding: 1px 5px;
@@ -1483,20 +1484,29 @@ button.edited:hover:not(:disabled) {
   background: none;
   color: var(--dim);
 }
-.treply .icon {
+/* Right after the reply button, whose auto margin already pushes both to the right edge. */
+.treply + .tjump {
+  margin-left: 0;
+}
+.treply .icon,
+.tjump .icon {
   width: 15px;
   height: 15px;
 }
-.treply:hover:not(:disabled) {
+.treply:hover:not(:disabled),
+.tjump:hover:not(:disabled) {
   background: var(--sel);
   color: var(--fg);
 }
 @media (hover: hover) {
-  .treply {
+  .treply,
+  .tjump {
     visibility: hidden;
   }
   .tb:hover .treply,
-  .treply:focus-visible {
+  .tb:hover .tjump,
+  .treply:focus-visible,
+  .tjump:focus-visible {
     visibility: visible;
   }
 }

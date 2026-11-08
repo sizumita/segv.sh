@@ -79,6 +79,23 @@ const TOP_TEXT: Record<Exclude<Top, "root">, string> = {
 /** The list follows a new last message while it is scrolled to within this of its end. */
 const NEAR_END_PX = 48;
 
+/** An arrow pointing up and to the left, out of the pane: show the message in the conversation. */
+const JumpIcon = () => (
+  <svg
+    class="icon"
+    viewBox="0 0 20 20"
+    aria-hidden="true"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.5"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  >
+    <path d="M12.5 5H5v7.5" />
+    <path d="M5 5l11 11" />
+  </svg>
+);
+
 /**
  * The side pane beside the conversation with a message's replies; `PaneState.thread` names the message. Its message box
  * replies to the last message it shows, or to the one whose "reply" was pressed (`PaneState.threadTo`) until it sends.
@@ -123,7 +140,8 @@ export const ReplyTree = component$<{ conv: ConversationView; canReply: boolean 
   });
 
   // "reply" makes the pane's message box reply to its message; a quote line shows that reply's own chain and replies;
-  // "(edited)" shows the message's versions (edit.tsx).
+  // "(edited)" shows the message's versions (edit.tsx); "show in conversation" scrolls the conversation beside the
+  // pane to the message, when the conversation holds it.
   const onClick = $((ev: MouseEvent) => {
     const el = ev.target as Element;
     const h = el.closest<HTMLElement>("[data-history]");
@@ -134,6 +152,15 @@ export const ReplyTree = component$<{ conv: ConversationView; canReply: boolean 
     const q = el.closest<HTMLElement>("[data-thread]");
     if (q) {
       pane.thread = q.dataset.thread ?? "";
+      return;
+    }
+    const j = el.closest<HTMLElement>("[data-jump]");
+    if (j) {
+      const key = j.dataset.jump ?? "";
+      box.value
+        ?.closest(".convbody")
+        ?.querySelector<HTMLElement>(`.msgs .m[data-key="${CSS.escape(key)}"]`)
+        ?.scrollIntoView({ block: "center" });
       return;
     }
     const t = el.closest<HTMLElement>("[data-reply]");
@@ -207,6 +234,15 @@ export const ReplyTree = component$<{ conv: ConversationView; canReply: boolean 
                           <ReplyIcon />
                         </button>
                       )}
+                      <button
+                        type="button"
+                        class="tjump"
+                        data-jump={m.key}
+                        aria-label={`show ${nameOf(m.fromHandle, m.fromNickname) || "this message"} in the conversation`}
+                        title="show in conversation"
+                      >
+                        <JumpIcon />
+                      </button>
                     </p>
                     {m.kind === "image" && m.image ? (
                       <MsgImage img={m.image} hold={props.conv.request} />
